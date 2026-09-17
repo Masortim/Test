@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+
+# PyInstaller
+build/
+dist/
+*.manifest
+
+# Промежуточные ресурсы
+portablizer/resources/icon_src.png
+
+# ОС/редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

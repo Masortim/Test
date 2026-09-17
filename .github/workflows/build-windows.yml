@@ -1,0 +1,51 @@
+name: Build Windows EXE
+
+# Собирает Portablizer.exe на настоящем Windows-раннере и публикует артефакт.
+on:
+  push:
+    branches: [ "arena/**" ]
+    paths:
+      - "portablizer/**"
+      - "app.py"
+      - "portablizer.spec"
+      - "requirements.txt"
+      - ".github/workflows/build-windows.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build EXE
+        run: pyinstaller --noconfirm --clean portablizer.spec
+
+      - name: Smoke test (import only)
+        run: |
+          python -c "import portablizer, portablizer.core.portablizer, portablizer.gui.main_window; print('import OK')"
+
+      - name: Show artifact
+        run: dir dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Portablizer-windows-x64
+          path: dist/Portablizer.exe
+          if-no-files-found: error
+          retention-days: 30
