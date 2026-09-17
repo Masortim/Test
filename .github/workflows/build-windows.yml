@@ -1,0 +1,68 @@
+name: Build Windows EXE
+
+# Собирает Portablizer.exe на настоящем Windows-раннере и публикует артефакт.
+on:
+  push:
+    branches: [ "arena/**" ]
+    paths:
+      - "portablizer/**"
+      - "app.py"
+      - "portablizer.spec"
+      - "requirements.txt"
+      - ".github/workflows/build-windows.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build EXE
+        run: pyinstaller --noconfirm --clean portablizer.spec
+
+      - name: Smoke test (import only)
+        run: |
+          python -c "import portablizer, portablizer.core.portablizer, portablizer.gui.main_window; print('import OK')"
+
+      - name: Show artifact
+        run: dir dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Portablizer-windows-x64
+          path: dist/Portablizer.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      # Артефакты Actions хранятся на blob-хранилище, недоступном из некоторых
+      # окружений. Поэтому дополнительно кладём собранный exe прямо в ветку,
+      # чтобы его можно было получить обычным git pull.
+      - name: Commit built EXE back to branch
+        if: github.ref == 'refs/heads/arena/01a0ae36-test'
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist-windows
+          cp dist/Portablizer.exe dist-windows/Portablizer.exe
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f dist-windows/Portablizer.exe
+          git commit -m "ci: build Portablizer.exe [skip ci]" || echo "no changes"
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          git push origin HEAD:"${GITHUB_REF_NAME}"
