@@ -12,6 +12,9 @@
 """
 from __future__ import annotations
 
+import ast
+import os
+import re
 import sys
 from typing import Dict, List, Tuple
 
@@ -76,6 +79,47 @@ def snapshot() -> Dict[str, Dict[str, str]]:
     for prefix, hive, base in _ROOTS:
         _walk(hive, base, prefix.split("\\", 1)[0], snap)
     return snap
+
+
+def changed_install_locations(before: Dict[str, Dict[str, str]],
+                              after: Dict[str, Dict[str, str]]) -> List[str]:
+    """Извлекает InstallLocation/DisplayIcon из новых записей установщика.
+
+    Снимок хранит значения как ``repr``. Функция намеренно не зависит от
+    ``winreg``, поэтому её можно тестировать и на других платформах.
+    """
+    locations: List[str] = []
+    seen = set()
+    for key, values in after.items():
+        if key in before and values == before[key]:
+            continue
+        # Эти значения наиболее надёжны в ветках Uninstall, но некоторые
+        # установщики сохраняют InstallLocation в собственном ключе Software.
+        for value_name in ("InstallLocation", "DisplayIcon"):
+            raw = values.get(value_name)
+            if raw is None:
+                # Имена значений реестра регистронезависимы.
+                raw = next(
+                    (v for n, v in values.items() if n.casefold() == value_name.casefold()),
+                    None,
+                )
+            if raw is None:
+                continue
+            try:
+                value = ast.literal_eval(raw)
+            except (ValueError, SyntaxError):
+                value = raw
+            if not isinstance(value, str) or not value.strip():
+                continue
+            value = os.path.expandvars(value.strip())
+            if value_name == "DisplayIcon":
+                # Типичный формат: "C:\\Program Files\\App\\app.exe",0
+                value = re.sub(r",\s*-?\d+\s*$", "", value).strip().strip('"')
+            normalized = os.path.normcase(os.path.normpath(value))
+            if normalized not in seen:
+                seen.add(normalized)
+                locations.append(value)
+    return locations
 
 
 def diff_to_reg(before: Dict[str, Dict[str, str]],

@@ -17,13 +17,14 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from . import launcher as launcher_mod
 from . import registry as reg_mod
@@ -82,6 +83,51 @@ class Portablizer:
         cleaned = "".join(c for c in base if c.isalnum() or c in keep).strip()
         return cleaned or "PortableApp"
 
+    def _prepare_output(self, portable_dir: str, app_dir: str,
+                        data_dir: str) -> None:
+        """Готовит чистый App и удаляет лончер от незавершённого запуска.
+
+        ``PortableData`` намеренно сохраняется: пользователь мог повторно
+        собрать уже используемый портатив, и удалять его настройки нельзя.
+        Программные файлы, напротив, должны соответствовать только текущему
+        установщику — иначе старый exe маскирует неудачную установку.
+        """
+        os.makedirs(portable_dir, exist_ok=True)
+        if os.path.isdir(app_dir):
+            shutil.rmtree(app_dir)
+        elif os.path.exists(app_dir):
+            os.remove(app_dir)
+        os.makedirs(app_dir, exist_ok=True)
+        os.makedirs(data_dir, exist_ok=True)
+
+        for filename in (
+            "Launch.bat", "launcher.py", "launcher_config.json",
+            "README_PORTABLE.txt", "portable.reg", "install.log",
+            "portablizer.log",
+        ):
+            path = os.path.join(portable_dir, filename)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                elif os.path.exists(path):
+                    os.remove(path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Не удалось очистить старый файл результата: {path}: {exc}"
+                ) from exc
+
+    def _save_run_log(self, portable_dir: str) -> None:
+        """Сохраняет журнал ядра независимо от поддержки лога установщиком."""
+        if not portable_dir:
+            return
+        try:
+            with open(os.path.join(portable_dir, "portablizer.log"), "w",
+                      encoding="utf-8-sig", newline="\r\n") as fh:
+                fh.write(self.log.text)
+                fh.write("\n")
+        except OSError:
+            pass
+
     # -- шаги -----------------------------------------------------------------
     def run(self, opts: PortableOptions) -> PortableResult:
         result = PortableResult(success=False)
@@ -94,8 +140,7 @@ class Portablizer:
             portable_dir = os.path.join(opts.output_dir, f"{name}_Portable")
             app_dir = os.path.join(portable_dir, "App")
             data_dir = os.path.join(portable_dir, "PortableData")
-            os.makedirs(app_dir, exist_ok=True)
-            os.makedirs(data_dir, exist_ok=True)
+            self._prepare_output(portable_dir, app_dir, data_dir)
             result.portable_dir = portable_dir
             self.log.info(f"Портативная папка: {portable_dir}")
 
@@ -131,12 +176,18 @@ class Portablizer:
             elif opts.capture_registry and not IS_WINDOWS:
                 self.log.warn("Захват реестра доступен только на Windows — пропускаю.")
 
+            # Запоминаем содержимое типовых каталогов установки. Некоторые
+            # установщики игнорируют /DIR и пишут в LocalAppData/Program Files;
+            # после завершения попробуем безопасно перенести созданный каталог.
+            install_locations_before = self._snapshot_install_locations(data_dir)
+
             # 4. Тихая установка
             self._check_cancel()
             self.progress(30, "Тихая установка в изолированном режиме")
-            self._run_install(plan, opts, app_dir, data_dir)
+            install_rc = self._run_install(plan, opts, app_dir, data_dir)
 
             # 5. Снимок реестра ПОСЛЕ + diff
+            after = {}
             if opts.capture_registry and IS_WINDOWS:
                 self._check_cancel()
                 self.progress(65, "Снимок реестра (после установки)")
@@ -149,16 +200,43 @@ class Portablizer:
                 result.reg_file = reg_path
                 self.log.ok(f"Изменения реестра сохранены: {reg_path}")
 
-            # 6. Поиск главного exe
+            # Если установщик не послушался целевого пути, ищем его результат
+            # в перенаправленном профиле и в новых каталогах Program Files.
+            if not self._find_main_exe(app_dir, name):
+                self.progress(72, "Поиск файлов, созданных установщиком")
+                registry_locations = reg_mod.changed_install_locations(before, after)
+                recovered = self._recover_installed_app(
+                    app_dir=app_dir,
+                    data_dir=data_dir,
+                    app_name=name,
+                    installer_path=opts.installer_path,
+                    before=install_locations_before,
+                    registry_locations=registry_locations,
+                )
+                if recovered:
+                    self.log.ok("Файлы программы перенесены в папку App.")
+
+            # 6. Поиск главного exe. Не создаём заведомо сломанный Launch.bat:
+            # отсутствие exe означает, что тихая установка фактически не дала
+            # портативного результата, даже если установщик вернул код 0.
             self._check_cancel()
             self.progress(75, "Поиск главного исполняемого файла")
             main_exe = self._find_main_exe(app_dir, name)
-            if main_exe:
-                result.main_exe_rel = os.path.relpath(main_exe, portable_dir)
-                self.log.ok(f"Главный exe: {result.main_exe_rel}")
-            else:
-                result.main_exe_rel = os.path.join("App", f"{name}.exe")
-                self.log.warn("Главный exe не найден автоматически — укажите его вручную.")
+            if not main_exe:
+                rc_hint = (
+                    "" if install_rc is None or install_rc in (0, 3010)
+                    else f" (код установщика: {install_rc})"
+                )
+                raise RuntimeError(
+                    "Установщик завершился, но в папке App не найден ни один "
+                    f"исполняемый файл{rc_hint}. Портатив не создан. Возможно, "
+                    "установщик не поддерживает тихий режим или использует "
+                    "другие ключи. Проверьте portablizer.log (и install.log, "
+                    "если он создан) и укажите подходящие ключи в поле "
+                    "«Доп. аргументы установки»."
+                )
+            result.main_exe_rel = os.path.relpath(main_exe, portable_dir)
+            self.log.ok(f"Главный exe: {result.main_exe_rel}")
 
             # 7. Зависимости и переменные среды
             self.progress(85, "Учёт зависимостей и переменных среды")
@@ -173,27 +251,26 @@ class Portablizer:
             self.progress(100, "Готово")
             self.log.ok("Портативное приложение успешно создано!")
             result.success = True
+            self._save_run_log(result.portable_dir)
             return result
 
         except Exception as exc:  # noqa: BLE001
             self.log.error(str(exc))
             result.messages.append(str(exc))
+            self._save_run_log(result.portable_dir)
             return result
 
     # -- установка ------------------------------------------------------------
     def _run_install(self, plan: SilentPlan, opts: PortableOptions,
-                     app_dir: str, data_dir: str) -> None:
+                     app_dir: str, data_dir: str) -> Optional[int]:
         if not IS_WINDOWS:
-            # На не-Windows реально запускать установщик нельзя. Мы создаём
-            # заглушку, чтобы конвейер можно было прогонять и тестировать.
+            # Не выдаём заглушку за готовое приложение: следующий этап честно
+            # завершит операцию ошибкой из-за отсутствия exe.
             self.log.warn(
-                "Не Windows: пропускаю реальный запуск установщика (демо-режим). "
-                "На Windows здесь произойдёт тихая установка в App\\."
+                "Не Windows: реальный запуск установщика невозможен. "
+                "Создание портатива поддерживается только на Windows."
             )
-            with open(os.path.join(app_dir, "PLACEHOLDER.txt"), "w",
-                      encoding="utf-8") as fh:
-                fh.write("Демо-режим (не Windows). Реальная установка не выполнялась.\n")
-            return
+            return None
 
         cmd = [plan.program] + list(plan.args)
         # NSIS: /D=... должен быть последним и без кавычек — добавляем сырьём.
@@ -241,10 +318,10 @@ class Portablizer:
             entries = []
         if not entries:
             self.log.warn(
-                "Целевая папка пуста. Возможно, установщик игнорирует ключ папки "
-                "или пишет по своему пути. Попробуйте другие ключи в «Доп. "
-                "аргументах» либо включите режим полной изоляции."
+                "Целевая папка пуста. Установщик мог проигнорировать ключ папки; "
+                "проверяю перенаправленный профиль и системные каталоги установки."
             )
+        return rc
 
     def _build_isolated_env(self, opts: PortableOptions,
                             data_dir: str) -> Dict[str, str]:
@@ -267,6 +344,232 @@ class Portablizer:
         for k, v in opts.extra_env.items():
             env[k] = os.path.expandvars(v)
         return env
+
+    # -- поиск результата установки вне App ---------------------------------
+    def _install_search_roots(self, data_dir: str) -> List[Tuple[str, int, bool]]:
+        """Возвращает (каталог, приоритет, принадлежит портативу).
+
+        Первые каталоги находятся в перенаправленном профиле и безопасны для
+        копирования. Затем идут обычные места установки Windows — они нужны для
+        установщиков, которые не учитывают переданное окружение.
+        """
+        roots: List[Tuple[str, int, bool]] = [
+            (os.path.join(data_dir, "AppData", "Local", "Programs"), 150, True),
+            (os.path.join(data_dir, "AppData", "Local"), 120, True),
+            (os.path.join(data_dir, "ProgramData"), 105, True),
+            (os.path.join(data_dir, "AppData", "Roaming"), 90, True),
+        ]
+        if IS_WINDOWS:
+            local = os.environ.get("LOCALAPPDATA", "")
+            roaming = os.environ.get("APPDATA", "")
+            program_data = os.environ.get("PROGRAMDATA", "")
+            if local:
+                roots.extend([
+                    (os.path.join(local, "Programs"), 130, False),
+                    (local, 80, False),
+                ])
+            for key in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+                value = os.environ.get(key, "")
+                if value:
+                    roots.append((value, 110, False))
+            if program_data:
+                roots.append((program_data, 65, False))
+            if roaming:
+                roots.append((roaming, 55, False))
+
+        # Переменные ProgramFiles часто указывают на один каталог.
+        unique: List[Tuple[str, int, bool]] = []
+        seen: Set[str] = set()
+        for path, priority, owned in roots:
+            if not path:
+                continue
+            normalized = os.path.normcase(os.path.abspath(path))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique.append((os.path.abspath(path), priority, owned))
+        return unique
+
+    def _snapshot_install_locations(self, data_dir: str) -> Dict[str, Set[str]]:
+        """Запоминает непосредственных потомков типовых мест установки."""
+        snapshot: Dict[str, Set[str]] = {}
+        for root, _priority, _owned in self._install_search_roots(data_dir):
+            entries: Set[str] = set()
+            try:
+                with os.scandir(root) as iterator:
+                    for entry in iterator:
+                        entries.add(os.path.normcase(os.path.abspath(entry.path)))
+            except OSError:
+                pass
+            snapshot[os.path.normcase(os.path.abspath(root))] = entries
+        return snapshot
+
+    @staticmethod
+    def _find_executables(root: str, limit: int = 2000) -> List[str]:
+        """Ищет exe без перехода по симлинкам/переходным каталогам."""
+        found: List[str] = []
+        if not os.path.isdir(root):
+            return found
+        for current, dirs, files in os.walk(root, followlinks=False):
+            # Не уходим в возможные junction/symlink за пределы дерева.
+            dirs[:] = [
+                d for d in dirs
+                if not os.path.islink(os.path.join(current, d))
+            ]
+            for filename in files:
+                if filename.lower().endswith(".exe"):
+                    found.append(os.path.join(current, filename))
+                    if len(found) >= limit:
+                        return found
+        return found
+
+    @staticmethod
+    def _name_keys(app_name: str, installer_path: str) -> Set[str]:
+        """Формирует нормализованные имена для оценки найденных файлов."""
+        values = [app_name, os.path.splitext(os.path.basename(installer_path))[0]]
+        keys: Set[str] = set()
+        suffixes = re.compile(
+            r"(?:[\s._-]*(?:setup|installer|install|portable|win(?:32|64)|"
+            r"x(?:86|64)|amd64|online|offline|latest|[0-9]+(?:\.[0-9]+)*))+$",
+            re.IGNORECASE,
+        )
+        for value in values:
+            value = suffixes.sub("", value).strip()
+            normalized = "".join(ch for ch in value.casefold() if ch.isalnum())
+            if len(normalized) >= 2:
+                keys.add(normalized)
+        return keys
+
+    @staticmethod
+    def _name_score(path: str, keys: Set[str]) -> int:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        normalized = "".join(ch for ch in stem.casefold() if ch.isalnum())
+        score = 0
+        for key in keys:
+            if normalized == key:
+                score = max(score, 220)
+            elif key in normalized or normalized in key:
+                score = max(score, 125)
+        bad = (
+            "unins", "uninstall", "setup", "install", "update", "updater",
+            "helper", "crash", "report", "redist", "vcredist", "squirrel",
+        )
+        if any(word in normalized for word in bad):
+            score -= 180
+        return score
+
+    def _recover_installed_app(
+        self,
+        app_dir: str,
+        data_dir: str,
+        app_name: str,
+        installer_path: str,
+        before: Dict[str, Set[str]],
+        registry_locations: Iterable[str] = (),
+    ) -> bool:
+        """Копирует результат установщика, если тот проигнорировал папку App.
+
+        Рассматриваются только новые каталоги или каталоги, имя которых похоже
+        на имя приложения. Это не даёт случайно скопировать произвольную уже
+        установленную программу из Program Files.
+        """
+        keys = self._name_keys(app_name, installer_path)
+        search_roots = self._install_search_roots(data_dir)
+        protected_roots = {
+            os.path.normcase(os.path.abspath(path))
+            for path, _priority, _owned in search_roots
+        }
+        # normalized source -> (score, representative exe, explanation, source)
+        candidates: Dict[str, Tuple[int, str, str, str]] = {}
+
+        def add_source(source: str, score: int, reason: str) -> None:
+            source = os.path.abspath(source)
+            # Никогда не копируем Program Files/AppData целиком, даже если
+            # некорректная запись реестра указывает прямо на такой корень.
+            if os.path.normcase(source) in protected_roots:
+                return
+            if not os.path.exists(source):
+                return
+            if os.path.isfile(source):
+                exes = [source] if source.lower().endswith(".exe") else []
+            else:
+                exes = self._find_executables(source)
+            for exe in exes:
+                exe_score = score + self._name_score(exe, keys)
+                try:
+                    exe_score += min(35, int(os.path.getsize(exe) / (1024 * 1024)))
+                except OSError:
+                    pass
+                normalized = os.path.normcase(source)
+                previous = candidates.get(normalized)
+                if previous is None or exe_score > previous[0]:
+                    candidates[normalized] = (exe_score, exe, reason, source)
+
+        # InstallLocation/DisplayIcon из новых записей реестра — самый точный
+        # сигнал. Для DisplayIcon берём каталог исполняемого файла.
+        for location in registry_locations:
+            location = os.path.abspath(location)
+            source = os.path.dirname(location) if os.path.isfile(location) else location
+            add_source(source, 240, "новая запись InstallLocation в реестре")
+
+        for root, priority, owned in search_roots:
+            root_key = os.path.normcase(os.path.abspath(root))
+            old_entries = before.get(root_key, set())
+            try:
+                entries = list(os.scandir(root))
+            except OSError:
+                continue
+            for entry in entries:
+                entry_path = os.path.abspath(entry.path)
+                is_new = os.path.normcase(entry_path) not in old_entries
+                name_match = self._name_score(entry.name, keys) > 0
+                if not (is_new or name_match):
+                    continue
+                # Прямой exe безопасно копируем отдельно. Для каталога берём
+                # всё его дерево (dll/resources должны остаться рядом).
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    is_exe = entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(".exe")
+                except OSError:
+                    continue
+                if not is_dir and not is_exe:
+                    continue
+                reason = "перенаправленный профиль" if owned else "новый каталог установки"
+                bonus = 55 if is_new else 0
+                if owned:
+                    bonus += 35
+                add_source(entry_path, priority + bonus, reason)
+
+        ranked = sorted(candidates.values(), key=lambda item: item[0], reverse=True)
+        for score, _exe, reason, source in ranked:
+            # Отрицательный результат — почти наверняка updater/uninstaller.
+            if score <= 0:
+                continue
+            self.log.info(
+                f"Найден возможный каталог программы ({reason}, оценка {score}): "
+                f"{source}"
+            )
+            try:
+                if os.path.isdir(source):
+                    for item in os.scandir(source):
+                        destination = os.path.join(app_dir, item.name)
+                        if item.is_dir(follow_symlinks=False):
+                            shutil.copytree(item.path, destination, dirs_exist_ok=True)
+                        elif item.is_file(follow_symlinks=False):
+                            shutil.copy2(item.path, destination)
+                else:
+                    shutil.copy2(source, os.path.join(app_dir, os.path.basename(source)))
+            except OSError as exc:
+                self.log.warn(f"Не удалось скопировать найденные файлы: {exc}")
+                # Не оставляем частичный каталог перед следующей попыткой.
+                shutil.rmtree(app_dir, ignore_errors=True)
+                os.makedirs(app_dir, exist_ok=True)
+                continue
+            if self._find_main_exe(app_dir, app_name):
+                return True
+            shutil.rmtree(app_dir, ignore_errors=True)
+            os.makedirs(app_dir, exist_ok=True)
+        return False
 
     # -- поиск главного exe ---------------------------------------------------
     def _find_main_exe(self, app_dir: str, name: str) -> Optional[str]:
@@ -300,7 +603,9 @@ class Portablizer:
             return s
 
         candidates.sort(key=score, reverse=True)
-        return candidates[0]
+        best = candidates[0]
+        # Один uninstaller/setup.exe не является запускаемым приложением.
+        return best if score(best) >= 0 else None
 
     # -- зависимости ----------------------------------------------------------
     def _collect_dep_dirs(self, app_dir: str, portable_dir: str) -> List[str]:
@@ -369,10 +674,12 @@ _README = """{app_name} — портативная версия
   Launch.bat            — портативный лончер (перенаправляет каталоги и env)
   launcher_config.json  — параметры лончера
   portable.reg          — захваченные при установке изменения реестра (если были)
-  install.log           — журнал тихой установки
+  install.log           — подробный журнал установщика (если он поддерживается)
+  portablizer.log       — журнал создания и диагностики портатива
 
-Диск C: и профиль пользователя Windows не затрагиваются: программа пишет
-данные только в папку PortableData внутри этой директории.
+При запуске стандартные каталоги профиля (AppData, Temp и др.) перенаправляются
+в PortableData. Отдельные программы могут обращаться к системным каталогам или
+реестру напрямую — полную виртуализацию Windows этот лончер не выполняет.
 
 Если окно консоли закрывается сразу:
   • запустите Launch.bat из уже открытой консоли (cmd.exe) — вы увидите текст

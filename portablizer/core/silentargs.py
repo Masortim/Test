@@ -7,8 +7,8 @@
 Особые случаи:
   * NSIS: параметр /D=<путь> ДОЛЖЕН быть последним, без кавычек, даже если
     в пути есть пробелы. Поэтому его добавляют отдельно (см. build()).
-  * MSI: запускается через msiexec.exe, TARGETDIR/INSTALLDIR передаются как
-    свойства.
+  * MSI: административно распаковывается через msiexec.exe /a с TARGETDIR,
+    чтобы не регистрировать пакет в системе.
 """
 from __future__ import annotations
 
@@ -52,18 +52,19 @@ def build_silent_plan(
     notes: List[str] = []
 
     if is_msi or installer_type == InstallerType.MSI:
+        # Административная установка распаковывает MSI в целевой каталог, не
+        # регистрируя пакет в системе. Обычный /i часто игнорирует INSTALLDIR и
+        # оставляет App пустой, одновременно изменяя Windows.
         args = [
-            "/i", installer_path,
+            "/a", installer_path,
             "/qn",                       # полностью тихо, без UI
             "/norestart",
             f"TARGETDIR={target_dir}",
-            f"INSTALLDIR={target_dir}",
-            f"APPLICATIONFOLDER={target_dir}",
         ]
         if log_file:
             args += ["/L*v", log_file]
         args += extra_args
-        notes.append("MSI запускается через msiexec с TARGETDIR/INSTALLDIR.")
+        notes.append("MSI распаковывается через административную установку /a в TARGETDIR.")
         return SilentPlan(program="msiexec.exe", args=args, notes=notes)
 
     if installer_type == InstallerType.INNO:
