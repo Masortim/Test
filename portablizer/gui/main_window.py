@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
+from .. import __version__
 from ..core.detect import detect_installer
 from ..core.portablizer import PortableOptions, PortableResult
 from . import style
@@ -64,7 +65,9 @@ class MainWindow(QMainWindow):
         self.worker: Optional[PortableWorker] = None
         self.last_result: Optional[PortableResult] = None
 
-        self.setWindowTitle("Portablizer — портативизатор установщиков")
+        self.setWindowTitle(
+            f"Portablizer {__version__} — портативизатор установщиков"
+        )
         self.setMinimumSize(940, 760)
         ico = _resource(os.path.join("resources", "app.ico"))
         if os.path.exists(ico):
@@ -116,10 +119,10 @@ class MainWindow(QMainWindow):
 
         col = QVBoxLayout()
         col.setSpacing(2)
-        title = QLabel("Portablizer")
+        title = QLabel(f"Portablizer {__version__}")
         title.setObjectName("Title")
-        sub = QLabel("Превращает любой exe/msi-установщик в автономное "
-                     "портативное приложение — без записи на диск C:")
+        sub = QLabel("Создаёт переносимую папку из exe/msi-установщика "
+                     "с изолированным пользовательским окружением")
         sub.setObjectName("Subtitle")
         col.addWidget(title)
         col.addWidget(sub)
@@ -360,6 +363,9 @@ class MainWindow(QMainWindow):
     def _on_finished(self, result: PortableResult) -> None:
         self.last_result = result
         self._set_running(False)
+        self.open_btn.setEnabled(
+            bool(result.portable_dir and os.path.isdir(result.portable_dir))
+        )
         if result.success:
             self.progress.setFormat("Готово — 100%")
             self.status_label.setText(
@@ -376,8 +382,14 @@ class MainWindow(QMainWindow):
             msg = "; ".join(result.messages) or "См. журнал."
             self.status_label.setText(f"✖ Не удалось: {msg}")
             self.status_label.setObjectName("StatusErr")
-            QMessageBox.critical(self, "Portablizer",
-                                 f"Не удалось создать портатив.\n\n{msg}")
+            folder_hint = (
+                f"\n\nДиагностика: {result.portable_dir}\\portablizer.log"
+                if result.portable_dir else ""
+            )
+            QMessageBox.critical(
+                self, "Portablizer",
+                f"Не удалось создать портатив.\n\n{msg}{folder_hint}",
+            )
         self.status_label.setStyleSheet(style.QSS)  # переприменить цвет
 
     def _open_result(self) -> None:

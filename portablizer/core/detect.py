@@ -74,17 +74,43 @@ class DetectionResult:
         return f"{self.installer_type.value} (уверенность {int(self.confidence * 100)}%)"
 
 
-def _read_head_tail(path: str, chunk: int = 6 * 1024 * 1024) -> bytes:
-    """Читаем начало и конец файла — сигнатуры бывают и в overlay в конце."""
-    size = os.path.getsize(path)
+def _scan_signatures(path: str, chunk_size: int = 4 * 1024 * 1024) -> Dict[InstallerType, List[bytes]]:
+    """Ищет сигнатуры во всём файле, не загружая установщик целиком.
+
+    Раньше проверялись только первые и последние 6 МБ. У крупных установщиков
+    маркер движка часто находится посередине, из-за чего они ошибочно получали
+    универсальный ключ ``/S`` и ничего не записывали в ``App``.
+    """
+    needles: Dict[InstallerType, List[tuple[bytes, bytes]]] = {
+        itype: [
+            (sig.lower(), sig.decode("latin-1").lower().encode("utf-16-le"))
+            for sig in signatures
+        ]
+        for itype, signatures in _SIGNATURES.items()
+    }
+    found: Dict[InstallerType, List[bytes]] = {itype: [] for itype in _SIGNATURES}
+    longest = max(
+        len(encoded)
+        for variants in needles.values()
+        for pair in variants
+        for encoded in pair
+    )
+    carry = b""
     with open(path, "rb") as fh:
-        head = fh.read(chunk)
-        if size > chunk * 2:
-            fh.seek(max(0, size - chunk))
-            tail = fh.read(chunk)
-        else:
-            tail = b""
-    return head + tail
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            data = (carry + chunk).lower()
+            for itype, variants in needles.items():
+                for index, (ascii_sig, wide_sig) in enumerate(variants):
+                    original = _SIGNATURES[itype][index]
+                    if original in found[itype]:
+                        continue
+                    if ascii_sig in data or wide_sig in data:
+                        found[itype].append(original)
+            carry = data[-(longest - 1):] if longest > 1 else b""
+    return found
 
 
 def detect_installer(path: str) -> DetectionResult:
@@ -95,19 +121,15 @@ def detect_installer(path: str) -> DetectionResult:
                                evidence=["расширение .msi"])
 
     try:
-        data = _read_head_tail(path)
+        signature_hits = _scan_signatures(path)
     except OSError as exc:  # noqa: PERF203
         return DetectionResult(InstallerType.UNKNOWN, 0.0, evidence=[f"ошибка чтения: {exc}"])
 
     scores: Dict[InstallerType, float] = {}
     evidence: Dict[InstallerType, List[str]] = {}
-    lowered = data.lower()
 
-    for itype, sigs in _SIGNATURES.items():
-        hits = []
-        for sig in sigs:
-            if sig.lower() in lowered:
-                hits.append(sig.decode("latin-1", "replace"))
+    for itype, matched in signature_hits.items():
+        hits = [sig.decode("latin-1", "replace") for sig in matched]
         if hits:
             scores[itype] = min(1.0, 0.55 + 0.15 * len(hits))
             evidence[itype] = [f"найдена сигнатура: {h}" for h in hits]
