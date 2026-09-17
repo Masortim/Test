@@ -13,7 +13,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -49,3 +49,20 @@ jobs:
           path: dist/Portablizer.exe
           if-no-files-found: error
           retention-days: 30
+
+      # Артефакты Actions хранятся на blob-хранилище, недоступном из некоторых
+      # окружений. Поэтому дополнительно кладём собранный exe прямо в ветку,
+      # чтобы его можно было получить обычным git pull.
+      - name: Commit built EXE back to branch
+        if: github.ref == 'refs/heads/arena/01a0ae36-test'
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist-windows
+          cp dist/Portablizer.exe dist-windows/Portablizer.exe
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f dist-windows/Portablizer.exe
+          git commit -m "ci: build Portablizer.exe [skip ci]" || echo "no changes"
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          git push origin HEAD:"${GITHUB_REF_NAME}"
