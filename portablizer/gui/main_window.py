@@ -298,6 +298,58 @@ class MainWindow(QMainWindow):
                 env[k.strip()] = v.strip()
         return env
 
+    @staticmethod
+    def _parse_install_args(raw: str) -> list[str]:
+        """Разбирает аргументы по правилам ``CommandLineToArgvW``.
+
+        Простое ``str.split`` ломает значения вроде
+        ``/DIR=\"C:\\Program Files\\App\"`` и передаёт установщику несколько
+        неправильных аргументов. В отличие от POSIX-парсеров, Windows
+        допускает обратные слеши перед кавычками, поэтому разбираем строку
+        небольшим совместимым state machine.
+        """
+        args: list[str] = []
+        current: list[str] = []
+        token_started = False
+        quoted = False
+        i = 0
+        raw = raw.strip()
+        while i < len(raw):
+            if raw[i] in " \\t" and not quoted:
+                if token_started:
+                    args.append("".join(current))
+                    current = []
+                    token_started = False
+                i += 1
+                continue
+            if raw[i] == "\\":
+                token_started = True
+                start = i
+                while i < len(raw) and raw[i] == "\\":
+                    i += 1
+                slashes = i - start
+                if i < len(raw) and raw[i] == '"':
+                    current.extend("\\" * (slashes // 2))
+                    if slashes % 2:
+                        current.append('"')
+                        i += 1
+                    else:
+                        quoted = not quoted
+                        i += 1
+                else:
+                    current.extend("\\" * slashes)
+                continue
+            if raw[i] == '"':
+                token_started = True
+                quoted = not quoted
+            else:
+                token_started = True
+                current.append(raw[i])
+            i += 1
+        if token_started or current or quoted:
+            args.append("".join(current))
+        return args
+
     def _collect_options(self) -> Optional[PortableOptions]:
         installer = self.installer_edit.text().strip()
         output = self.output_edit.text().strip()
@@ -310,7 +362,7 @@ class MainWindow(QMainWindow):
                                 "Укажите папку для сохранения портатива.")
             return None
         os.makedirs(output, exist_ok=True)
-        args = [a for a in self.args_edit.text().strip().split() if a]
+        args = self._parse_install_args(self.args_edit.text())
         return PortableOptions(
             installer_path=installer,
             output_dir=output,
