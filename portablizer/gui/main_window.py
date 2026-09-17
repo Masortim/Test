@@ -182,31 +182,47 @@ class MainWindow(QMainWindow):
         lay.addLayout(grid)
 
         # Чекбоксы изоляции
-        checks = QHBoxLayout()
-        checks.setSpacing(20)
+        checks = QGridLayout()
+        checks.setHorizontalSpacing(20)
+        checks.setVerticalSpacing(8)
         self.cb_redirect = QCheckBox("Изолировать AppData/Temp/профиль")
         self.cb_redirect.setChecked(True)
         self.cb_redirect.setToolTip(
             "Перенаправляет пользовательские каталоги внутрь портативной папки, "
             "чтобы программа не писала в C:\\Users\\…")
-        self.cb_registry = QCheckBox("Захватывать изменения реестра (.reg)")
+        self.cb_registry = QCheckBox("Переносить настройки из реестра")
         self.cb_registry.setChecked(True)
         self.cb_registry.setToolTip(
-            "Снимает реестр до/после установки и сохраняет разницу; лончер "
-            "применяет её при запуске.")
-        self.cb_exelauncher = QCheckBox("Также подготовить launcher.py для launcher.exe")
+            "Снимает реестр до/после установки и переносит в портатив только "
+            "настройки самой программы. Записи об установке (список "
+            "«Установленные программы», автозапуск) не переносятся никогда.")
+        self.cb_cleanup = QCheckBox("Убрать следы установки с этого ПК")
+        self.cb_cleanup.setChecked(True)
+        self.cb_cleanup.setToolTip(
+            "После сборки удаляет программу из списка «Установленные "
+            "программы», убирает созданные ярлыки и возвращает реестр этого "
+            "компьютера в исходное состояние. Портатив при этом не страдает.")
+        self.cb_integration = QCheckBox("Переносить ассоциации файлов и COM")
+        self.cb_integration.setToolTip(
+            "По умолчанию выключено: ассоциации меняют настройки чужой "
+            "системы и портативности не добавляют. Включайте, только если без "
+            "них программа не работает.")
+        self.cb_exelauncher = QCheckBox("Подготовить launcher.py для launcher.exe")
         self.cb_exelauncher.setToolTip(
             "Кладёт в портатив исходник лончера, который можно собрать в exe.")
-        checks.addWidget(self.cb_redirect)
-        checks.addWidget(self.cb_registry)
-        checks.addWidget(self.cb_exelauncher)
-        checks.addStretch(1)
+        checks.addWidget(self.cb_redirect, 0, 0)
+        checks.addWidget(self.cb_registry, 0, 1)
+        checks.addWidget(self.cb_cleanup, 1, 0)
+        checks.addWidget(self.cb_integration, 1, 1)
+        checks.addWidget(self.cb_exelauncher, 2, 0)
+        checks.setColumnStretch(2, 1)
         lay.addLayout(checks)
 
         hint = QLabel(
-            "Подсказка: захват реестра и реальная тихая установка выполняются "
-            "только под Windows. Рекомендуется запускать Portablizer от имени "
-            "администратора для корректного снимка HKLM.")
+            "Подсказка: реальная тихая установка и работа с реестром "
+            "выполняются только под Windows. Запускайте Portablizer от имени "
+            "администратора — это нужно и для снимка HKLM, и для полной "
+            "очистки следов установки с этого компьютера.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -370,6 +386,8 @@ class MainWindow(QMainWindow):
             redirect_userdirs=self.cb_redirect.isChecked(),
             capture_registry=self.cb_registry.isChecked(),
             build_exe_launcher=self.cb_exelauncher.isChecked(),
+            cleanup_host=self.cb_cleanup.isChecked(),
+            include_shell_integration=self.cb_integration.isChecked(),
             extra_install_args=args,
             extra_env=self._parse_env(),
         )
@@ -424,11 +442,30 @@ class MainWindow(QMainWindow):
                 f"✔ Портатив создан: {result.portable_dir}")
             self.status_label.setObjectName("StatusOk")
             self.open_btn.setEnabled(True)
-            QMessageBox.information(
-                self, "Portablizer",
-                "Портативное приложение создано!\n\n"
-                f"Папка: {result.portable_dir}\n"
-                f"Запуск: Launch.bat")
+
+            details = [
+                "Портативное приложение создано!",
+                "",
+                f"Папка: {result.portable_dir}",
+                "Запуск: Launch.bat (или LaunchHidden.vbs — без консоли)",
+                "",
+                "Скопируйте папку целиком на флешку — установка на другом "
+                "компьютере не потребуется.",
+            ]
+            if result.removed_from_installed_list:
+                details += [
+                    "",
+                    "Из списка «Установленные программы» этого ПК убрано: "
+                    + ", ".join(result.removed_from_installed_list),
+                ]
+            if result.cleanup_pending:
+                details += [
+                    "",
+                    "⚠ Часть следов установки удалить не удалось (нужны права "
+                    "администратора). Запустите cleanup_host.reg из папки "
+                    "портатива от имени администратора.",
+                ]
+            QMessageBox.information(self, "Portablizer", "\n".join(details))
         else:
             self.progress.setFormat("Ошибка")
             msg = "; ".join(result.messages) or "См. журнал."
@@ -463,7 +500,8 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(running)
         for w in (self.installer_edit, self.output_edit, self.name_edit,
                   self.args_edit, self.env_edit, self.cb_redirect,
-                  self.cb_registry, self.cb_exelauncher):
+                  self.cb_registry, self.cb_exelauncher, self.cb_cleanup,
+                  self.cb_integration):
             w.setEnabled(not running)
 
 

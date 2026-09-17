@@ -46,9 +46,30 @@ class PortableOptions:
     redirect_userdirs: bool = True     # изолировать AppData/Temp/...
     capture_registry: bool = True      # захватывать изменения реестра
     build_exe_launcher: bool = False   # генерировать launcher.py для сборки exe
+    # Удалять следы установки (в т.ч. запись в «Установленные программы») с
+    # компьютера, на котором создаётся портатив.
+    cleanup_host: bool = True
+    # Переносить ассоциации файлов/COM. По умолчанию выключено: чужому ПК это
+    # не нужно, а портативность от этого только страдает.
+    include_shell_integration: bool = False
     extra_install_args: List[str] = field(default_factory=list)
     extra_env: Dict[str, str] = field(default_factory=dict)
     install_timeout: int = 1800        # сек
+
+
+@dataclass
+class RegistryCapture:
+    """Результат захвата реестра: что переносим и что чистим."""
+
+    diff: "reg_mod.RegistryDiff"
+    keys: List[str] = field(default_factory=list)
+    created_keys: List[str] = field(default_factory=list)
+    reg_file: str = ""
+    machine_reg_file: str = ""
+    has_root_token: bool = False
+    uninstall_entries: List[str] = field(default_factory=list)
+    cleanup_file: str = ""
+    cleanup_keys: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -60,6 +81,12 @@ class PortableResult:
     plan: Optional[SilentPlan] = None
     reg_file: str = ""
     messages: List[str] = field(default_factory=list)
+    #: Ключи реестра, которые обслуживает лончер.
+    registry_keys: List[str] = field(default_factory=list)
+    #: Записи, убранные из списка «Установленные программы» этого ПК.
+    removed_from_installed_list: List[str] = field(default_factory=list)
+    #: Осталось ли что-то вычистить вручную (не хватило прав).
+    cleanup_pending: bool = False
 
 
 class Portablizer:
@@ -102,8 +129,9 @@ class Portablizer:
         os.makedirs(data_dir, exist_ok=True)
 
         for filename in (
-            "Launch.bat", "launcher.py", "launcher_config.json",
-            "README_PORTABLE.txt", "portable.reg", "install.log",
+            "Launch.bat", "LaunchHidden.vbs", "launcher.py",
+            "launcher_config.json", "README_PORTABLE.txt", "portable.reg",
+            "portable_machine.reg", "cleanup_host.reg", "install.log",
             "portablizer.log",
         ):
             path = os.path.join(portable_dir, filename)
@@ -182,6 +210,10 @@ class Portablizer:
             # установщики игнорируют /DIR и пишут в LocalAppData/Program Files;
             # после завершения попробуем безопасно перенести созданный каталог.
             install_locations_before = self._snapshot_install_locations(data_dir)
+            # Ярлыки в меню «Пуск» и на рабочем столе создаются через
+            # shell-папки и не подчиняются переменным окружения, поэтому их
+            # приходится отслеживать отдельно.
+            shortcuts_before = self._snapshot_shortcuts()
 
             # 4. Тихая установка
             self._check_cancel()
@@ -189,18 +221,19 @@ class Portablizer:
             install_rc = self._run_install(plan, opts, app_dir, data_dir)
 
             # 5. Снимок реестра ПОСЛЕ + diff
-            after = {}
+            after: reg_mod.Snapshot = {}
+            capture = None
             if opts.capture_registry and IS_WINDOWS:
                 self._check_cancel()
                 self.progress(65, "Снимок реестра (после установки)")
                 self.log.info("Делаю снимок реестра после установки...")
                 after = reg_mod.snapshot()
-                reg_text = reg_mod.diff_to_reg(before, after)
-                reg_path = os.path.join(portable_dir, "portable.reg")
-                with open(reg_path, "w", encoding="utf-16") as fh:
-                    fh.write(reg_text)
-                result.reg_file = reg_path
-                self.log.ok(f"Изменения реестра сохранены: {reg_path}")
+                capture = self._capture_registry(
+                    portable_dir, before, after, opts,
+                )
+                result.reg_file = capture.reg_file
+                result.registry_keys = capture.keys
+                result.removed_from_installed_list = capture.uninstall_entries
 
             # Если установщик не послушался целевого пути, ищем его результат
             # в перенаправленном профиле и в новых каталогах Program Files.
@@ -248,7 +281,15 @@ class Portablizer:
             self._check_cancel()
             self.progress(92, "Генерация портативного лончера")
             self._write_launcher(portable_dir, name, result.main_exe_rel,
-                                 opts, path_prepend)
+                                 opts, path_prepend, capture)
+
+            # 9. Уборка следов установки с ЭТОГО компьютера: программа не
+            # должна остаться в списке «Установленные программы».
+            self.progress(97, "Удаление следов установки с этого ПК")
+            if capture is not None:
+                self._cleanup_host(capture, opts, result)
+            if opts.cleanup_host:
+                self._cleanup_shortcuts(shortcuts_before, result)
 
             self.progress(100, "Готово")
             self.log.ok("Портативное приложение успешно создано!")
@@ -261,6 +302,208 @@ class Portablizer:
             result.messages.append(str(exc))
             self._save_run_log(result.portable_dir)
             return result
+
+    # -- реестр ---------------------------------------------------------------
+    def _capture_registry(self, portable_dir: str,
+                          before: "reg_mod.Snapshot",
+                          after: "reg_mod.Snapshot",
+                          opts: PortableOptions) -> RegistryCapture:
+        """Разделяет изменения реестра на «переносим» и «чистим».
+
+        В портатив попадают только настройки самой программы. Записи об
+        установке (список «Установленные программы», автозапуск, служба
+        Windows Installer) переносить нельзя: иначе портатив «устанавливал»
+        бы себя на каждом чужом ПК — ровно то, чего от него не ждут.
+        """
+        diff = reg_mod.compute_diff(before, after)
+        capture = RegistryCapture(diff=diff)
+
+        wanted = [reg_mod.CATEGORY_APP]
+        if opts.include_shell_integration:
+            wanted.append(reg_mod.CATEGORY_INTEGRATION)
+        portable_keys = diff.keys_of(*wanted)
+        trace_keys = diff.keys_of(reg_mod.CATEGORY_TRACE)
+        skipped_integration = (
+            [] if opts.include_shell_integration
+            else diff.keys_of(reg_mod.CATEGORY_INTEGRATION)
+        )
+
+        # Путь портативной папки заменяем маркером: иначе настройки указывали
+        # бы на каталог того ПК, где собирали портатив.
+        tokens = [(portable_dir, launcher_mod.ROOT_TOKEN)]
+        alt = portable_dir.replace("\\", "/")
+        if alt != portable_dir:
+            tokens.append((alt, launcher_mod.ROOT_TOKEN))
+
+        user_keys = [k for k in portable_keys if k.startswith("HKCU")]
+        machine_keys = [k for k in portable_keys if k.startswith("HKLM")]
+
+        reg_path = os.path.join(portable_dir, "portable.reg")
+        user_text = reg_mod.render_keys(after, user_keys, tokens)
+        if reg_mod.has_entries(user_text):
+            reg_mod.write_reg_file(reg_path, user_text)
+            capture.reg_file = reg_path
+            capture.has_root_token = launcher_mod.ROOT_TOKEN in user_text
+
+        if machine_keys:
+            machine_path = os.path.join(portable_dir, "portable_machine.reg")
+            machine_text = reg_mod.render_keys(after, machine_keys, tokens)
+            if reg_mod.has_entries(machine_text):
+                reg_mod.write_reg_file(machine_path, machine_text)
+                capture.machine_reg_file = machine_path
+
+        capture.keys = launcher_mod.usable_registry_keys(portable_keys)
+        capture.created_keys = launcher_mod.usable_registry_keys(
+            [k for k in diff.new_keys if k in set(capture.keys)]
+        )
+
+        # Всё, что установщик наследил на этом ПК: и следы, и перенесённые в
+        # портатив настройки — на исходной машине они больше не нужны.
+        capture.cleanup_keys = sorted(
+            set(trace_keys) | set(portable_keys) | set(skipped_integration)
+        )
+        cleanup_text = reg_mod.render_host_cleanup(diff, capture.cleanup_keys)
+        if reg_mod.has_entries(cleanup_text):
+            cleanup_path = os.path.join(portable_dir, "cleanup_host.reg")
+            reg_mod.write_reg_file(cleanup_path, cleanup_text)
+            capture.cleanup_file = cleanup_path
+
+        capture.uninstall_entries = [
+            name for _key, name
+            in reg_mod.installed_program_entries(diff, after)
+        ]
+
+        if capture.reg_file or capture.machine_reg_file:
+            self.log.ok(
+                f"Настройки программы сохранены в портатив: "
+                f"{len(capture.keys)} ключ(ей) реестра."
+            )
+        else:
+            self.log.info("Программа не создала собственных настроек в реестре.")
+        if trace_keys:
+            self.log.info(
+                f"Записи об установке в портатив НЕ переносятся "
+                f"({len(trace_keys)} ключ(ей)): они нужны только этому ПК."
+            )
+        if skipped_integration:
+            self.log.info(
+                f"Ассоциации файлов и COM пропущены ({len(skipped_integration)} "
+                "ключ(ей)) — портатив не меняет настройки чужой системы."
+            )
+        return capture
+
+    def _cleanup_host(self, capture: RegistryCapture, opts: PortableOptions,
+                      result: PortableResult) -> None:
+        """Возвращает реестр этого ПК в состояние «до установки»."""
+        entries = capture.uninstall_entries
+        if not opts.cleanup_host:
+            if entries:
+                result.cleanup_pending = True
+                self.log.warn(
+                    "Очистка отключена: программа осталась в списке "
+                    f"«Установленные программы» ({', '.join(entries)}). "
+                    "Импортируйте cleanup_host.reg, чтобы убрать её."
+                )
+            return
+        if not capture.cleanup_file or not IS_WINDOWS:
+            return
+
+        rc = self._reg_import(capture.cleanup_file)
+        if rc == 0:
+            if entries:
+                self.log.ok(
+                    "Из списка «Установленные программы» удалено: "
+                    + ", ".join(entries)
+                )
+            self.log.ok(
+                "Следы установки удалены — этот компьютер остался чистым."
+            )
+            return
+
+        result.cleanup_pending = True
+        self.log.warn(
+            "Не удалось полностью удалить следы установки (обычно нужны права "
+            "администратора). Запустите cleanup_host.reg вручную: "
+            f"{capture.cleanup_file}"
+        )
+
+    # -- ярлыки ---------------------------------------------------------------
+    @staticmethod
+    def _shortcut_roots() -> List[str]:
+        """Каталоги, куда установщики кладут ярлыки (меню «Пуск», рабочий стол)."""
+        if not IS_WINDOWS:
+            return []
+        roots: List[str] = []
+        for base, tail in (
+            ("APPDATA", os.path.join("Microsoft", "Windows", "Start Menu", "Programs")),
+            ("PROGRAMDATA", os.path.join("Microsoft", "Windows", "Start Menu", "Programs")),
+            ("USERPROFILE", "Desktop"),
+            ("PUBLIC", "Desktop"),
+        ):
+            value = os.environ.get(base, "")
+            if value:
+                roots.append(os.path.join(value, tail))
+        return roots
+
+    def _snapshot_shortcuts(self) -> Set[str]:
+        """Запоминает существующие ярлыки, чтобы найти созданные установщиком."""
+        found: Set[str] = set()
+        for root in self._shortcut_roots():
+            for current, _dirs, files in os.walk(root):
+                for filename in files:
+                    if filename.lower().endswith((".lnk", ".url")):
+                        found.add(os.path.normcase(
+                            os.path.join(current, filename)))
+        return found
+
+    def _cleanup_shortcuts(self, before: Set[str],
+                           result: PortableResult) -> None:
+        """Удаляет ярлыки, созданные установщиком на этом компьютере."""
+        if not IS_WINDOWS:
+            return
+        removed: List[str] = []
+        for root in self._shortcut_roots():
+            for current, _dirs, files in os.walk(root):
+                for filename in files:
+                    if not filename.lower().endswith((".lnk", ".url")):
+                        continue
+                    path = os.path.join(current, filename)
+                    if os.path.normcase(path) in before:
+                        continue
+                    try:
+                        os.remove(path)
+                        removed.append(filename)
+                    except OSError:
+                        result.cleanup_pending = True
+        # Пустые папки меню «Пуск», оставшиеся после удаления ярлыков.
+        for root in self._shortcut_roots():
+            for current, dirs, _files in os.walk(root, topdown=False):
+                for name in dirs:
+                    path = os.path.join(current, name)
+                    try:
+                        if not os.listdir(path):
+                            os.rmdir(path)
+                    except OSError:
+                        pass
+        if removed:
+            self.log.ok(
+                f"Удалены созданные установщиком ярлыки ({len(removed)}): "
+                + ", ".join(sorted(removed)[:5])
+                + (" …" if len(removed) > 5 else "")
+            )
+
+    @staticmethod
+    def _reg_import(path: str) -> int:
+        """Импортирует .reg без появления окна консоли."""
+        try:
+            proc = subprocess.run(
+                ["reg", "import", path],
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+                capture_output=True,
+            )
+            return proc.returncode
+        except OSError:
+            return 1
 
     # -- установка ------------------------------------------------------------
     def _run_install(self, plan: SilentPlan, opts: PortableOptions,
@@ -655,63 +898,105 @@ class Portablizer:
 
     # -- лончер ---------------------------------------------------------------
     def _write_launcher(self, portable_dir: str, name: str, main_exe_rel: str,
-                        opts: PortableOptions, path_prepend: List[str]) -> None:
+                        opts: PortableOptions, path_prepend: List[str],
+                        capture: Optional[RegistryCapture] = None) -> None:
+        has_registry = bool(
+            capture and (capture.reg_file or capture.machine_reg_file
+                         or capture.keys)
+        )
         cfg = launcher_mod.LauncherConfig(
             app_name=name,
-            target_exe_rel=main_exe_rel,
+            target_exe_rel=main_exe_rel.replace("\\", "/"),
             data_dir_name="PortableData",
-            apply_registry=opts.capture_registry,
+            apply_registry=has_registry,
+            registry_keys=list(capture.keys) if capture else [],
+            registry_created_keys=list(capture.created_keys) if capture else [],
+            registry_has_root_token=bool(capture and capture.has_root_token),
             extra_env=opts.extra_env,
             path_prepend=path_prepend,
         )
-        # Launch.bat — обязательно CRLF и UTF-8 без BOM: cmd.exe не переваривает
-        # ни LF-концы строк в многострочных блоках, ни BOM в первой строке.
+        # Launch.bat — CRLF, чистый ASCII и без BOM. cmd.exe читает .bat по
+        # байтовым смещениям: BOM, LF-концы строк или многобайтовый символ
+        # сбивают разбор, и окно закрывается без сообщения.
         bat = launcher_mod.render_bat(cfg)
-        with open(os.path.join(portable_dir, "Launch.bat"), "w",
-                  encoding="utf-8", newline="\r\n") as fh:
-            fh.write(bat)
+        self._write_text(os.path.join(portable_dir, "Launch.bat"), bat,
+                         encoding="ascii")
+        # Запуск без окна консоли.
+        self._write_text(os.path.join(portable_dir, "LaunchHidden.vbs"),
+                         launcher_mod.render_vbs(), encoding="ascii")
         # config json (для launcher.exe)
-        with open(os.path.join(portable_dir, "launcher_config.json"), "w",
-                  encoding="utf-8") as fh:
-            fh.write(launcher_mod.render_config_json(cfg))
+        self._write_text(os.path.join(portable_dir, "launcher_config.json"),
+                         launcher_mod.render_config_json(cfg), newline="\n")
         # launcher.py (опционально — для сборки launcher.exe)
         if opts.build_exe_launcher:
-            with open(os.path.join(portable_dir, "launcher.py"), "w",
-                      encoding="utf-8") as fh:
-                fh.write(launcher_mod.render_py_launcher(cfg))
+            self._write_text(os.path.join(portable_dir, "launcher.py"),
+                             launcher_mod.render_py_launcher(cfg),
+                             newline="\n")
         # README
-        with open(os.path.join(portable_dir, "README_PORTABLE.txt"), "w",
-                  encoding="utf-8") as fh:
-            fh.write(_README.format(app_name=name, main_exe_rel=main_exe_rel))
+        registry_note = (
+            "portable.reg           - настройки программы (переносятся с папкой)\n"
+            if capture and capture.reg_file else ""
+        )
+        self._write_text(
+            os.path.join(portable_dir, "README_PORTABLE.txt"),
+            _README.format(app_name=name, main_exe_rel=main_exe_rel,
+                           registry_note=registry_note),
+        )
         self.log.ok("Лончер и сопроводительные файлы созданы.")
+
+    @staticmethod
+    def _write_text(path: str, text: str, encoding: str = "utf-8",
+                    newline: str = "\r\n") -> None:
+        with open(path, "w", encoding=encoding, newline=newline) as fh:
+            fh.write(text)
 
 
 _README = """{app_name} — портативная версия
 ================================================================
 
 Как пользоваться:
-  1. Скопируйте всю эту папку на флешку/другой ПК/в любое место.
+  1. Скопируйте ВСЮ эту папку на флешку, другой ПК или в любое место.
   2. Запустите Launch.bat — программа стартует в изолированном режиме.
+     LaunchHidden.vbs запускает то же самое, но без окна консоли.
+
+Устанавливать ничего не нужно: программа не появляется в списке
+«Установленные программы» и не требует прав администратора.
 
 Что внутри:
   App\\                  — установленная программа ({main_exe_rel})
-  PortableData\\         — все пользовательские данные (AppData, Temp, реестр-импорт)
+  PortableData\\         — все пользовательские данные (AppData, Temp, настройки)
   Launch.bat            — портативный лончер (перенаправляет каталоги и env)
+  LaunchHidden.vbs      — запуск без окна консоли
   launcher_config.json  — параметры лончера
-  portable.reg          — захваченные при установке изменения реестра (если были)
-  install.log           — подробный журнал установщика (если он поддерживается)
+{registry_note}  install.log           — подробный журнал установщика (если он поддерживается)
   portablizer.log       — журнал создания и диагностики портатива
 
-При запуске стандартные каталоги профиля (AppData, Temp и др.) перенаправляются
-в PortableData. Отдельные программы могут обращаться к системным каталогам или
-реестру напрямую — полную виртуализацию Windows этот лончер не выполняет.
+Ключи запуска (Launch.bat):
+  --nopause         не ждать нажатия клавиши
+  --pause           всегда ждать нажатия клавиши перед закрытием
+  --no-registry     вообще не трогать реестр
+  --keep-registry   оставить настройки в реестре после выхода
+  --reset           забыть сохранённые настройки и стартовать «с нуля»
+  --help            справка
+  -- <аргументы>    передать аргументы самой программе
+
+Как это работает:
+  • стандартные каталоги профиля (AppData, Temp, Документы и др.) на время
+    работы перенаправляются в PortableData — программа не пишет в C:\\Users;
+  • если программе нужны записи реестра, лончер перед стартом сохраняет
+    прежнее состояние чужого ПК, подставляет настройки из портатива, а после
+    выхода выгружает изменения обратно в папку и возвращает реестр как было;
+  • путь портативной папки внутри настроек хранится маркером, поэтому смена
+    буквы диска или компьютера ничего не ломает.
+
+Полной виртуализации Windows лончер не выполняет: отдельные программы могут
+обращаться к системным каталогам напрямую.
 
 Если окно консоли закрывается сразу:
   • запустите Launch.bat из уже открытой консоли (cmd.exe) — вы увидите текст
     ошибки; при ненулевом коде возврата лончер сам делает паузу;
-  • проверьте, что путь в строке TARGET внутри Launch.bat указывает на
-    существующий exe (его можно поправить вручную);
-  • для запуска без паузы используйте: Launch.bat --nopause
+  • убедитесь, что папка App скопирована целиком вместе с Launch.bat;
+  • подробности — в portablizer.log.
 
 Сгенерировано Portablizer.
 """
