@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
+from .. import __version__
 from . import launcher as launcher_mod
 from . import registry as reg_mod
 from .detect import DetectionResult, InstallerType, detect_installer
@@ -132,6 +133,7 @@ class Portablizer:
     def run(self, opts: PortableOptions) -> PortableResult:
         result = PortableResult(success=False)
         try:
+            self.log.info(f"Portablizer {__version__}")
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
                 raise FileNotFoundError(f"Установщик не найден: {opts.installer_path}")
@@ -390,17 +392,48 @@ class Portablizer:
             unique.append((os.path.abspath(path), priority, owned))
         return unique
 
+    @staticmethod
+    def _location_entries(root: str) -> List[Tuple[str, str, bool, bool]]:
+        """Возвращает потомков места установки на глубине до двух уровней."""
+        result: List[Tuple[str, str, bool, bool]] = []
+        try:
+            first_level = list(os.scandir(root))
+        except OSError:
+            return result
+        for entry in first_level:
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_file = entry.is_file(follow_symlinks=False)
+            except OSError:
+                continue
+            result.append((entry.path, entry.name, is_dir, is_file))
+            if not is_dir:
+                continue
+            # Пример: Program Files\\Vendor уже существовал, а установщик
+            # создал внутри новый каталог Vendor\\Type.
+            try:
+                second_level = list(os.scandir(entry.path))
+            except OSError:
+                continue
+            for child in second_level:
+                try:
+                    child_is_dir = child.is_dir(follow_symlinks=False)
+                    child_is_file = child.is_file(follow_symlinks=False)
+                except OSError:
+                    continue
+                result.append((
+                    child.path, child.name, child_is_dir, child_is_file,
+                ))
+        return result
+
     def _snapshot_install_locations(self, data_dir: str) -> Dict[str, Set[str]]:
-        """Запоминает непосредственных потомков типовых мест установки."""
+        """Запоминает потомков типовых мест установки на глубине до двух."""
         snapshot: Dict[str, Set[str]] = {}
         for root, _priority, _owned in self._install_search_roots(data_dir):
-            entries: Set[str] = set()
-            try:
-                with os.scandir(root) as iterator:
-                    for entry in iterator:
-                        entries.add(os.path.normcase(os.path.abspath(entry.path)))
-            except OSError:
-                pass
+            entries = {
+                os.path.normcase(os.path.abspath(path))
+                for path, _name, _is_dir, _is_file in self._location_entries(root)
+            }
             snapshot[os.path.normcase(os.path.abspath(root))] = entries
         return snapshot
 
@@ -515,23 +548,15 @@ class Portablizer:
         for root, priority, owned in search_roots:
             root_key = os.path.normcase(os.path.abspath(root))
             old_entries = before.get(root_key, set())
-            try:
-                entries = list(os.scandir(root))
-            except OSError:
-                continue
-            for entry in entries:
-                entry_path = os.path.abspath(entry.path)
+            for path, entry_name, is_dir, is_file in self._location_entries(root):
+                entry_path = os.path.abspath(path)
                 is_new = os.path.normcase(entry_path) not in old_entries
-                name_match = self._name_score(entry.name, keys) > 0
+                name_match = self._name_score(entry_name, keys) > 0
                 if not (is_new or name_match):
                     continue
                 # Прямой exe безопасно копируем отдельно. Для каталога берём
                 # всё его дерево (dll/resources должны остаться рядом).
-                try:
-                    is_dir = entry.is_dir(follow_symlinks=False)
-                    is_exe = entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(".exe")
-                except OSError:
-                    continue
+                is_exe = is_file and entry_name.lower().endswith(".exe")
                 if not is_dir and not is_exe:
                     continue
                 reason = "перенаправленный профиль" if owned else "новый каталог установки"

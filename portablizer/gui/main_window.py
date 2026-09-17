@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
+from .. import __version__
 from ..core.detect import detect_installer
 from ..core.portablizer import PortableOptions, PortableResult
 from . import style
@@ -64,7 +65,9 @@ class MainWindow(QMainWindow):
         self.worker: Optional[PortableWorker] = None
         self.last_result: Optional[PortableResult] = None
 
-        self.setWindowTitle("Portablizer — портативизатор установщиков")
+        self.setWindowTitle(
+            f"Portablizer {__version__} — портативизатор установщиков"
+        )
         self.setMinimumSize(940, 760)
         ico = _resource(os.path.join("resources", "app.ico"))
         if os.path.exists(ico):
@@ -116,7 +119,7 @@ class MainWindow(QMainWindow):
 
         col = QVBoxLayout()
         col.setSpacing(2)
-        title = QLabel("Portablizer")
+        title = QLabel(f"Portablizer {__version__}")
         title.setObjectName("Title")
         sub = QLabel("Создаёт переносимую папку из exe/msi-установщика "
                      "с изолированным пользовательским окружением")

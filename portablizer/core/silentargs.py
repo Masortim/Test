@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import ntpath
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -50,6 +51,16 @@ def build_silent_plan(
 ) -> SilentPlan:
     extra_args = extra_args or []
     notes: List[str] = []
+
+    # QFileDialog нередко возвращает путь с прямыми слешами (`E:/Type`), а
+    # os.path.join на Windows добавляет к нему обратные. Windows API это обычно
+    # принимает, но NSIS разбирает сырой хвост /D самостоятельно и у некоторых
+    # сборок смешанный путь остаётся без эффекта. Передаём только канонический
+    # Windows-синтаксис: `E:\\Type\\Type_Portable\\App`.
+    installer_path = ntpath.normpath(installer_path)
+    target_dir = ntpath.normpath(target_dir)
+    if log_file:
+        log_file = ntpath.normpath(log_file)
 
     if is_msi or installer_type == InstallerType.MSI:
         # Административная установка распаковывает MSI в целевой каталог, не

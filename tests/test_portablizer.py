@@ -61,6 +61,31 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertTrue((app / "Type.exe").exists())
             self.assertTrue((app / "Type.dll").exists())
 
+    def test_recovers_new_app_inside_existing_vendor_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            vendor = data / "AppData" / "Local" / "Programs" / "Vendor"
+            app.mkdir(parents=True)
+            vendor.mkdir(parents=True)
+            before = self.engine._snapshot_install_locations(str(data))
+
+            installed = vendor / "Type"
+            installed.mkdir()
+            (installed / "Type.exe").write_bytes(b"MZ application")
+
+            recovered = self.engine._recover_installed_app(
+                app_dir=str(app),
+                data_dir=str(data),
+                app_name="Type",
+                installer_path=str(Path(temp, "Type.exe")),
+                before=before,
+            )
+
+            self.assertTrue(recovered)
+            self.assertTrue((app / "Type.exe").exists())
+
     def test_empty_install_does_not_create_broken_launcher(self):
         # Подменяем платформу, чтобы тест никогда не запускал dummy exe, в том
         # числе на Windows-раннере сборки.
@@ -136,6 +161,15 @@ class InstallerDetectionTests(unittest.TestCase):
 
 
 class InstallerPlanTests(unittest.TestCase):
+    def test_nsis_target_uses_only_windows_separators(self):
+        plan = build_silent_plan(
+            InstallerType.NSIS,
+            "C:/Users/test/Downloads/Type.exe",
+            r"E:/Type\Type_Portable\App",
+        )
+        self.assertEqual(plan.program, r"C:\Users\test\Downloads\Type.exe")
+        self.assertEqual(plan.raw_tail, r"/D=E:\Type\Type_Portable\App")
+
     def test_msi_uses_administrative_extraction(self):
         plan = build_silent_plan(
             InstallerType.MSI,
