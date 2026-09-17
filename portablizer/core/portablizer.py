@@ -334,10 +334,11 @@ class Portablizer:
             extra_env=opts.extra_env,
             path_prepend=path_prepend,
         )
-        # Launch.bat
+        # Launch.bat — обязательно CRLF и UTF-8 без BOM: cmd.exe не переваривает
+        # ни LF-концы строк в многострочных блоках, ни BOM в первой строке.
         bat = launcher_mod.render_bat(cfg)
         with open(os.path.join(portable_dir, "Launch.bat"), "w",
-                  encoding="utf-8") as fh:
+                  encoding="utf-8", newline="\r\n") as fh:
             fh.write(bat)
         # config json (для launcher.exe)
         with open(os.path.join(portable_dir, "launcher_config.json"), "w",
@@ -372,6 +373,13 @@ _README = """{app_name} — портативная версия
 
 Диск C: и профиль пользователя Windows не затрагиваются: программа пишет
 данные только в папку PortableData внутри этой директории.
+
+Если окно консоли закрывается сразу:
+  • запустите Launch.bat из уже открытой консоли (cmd.exe) — вы увидите текст
+    ошибки; при ненулевом коде возврата лончер сам делает паузу;
+  • проверьте, что путь в строке TARGET внутри Launch.bat указывает на
+    существующий exe (его можно поправить вручную);
+  • для запуска без паузы используйте: Launch.bat --nopause
 
 Сгенерировано Portablizer.
 """
