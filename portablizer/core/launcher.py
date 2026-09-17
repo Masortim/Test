@@ -149,6 +149,19 @@ def _bat_escape_text(text: str) -> str:
     return out.replace("\r", " ").replace("\n", " ")
 
 
+def _bat_escape_value(value: str) -> str:
+    """Экранирует пользовательское значение в строке ``set "K=V"``.
+
+    Путь к портативу вполне может содержать ``&`` или ``%`` (например,
+    ``D:\\Builds\\100%\\Tools``). Без экранирования cmd.exe либо запускает
+    обрезанную команду, либо пытается раскрыть процент как переменную.
+    """
+    value = value.replace("^", "^^")
+    for ch in ("&", "|", "<", ">", "(", ")"):
+        value = value.replace(ch, "^" + ch)
+    return value.replace("%", "%%").replace('"', '^"')
+
+
 def _bat_quote_arg(arg: str) -> str:
     """Оборачивает аргумент командной строки в кавычки, если это нужно."""
     if arg and not any(c in arg for c in ' \t"'):
@@ -163,7 +176,7 @@ def _bat_args(args: List[str]) -> str:
 def _bat_path_lines(cfg: LauncherConfig) -> str:
     lines = []
     for rel in cfg.path_prepend:
-        rel = rel.replace("/", "\\")
+        rel = _bat_escape_value(rel.replace("/", "\\"))
         lines.append(f'set "PATH=%PORTABLE_ROOT%\\{rel};%PATH%"')
     if not lines:
         lines.append('rem (локальные зависимости для PATH не заданы)')
@@ -173,7 +186,10 @@ def _bat_path_lines(cfg: LauncherConfig) -> str:
 def _bat_env_lines(cfg: LauncherConfig) -> str:
     lines = []
     for k, v in cfg.extra_env.items():
-        lines.append(f'set "{k}={v}"')
+        # Неверное имя переменной делает весь .bat синтаксически опасным.
+        if not k or any(ch in k for ch in "= \t\r\n%&|<>^()\""):
+            continue
+        lines.append(f'set "{k}={_bat_escape_value(str(v))}"')
     if not lines:
         lines.append('rem (пользовательские переменные окружения не заданы)')
     return "\n".join(lines)
@@ -188,8 +204,8 @@ def render_bat(cfg: LauncherConfig) -> str:
 
     return _BAT_TEMPLATE.format(
         app_name=_bat_escape_text(cfg.app_name),
-        data_dir_name=cfg.data_dir_name,
-        target_exe_rel=cfg.target_exe_rel.replace("/", "\\"),
+        data_dir_name=_bat_escape_value(cfg.data_dir_name),
+        target_exe_rel=_bat_escape_value(cfg.target_exe_rel.replace("/", "\\")),
         target_args=_bat_args(cfg.target_args),
         path_lines=_bat_path_lines(cfg),
         env_lines=_bat_env_lines(cfg),
