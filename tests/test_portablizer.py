@@ -16,15 +16,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import batsim
 from portablizer.core import launcher as launcher_mod
 from portablizer.core import registry
-from portablizer.core.detect import InstallerType, detect_installer
+from portablizer.core.detect import (
+    TRUSTED_CONFIDENCE, DetectionResult, InstallerType, detect_installer,
+)
 from portablizer.core.launcher import (
     LauncherConfig, ensure_ascii_bat, render_bat, render_config_json,
     render_vbs,
 )
 from portablizer.core.logutil import Logger
 from portablizer.core.portablizer import (
-    PortableOptions, Portablizer, _burn_layout_payloads, _exit_code_hint,
-    _format_exit_code,
+    PortableOptions, PortableResult, Portablizer, _burn_layout_payloads,
+    _exit_code_hint, _format_exit_code,
 )
 from portablizer.core.silentargs import (
     SilentPlan, build_attempts, build_burn_layout_plan, build_custom_cli_plan,
@@ -751,7 +753,10 @@ class BurnFallbackTests(unittest.TestCase):
     def test_burn_fallback_recovers_app_from_layout_msi(self):
         with tempfile.TemporaryDirectory() as temp:
             installer = Path(temp, "TypeSetup.exe")
-            installer.write_bytes(b"MZ WixBurn .wixburn")
+            # Структурно валидный Burn-бандл: опознаётся по секции .wixburn
+            # с высокой уверенностью, поэтому лестница — только сценарии Burn.
+            _fake_pe(str(installer), [".text", ".rsrc", ".wixburn"],
+                     b"WixBurn wixstdba")
             portable = Path(temp, "Type_Portable")
             app = portable / "App"
             data = portable / "PortableData"
@@ -802,7 +807,10 @@ class BurnFallbackTests(unittest.TestCase):
     def test_burn_fallback_keeps_layout_when_no_msi_found(self):
         with tempfile.TemporaryDirectory() as temp:
             installer = Path(temp, "TypeSetup.exe")
-            installer.write_bytes(b"MZ WixBurn .wixburn")
+            # Структурно валидный Burn-бандл: опознаётся по секции .wixburn
+            # с высокой уверенностью, поэтому лестница — только сценарии Burn.
+            _fake_pe(str(installer), [".text", ".rsrc", ".wixburn"],
+                     b"WixBurn wixstdba")
             portable = Path(temp, "Type_Portable")
             app = portable / "App"
             data = portable / "PortableData"
@@ -859,7 +867,10 @@ class BurnFallbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, mock.patch(
                 "portablizer.core.portablizer.IS_WINDOWS", True):
             installer = Path(temp, "TypeSetup.exe")
-            installer.write_bytes(b"MZ WixBurn .wixburn")
+            # Структурно валидный Burn-бандл: опознаётся по секции .wixburn
+            # с высокой уверенностью, поэтому лестница — только сценарии Burn.
+            _fake_pe(str(installer), [".text", ".rsrc", ".wixburn"],
+                     b"WixBurn wixstdba")
             engine = FakeBurn(Logger())
             result = engine.run(PortableOptions(
                 installer_path=str(installer), output_dir=temp,
@@ -887,7 +898,10 @@ class BurnFallbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, mock.patch(
                 "portablizer.core.portablizer.IS_WINDOWS", True):
             installer = Path(temp, "TypeSetup.exe")
-            installer.write_bytes(b"MZ WixBurn .wixburn")
+            # Структурно валидный Burn-бандл: опознаётся по секции .wixburn
+            # с высокой уверенностью, поэтому лестница — только сценарии Burn.
+            _fake_pe(str(installer), [".text", ".rsrc", ".wixburn"],
+                     b"WixBurn wixstdba")
             engine = FakeBurn(Logger())
             result = engine.run(PortableOptions(
                 installer_path=str(installer), output_dir=temp,
@@ -1090,6 +1104,198 @@ class CustomBootstrapperDetectionTests(unittest.TestCase):
             self.assertTrue(any("/VERYSILENT" in a for a in joined))
 
 
+class WeakSignatureDetectionTests(unittest.TestCase):
+    """Одиночная слабая подстрока («nsis») — не доказательство движка.
+
+    Регрессия на журнал пользователя: установщик, в котором из сигнатур
+    совпала лишь подстрока «nsis», получал уверенность 70 %, единственную
+    команду ``/S /D=…`` и код -1 — настоящий установщик (ZennoLab) этих
+    ключей не понимает.
+    """
+
+    # Содержимое повторяет свидетельства из журнала: только слабое «nsis»
+    # и ключи с одним слешем, ни одного «--», никаких URL.
+    PACKED_PAYLOAD = (
+        b"/quiet /passive /layout /qn /qb /uninstall /NORESTART /SILENT "
+        b"bootstrapper mentions nsis internally "
+        b"requireAdministrator"
+    )
+
+    def _installer(self, temp, payload, name="Mystery.exe"):
+        path = os.path.join(temp, name)
+        _fake_pe(path, [".text", ".rsrc"], payload)
+        return path
+
+    def test_lone_nsis_substring_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            det = detect_installer(
+                self._installer(temp, self.PACKED_PAYLOAD))
+            self.assertEqual(det.installer_type, InstallerType.NSIS)
+            self.assertLess(det.confidence, TRUSTED_CONFIDENCE)
+            self.assertTrue(any("слаб" in e for e in det.evidence))
+
+    def test_low_confidence_detection_gets_generic_fallback_ladder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._installer(temp, self.PACKED_PAYLOAD)
+            attempts = build_attempts(detect_installer(installer), installer,
+                                      r"E:\P\App")
+            self.assertGreaterEqual(len(attempts), 3)
+            # Первой идёт команда предполагаемого движка…
+            self.assertEqual(attempts[0].args[:1], ["/S"])
+            self.assertEqual(attempts[0].raw_tail, r"/D=E:\P\App")
+            # …а за ней — универсальные варианты, если предположение неверно.
+            joined = [" ".join(a.args) for a in attempts[1:]]
+            self.assertTrue(any("/VERYSILENT" in a for a in joined))
+            self.assertTrue(any("/quiet" in a for a in joined))
+
+    def test_strong_nsis_signature_keeps_trusted_single_scenario(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._installer(
+                temp, b"Nullsoft Install System " + self.PACKED_PAYLOAD)
+            det = detect_installer(installer)
+            self.assertEqual(det.installer_type, InstallerType.NSIS)
+            self.assertGreaterEqual(det.confidence, TRUSTED_CONFIDENCE)
+            attempts = build_attempts(det, installer, r"E:\P\App")
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0].label, "NSIS: /S /D")
+
+
+class VendorProfileTests(unittest.TestCase):
+    """Упакованный установщик ZennoLab узнаётся по имени файла продукта.
+
+    Регрессия на журнал пользователя: ZennoPosterLite-RU-v7.9.2.0.exe был
+    опознан как NSIS по слабой подстроке и упал с кодом -1 на ключах /S /D.
+    Строк внутри сборки не видно, но ZennoLab публикует точную команду:
+    ``--silent --hidden --accept-license-agreement="…" --installPath=…``.
+    """
+
+    ZENNO_NAME = "ZennoPosterLite-RU-v7.9.2.0.exe"
+    ZENNO_LICENSE = "https://zennolab.com/terms-of-service/"
+
+    def _zennolite(self, temp, payload=WeakSignatureDetectionTests.PACKED_PAYLOAD,
+                   name=ZENNO_NAME):
+        path = os.path.join(temp, name)
+        _fake_pe(path, [".text", ".rsrc"], payload, dotnet=True)
+        return path
+
+    def test_packed_installer_is_recognized_by_vendor_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            det = detect_installer(self._zennolite(temp))
+            self.assertEqual(det.installer_type, InstallerType.CUSTOM_CLI)
+            self.assertEqual(det.license_url, self.ZENNO_LICENSE)
+            self.assertEqual(det.vendor_args, ["--installType=StandAlone"])
+            self.assertTrue(det.has_switch("--silent"))
+            self.assertTrue(det.has_switch("--accept-license-agreement"))
+            self.assertTrue(det.has_switch("--installPath"))
+            self.assertTrue(det.requires_admin)
+            self.assertTrue(any("ZennoLab" in e for e in det.evidence))
+            # В журнале видно, чей это установщик, а не абстрактный тип.
+            self.assertEqual(det.vendor_name, "ZennoLab")
+            self.assertTrue(det.human.startswith("ZennoLab: "))
+            self.assertIn("Custom CLI bootstrapper", det.human)
+
+    def test_command_line_matches_zennolab_documentation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._zennolite(temp)
+            attempts = build_attempts(detect_installer(installer), installer,
+                                      r"E:\Portable\ZP_Portable\App")
+            self.assertGreaterEqual(len(attempts), 2)
+            first = attempts[0].args
+            self.assertIn("--silent", first)
+            self.assertIn("--hidden", first)
+            self.assertIn(
+                f"--accept-license-agreement={self.ZENNO_LICENSE}", first)
+            self.assertIn(r"--installPath=E:\Portable\ZP_Portable\App", first)
+            # StandAlone: не трогаем уже установленную на этом ПК копию.
+            self.assertIn("--installType=StandAlone", first)
+            # Запасной вариант без пути всё равно принимает лицензию и не
+            # обновляет существующие копии.
+            second = attempts[1].args
+            self.assertFalse(any(a.startswith("--installPath=")
+                                 for a in second))
+            self.assertIn("--installType=StandAlone", second)
+
+    def test_unrelated_filename_is_not_hijacked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            det = detect_installer(self._zennolite(temp, name="Mystery.exe"))
+            self.assertNotEqual(det.installer_type, InstallerType.CUSTOM_CLI)
+
+    def test_strong_engine_beats_vendor_filename(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._zennolite(
+                temp,
+                payload=b"This installation was built with Inno Setup "
+                        + WeakSignatureDetectionTests.PACKED_PAYLOAD)
+            det = detect_installer(installer)
+            self.assertEqual(det.installer_type, InstallerType.INNO)
+
+    def test_run_succeeds_with_documented_command_line(self):
+        # Сквозной сценарий журнала пользователя — теперь он должен РАБОТАТЬ.
+        class ZennoInstaller(Portablizer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.calls.append(plan.args)
+                if not any(a == "--accept-license-agreement="
+                                + VendorProfileTests.ZENNO_LICENSE
+                           for a in plan.args):
+                    # Как в журнале: без принятой лицензии установщик падает.
+                    return 4294967295
+                Path(app_dir, "ZennoPoster.exe").write_bytes(b"MZ app")
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._zennolite(temp)
+            engine = ZennoInstaller(Logger())
+            result = engine.run(PortableOptions(
+                installer_path=installer, output_dir=temp,
+                app_name="ZennoPoster", capture_registry=False,
+                cleanup_host=False))
+            self.assertTrue(result.success, "; ".join(result.messages))
+            self.assertEqual(len(engine.calls), 1)
+            self.assertEqual(result.attempts_made, 1)
+            self.assertTrue(Path(result.portable_dir, "Launch.bat").exists())
+
+
+class FailureLogArtifactsTests(unittest.TestCase):
+    """Артефакты диагностики: вывод установщика и очистка прошлых запусков."""
+
+    def test_installer_output_log_is_cleaned_before_rerun(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir()
+            (portable / "installer-output.log").write_text(
+                "old output", encoding="utf-8")
+            Portablizer(Logger())._prepare_output(
+                str(portable), str(app), str(data))
+            self.assertFalse((portable / "installer-output.log").exists())
+
+    def test_failure_message_points_at_installer_output_log(self):
+        with tempfile.TemporaryDirectory() as temp:
+            Path(temp, "installer-output.log").write_text(
+                "Error: license agreement not accepted", encoding="utf-8")
+            engine = Portablizer(Logger())
+            result = PortableResult(success=False, portable_dir=temp,
+                                    attempts_made=1)
+            det = DetectionResult(InstallerType.NSIS, 0.7)
+            message = engine._failure_message(det, 4294967295, result)
+            self.assertIn("installer-output.log", message)
+
+    def test_failure_message_without_output_log_stays_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = Portablizer(Logger())
+            result = PortableResult(success=False, portable_dir=temp,
+                                    attempts_made=1)
+            det = DetectionResult(InstallerType.NSIS, 0.7)
+            message = engine._failure_message(det, 4294967295, result)
+            self.assertNotIn("installer-output.log", message)
+
+
 class AttemptLadderTests(unittest.TestCase):
     """Оркестратор обязан идти по лестнице до фактического результата."""
 
@@ -1252,6 +1458,31 @@ class FailureDiagnosticsTests(unittest.TestCase):
         portable = Path(result.portable_dir)
         self.assertFalse((portable / "Launch.bat").exists())
         self.assertTrue((portable / "portablizer.log").exists())
+
+    def test_failure_lists_outcome_of_every_attempt(self):
+        # Кода возврата одной последней попытки мало: итог нужен по каждой.
+        result = self._failed_result(
+            CustomBootstrapperDetectionTests.ZENNO_PAYLOAD)
+        message = "; ".join(result.messages)
+        self.assertIn("Итог каждой команды", message)
+        # Заголовки всех трёх сценариев лестницы присутствуют в отчёте.
+        self.assertIn("Собственные ключи установщика", message)
+        self.assertIn("Собственные ключи без пути установки", message)
+        self.assertIn("Собственные ключи без --hidden", message)
+        self.assertEqual(len(result.attempt_outcomes), result.attempts_made)
+        self.assertTrue(all(rc == 4294967295
+                            for _label, rc in result.attempt_outcomes))
+
+    def test_success_code_with_no_files_is_spelled_out(self):
+        self.assertIn(
+            "код 0, но файлов",
+            Portablizer(Logger())._failure_message(
+                DetectionResult(InstallerType.NSIS, 0.7), 0,
+                PortableResult(
+                    success=False, attempts_made=2,
+                    attempt_outcomes=[("NSIS: /S /D", 4294967295),
+                                      ("Универсальные ключи: /S", 0)],
+                )))
 
 
 if __name__ == "__main__":

@@ -26,7 +26,9 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
-from .detect import DetectionResult, InstallerType
+from .detect import (
+    TRUSTED_CONFIDENCE, DetectionResult, InstallerType,
+)
 
 #: Больше попыток запускать бессмысленно: каждая стоит времени пользователя.
 MAX_ATTEMPTS = 6
@@ -290,10 +292,29 @@ def build_custom_cli_plan(
     if detection is not None and detection.has_switch("--norestart"):
         args.append(detection.switch("--norestart"))
 
+    # Документированные производителем фиксированные ключи (профиль вендора):
+    # например, у ZennoLab --installType=StandAlone гарантирует чистую
+    # установку в нашу папку даже при наличии другой версии на этом ПК —
+    # иначе Default обновил бы чужую установку, а компьютер-сборщик должен
+    # остаться без изменений.
+    if detection is not None:
+        present = {a.split("=", 1)[0].casefold() for a in args}
+        for fixed in detection.vendor_args:
+            key = fixed.split("=", 1)[0].casefold()
+            if key not in present:
+                args.append(fixed)
+                present.add(key)
+
     args += list(extra_args or [])
-    notes.append(
-        "Ключи взяты из строк самого установщика, а не подобраны наугад."
-    )
+    if detection is not None and detection.vendor_args:
+        notes.append(
+            "Ключи заданы по официальной документации производителя "
+            "(строки внутри сборки упакованы и не использовались)."
+        )
+    else:
+        notes.append(
+            "Ключи взяты из строк самого установщика, а не подобраны наугад."
+        )
     label = "Собственные ключи установщика: " + " ".join(
         a.split("=", 1)[0] for a in args[:4])
     return SilentPlan(program=installer_path, args=args, notes=notes,
@@ -425,13 +446,25 @@ def build_attempts(
             installer_path, layout_dir, log_file=log_path("install-layout.log"),
             extra_args=extra))
 
-    if itype in (InstallerType.UNKNOWN, InstallerType.SELF_EXTRACT,
-                 InstallerType.SQUIRREL):
+    # Тип, опознанный ненадёжно (например, по одиночной слабой подстроке
+    # «nsis»), не должен заканчиваться единственной типо-специфичной
+    # командой: если она не подошла, в ход идут универсальные наборы ключей.
+    weakly_detected = (
+        not (detection.is_msi or itype == InstallerType.MSI)
+        and itype != InstallerType.CUSTOM_CLI
+        and detection.confidence < TRUSTED_CONFIDENCE
+    )
+    generic_types = (InstallerType.UNKNOWN, InstallerType.SELF_EXTRACT,
+                     InstallerType.SQUIRREL)
+    if weakly_detected or itype in generic_types:
+        note = ("Универсальный набор ключей для нераспознанного установщика."
+                if itype in generic_types and not weakly_detected
+                else "Универсальный набор ключей: определение типа "
+                     "ненадёжно, пробуем типовые ключи по очереди.")
         for switches in _GENERIC_LADDER:
             plan = SilentPlan(
                 program=installer_path, args=list(switches) + extra,
-                notes=["Универсальный набор ключей для нераспознанного "
-                       "установщика."],
+                notes=[note],
                 label="Универсальные ключи: " + " ".join(switches),
                 output_dir=native_target,
             )

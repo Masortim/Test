@@ -12,7 +12,7 @@
   * InstallAware / Wise / install4j / BitRock / прочее -> эвристики
   * Собственный bootstrapper -> ключи вида ``--silent --installPath=...``
 
-Определение построено на трёх независимых источниках:
+Определение построено на четырёх независимых источниках:
 
 1. **Структура PE.** Настоящий WiX Burn-бандл всегда имеет секцию с именем
    ``.wixburn``. Одноимённая строка внутри файла ничего не доказывает: она
@@ -20,12 +20,22 @@
    его внутри себя как вложенный пакет). Раньше Portablizer верил строке и
    отправлял в заведомо чужой установщик ключи ``/quiet /install`` — тот
    падал с кодом ``-1`` (``0xFFFFFFFF``), ничего не установив.
-2. **Байтовые сигнатуры** движков (быстро и без запуска).
+2. **Байтовые сигнатуры** движков (быстро и без запуска). Одна короткая
+   подстрока вроде «nsis» — слабое доказательство: она встречается и в чужих
+   установщиках. Поэтому слабым сигнатурам без сильных подтверждений
+   («Nullsoft Install System» и т.п.) уверенность сознательно занижается, а
+   лестница попыток дополняется универсальными командами.
 3. **Ключи командной строки, которые установщик сам содержит внутри себя.**
    Современные bootstrapper'ы (в т.ч. .NET) разбирают аргументы вида
    ``--silent``, ``--installPath``, ``--accept-license-agreement`` и хранят
    эти строки в бинарнике. Найдя их, мы можем построить корректную тихую
    команду даже для установщика, которого не знаем «в лицо».
+4. **Профиль производителя.** У некоторых вендоров (ZennoLab) свежие сборки
+   хранят строки упакованными — источники 2–3 молчат. Но имена файлов у их
+   продуктов стандартизованы (``ZennoPosterLite-RU-v7.9.2.0.exe``), а точный
+   синтаксис тихой установки опубликован в официальной документации. Если
+   движок не опознан уверенно, а имя файла совпадает с профилем, ключи
+   берутся из документации производителя.
 """
 from __future__ import annotations
 
@@ -35,7 +45,7 @@ import struct
 import zipfile
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 class InstallerType(str, Enum):
@@ -94,6 +104,24 @@ _SIGNATURES: Dict[InstallerType, List[bytes]] = {
     ],
 }
 
+#: Слабые сигнатуры. Короткая подстрока вроде «nsis» встречается и в чужих
+#: установщиках (упоминание движка, вложенные ресурсы, URL). Реальный случай:
+#: установщик ZennoPosterLite, опознанный как NSIS только по такой подстроке,
+#: получил чужие ключи ``/S /D=``, завершился кодом -1 и ничего не установил.
+#: Одно-два слабых совпадения без сильных подтверждений («Nullsoft Install
+#: System» и т.п.) — не доказательство движка, а лишь повод понизить оценку.
+_WEAK_SIGNATURES: Set[Tuple["InstallerType", bytes]] = {
+    (InstallerType.NSIS, b"nsis"),
+}
+
+#: Оценка, начиная с которой определение считается заслуживающим доверия и
+#: лестница попыток строится только из команд «своего» сценария. Ниже неё
+#: добавляются универсальные запасные варианты (см. silentargs.build_attempts).
+TRUSTED_CONFIDENCE = 0.6
+
+#: Потолок уверенности для типа, опознанного только по слабым подстрокам.
+_WEAK_ONLY_CONFIDENCE = 0.45
+
 #: Ключи командной строки, которые умеют разбирать современные установщики.
 #: Ищем их прямо в бинарнике: если установщик содержит строку ``--installPath``,
 #: он почти наверняка её и разбирает. Регистр сохранён канонический — именно в
@@ -127,6 +155,61 @@ _URL_RE = re.compile(
 _LICENSE_HINTS = ("terms", "license", "licence", "eula", "agreement", "legal")
 
 _RESOURCE_SECTION = ".wixburn"
+
+
+# --- профили производителей ---------------------------------------------------
+
+@dataclass(frozen=True)
+class VendorProfile:
+    """Документированная командная строка установщиков одного вендора.
+
+    Свежие сборки часто прячут служебные строки (упакованный .NET), поэтому
+    эвристике по найденным в бинарнике ключам опереться не на что. Зато
+    имена файлов продуктов стандартизованы, а синтаксис тихой установки
+    опубликован самим производителем.
+    """
+
+    name: str                          # производитель (для журнала)
+    filename_re: re.Pattern            # стандартизованное имя файла продукта
+    hosts: Tuple[str, ...]             # характерные URL-хосты внутри бинарника
+    switches: Tuple[str, ...]          # ключи из официальной документации
+    license_url: str                   # URL, который требует --accept-license
+    fixed_args: Tuple[str, ...] = ()   # документированные фиксированные ключи
+
+
+_VENDOR_PROFILES: Tuple[VendorProfile, ...] = (
+    # ZennoLab (docs.zennolab.com: «Silent Installation of ZennoLab Products»):
+    #   product.exe --silent --hidden \
+    #       --accept-license-agreement="https://zennolab.com/terms-of-service/" \
+    #       --installPath="C:\\Path" --installType="StandAlone"
+    # Без ключа принятия лицензии установщик завершается с кодом -1.
+    # Тип StandAlone выбран осознанно: Default при наличии на этом ПК другой
+    # версии продукта ОБНОВИЛ бы её, изменив чужую установку, а компьютер-
+    # сборщик обещано оставить без изменений.
+    VendorProfile(
+        name="ZennoLab",
+        filename_re=re.compile(r"zenno|capmonster", re.IGNORECASE),
+        hosts=("zennolab.com",),
+        switches=("--silent", "--hidden", "--accept-license-agreement",
+                  "--installPath", "--installType"),
+        license_url="https://zennolab.com/terms-of-service/",
+        fixed_args=("--installType=StandAlone",),
+    ),
+)
+
+
+def _vendor_profile(path: str) -> Optional[VendorProfile]:
+    """Профиль производителя по имени файла установщика.
+
+    Имя — умышленно «дешёвое» доказательство, поэтому профиль применяется
+    только когда движок не опознан уверенно (см. detect_installer): случайно
+    переименованный в Zenno*.exe установщик Inno Setup не пострадает.
+    """
+    basename = os.path.basename(path)
+    for profile in _VENDOR_PROFILES:
+        if profile.filename_re.search(basename):
+            return profile
+    return None
 
 
 # --- разбор PE ----------------------------------------------------------------
@@ -303,6 +386,11 @@ class DetectionResult:
     switch_hints: List[str] = field(default_factory=list)
     #: URL лицензионного соглашения (нужен установщикам с --accept-license-*).
     license_urls: List[str] = field(default_factory=list)
+    #: Фиксированные аргументы из документации производителя (профиль вендора);
+    #: строками в бинарнике их не найти, значения заданы самим вендором.
+    vendor_args: List[str] = field(default_factory=list)
+    #: Имя производителя из профиля вендора (для показа пользователю).
+    vendor_name: str = ""
     #: В манифесте указан requireAdministrator — без UAC установка невозможна.
     requires_admin: bool = False
     is_dotnet: bool = False
@@ -312,7 +400,9 @@ class DetectionResult:
 
     @property
     def human(self) -> str:
-        return f"{self.installer_type.value} (уверенность {int(self.confidence * 100)}%)"
+        prefix = f"{self.vendor_name}: " if self.vendor_name else ""
+        return (f"{prefix}{self.installer_type.value} "
+                f"(уверенность {int(self.confidence * 100)}%)")
 
     def has_switch(self, *tokens: str) -> bool:
         available = {s.casefold() for s in self.switch_hints}
@@ -361,9 +451,22 @@ def detect_installer(path: str) -> DetectionResult:
 
     for itype, matched in scan.signatures.items():
         hits = [sig.decode("latin-1", "replace") for sig in matched]
-        if hits:
-            scores[itype] = min(1.0, 0.55 + 0.15 * len(hits))
-            evidence[itype] = [f"найдена сигнатура: {h}" for h in hits]
+        if not hits:
+            continue
+        strong = [sig for sig in matched
+                  if (itype, sig) not in _WEAK_SIGNATURES]
+        if strong:
+            scores[itype] = min(1.0, 0.55 + 0.15 * len(strong))
+        else:
+            # Только слабые подстроки: верим мало — иначе чужому установщику
+            # уйдут ключи движка, которого в нём нет.
+            scores[itype] = min(_WEAK_ONLY_CONFIDENCE,
+                                0.35 + 0.05 * len(matched))
+        evidence[itype] = [f"найдена сигнатура: {h}" for h in hits]
+        if not strong:
+            evidence[itype].append(
+                "совпали лишь слабые подстроки — такой тип не подтверждён "
+                "и будет дополнен универсальными запасными командами")
 
     # Настоящий Burn-бандл опознаётся только по секции PE. Строка «WixBurn»
     # внутри файла означает лишь упоминание движка: так выглядят, например,
@@ -412,19 +515,51 @@ def detect_installer(path: str) -> DetectionResult:
         result = DetectionResult(best, scores[best],
                                  evidence=list(evidence.get(best, [])))
 
-    result.switch_hints = list(scan.switches)
-    result.license_urls = list(scan.urls)
+    # Профиль производителя — только если движок не опознан уверенно, а его
+    # строковые ключи в бинарнике не нашлись (тип CUSTOM_CLI выше — как раз
+    # они и есть). Сильная сигнатура настоящего движка для нас важнее имени
+    # файла: репак, названный Zenno*.exe, но собранный в Inno Setup,
+    # обрабатывается как Inno Setup.
+    profile: Optional[VendorProfile] = None
+    if (result.installer_type != InstallerType.CUSTOM_CLI
+            and result.confidence < TRUSTED_CONFIDENCE):
+        profile = _vendor_profile(path)
+    if profile is not None:
+        vendor_evidence = [
+            f"установщик {profile.name}: имя файла соответствует продукту "
+            f"этого производителя; строки внутри сборки упакованы, поэтому "
+            f"ключи взяты из официальной документации {profile.name}",
+            "ключи из документации: " + ", ".join(profile.switches),
+            f"обязательное принятие лицензии: {profile.license_url}",
+        ]
+        if any(host in url for url in scan.urls for host in profile.hosts):
+            vendor_evidence.append(
+                "внутри найден сайт производителя: "
+                + ", ".join(profile.hosts))
+        scan_evidence = result.evidence
+        result = DetectionResult(
+            InstallerType.CUSTOM_CLI, 0.8,
+            evidence=vendor_evidence + scan_evidence,
+            switch_hints=list(profile.switches),
+            license_urls=[profile.license_url]
+            + [u for u in scan.urls if u != profile.license_url],
+            vendor_args=list(profile.fixed_args),
+            vendor_name=profile.name)
+
+    if profile is None:
+        result.switch_hints = list(scan.switches)
+        result.license_urls = list(scan.urls)
     result.requires_admin = scan.requires_admin
     result.is_dotnet = pe.is_dotnet
     result.sections = list(pe.sections)
     result.has_zip_payload = _has_zip_payload(path)
 
-    if result.switch_hints:
+    if profile is None and result.switch_hints:
         result.evidence.append(
             "ключи внутри файла: " + ", ".join(result.switch_hints[:8])
             + (" …" if len(result.switch_hints) > 8 else "")
         )
-    if result.license_url:
+    if profile is None and result.license_url:
         result.evidence.append(
             f"ссылка на лицензионное соглашение: {result.license_url}")
     if result.requires_admin:
