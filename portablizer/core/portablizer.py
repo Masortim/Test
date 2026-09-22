@@ -250,7 +250,7 @@ class Portablizer:
             "launcher_config.json", "README_PORTABLE.txt", "portable.reg",
             "portable_machine.reg", "cleanup_host.reg", "install.log",
             "install-retry.log", "install-layout.log", "installer-engine.log",
-            "portablizer.log", "_bundle_layout",
+            "installer-output.log", "portablizer.log", "_bundle_layout",
         ):
             path = os.path.join(portable_dir, filename)
             try:
@@ -528,11 +528,24 @@ class Portablizer:
             f" Испробовано вариантов команды: {tried}." if tried > 1 else ""
         )
         advice = "".join(f"\n  • {h}" for h in result.hints)
+        # Если установщик выводил текст (stdout/stderr), он сохранён рядом —
+        # там часто написана точная причина отказа.
+        output_note = ""
+        if result.portable_dir:
+            try:
+                output_log = os.path.join(result.portable_dir,
+                                          "installer-output.log")
+                if os.path.getsize(output_log) > 0:
+                    output_note = ("\nТекстовый вывод установщика "
+                                   "(stdout/stderr) — в installer-output.log.")
+            except OSError:
+                pass
         return (
             "Установщик завершился, но в папке App не найден ни один "
             f"исполняемый файл{rc_hint}.{attempts_text} Портатив не создан."
             + (f"\n\nЧто можно сделать:{advice}" if advice else "")
             + "\n\nПодробности — в portablizer.log рядом с папкой портатива."
+            + output_note
         )
 
     # -- реестр ---------------------------------------------------------------
@@ -740,8 +753,8 @@ class Portablizer:
     # -- установка ------------------------------------------------------------
     def _run_install(self, plan: SilentPlan, opts: PortableOptions,
                      app_dir: str, data_dir: str,
-                     progress_from: int = 30,
-                     progress_to: int = 60) -> Optional[int]:
+                     progress_from: int = 30, progress_to: int = 60,
+                     console_log: Optional[str] = None) -> Optional[int]:
         if not IS_WINDOWS:
             # Не выдаём заглушку за готовое приложение: следующий этап честно
             # завершит операцию ошибкой из-за отсутствия exe.
@@ -756,43 +769,77 @@ class Portablizer:
         # subprocess с list не даст «сырой» аргумент, поэтому для NSIS собираем
         # командную строку строкой.
         env = self._build_isolated_env(opts, data_dir)
+        cmdline = subprocess.list2cmdline(cmd)
+        if plan.raw_tail:
+            cmdline += " " + plan.raw_tail
+
+        # stdout/stderr установщика сохраняем в файл: CLI-установщики пишут
+        # туда причину отказа (например, «license agreement not accepted»),
+        # а GUI-движки просто молчат. Без этого код -1 остаётся загадкой.
+        console_handle = None
+        if console_log:
+            try:
+                console_handle = open(console_log, "ab")
+                console_handle.write(
+                    (f"===== {plan.label} =====\r\n{cmdline}\r\n")
+                    .encode("utf-8", "replace"))
+                console_handle.flush()
+            except OSError:
+                console_handle = None
 
         creationflags = 0x08000000  # CREATE_NO_WINDOW
         self.log.info("Запуск установщика (тихо, изолированно)...")
+        rc: Optional[int] = None
         try:
-            if plan.raw_tail:
-                cmdline = subprocess.list2cmdline(cmd) + " " + plan.raw_tail
-                self.log.debug(f"cmdline: {cmdline}")
-                proc = subprocess.Popen(cmdline, env=env,
-                                        creationflags=creationflags)
-            else:
-                proc = subprocess.Popen(cmd, env=env,
-                                        creationflags=creationflags)
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"Не удалось запустить установщик: {exc}") from exc
-        except OSError as exc:
-            if getattr(exc, "winerror", None) == 740:  # ERROR_ELEVATION_REQUIRED
+            try:
+                if plan.raw_tail:
+                    self.log.debug(f"cmdline: {cmdline}")
+                    popen_args = cmdline
+                else:
+                    popen_args = cmd
+                proc = subprocess.Popen(
+                    popen_args, env=env, creationflags=creationflags,
+                    stdout=console_handle,
+                    stderr=subprocess.STDOUT if console_handle else None)
+            except FileNotFoundError as exc:
                 raise RuntimeError(
-                    "Установщику нужны права администратора. Запустите "
-                    "Portablizer от имени администратора и повторите сборку."
-                ) from exc
-            raise RuntimeError(f"Не удалось запустить установщик: {exc}") from exc
+                    f"Не удалось запустить установщик: {exc}") from exc
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 740:  # ERROR_ELEVATION_REQUIRED
+                    raise RuntimeError(
+                        "Установщику нужны права администратора. Запустите "
+                        "Portablizer от имени администратора и повторите сборку."
+                    ) from exc
+                raise RuntimeError(
+                    f"Не удалось запустить установщик: {exc}") from exc
 
-        start = time.time()
-        while proc.poll() is None:
-            if self.cancel.is_set():
-                proc.terminate()
-                raise RuntimeError("Установка отменена пользователем.")
-            if time.time() - start > opts.install_timeout:
-                proc.terminate()
-                raise RuntimeError("Превышено время ожидания установки.")
-            # плавный прогресс во время установки: progress_from -> progress_to
-            frac = min(1.0, (time.time() - start) / 60.0)
-            span = max(1, progress_to - progress_from)
-            self.progress(progress_from + int(span * frac), "Тихая установка...")
-            time.sleep(0.5)
+            start = time.time()
+            while proc.poll() is None:
+                if self.cancel.is_set():
+                    proc.terminate()
+                    raise RuntimeError("Установка отменена пользователем.")
+                if time.time() - start > opts.install_timeout:
+                    proc.terminate()
+                    raise RuntimeError("Превышено время ожидания установки.")
+                # плавный прогресс во время установки: progress_from -> progress_to
+                frac = min(1.0, (time.time() - start) / 60.0)
+                span = max(1, progress_to - progress_from)
+                self.progress(progress_from + int(span * frac),
+                              "Тихая установка...")
+                time.sleep(0.5)
+            rc = proc.returncode
+        finally:
+            if console_handle is not None:
+                try:
+                    code = (str(rc) if rc is not None
+                            else "нет (установщик не запустился или прерван)")
+                    console_handle.write(
+                        f"<<< код возврата: {code} >>>\r\n\r\n"
+                        .encode("utf-8", "replace"))
+                    console_handle.close()
+                except OSError:
+                    pass
 
-        rc = proc.returncode
         if rc not in (0, 3010):  # 3010 = успех, требуется перезагрузка
             hint = _exit_code_hint(rc)
             self.log.warn(
@@ -830,6 +877,7 @@ class Portablizer:
         last_rc: Optional[int] = None
         total = len(attempts)
         span = max(1, 58 - 30)
+        console_log = os.path.join(portable_dir, "installer-output.log")
 
         for index, plan in enumerate(attempts):
             self._check_cancel()
@@ -846,7 +894,8 @@ class Portablizer:
                 )
 
             rc = self._run_install(plan, opts, app_dir, data_dir,
-                                   progress_from=start, progress_to=stop)
+                                   progress_from=start, progress_to=stop,
+                                   console_log=console_log)
             last_rc = rc
             self._attempts_made += 1
 
@@ -855,7 +904,8 @@ class Portablizer:
             if plan.extracts_only and plan.output_dir \
                     and os.path.normcase(plan.output_dir) != os.path.normcase(app_dir):
                 if self._install_layout_packages(plan.output_dir, opts, app_dir,
-                                                 data_dir, name):
+                                                 data_dir, name,
+                                                 console_log=console_log):
                     self.log.ok(f"Сработал сценарий: {plan.label}")
                     return rc, plan
                 continue
@@ -878,7 +928,8 @@ class Portablizer:
 
     def _install_layout_packages(self, layout_dir: str, opts: PortableOptions,
                                  app_dir: str, data_dir: str,
-                                 name: str) -> bool:
+                                 name: str,
+                                 console_log: Optional[str] = None) -> bool:
         """Распаковывает MSI из подготовленного ``/layout`` прямо в ``App``."""
         msis, other_payloads = _burn_layout_payloads(layout_dir)
         if other_payloads:
@@ -901,7 +952,8 @@ class Portablizer:
             msi_plan = build_silent_plan(InstallerType.MSI, msi, app_dir,
                                          is_msi=True)
             self._run_install(msi_plan, opts, app_dir, data_dir,
-                              progress_from=58, progress_to=60)
+                              progress_from=58, progress_to=60,
+                              console_log=console_log)
 
         if self._find_main_exe(app_dir, name):
             self.log.ok("Пакеты бандла распакованы в папку App.")
