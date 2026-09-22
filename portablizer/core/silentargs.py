@@ -48,6 +48,7 @@ def build_silent_plan(
     is_msi: bool = False,
     log_file: Optional[str] = None,
     extra_args: Optional[List[str]] = None,
+    override_install_folder: bool = True,
 ) -> SilentPlan:
     extra_args = extra_args or []
     notes: List[str] = []
@@ -107,9 +108,23 @@ def build_silent_plan(
         return SilentPlan(program=installer_path, args=args, notes=notes)
 
     if installer_type == InstallerType.WIX_BURN:
-        args = ["/quiet", "/norestart", "/install",
-                f"InstallFolder={target_dir}"] + extra_args
-        notes.append("WiX Burn: /quiet /install (папку принимает не всегда).")
+        # Переменную InstallFolder принимают только бандлы, объявившие её
+        # публичной (bal:Overridable). Если бандл её не знает, вся командная
+        # строка считается недопустимой и установка мгновенно проваливается
+        # (типичен код -1 / 0xFFFFFFFF). Поэтому при неудаче Portablizer
+        # повторяет запуск уже без неё (Portablizer._burn_fallback), а затем
+        # распаковывает бандл через /layout (build_burn_layout_plan).
+        args = ["/quiet", "/norestart", "/install"]
+        if override_install_folder:
+            args.append(f"InstallFolder={target_dir}")
+        if log_file:
+            args += ["/log", log_file]
+        args += extra_args
+        notes.append(
+            "WiX Burn: /quiet /install + /log. Папку бандл принимает только "
+            "при публичной переменной InstallFolder; при неудаче Portablizer "
+            "повторит запуск без неё и распакует бандл через /layout."
+        )
         return SilentPlan(program=installer_path, args=args, notes=notes)
 
     if installer_type == InstallerType.INSTALLAWARE:
@@ -129,6 +144,37 @@ def build_silent_plan(
         "рекомендуется задать ключи вручную в поле «Доп. аргументы»."
     )
     return SilentPlan(program=installer_path, args=args, notes=notes)
+
+
+def build_burn_layout_plan(
+    installer_path: str,
+    layout_dir: str,
+    log_file: Optional[str] = None,
+    extra_args: Optional[List[str]] = None,
+) -> SilentPlan:
+    """План распаковки WiX Burn-бандла без установки (``/layout``).
+
+    ``/layout <папка>`` просит движок Burn собрать все пакеты бандла в
+    указанную папку, не выполняя установку: не нужны ни права администратора,
+    ни изменение системы. Извлечённые MSI затем распаковываются
+    административной установкой (``msiexec /a``) прямо в папку App портатива.
+    """
+    installer_path = ntpath.normpath(installer_path)
+    layout_dir = ntpath.normpath(layout_dir)
+    if log_file:
+        log_file = ntpath.normpath(log_file)
+    args = ["/layout", layout_dir, "/quiet", "/norestart"]
+    if log_file:
+        args += ["/log", log_file]
+    args += list(extra_args or [])
+    return SilentPlan(
+        program=installer_path,
+        args=args,
+        notes=[
+            "WiX Burn /layout: содержимое бандла собирается в папку без "
+            "установки в систему и без прав администратора.",
+        ],
+    )
 
 
 def candidate_silent_switches(installer_type: InstallerType) -> List[str]:

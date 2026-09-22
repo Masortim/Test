@@ -18,8 +18,11 @@ from portablizer.core.launcher import (
     render_vbs,
 )
 from portablizer.core.logutil import Logger
-from portablizer.core.portablizer import PortableOptions, Portablizer
-from portablizer.core.silentargs import build_silent_plan
+from portablizer.core.portablizer import (
+    PortableOptions, Portablizer, _burn_layout_payloads, _exit_code_hint,
+    _format_exit_code,
+)
+from portablizer.core.silentargs import build_burn_layout_plan, build_silent_plan
 
 
 def _labels(bat: str):
@@ -657,6 +660,229 @@ class InstallerPlanTests(unittest.TestCase):
         self.assertIn("/a", plan.args)
         self.assertNotIn("/i", plan.args)
         self.assertIn(r"TARGETDIR=E:\Type_Portable\App", plan.args)
+
+
+class BurnPlanTests(unittest.TestCase):
+    def test_burn_plan_sets_folder_and_writes_log(self):
+        plan = build_silent_plan(
+            InstallerType.WIX_BURN,
+            r"C:\Downloads\Type.exe",
+            r"E:\Type_Portable\App",
+            log_file=r"E:\Type_Portable\install.log",
+        )
+        self.assertIn("/install", plan.args)
+        self.assertIn("/quiet", plan.args)
+        self.assertIn("InstallFolder=E:\\Type_Portable\\App", plan.args)
+        log_index = plan.args.index("/log")
+        self.assertEqual(plan.args[log_index + 1], r"E:\Type_Portable\install.log")
+
+    def test_burn_plan_can_drop_install_folder_override(self):
+        plan = build_silent_plan(
+            InstallerType.WIX_BURN,
+            r"C:\Downloads\Type.exe",
+            r"E:\Type_Portable\App",
+            override_install_folder=False,
+        )
+        self.assertFalse(
+            any(a.startswith("InstallFolder=") for a in plan.args))
+
+    def test_burn_layout_plan_extracts_without_installing(self):
+        plan = build_burn_layout_plan(
+            r"C:\Downloads\Type.exe",
+            r"E:\Type_Portable\_bundle_layout",
+            log_file=r"E:\Type_Portable\install-layout.log",
+        )
+        self.assertEqual(plan.args[0], "/layout")
+        self.assertEqual(plan.args[1], r"E:\Type_Portable\_bundle_layout")
+        self.assertIn("/quiet", plan.args)
+        self.assertIn("/norestart", plan.args)
+        self.assertNotIn("/install", plan.args)
+
+
+class ExitCodeTests(unittest.TestCase):
+    def test_unsigned_codes_are_decoded_to_signed_and_hex(self):
+        self.assertEqual(
+            _format_exit_code(4294967295), "4294967295 (-1, 0xFFFFFFFF)")
+        self.assertIn("администратора", _exit_code_hint(4294967295))
+
+    def test_known_windows_codes_have_hints(self):
+        self.assertEqual(_format_exit_code(740), "740")
+        self.assertIn("администратора", _exit_code_hint(740))
+        self.assertIn("UAC", _exit_code_hint(1223))
+
+    def test_success_and_unknown_codes_have_no_hint(self):
+        self.assertEqual(_format_exit_code(None), "неизвестен")
+        self.assertEqual(_exit_code_hint(None), "")
+        self.assertEqual(_exit_code_hint(0), "")
+        self.assertEqual(_exit_code_hint(1), "")
+        self.assertEqual(_format_exit_code(3010), "3010")
+
+
+class BurnFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = Portablizer(Logger())
+
+    def test_layout_payloads_rank_msis_by_size(self):
+        with tempfile.TemporaryDirectory() as temp:
+            layout = Path(temp, "_bundle_layout")
+            (layout / "redist").mkdir(parents=True)
+            (layout / "app.msi").write_bytes(b"x" * 100)
+            (layout / "redist" / "vc.msi").write_bytes(b"x" * 10)
+            (layout / "redist" / "tool.exe").write_bytes(b"MZ")
+
+            msis, others = _burn_layout_payloads(str(layout))
+
+            self.assertEqual([Path(m).name for m in msis],
+                             ["app.msi", "vc.msi"])
+            self.assertEqual([Path(o).name for o in others], ["tool.exe"])
+
+    def test_layout_payloads_of_missing_folder(self):
+        msis, others = _burn_layout_payloads(r"C:\nowhere\_bundle_layout")
+        self.assertEqual(msis, [])
+        self.assertEqual(others, [])
+
+    def test_burn_fallback_recovers_app_from_layout_msi(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "TypeSetup.exe")
+            installer.write_bytes(b"MZ WixBurn .wixburn")
+            portable = Path(temp, "Type_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir(parents=True)
+
+            class FakeBurn(Portablizer):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.calls = []
+
+                def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                    self.calls.append(plan)
+                    if "/layout" in plan.args:
+                        layout = portable / "_bundle_layout"
+                        layout.mkdir(parents=True, exist_ok=True)
+                        (layout / "app.msi").write_bytes(b"MZ fake msi payload")
+                    elif plan.program == "msiexec.exe":
+                        Path(app_dir, "Type.exe").write_bytes(b"MZ application")
+                    return 0
+
+            engine = FakeBurn(Logger())
+            rc = engine._burn_fallback(
+                PortableOptions(installer_path=str(installer),
+                                output_dir=temp, app_name="Type"),
+                str(app), str(data), str(portable), "Type")
+
+            # Повтор без InstallFolder, затем /layout, затем msiexec /a.
+            self.assertEqual(len(engine.calls), 3)
+            self.assertFalse(any(a.startswith("InstallFolder=")
+                                 for a in engine.calls[0].args))
+            self.assertIn("/layout", engine.calls[1].args)
+            self.assertEqual(engine.calls[2].program, "msiexec.exe")
+            self.assertIn("/a", engine.calls[2].args)
+            self.assertNotIn("/i", engine.calls[2].args)
+            self.assertEqual(rc, 0)
+            self.assertTrue((app / "Type.exe").exists())
+            # Временная распаковка бандла удалена.
+            self.assertFalse((portable / "_bundle_layout").exists())
+
+    def test_burn_fallback_keeps_layout_when_no_msi_found(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "TypeSetup.exe")
+            installer.write_bytes(b"MZ WixBurn .wixburn")
+            portable = Path(temp, "Type_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir(parents=True)
+
+            class FakeBurn(Portablizer):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.calls = []
+
+                def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                    self.calls.append(plan)
+                    if "/layout" in plan.args:
+                        layout = portable / "_bundle_layout"
+                        layout.mkdir(parents=True, exist_ok=True)
+                        (layout / "tool.exe").write_bytes(b"MZ exe payload")
+                    return 5
+
+            engine = FakeBurn(Logger())
+            rc = engine._burn_fallback(
+                PortableOptions(installer_path=str(installer),
+                                output_dir=temp, app_name="Type"),
+                str(app), str(data), str(portable), "Type")
+
+            # Только повтор и /layout: MSI не было, msiexec не вызывался.
+            self.assertEqual(len(engine.calls), 2)
+            self.assertEqual(rc, 5)
+            self.assertFalse((app / "Type.exe").exists())
+            layout = portable / "_bundle_layout"
+            self.assertTrue(layout.is_dir())
+            self.assertTrue((layout / "tool.exe").exists())
+
+    def test_run_triggers_burn_fallback_when_primary_fails(self):
+        # Сценарий со скриншота: WiX Burn, тихая установка возвращает -1
+        # (беззнаковое 4294967295), App пуста — резервный сценарий спасает.
+        class FakeBurn(Portablizer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.calls.append(plan)
+                if any(a.startswith("InstallFolder=") for a in plan.args):
+                    return 4294967295
+                Path(app_dir, "Type.exe").write_bytes(b"MZ application")
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+                "portablizer.core.portablizer.IS_WINDOWS", True):
+            installer = Path(temp, "TypeSetup.exe")
+            installer.write_bytes(b"MZ WixBurn .wixburn")
+            engine = FakeBurn(Logger())
+            result = engine.run(PortableOptions(
+                installer_path=str(installer), output_dir=temp,
+                app_name="Type", capture_registry=False, cleanup_host=False,
+            ))
+
+            self.assertTrue(result.success)
+            self.assertEqual(len(engine.calls), 2)
+            self.assertEqual(result.main_exe_rel,
+                             os.path.join("App", "Type.exe"))
+            self.assertIn("резервные сценарии", engine.log.text)
+
+    def test_failed_burn_reports_decoded_exit_code(self):
+        # Даже резервные сценарии не помогли: ошибка обязана расшифровать
+        # беззнаковый код 4294967295 как -1 и подсказать причину.
+        class FakeBurn(Portablizer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.calls.append(plan)
+                return 4294967295
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+                "portablizer.core.portablizer.IS_WINDOWS", True):
+            installer = Path(temp, "TypeSetup.exe")
+            installer.write_bytes(b"MZ WixBurn .wixburn")
+            engine = FakeBurn(Logger())
+            result = engine.run(PortableOptions(
+                installer_path=str(installer), output_dir=temp,
+                app_name="Type", capture_registry=False, cleanup_host=False,
+            ))
+
+            self.assertFalse(result.success)
+            self.assertFalse(Path(temp, "Type_Portable", "Launch.bat").exists())
+            # Первая попытка + повтор + /layout.
+            self.assertEqual(len(engine.calls), 3)
+            message = "; ".join(result.messages)
+            self.assertIn("4294967295 (-1, 0xFFFFFFFF)", message)
+            self.assertIn("администратора", message)
+            self.assertIn("не найден ни один", message)
 
 
 class RegistryLocationTests(unittest.TestCase):
