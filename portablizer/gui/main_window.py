@@ -291,7 +291,16 @@ class MainWindow(QMainWindow):
         if path and os.path.isfile(path):
             try:
                 det = detect_installer(path)
-                self.detect_label.setText(f"Тип установщика: {det.human}")
+                notes = []
+                if det.requires_admin:
+                    notes.append("нужны права администратора")
+                if det.license_url:
+                    notes.append("требует принятия лицензии")
+                if det.has_zip_payload:
+                    notes.append("внутри есть архив")
+                suffix = f" — {', '.join(notes)}" if notes else ""
+                self.detect_label.setText(
+                    f"Тип установщика: {det.human}{suffix}")
             except Exception as exc:  # noqa: BLE001
                 self.detect_label.setText(f"Тип установщика: ошибка ({exc})")
             if not self.output_edit.text().strip():
@@ -331,7 +340,11 @@ class MainWindow(QMainWindow):
         i = 0
         raw = raw.strip()
         while i < len(raw):
-            if raw[i] in " \\t" and not quoted:
+            # Разделители — только пробел и табуляция. Раньше здесь по ошибке
+            # стоял литерал " \\t" (пробел, ОБРАТНЫЙ СЛЕШ, буква «t»), поэтому
+            # любой аргумент с буквой «t» рвался на части: «--silent»
+            # превращался в «--silen», а пути ломались на каждом слеше.
+            if raw[i] in " \t" and not quoted:
                 if token_started:
                     args.append("".join(current))
                     current = []
@@ -468,17 +481,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Portablizer", "\n".join(details))
         else:
             self.progress.setFormat("Ошибка")
-            msg = "; ".join(result.messages) or "См. журнал."
-            self.status_label.setText(f"✖ Не удалось: {msg}")
+            msg = "\n\n".join(result.messages) or "См. журнал."
+            # В однострочный статус берём только первую фразу: полный текст
+            # с планом действий пользователь читает в диалоге.
+            short = msg.split("\n", 1)[0]
+            self.status_label.setText(f"✖ Не удалось: {short}")
             self.status_label.setObjectName("StatusErr")
             folder_hint = (
                 f"\n\nДиагностика: {result.portable_dir}\\portablizer.log"
                 if result.portable_dir else ""
             )
-            QMessageBox.critical(
-                self, "Portablizer",
-                f"Не удалось создать портатив.\n\n{msg}{folder_hint}",
-            )
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Critical)
+            box.setWindowTitle("Portablizer")
+            box.setText("Не удалось создать портатив.")
+            box.setInformativeText(f"{msg}{folder_hint}")
+            box.exec()
         self.status_label.setStyleSheet(style.QSS)  # переприменить цвет
 
     def _open_result(self) -> None:

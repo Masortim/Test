@@ -2,13 +2,24 @@
 
 Порядок работы:
   1. detect          — определить движок установщика.
-  2. plan            — построить команду тихой установки в целевую папку.
+  2. plan            — построить ЛЕСТНИЦУ команд тихой установки (несколько
+                       вариантов от самого точного к самому общему).
   3. snapshot(before)— снять состояние реестра (Windows).
-  4. install         — запустить установщик тихо и изолированно, дождаться.
+  4. install         — выполнять попытки по очереди, пока в App не появятся
+                       файлы программы.
   5. snapshot(after) — снять состояние реестра и сохранить diff в portable.reg.
   6. detect_main_exe — найти главный exe установленной программы.
   7. gather_deps     — эвристически собрать/скопировать зависимости (VC++ и т.п.).
   8. launcher        — сгенерировать Launch.bat / launcher_config.json / launcher.py.
+
+Почему именно лестница попыток
+------------------------------
+Один «правильный» набор ключей существует далеко не всегда. Установщик может
+не знать переданную переменную целевой папки, требовать явного принятия
+лицензии или вовсе использовать собственный синтаксис. Раньше Portablizer
+делал одну попытку (плюс два жёстко зашитых сценария для WiX Burn) и сдавался,
+сообщая лишь код возврата. Теперь варианты перебираются по порядку, а после
+каждого проверяется фактический результат — файлы в ``App``.
 
 Класс спроектирован так, чтобы работать в отдельном потоке GUI: он принимает
 ``Logger`` и функцию ``progress(percent, stage)`` и не трогает Qt напрямую.
@@ -23,15 +34,16 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .. import __version__
 from . import launcher as launcher_mod
 from . import registry as reg_mod
 from .detect import DetectionResult, InstallerType, detect_installer
 from .logutil import Logger
-from .silentargs import SilentPlan, build_burn_layout_plan, build_silent_plan
+from .silentargs import SilentPlan, build_attempts, build_silent_plan
 
 ProgressCB = Callable[[int, str], None]
 
@@ -56,6 +68,28 @@ _NEGATIVE_EXIT_HINT = (
     "процесс установщика аварийно завершился: как правило, не хватило прав "
     "администратора или тихий режим не поддерживается"
 )
+
+#: Код -1 от bootstrapper'а почти всегда означает «не разобрал командную
+#: строку»: неизвестный ключ, отсутствие обязательного (например, принятия
+#: лицензии) или запрет на запуск без UAC.
+_BAD_COMMAND_LINE_CODES = frozenset({0xFFFFFFFF, 0x80070057, 1639, 87})
+
+
+def is_elevated() -> bool:
+    """True, если Portablizer запущен с правами администратора.
+
+    Знать это нужно заранее: установщик с ``requireAdministrator`` в манифесте
+    без повышения прав просто не стартует, и пользователю надо сказать об этом
+    прямо, а не показывать код ``-1``.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes  # локальный импорт: модуль должен грузиться и на Linux
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _format_exit_code(rc: Optional[int]) -> str:
@@ -158,6 +192,14 @@ class PortableResult:
     removed_from_installed_list: List[str] = field(default_factory=list)
     #: Осталось ли что-то вычистить вручную (не хватило прав).
     cleanup_pending: bool = False
+    #: Сколько вариантов команды установки было запланировано.
+    attempts_planned: int = 0
+    #: Сколько вариантов реально выполнено.
+    attempts_made: int = 0
+    #: Название сработавшего сценария установки.
+    successful_attempt: str = ""
+    #: Подсказки пользователю, если установка не удалась.
+    hints: List[str] = field(default_factory=list)
 
 
 class Portablizer:
@@ -169,6 +211,8 @@ class Portablizer:
         self.cancel = cancel_event or threading.Event()
         #: Время начала run() — по нему отбираются журналы установщика.
         self._run_started: Optional[float] = None
+        #: Сколько вариантов команды установки реально выполнено.
+        self._attempts_made = 0
 
     # -- вспомогательное ------------------------------------------------------
     def _check_cancel(self) -> None:
@@ -237,6 +281,7 @@ class Portablizer:
         try:
             self.log.info(f"Portablizer {__version__}")
             self._run_started = time.time()
+            self._attempts_made = 0
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
                 raise FileNotFoundError(f"Установщик не найден: {opts.installer_path}")
@@ -262,18 +307,38 @@ class Portablizer:
             for e in det.evidence:
                 self.log.debug(f"  • {e}")
 
-            # 2. План тихой установки
+            # 1b. Предупреждаем о нехватке прав ДО запуска: установщик с
+            # requireAdministrator без повышения просто не стартует.
+            if IS_WINDOWS and det.requires_admin and not is_elevated():
+                self.log.warn(
+                    "Установщик требует прав администратора "
+                    "(requireAdministrator в манифесте), а Portablizer запущен "
+                    "без повышения. Тихая установка, скорее всего, завершится "
+                    "кодом -1. Закройте программу и запустите её «от имени "
+                    "администратора»."
+                )
+
+            # 2. Лестница планов тихой установки
             self.progress(15, "Построение команды тихой установки")
-            log_file = os.path.join(portable_dir, "install.log")
-            plan = build_silent_plan(
-                det.installer_type, opts.installer_path, app_dir,
-                is_msi=det.is_msi, log_file=log_file,
+            attempts = build_attempts(
+                det, opts.installer_path, app_dir,
+                log_dir=portable_dir,
                 extra_args=opts.extra_install_args,
+                layout_dir=os.path.join(portable_dir, "_bundle_layout"),
             )
-            result.plan = plan
-            self.log.info(f"Команда: {plan.display()}")
-            for n in plan.notes:
+            result.plan = attempts[0] if attempts else None
+            result.attempts_planned = len(attempts)
+            self.log.info(f"Команда: {attempts[0].display()}")
+            for n in attempts[0].notes:
                 self.log.debug(f"  • {n}")
+            if len(attempts) > 1:
+                self.log.info(
+                    f"Подготовлено запасных сценариев установки: "
+                    f"{len(attempts) - 1}. Они запустятся автоматически, если "
+                    "основной не даст файлов."
+                )
+                for extra_plan in attempts[1:]:
+                    self.log.debug(f"  • запасной: {extra_plan.label}")
 
             # 3. Снимок реестра ДО
             before = {}
@@ -294,28 +359,26 @@ class Portablizer:
             # приходится отслеживать отдельно.
             shortcuts_before = self._snapshot_shortcuts()
 
-            # 4. Тихая установка
+            # 4. Тихая установка: идём по лестнице попыток, пока в App не
+            # появятся файлы программы. Снимок реестра «после» делается ниже —
+            # он накрывает все попытки сразу.
             self._check_cancel()
             self.progress(30, "Тихая установка в изолированном режиме")
-            install_rc = self._run_install(plan, opts, app_dir, data_dir)
+            install_rc, used_plan = self._run_attempts(
+                attempts, opts, app_dir, data_dir, portable_dir, name)
+            result.attempts_made = self._attempts_made
+            if used_plan is not None:
+                result.plan = used_plan
+                result.successful_attempt = used_plan.label
 
-            # 4b. WiX Burn: если тихая установка не дала файлов, применяем
-            # резервные сценарии (повтор без InstallFolder, распаковка бандла
-            # через /layout + административная установка MSI). Снимок реестра
-            # «после» делается ниже — он накрывает и эти попытки.
-            if (IS_WINDOWS
-                    and det.installer_type == InstallerType.WIX_BURN
-                    and not self._find_main_exe(app_dir, name)):
+            # 4b. Установщик не отдал файлы ни одной командой. Последний
+            # honest-шанс: распаковать приклеенный к exe ZIP — так устроены
+            # многие современные bootstrapper'ы, и это не требует ни прав
+            # администратора, ни изменения системы.
+            if not self._find_main_exe(app_dir, name) and det.has_zip_payload:
                 self._check_cancel()
-                self.progress(60, "WiX Burn: резервные сценарии установки")
-                self.log.warn(
-                    "Прямая тихая установка WiX Burn не дала файлов — "
-                    "пробую резервные сценарии."
-                )
-                fallback_rc = self._burn_fallback(opts, app_dir, data_dir,
-                                                  portable_dir, name)
-                if fallback_rc is not None and fallback_rc not in (0, 3010):
-                    install_rc = fallback_rc
+                self.progress(62, "Распаковка вложенного архива установщика")
+                self._extract_zip_payload(opts.installer_path, app_dir, name)
 
             # 5. Снимок реестра ПОСЛЕ + diff
             after: reg_mod.Snapshot = {}
@@ -355,22 +418,9 @@ class Portablizer:
             self.progress(75, "Поиск главного исполняемого файла")
             main_exe = self._find_main_exe(app_dir, name)
             if not main_exe:
-                if install_rc is None or install_rc in (0, 3010):
-                    rc_hint = ""
-                else:
-                    hint = _exit_code_hint(install_rc)
-                    rc_hint = (
-                        f" (код установщика: {_format_exit_code(install_rc)}"
-                        + (f" — {hint}" if hint else "") + ")"
-                    )
+                result.hints = self._failure_hints(det, install_rc, opts)
                 raise RuntimeError(
-                    "Установщик завершился, но в папке App не найден ни один "
-                    f"исполняемый файл{rc_hint}. Портатив не создан. Возможно, "
-                    "установщик не поддерживает тихий режим или использует "
-                    "другие ключи. Проверьте portablizer.log (и install.log, "
-                    "если он создан) и укажите подходящие ключи в поле "
-                    "«Доп. аргументы установки»."
-                )
+                    self._failure_message(det, install_rc, result))
             result.main_exe_rel = os.path.relpath(main_exe, portable_dir)
             self.log.ok(f"Главный exe: {result.main_exe_rel}")
 
@@ -403,6 +453,87 @@ class Portablizer:
             result.messages.append(str(exc))
             self._save_run_log(result.portable_dir)
             return result
+
+    # -- диагностика неудачи --------------------------------------------------
+    def _failure_hints(self, det: DetectionResult, rc: Optional[int],
+                       opts: PortableOptions) -> List[str]:
+        """Формирует конкретные советы вместо общего «смотрите журнал».
+
+        Пользователю бесполезно знать, что «код -1»; ему нужно знать, что
+        именно сделать дальше. Подсказки упорядочены по вероятности решения.
+        """
+        hints: List[str] = []
+
+        needs_admin = det.requires_admin or (
+            rc is not None and rc in _BAD_COMMAND_LINE_CODES)
+        if IS_WINDOWS and needs_admin and not is_elevated():
+            hints.append(
+                "Запустите Portablizer от имени администратора — этому "
+                "установщику нужны повышенные права (правый клик по "
+                "Portablizer.exe → «Запуск от имени администратора»)."
+            )
+
+        if det.installer_type == InstallerType.CUSTOM_CLI or det.has_switch(
+                "--accept-license-agreement", "--accept-licenses"):
+            url = det.license_url or "https://<сайт разработчика>/terms/"
+            hints.append(
+                "Установщик принимает собственные ключи. Проверьте в поле "
+                "«Доп. аргументы установки» строку вида: "
+                f'--silent --accept-license-agreement="{url}"'
+            )
+
+        if det.installer_type == InstallerType.UNKNOWN:
+            hints.append(
+                "Тип установщика распознать не удалось. Узнайте ключи тихой "
+                "установки в документации разработчика (часто это /S, "
+                "/VERYSILENT, /quiet или --silent) и укажите их в поле "
+                "«Доп. аргументы установки»."
+            )
+
+        if rc is not None and rc in _BAD_COMMAND_LINE_CODES:
+            hints.append(
+                "Код -1 обычно означает, что установщик не понял командную "
+                "строку: лишний или неизвестный ключ. Попробуйте очистить "
+                "поле «Доп. аргументы установки» или указать только ключ "
+                "тишины."
+            )
+
+        if opts.extra_install_args:
+            hints.append(
+                "Сейчас передаются ваши аргументы: "
+                + " ".join(opts.extra_install_args)
+                + ". Если установка не идёт, попробуйте без них."
+            )
+
+        hints.append(
+            "Некоторые установщики требуют входа в аккаунт или активной "
+            "лицензии и в тихом режиме не работают в принципе — такую "
+            "программу портативной сделать нельзя."
+        )
+        return hints
+
+    def _failure_message(self, det: DetectionResult, rc: Optional[int],
+                         result: PortableResult) -> str:
+        """Итоговое сообщение об ошибке — с расшифровкой кода и советами."""
+        if rc is None or rc in (0, 3010):
+            rc_hint = ""
+        else:
+            hint = _exit_code_hint(rc)
+            rc_hint = (
+                f" (код установщика: {_format_exit_code(rc)}"
+                + (f" — {hint}" if hint else "") + ")"
+            )
+        tried = result.attempts_made or result.attempts_planned
+        attempts_text = (
+            f" Испробовано вариантов команды: {tried}." if tried > 1 else ""
+        )
+        advice = "".join(f"\n  • {h}" for h in result.hints)
+        return (
+            "Установщик завершился, но в папке App не найден ни один "
+            f"исполняемый файл{rc_hint}.{attempts_text} Портатив не создан."
+            + (f"\n\nЧто можно сделать:{advice}" if advice else "")
+            + "\n\nПодробности — в portablizer.log рядом с папкой портатива."
+        )
 
     # -- реестр ---------------------------------------------------------------
     def _capture_registry(self, portable_dir: str,
@@ -684,56 +815,71 @@ class Portablizer:
             )
         return rc
 
-    # -- WiX Burn: резервные сценарии ----------------------------------------
-    def _burn_fallback(self, opts: PortableOptions, app_dir: str, data_dir: str,
-                       portable_dir: str, name: str) -> Optional[int]:
-        """Резервные сценарии WiX Burn, если тихая установка не дала файлов.
+    # -- лестница попыток установки ------------------------------------------
+    def _run_attempts(self, attempts: Sequence[SilentPlan],
+                      opts: PortableOptions, app_dir: str, data_dir: str,
+                      portable_dir: str, name: str,
+                      ) -> Tuple[Optional[int], Optional[SilentPlan]]:
+        """Выполняет варианты установки, пока в ``App`` не появятся файлы.
 
-        1. Повтор без переменной ``InstallFolder``: не все бандлы объявляют её
-           публичной (bal:Overridable), и тогда вся командная строка считается
-           недопустимой — установщик завершается (типичен код ``-1``), ничего
-           не установив.
-        2. Распаковка бандла через ``/layout``: движок Burn собирает все пакеты
-           в указанную папку, не выполняя установку и не требуя прав
-           администратора. Извлечённые MSI распаковываются административной
-           установкой (``msiexec /a``) прямо в ``App`` — без регистрации
-           пакета в системе.
+        Возвращает ``(код последней попытки, сработавший план)``. Успехом
+        считается только фактический результат на диске: код возврата ``0``
+        при пустой папке успехом не является, и наоборот — некоторые
+        установщики отдают ненулевой код, успев разложить файлы.
         """
-        rc: Optional[int] = None
+        last_rc: Optional[int] = None
+        total = len(attempts)
+        span = max(1, 58 - 30)
 
-        # -- 1. Повтор без InstallFolder ------------------------------------
-        self.log.info(
-            "WiX Burn: повторяю установку без ключа InstallFolder — не все "
-            "бандлы объявляют эту переменную."
-        )
-        retry_plan = build_silent_plan(
-            InstallerType.WIX_BURN, opts.installer_path, app_dir,
-            override_install_folder=False,
-            log_file=os.path.join(portable_dir, "install-retry.log"),
-            extra_args=opts.extra_install_args,
-        )
-        self.log.debug(f"cmdline: {retry_plan.display()}")
-        rc = self._run_install(retry_plan, opts, app_dir, data_dir,
-                               progress_from=45, progress_to=55)
-        if self._find_main_exe(app_dir, name):
-            self.log.ok("Повторная тихая установка WiX Burn прошла успешно.")
-            return rc
+        for index, plan in enumerate(attempts):
+            self._check_cancel()
+            start = 30 + int(span * index / max(1, total))
+            stop = 30 + int(span * (index + 1) / max(1, total))
+            if index:
+                self.log.info(
+                    f"Сценарий {index + 1} из {total}: {plan.label}")
+                self.log.debug(f"cmdline: {plan.display()}")
+            if plan.needs_admin and IS_WINDOWS and not is_elevated():
+                self.log.debug(
+                    "  • сценарию нужны права администратора, которых нет — "
+                    "выполняю, но успех маловероятен"
+                )
 
-        # -- 2. Распаковка /layout + msiexec /a ------------------------------
-        layout_dir = os.path.join(portable_dir, "_bundle_layout")
-        self.log.info(
-            "WiX Burn: распаковываю пакеты бандла через /layout — без "
-            "установки в систему и без прав администратора..."
-        )
-        layout_plan = build_burn_layout_plan(
-            opts.installer_path, layout_dir,
-            log_file=os.path.join(portable_dir, "install-layout.log"),
-            extra_args=opts.extra_install_args,
-        )
-        self.log.debug(f"cmdline: {layout_plan.display()}")
-        rc = self._run_install(layout_plan, opts, app_dir, data_dir,
-                               progress_from=55, progress_to=58)
+            rc = self._run_install(plan, opts, app_dir, data_dir,
+                                   progress_from=start, progress_to=stop)
+            last_rc = rc
+            self._attempts_made += 1
 
+            # Распаковка бандла сама по себе файлов в App не даёт: из неё ещё
+            # нужно вытащить MSI-пакеты.
+            if plan.extracts_only and plan.output_dir \
+                    and os.path.normcase(plan.output_dir) != os.path.normcase(app_dir):
+                if self._install_layout_packages(plan.output_dir, opts, app_dir,
+                                                 data_dir, name):
+                    self.log.ok(f"Сработал сценарий: {plan.label}")
+                    return rc, plan
+                continue
+
+            if self._find_main_exe(app_dir, name):
+                if index:
+                    self.log.ok(f"Сработал запасной сценарий: {plan.label}")
+                else:
+                    self.log.ok("Тихая установка прошла успешно.")
+                return rc, plan
+
+            if index + 1 < total:
+                self.log.warn(
+                    f"Сценарий «{plan.label}» не дал файлов в App — перехожу "
+                    "к следующему."
+                )
+
+        self._collect_engine_log(opts, data_dir, portable_dir)
+        return last_rc, None
+
+    def _install_layout_packages(self, layout_dir: str, opts: PortableOptions,
+                                 app_dir: str, data_dir: str,
+                                 name: str) -> bool:
+        """Распаковывает MSI из подготовленного ``/layout`` прямо в ``App``."""
         msis, other_payloads = _burn_layout_payloads(layout_dir)
         if other_payloads:
             self.log.info(
@@ -747,27 +893,71 @@ class Portablizer:
                 "В распакованном бандле нет ни одного MSI-пакета — "
                 "распаковывать нечего."
             )
-            self._collect_engine_log(opts, data_dir, portable_dir)
-            return rc
+            return False
 
         for msi in msis:
+            self._check_cancel()
             self.log.info(f"Распаковываю MSI-пакет в App: {os.path.basename(msi)}")
             msi_plan = build_silent_plan(InstallerType.MSI, msi, app_dir,
                                          is_msi=True)
-            rc = self._run_install(msi_plan, opts, app_dir, data_dir,
-                                   progress_from=58, progress_to=60)
+            self._run_install(msi_plan, opts, app_dir, data_dir,
+                              progress_from=58, progress_to=60)
 
         if self._find_main_exe(app_dir, name):
             self.log.ok("Пакеты бандла распакованы в папку App.")
             shutil.rmtree(layout_dir, ignore_errors=True)
             self.log.info("Временная распаковка бандла удалена.")
-        else:
-            self.log.warn(
-                "MSI-пакеты не дали исполняемых файлов. Распакованное "
-                f"содержимое оставлено для диагностики: {layout_dir}"
-            )
-            self._collect_engine_log(opts, data_dir, portable_dir)
-        return rc
+            return True
+
+        self.log.warn(
+            "MSI-пакеты не дали исполняемых файлов. Распакованное "
+            f"содержимое оставлено для диагностики: {layout_dir}"
+        )
+        return False
+
+    # -- распаковка вложенного архива ----------------------------------------
+    def _extract_zip_payload(self, installer_path: str, app_dir: str,
+                             name: str) -> bool:
+        """Достаёт программу из ZIP, приклеенного к установщику.
+
+        Многие современные bootstrapper'ы — это обычный exe с ZIP на конце.
+        Если ни одна команда установки не сработала, содержимое можно забрать
+        напрямую: системе это ничего не делает и прав администратора не
+        требует.
+        """
+        self.log.info(
+            "Внутри установщика найден архив — пробую распаковать его "
+            "напрямую, без установки в систему..."
+        )
+        try:
+            with zipfile.ZipFile(installer_path) as archive:
+                members = [m for m in archive.infolist() if not m.is_dir()]
+                if not members:
+                    return False
+                for member in members:
+                    # Защита от путей вида ../../ в архиве.
+                    target = os.path.normpath(
+                        os.path.join(app_dir, member.filename))
+                    if not os.path.normcase(target).startswith(
+                            os.path.normcase(os.path.abspath(app_dir))):
+                        continue
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with archive.open(member) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+            self.log.warn(f"Не удалось распаковать вложенный архив: {exc}")
+            return False
+
+        if self._find_main_exe(app_dir, name):
+            self.log.ok("Программа извлечена из вложенного архива установщика.")
+            return True
+        self.log.warn(
+            "Вложенный архив распакован, но исполняемых файлов программы в "
+            "нём нет."
+        )
+        shutil.rmtree(app_dir, ignore_errors=True)
+        os.makedirs(app_dir, exist_ok=True)
+        return False
 
     def _collect_engine_log(self, opts: PortableOptions, data_dir: str,
                             portable_dir: str) -> None:
