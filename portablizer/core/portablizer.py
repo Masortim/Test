@@ -198,6 +198,10 @@ class PortableResult:
     attempts_made: int = 0
     #: Название сработавшего сценария установки.
     successful_attempt: str = ""
+    #: История лестницы: (название сценария, код возврата). Кода только
+    #: последней попытки для диагностики мало — нужен итог каждой.
+    attempt_outcomes: List[Tuple[str, Optional[int]]] = field(
+        default_factory=list)
     #: Подсказки пользователю, если установка не удалась.
     hints: List[str] = field(default_factory=list)
 
@@ -213,6 +217,8 @@ class Portablizer:
         self._run_started: Optional[float] = None
         #: Сколько вариантов команды установки реально выполнено.
         self._attempts_made = 0
+        #: История лестницы попыток: (название сценария, код возврата).
+        self._attempt_history: List[Tuple[str, Optional[int]]] = []
 
     # -- вспомогательное ------------------------------------------------------
     def _check_cancel(self) -> None:
@@ -282,6 +288,7 @@ class Portablizer:
             self.log.info(f"Portablizer {__version__}")
             self._run_started = time.time()
             self._attempts_made = 0
+            self._attempt_history = []
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
                 raise FileNotFoundError(f"Установщик не найден: {opts.installer_path}")
@@ -419,6 +426,7 @@ class Portablizer:
             main_exe = self._find_main_exe(app_dir, name)
             if not main_exe:
                 result.hints = self._failure_hints(det, install_rc, opts)
+                result.attempt_outcomes = list(self._attempt_history)
                 raise RuntimeError(
                     self._failure_message(det, install_rc, result))
             result.main_exe_rel = os.path.relpath(main_exe, portable_dir)
@@ -527,6 +535,18 @@ class Portablizer:
         attempts_text = (
             f" Испробовано вариантов команды: {tried}." if tried > 1 else ""
         )
+        outcomes_text = ""
+        if len(result.attempt_outcomes) > 1:
+            lines = []
+            for label, outcome in result.attempt_outcomes:
+                if outcome is None:
+                    verdict = "не запускалась"
+                elif outcome in (0, 3010):
+                    verdict = f"код {outcome}, но файлов в App не появилось"
+                else:
+                    verdict = f"код {_format_exit_code(outcome)}"
+                lines.append(f"\n  • «{label}» — {verdict}")
+            outcomes_text = "\n\nИтог каждой команды:" + "".join(lines)
         advice = "".join(f"\n  • {h}" for h in result.hints)
         # Если установщик выводил текст (stdout/stderr), он сохранён рядом —
         # там часто написана точная причина отказа.
@@ -543,6 +563,7 @@ class Portablizer:
         return (
             "Установщик завершился, но в папке App не найден ни один "
             f"исполняемый файл{rc_hint}.{attempts_text} Портатив не создан."
+            + outcomes_text
             + (f"\n\nЧто можно сделать:{advice}" if advice else "")
             + "\n\nПодробности — в portablizer.log рядом с папкой портатива."
             + output_note
@@ -898,6 +919,7 @@ class Portablizer:
                                    console_log=console_log)
             last_rc = rc
             self._attempts_made += 1
+            self._attempt_history.append((plan.label, rc))
 
             # Распаковка бандла сама по себе файлов в App не даёт: из неё ещё
             # нужно вытащить MSI-пакеты.

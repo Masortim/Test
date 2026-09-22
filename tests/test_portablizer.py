@@ -1189,6 +1189,10 @@ class VendorProfileTests(unittest.TestCase):
             self.assertTrue(det.has_switch("--installPath"))
             self.assertTrue(det.requires_admin)
             self.assertTrue(any("ZennoLab" in e for e in det.evidence))
+            # В журнале видно, чей это установщик, а не абстрактный тип.
+            self.assertEqual(det.vendor_name, "ZennoLab")
+            self.assertTrue(det.human.startswith("ZennoLab: "))
+            self.assertIn("Custom CLI bootstrapper", det.human)
 
     def test_command_line_matches_zennolab_documentation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1454,6 +1458,31 @@ class FailureDiagnosticsTests(unittest.TestCase):
         portable = Path(result.portable_dir)
         self.assertFalse((portable / "Launch.bat").exists())
         self.assertTrue((portable / "portablizer.log").exists())
+
+    def test_failure_lists_outcome_of_every_attempt(self):
+        # Кода возврата одной последней попытки мало: итог нужен по каждой.
+        result = self._failed_result(
+            CustomBootstrapperDetectionTests.ZENNO_PAYLOAD)
+        message = "; ".join(result.messages)
+        self.assertIn("Итог каждой команды", message)
+        # Заголовки всех трёх сценариев лестницы присутствуют в отчёте.
+        self.assertIn("Собственные ключи установщика", message)
+        self.assertIn("Собственные ключи без пути установки", message)
+        self.assertIn("Собственные ключи без --hidden", message)
+        self.assertEqual(len(result.attempt_outcomes), result.attempts_made)
+        self.assertTrue(all(rc == 4294967295
+                            for _label, rc in result.attempt_outcomes))
+
+    def test_success_code_with_no_files_is_spelled_out(self):
+        self.assertIn(
+            "код 0, но файлов",
+            Portablizer(Logger())._failure_message(
+                DetectionResult(InstallerType.NSIS, 0.7), 0,
+                PortableResult(
+                    success=False, attempts_made=2,
+                    attempt_outcomes=[("NSIS: /S /D", 4294967295),
+                                      ("Универсальные ключи: /S", 0)],
+                )))
 
 
 if __name__ == "__main__":

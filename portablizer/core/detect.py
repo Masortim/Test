@@ -389,6 +389,8 @@ class DetectionResult:
     #: Фиксированные аргументы из документации производителя (профиль вендора);
     #: строками в бинарнике их не найти, значения заданы самим вендором.
     vendor_args: List[str] = field(default_factory=list)
+    #: Имя производителя из профиля вендора (для показа пользователю).
+    vendor_name: str = ""
     #: В манифесте указан requireAdministrator — без UAC установка невозможна.
     requires_admin: bool = False
     is_dotnet: bool = False
@@ -398,7 +400,9 @@ class DetectionResult:
 
     @property
     def human(self) -> str:
-        return f"{self.installer_type.value} (уверенность {int(self.confidence * 100)}%)"
+        prefix = f"{self.vendor_name}: " if self.vendor_name else ""
+        return (f"{prefix}{self.installer_type.value} "
+                f"(уверенность {int(self.confidence * 100)}%)")
 
     def has_switch(self, *tokens: str) -> bool:
         available = {s.casefold() for s in self.switch_hints}
@@ -539,7 +543,8 @@ def detect_installer(path: str) -> DetectionResult:
             switch_hints=list(profile.switches),
             license_urls=[profile.license_url]
             + [u for u in scan.urls if u != profile.license_url],
-            vendor_args=list(profile.fixed_args))
+            vendor_args=list(profile.fixed_args),
+            vendor_name=profile.name)
 
     if profile is None:
         result.switch_hints = list(scan.switches)
