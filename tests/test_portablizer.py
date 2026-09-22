@@ -1,9 +1,13 @@
+import ast
 import json
 import os
 import re
+import shutil
+import struct
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -22,7 +26,10 @@ from portablizer.core.portablizer import (
     PortableOptions, Portablizer, _burn_layout_payloads, _exit_code_hint,
     _format_exit_code,
 )
-from portablizer.core.silentargs import build_burn_layout_plan, build_silent_plan
+from portablizer.core.silentargs import (
+    SilentPlan, build_attempts, build_burn_layout_plan, build_custom_cli_plan,
+    build_silent_plan,
+)
 
 
 def _labels(bat: str):
@@ -139,7 +146,7 @@ class PortablizerOutputTests(unittest.TestCase):
 
     def test_successful_install_writes_portable_launcher_set(self):
         class FakePortablizer(Portablizer):
-            def _run_install(self, plan, opts, app_dir, data_dir):
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
                 Path(app_dir, "Type.exe").write_bytes(b"MZ application")
                 return 0
 
@@ -176,7 +183,7 @@ class PortablizerOutputTests(unittest.TestCase):
 
     def test_readme_promises_no_installation_on_other_pc(self):
         class FakePortablizer(Portablizer):
-            def _run_install(self, plan, opts, app_dir, data_dir):
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
                 Path(app_dir, "Type.exe").write_bytes(b"MZ application")
                 return 0
 
@@ -767,20 +774,27 @@ class BurnFallbackTests(unittest.TestCase):
                     return 0
 
             engine = FakeBurn(Logger())
-            rc = engine._burn_fallback(
-                PortableOptions(installer_path=str(installer),
-                                output_dir=temp, app_name="Type"),
-                str(app), str(data), str(portable), "Type")
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Type")
+            attempts = build_attempts(
+                detect_installer(str(installer)), str(installer), str(app),
+                log_dir=str(portable),
+                layout_dir=str(portable / "_bundle_layout"))
+            rc, used = engine._run_attempts(attempts, opts, str(app),
+                                            str(data), str(portable), "Type")
 
-            # Повтор без InstallFolder, затем /layout, затем msiexec /a.
-            self.assertEqual(len(engine.calls), 3)
+            # С InstallFolder, без него, затем /layout, затем msiexec /a.
+            self.assertEqual(len(engine.calls), 4)
+            self.assertTrue(any(a.startswith("InstallFolder=")
+                                for a in engine.calls[0].args))
             self.assertFalse(any(a.startswith("InstallFolder=")
-                                 for a in engine.calls[0].args))
-            self.assertIn("/layout", engine.calls[1].args)
-            self.assertEqual(engine.calls[2].program, "msiexec.exe")
-            self.assertIn("/a", engine.calls[2].args)
-            self.assertNotIn("/i", engine.calls[2].args)
+                                 for a in engine.calls[1].args))
+            self.assertIn("/layout", engine.calls[2].args)
+            self.assertEqual(engine.calls[3].program, "msiexec.exe")
+            self.assertIn("/a", engine.calls[3].args)
+            self.assertNotIn("/i", engine.calls[3].args)
             self.assertEqual(rc, 0)
+            self.assertIn("/layout", used.args)
             self.assertTrue((app / "Type.exe").exists())
             # Временная распаковка бандла удалена.
             self.assertFalse((portable / "_bundle_layout").exists())
@@ -809,13 +823,18 @@ class BurnFallbackTests(unittest.TestCase):
                     return 5
 
             engine = FakeBurn(Logger())
-            rc = engine._burn_fallback(
-                PortableOptions(installer_path=str(installer),
-                                output_dir=temp, app_name="Type"),
-                str(app), str(data), str(portable), "Type")
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Type")
+            attempts = build_attempts(
+                detect_installer(str(installer)), str(installer), str(app),
+                log_dir=str(portable),
+                layout_dir=str(portable / "_bundle_layout"))
+            rc, used = engine._run_attempts(attempts, opts, str(app),
+                                            str(data), str(portable), "Type")
 
-            # Только повтор и /layout: MSI не было, msiexec не вызывался.
-            self.assertEqual(len(engine.calls), 2)
+            # Обе команды установки и /layout: MSI не было, msiexec не вызывался.
+            self.assertEqual(len(engine.calls), 3)
+            self.assertIsNone(used)
             self.assertEqual(rc, 5)
             self.assertFalse((app / "Type.exe").exists())
             layout = portable / "_bundle_layout"
@@ -851,7 +870,7 @@ class BurnFallbackTests(unittest.TestCase):
             self.assertEqual(len(engine.calls), 2)
             self.assertEqual(result.main_exe_rel,
                              os.path.join("App", "Type.exe"))
-            self.assertIn("резервные сценарии", engine.log.text)
+            self.assertIn("Сработал запасной сценарий", engine.log.text)
 
     def test_failed_burn_reports_decoded_exit_code(self):
         # Даже резервные сценарии не помогли: ошибка обязана расшифровать
@@ -909,6 +928,330 @@ class RegistryLocationTests(unittest.TestCase):
         before = {}
         after = {r"HKCU\Software\X": {"InstallLocation": repr(r"C:\X")}}
         self.assertIn(r"C:\X", registry.changed_install_locations(before, after))
+
+
+def _fake_pe(path, sections, payload=b"", dotnet=False):
+    """Пишет минимальный, но структурно валидный PE-файл.
+
+    Нужен, чтобы проверять разбор секций и признака .NET без настоящих
+    установщиков в репозитории.
+    """
+    dos = bytearray(0x40)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x40)
+    optional_size = 240
+    coff = struct.pack("<HHIIIHH", 0x14C, len(sections), 0, 0, 0,
+                       optional_size, 0x2102)
+    optional = bytearray(optional_size)
+    struct.pack_into("<H", optional, 0, 0x10B)      # PE32
+    struct.pack_into("<I", optional, 92, 16)        # NumberOfRvaAndSizes
+    if dotnet:
+        struct.pack_into("<II", optional, 96 + 14 * 8, 0x2000, 0x48)
+    table = b"".join(name.encode().ljust(8, b"\0") + b"\0" * 32
+                     for name in sections)
+    Path(path).write_bytes(bytes(dos) + b"PE\0\0" + coff + bytes(optional)
+                           + table + payload)
+
+
+class InstallArgumentParsingTests(unittest.TestCase):
+    """Разбор поля «Доп. аргументы установки».
+
+    Именно сюда пользователя отправляет сообщение об ошибке, поэтому поле
+    обязано работать безупречно. Раньше разделителями считалась строка
+    ``" \\t"`` — пробел, обратный слеш и буква «t», — и любой аргумент с «t»
+    рвался на куски (``--silent`` -> ``--silen``).
+    """
+
+    @staticmethod
+    def _parse(raw):
+        # Импортируем парсер без Qt: в окружении сборки нет libGL.
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "portablizer", "gui", "main_window.py")
+        with open(path, encoding="utf-8") as fh:
+            source = fh.read()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and \
+                    node.name == "_parse_install_args":
+                node.decorator_list = []
+                module = ast.Module(body=[node], type_ignores=[])
+                namespace: dict = {}
+                exec(compile(module, path, "exec"), namespace)  # noqa: S102
+                return namespace["_parse_install_args"](raw)
+        raise AssertionError("парсер аргументов не найден")
+
+    def test_switch_containing_letter_t_is_not_split(self):
+        self.assertEqual(self._parse("--silent"), ["--silent"])
+        self.assertEqual(self._parse("/VERYSILENT"), ["/VERYSILENT"])
+
+    def test_quoted_value_with_url_survives(self):
+        self.assertEqual(
+            self._parse('--silent --accept-license-agreement='
+                        '"https://zennolab.com/terms-of-service/"'),
+            ["--silent",
+             "--accept-license-agreement=https://zennolab.com/terms-of-service/"],
+        )
+
+    def test_quoted_path_with_spaces_stays_one_argument(self):
+        self.assertEqual(
+            self._parse('/DIR="C:\\Program Files\\App" /NOICONS'),
+            ["/DIR=C:\\Program Files\\App", "/NOICONS"],
+        )
+
+    def test_tab_separates_arguments(self):
+        self.assertEqual(self._parse("/VERYSILENT\t/NORESTART"),
+                         ["/VERYSILENT", "/NORESTART"])
+
+    def test_empty_input_yields_no_arguments(self):
+        self.assertEqual(self._parse("   "), [])
+
+
+class CustomBootstrapperDetectionTests(unittest.TestCase):
+    """Регрессия на журнал пользователя: код -1 и пустая папка App.
+
+    Установщик лишь УПОМИНАЛ WixBurn, но настоящим Burn-бандлом не был.
+    Portablizer верил строке, слал ``/quiet /install`` и получал -1.
+    """
+
+    def _installer(self, temp, payload, sections=(".text", ".rsrc"),
+                   dotnet=True, name="ZennoPosterLite-RU-v7.9.2.0.exe"):
+        path = os.path.join(temp, name)
+        _fake_pe(path, list(sections), payload, dotnet=dotnet)
+        return path
+
+    ZENNO_PAYLOAD = (
+        b"WixBurn .wixburn wixstdba "
+        b"--silent --hidden --accept-license-agreement= --installPath "
+        b"--installType https://zennolab.com/terms-of-service/ "
+        b"requireAdministrator"
+    )
+
+    def test_burn_strings_without_section_are_not_a_burn_bundle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            det = detect_installer(self._installer(temp, self.ZENNO_PAYLOAD))
+            self.assertNotEqual(det.installer_type, InstallerType.WIX_BURN)
+            self.assertEqual(det.installer_type, InstallerType.CUSTOM_CLI)
+
+    def test_real_burn_bundle_is_still_detected_by_pe_section(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = self._installer(
+                temp, b"WixBurn wixstdba",
+                sections=(".text", ".rdata", ".wixburn"), dotnet=False,
+                name="RealBundle.exe")
+            det = detect_installer(path)
+            self.assertEqual(det.installer_type, InstallerType.WIX_BURN)
+            self.assertGreater(det.confidence, 0.9)
+
+    def test_license_url_and_admin_requirement_are_extracted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            det = detect_installer(self._installer(temp, self.ZENNO_PAYLOAD))
+            self.assertEqual(det.license_url,
+                             "https://zennolab.com/terms-of-service/")
+            self.assertTrue(det.requires_admin)
+            self.assertTrue(det.is_dotnet)
+
+    def test_plan_uses_the_switches_found_inside_the_installer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._installer(temp, self.ZENNO_PAYLOAD)
+            det = detect_installer(installer)
+            plan = build_custom_cli_plan(installer, r"E:\P\App", detection=det)
+            self.assertIn("--silent", plan.args)
+            self.assertIn(
+                "--accept-license-agreement=https://zennolab.com/terms-of-service/",
+                plan.args)
+            self.assertIn(r"--installPath=E:\P\App", plan.args)
+            # Ключи классических движков сюда попасть не должны.
+            self.assertNotIn("/quiet", plan.args)
+            self.assertNotIn("/install", plan.args)
+
+    def test_attempt_ladder_offers_several_variants(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._installer(temp, self.ZENNO_PAYLOAD)
+            attempts = build_attempts(detect_installer(installer), installer,
+                                      r"E:\P\App", log_dir=r"E:\P")
+            self.assertGreaterEqual(len(attempts), 2)
+            # Первый вариант — самый точный, с путём установки.
+            self.assertTrue(any(a.startswith("--installPath=")
+                                for a in attempts[0].args))
+            # Дальше — без пути, на случай если установщик его не принимает.
+            self.assertFalse(any(a.startswith("--installPath=")
+                                 for a in attempts[1].args))
+
+    def test_unknown_installer_falls_back_to_generic_switch_ladder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._installer(temp, b"nothing recognisable here",
+                                        dotnet=False, name="Mystery.exe")
+            det = detect_installer(installer)
+            self.assertEqual(det.installer_type, InstallerType.UNKNOWN)
+            attempts = build_attempts(det, installer, r"E:\P\App")
+            self.assertGreaterEqual(len(attempts), 3)
+            joined = [" ".join(a.args) for a in attempts]
+            self.assertTrue(any("/S" in a for a in joined))
+            self.assertTrue(any("/VERYSILENT" in a for a in joined))
+
+
+class AttemptLadderTests(unittest.TestCase):
+    """Оркестратор обязан идти по лестнице до фактического результата."""
+
+    def _engine(self, succeed_on):
+        class Fake(Portablizer):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.calls = []
+
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.calls.append(plan.label)
+                if len(self.calls) == succeed_on:
+                    Path(app_dir, "Type.exe").write_bytes(b"MZ application")
+                    return 0
+                return 4294967295
+
+        return Fake(Logger())
+
+    def _plans(self, count):
+        return [SilentPlan(program="setup.exe", args=[f"/v{i}"],
+                           label=f"вариант {i}", output_dir="")
+                for i in range(count)]
+
+    def test_stops_at_the_first_attempt_that_produces_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            engine = self._engine(succeed_on=2)
+            rc, used = engine._run_attempts(
+                self._plans(4),
+                PortableOptions(installer_path="x", output_dir=temp),
+                str(app), str(Path(temp, "Data")), temp, "Type")
+            self.assertEqual(len(engine.calls), 2)
+            self.assertEqual(rc, 0)
+            self.assertEqual(used.label, "вариант 1")
+
+    def test_exhausts_every_attempt_before_giving_up(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            engine = self._engine(succeed_on=99)
+            rc, used = engine._run_attempts(
+                self._plans(3),
+                PortableOptions(installer_path="x", output_dir=temp),
+                str(app), str(Path(temp, "Data")), temp, "Type")
+            self.assertEqual(len(engine.calls), 3)
+            self.assertIsNone(used)
+            self.assertEqual(rc, 4294967295)
+
+    def test_zero_exit_code_with_empty_folder_is_not_success(self):
+        """Код 0 сам по себе ничего не значит — важны файлы на диске."""
+        class Liar(Portablizer):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.calls = []
+
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.calls.append(plan.label)
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            engine = Liar(Logger())
+            _rc, used = engine._run_attempts(
+                self._plans(3),
+                PortableOptions(installer_path="x", output_dir=temp),
+                str(app), str(Path(temp, "Data")), temp, "Type")
+            self.assertIsNone(used)
+            self.assertEqual(len(engine.calls), 3)
+
+
+class ZipPayloadTests(unittest.TestCase):
+    """Установщик с приклеенным ZIP можно распаковать без установки."""
+
+    def _installer_with_zip(self, path, names):
+        with open(path, "wb") as fh:
+            fh.write(b"MZ" + b"\x00" * 512)
+        with zipfile.ZipFile(path, "a") as archive:
+            for name in names:
+                archive.writestr(name, "MZ payload" * 10)
+
+    def test_zip_payload_is_detected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = os.path.join(temp, "Setup.exe")
+            self._installer_with_zip(installer, ["Type.exe"])
+            self.assertTrue(detect_installer(installer).has_zip_payload)
+
+    def test_program_is_extracted_from_the_embedded_archive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = os.path.join(temp, "Setup.exe")
+            self._installer_with_zip(installer, ["Type.exe", "lib/helper.dll"])
+            app = Path(temp, "App")
+            app.mkdir()
+            engine = Portablizer(Logger())
+            self.assertTrue(
+                engine._extract_zip_payload(installer, str(app), "Type"))
+            self.assertTrue((app / "Type.exe").exists())
+            self.assertTrue((app / "lib" / "helper.dll").exists())
+
+    def test_archive_cannot_escape_the_app_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = os.path.join(temp, "Setup.exe")
+            self._installer_with_zip(installer,
+                                     ["../escaped.exe", "Type.exe"])
+            app = Path(temp, "App")
+            app.mkdir()
+            engine = Portablizer(Logger())
+            engine._extract_zip_payload(installer, str(app), "Type")
+            self.assertFalse(Path(temp, "escaped.exe").exists())
+
+
+class FailureDiagnosticsTests(unittest.TestCase):
+    """Вместо «смотрите журнал» пользователь должен получать план действий."""
+
+    def _failed_result(self, payload, extra_args=()):
+        class AlwaysFails(Portablizer):
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                return 4294967295
+
+        temp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(temp, ignore_errors=True))
+        installer = os.path.join(temp, "ZennoPosterLite-RU-v7.9.2.0.exe")
+        _fake_pe(installer, [".text", ".rsrc"], payload, dotnet=True)
+        with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                mock.patch("portablizer.core.portablizer.is_elevated",
+                           return_value=False):
+            return AlwaysFails(Logger()).run(PortableOptions(
+                installer_path=installer, output_dir=temp, app_name="Type",
+                capture_registry=False, cleanup_host=False,
+                extra_install_args=list(extra_args),
+            ))
+
+    def test_failure_explains_admin_rights_and_license_switch(self):
+        result = self._failed_result(
+            CustomBootstrapperDetectionTests.ZENNO_PAYLOAD)
+        self.assertFalse(result.success)
+        message = "; ".join(result.messages)
+        self.assertIn("4294967295 (-1, 0xFFFFFFFF)", message)
+        self.assertIn("администратора", message)
+        self.assertIn("--accept-license-agreement", message)
+        self.assertIn("zennolab.com", message)
+
+    def test_failure_reports_how_many_variants_were_tried(self):
+        result = self._failed_result(
+            CustomBootstrapperDetectionTests.ZENNO_PAYLOAD)
+        self.assertGreater(result.attempts_made, 1)
+        self.assertEqual(result.attempts_made, result.attempts_planned)
+        self.assertIn("Испробовано вариантов", "; ".join(result.messages))
+
+    def test_user_supplied_arguments_are_mentioned_in_the_advice(self):
+        result = self._failed_result(
+            CustomBootstrapperDetectionTests.ZENNO_PAYLOAD,
+            extra_args=["/WRONGSWITCH"])
+        self.assertIn("/WRONGSWITCH", "; ".join(result.messages))
+
+    def test_no_broken_launcher_is_left_behind_on_failure(self):
+        result = self._failed_result(
+            CustomBootstrapperDetectionTests.ZENNO_PAYLOAD)
+        portable = Path(result.portable_dir)
+        self.assertFalse((portable / "Launch.bat").exists())
+        self.assertTrue((portable / "portablizer.log").exists())
 
 
 if __name__ == "__main__":
