@@ -7,6 +7,10 @@
 Особые случаи:
   * NSIS: параметр /D=<путь> ДОЛЖЕН быть последним, без кавычек, даже если
     в пути есть пробелы. Поэтому его добавляют отдельно (см. build()).
+  * InstallShield: команда зависит от ПОКОЛЕНИЯ. Обёртке над MSI нужен
+    ``/s /v"/qn INSTALLDIR=\"…\""`` (кавычки внутри /v экранируются),
+    классическому InstallScript 5/6 — ``/s /f1"setup.iss" /f2"setup.log"``,
+    и целевую папку он принимает только через файл ответов.
   * MSI: административно распаковывается через msiexec.exe /a с TARGETDIR,
     чтобы не регистрировать пакет в системе.
   * Собственные bootstrapper'ы (``--silent --installPath=...``): ключи
@@ -27,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
 from .detect import (
-    TRUSTED_CONFIDENCE, DetectionResult, InstallerType,
+    TRUSTED_CONFIDENCE, DetectionResult, InstallerType, InstallShieldGeneration,
 )
 
 #: Больше попыток запускать бессмысленно: каждая стоит времени пользователя.
@@ -50,6 +54,19 @@ class SilentPlan:
     extracts_only: bool = False
     #: Плану заведомо нужны права администратора.
     needs_admin: bool = False
+    #: Установщик показывает окно и ждёт действий пользователя (режим записи
+    #: ответов у InstallScript). Такой план нельзя запускать с CREATE_NO_WINDOW
+    #: и нельзя ограничивать обычным таймаутом тихой установки.
+    interactive: bool = False
+    #: Движок сам пишет сюда итог (InstallShield: setup.log с ResultCode).
+    result_log: str = ""
+    #: Движок физически не умеет принимать целевую папку в командной строке:
+    #: файлы окажутся в его каталоге по умолчанию, и их придётся переносить.
+    ignores_target_dir: bool = False
+    #: Что сказать пользователю перед запуском (для интерактивных планов).
+    instructions: List[str] = field(default_factory=list)
+    #: Файл ответов, который план читает (или записывает в режиме /r).
+    response_file: str = ""
 
     def display(self) -> str:
         parts = [self.program] + list(self.args)
@@ -156,13 +173,15 @@ def build_silent_plan(
                           label="NSIS: /S /D", output_dir=native_target)
 
     if installer_type == InstallerType.INSTALLSHIELD:
-        # Классический InstallShield: /s /v"/qn INSTALLDIR=\"...\""
-        inner = f'/qn INSTALLDIR="{target_dir}" /norestart'
-        args = ["/s", f'/v{inner}'] + extra_args
-        notes.append("InstallShield: /s /v\"/qn INSTALLDIR=...\".")
-        return SilentPlan(program=installer_path, args=args, notes=notes,
-                          label="InstallShield: /s /v\"/qn INSTALLDIR\"",
-                          output_dir=native_target)
+        generation = (detection.installshield_generation if detection
+                      else InstallShieldGeneration.UNKNOWN)
+        if generation == InstallShieldGeneration.INSTALLSCRIPT:
+            return build_installscript_plan(
+                installer_path, target_dir,
+                response_file=(detection.response_file if detection else ""),
+                log_file=log_file, extra_args=extra_args)
+        return build_installshield_msi_plan(
+            installer_path, target_dir, extra_args=extra_args)
 
     if installer_type == InstallerType.WIX_BURN:
         # Переменную InstallFolder принимают только бандлы, объявившие её
@@ -234,6 +253,144 @@ def build_silent_plan(
     )
     return SilentPlan(program=installer_path, args=args, notes=notes,
                       label="Универсальный ключ /S", output_dir=native_target)
+
+
+def _is_switch(switch: str, value: str) -> str:
+    """Ключ InstallShield с путём: ``/f1"C:\\dir\\setup.iss"``.
+
+    У setup.exe между ключом и значением НЕ должно быть пробела, а путь
+    заключается в кавычки внутри самого аргумента. Собрать это через
+    ``subprocess.list2cmdline`` нельзя: он закавычит аргумент целиком
+    (``"/f1C:\\dir with space\\setup.iss"``) — такую форму движок не разбирает.
+    Поэтому подобные ключи уходят «сырым хвостом» командной строки.
+    """
+    return f'{switch}"{value}"' if value else switch
+
+
+def build_installscript_plan(
+    installer_path: str,
+    target_dir: str,
+    response_file: str = "",
+    log_file: Optional[str] = None,
+    extra_args: Optional[Sequence[str]] = None,
+    record: bool = False,
+) -> SilentPlan:
+    """Команда для классического InstallShield InstallScript (5/6).
+
+    Отличия от современной обёртки над MSI — принципиальные:
+
+    * ключа ``/v`` не существует: всё, что передано после него, движок просто
+      не понимает (именно это и произошло с диском American McGee's Alice —
+      setup.exe вышел за две секунды с кодом 0, ничего не установив);
+    * целевую папку из командной строки InstallScript не принимает: путь
+      хранится в файле ответов, поэтому программу приходится забирать из
+      каталога по умолчанию (этим занимается перенос из ``_recover_installed_app``);
+    * ``/s`` работает только по записанному файлу ответов ``setup.iss``
+      (``/r``); без него setup.log получает ``ResultCode=-3`` или ``-5``;
+    * ``/f1``/``/f2`` задают файл ответов и журнал. Для установщика на
+      компакт-диске это обязательно: по умолчанию движок пишет журнал рядом с
+      setup.exe, то есть на носитель только для чтения.
+    """
+    # Пути в аргументах — в синтаксисе Windows (их читает установщик), а
+    # native_* — в синтаксисе текущей ОС: эти файлы Portablizer открывает сам.
+    native_target = _native(target_dir)
+    native_response = _native(response_file) if response_file else ""
+    native_log = _native(log_file) if log_file else ""
+    installer_path = _norm(installer_path)
+    response_file = _norm(response_file) if response_file else ""
+    log_file = _norm(log_file) if log_file else ""
+
+    args = ["/r" if record else "/s"] + list(extra_args or [])
+    tail: List[str] = []
+    if response_file:
+        tail.append(_is_switch("/f1", response_file))
+    if log_file:
+        tail.append(_is_switch("/f2", log_file))
+    # /SMS заставляет setup.exe дождаться конца установки, а не возвращать
+    # управление сразу (движок работает в отдельном процессе ikernel.exe).
+    tail.append("/SMS")
+
+    if record:
+        notes = [
+            "InstallShield InstallScript: режим записи ответов /r — мастер "
+            "покажет окна, а Portablizer сохранит ваши ответы в setup.iss и "
+            "заберёт установленную программу в портатив.",
+        ]
+        label = "InstallShield InstallScript: мастер с записью ответов /r"
+    else:
+        notes = [
+            "InstallShield InstallScript: /s работает только по файлу "
+            "ответов setup.iss, поэтому он передан ключом /f1, а журнал — "
+            "ключом /f2 (носитель установщика может быть только для чтения).",
+        ]
+        label = ("InstallScript: /s /f1\"setup.iss\"" if response_file
+                 else "InstallScript: /s без файла ответов")
+
+    return SilentPlan(
+        program=installer_path,
+        args=args,
+        raw_tail=" ".join(tail),
+        notes=notes,
+        label=label,
+        output_dir=native_target,
+        interactive=record,
+        result_log=native_log,
+        response_file=native_response,
+        ignores_target_dir=True,
+        instructions=[
+            "Откроется окно мастера установки. Пройдите его и в качестве "
+            f"папки назначения укажите: {native_target}",
+            "Если мастер не даёт выбрать папку, оставьте его вариант — "
+            "Portablizer сам перенесёт установленную программу в портатив.",
+        ] if record else [],
+    )
+
+
+def build_installshield_msi_plan(
+    installer_path: str,
+    target_dir: str,
+    response_file: str = "",
+    extra_args: Optional[Sequence[str]] = None,
+    with_target_dir: bool = True,
+) -> SilentPlan:
+    """Команда для InstallShield-обёртки над MSI (Basic / InstallScript MSI).
+
+    Документированная форма — ``setup.exe /s /v"/qn INSTALLDIR=\\"путь\\""``:
+    ключ ``/v`` стоит ВНЕ кавычек, а внутренние кавычки экранируются. Если
+    собрать это списком аргументов, ``list2cmdline`` закавычит токен целиком
+    (``"/v/qn INSTALLDIR=…"``) — такую строку setup.exe разбирает неверно.
+    """
+    native_target = _native(target_dir)
+    installer_path = _norm(installer_path)
+    target_dir = _norm(target_dir)
+    response_file = _norm(response_file) if response_file else ""
+
+    args = ["/s"] + list(extra_args or [])
+    tail: List[str] = []
+    if response_file:
+        # InstallScript MSI умеет и файл ответов, и /v одновременно.
+        tail.append(_is_switch("/f1", response_file))
+    if with_target_dir:
+        inner = f'/qn INSTALLDIR=\\"{target_dir}\\" /norestart'
+        label = "InstallShield (MSI): /s /v\"/qn INSTALLDIR=…\""
+    else:
+        inner = "/qn /norestart"
+        label = "InstallShield (MSI): /s /v\"/qn\" без целевой папки"
+    tail.append(f'/v"{inner}"')
+
+    return SilentPlan(
+        program=installer_path,
+        args=args,
+        raw_tail=" ".join(tail),
+        notes=[
+            "InstallShield с обёрткой над MSI: ключи после /v передаются "
+            "msiexec; кавычки внутри /v экранируются, иначе setup.exe "
+            "разбирает строку неправильно.",
+        ],
+        label=label,
+        output_dir=native_target,
+        ignores_target_dir=not with_target_dir,
+    )
 
 
 def build_custom_cli_plan(
@@ -368,6 +525,80 @@ _GENERIC_LADDER: Sequence[Sequence[str]] = (
 )
 
 
+def build_installshield_attempts(
+    detection: DetectionResult,
+    installer_path: str,
+    target_dir: str,
+    response_file: str = "",
+    record_file: str = "",
+    log_file: str = "",
+    extract_dir: str = "",
+    extra_args: Optional[Sequence[str]] = None,
+    allow_assisted: bool = False,
+) -> List[SilentPlan]:
+    """Лестница попыток для InstallShield — отдельно по поколениям.
+
+    Раньше здесь была одна-единственная команда обёртки над MSI
+    (``/s /v"/qn INSTALLDIR=…"``). Для InstallScript 5/6 она бессмысленна:
+    ключ ``/v`` такому движку неизвестен, и setup.exe завершается за пару
+    секунд с кодом 0, не установив ничего. Теперь набор команд выбирается по
+    поколению, а при неуверенном определении пробуются оба.
+    """
+    extra = list(extra_args or [])
+    generation = detection.installshield_generation
+    attempts: List[SilentPlan] = []
+
+    def installscript(record: bool = False) -> SilentPlan:
+        # В режиме записи файл ответов ещё не существует, но путь обязателен:
+        # без /f1 движок создаёт setup.iss в папке Windows, то есть мусорит на
+        # компьютере-сборщике и теряет файл, ради которого всё затевалось.
+        answers = (record_file or response_file) if record else response_file
+        return build_installscript_plan(
+            installer_path, target_dir, response_file=answers,
+            log_file=log_file, extra_args=extra, record=record)
+
+    def msi_wrapper(with_target_dir: bool = True) -> SilentPlan:
+        return build_installshield_msi_plan(
+            installer_path, target_dir, response_file=response_file,
+            extra_args=extra, with_target_dir=with_target_dir)
+
+    if generation == InstallShieldGeneration.INSTALLSCRIPT:
+        attempts.append(installscript())
+    elif generation == InstallShieldGeneration.MSI:
+        attempts.append(msi_wrapper())
+        attempts.append(msi_wrapper(with_target_dir=False))
+    else:
+        # Поколение неизвестно: обёртка над MSI безопаснее (лишние ключи
+        # InstallScript просто игнорирует), поэтому она идёт первой.
+        attempts.append(msi_wrapper())
+        attempts.append(installscript())
+        attempts.append(msi_wrapper(with_target_dir=False))
+
+    # Распаковка без установки: современные setup.exe умеют выложить свои
+    # MSI-пакеты в папку, откуда их распакует msiexec /a — система при этом
+    # не меняется и права администратора не нужны.
+    if extract_dir and generation != InstallShieldGeneration.INSTALLSCRIPT \
+            and detection.has_switch("/extract_all"):
+        attempts.append(SilentPlan(
+            program=_norm(installer_path),
+            args=["/s"],
+            raw_tail=_is_switch("/extract_all:", _norm(extract_dir)),
+            notes=["InstallShield: /extract_all выкладывает MSI-пакеты в "
+                   "папку, не устанавливая программу в систему."],
+            label="InstallShield: распаковка /extract_all",
+            output_dir=_native(extract_dir),
+            extracts_only=True,
+        ))
+
+    # Записать ответы может только человек: мастер задаёт вопросы, на которые
+    # нет правильного ответа «по умолчанию». Поэтому режим /r — последний и
+    # только с явного разрешения пользователя.
+    if allow_assisted and generation != InstallShieldGeneration.MSI:
+        attempts.append(installscript(record=True))
+
+    return attempts
+
+
 def build_attempts(
     detection: DetectionResult,
     installer_path: str,
@@ -375,6 +606,8 @@ def build_attempts(
     log_dir: str = "",
     extra_args: Optional[Sequence[str]] = None,
     layout_dir: str = "",
+    response_file: str = "",
+    allow_assisted: bool = False,
 ) -> List[SilentPlan]:
     """Строит упорядоченную лестницу попыток тихой установки.
 
@@ -390,6 +623,14 @@ def build_attempts(
 
     def log_path(name: str) -> Optional[str]:
         return ntpath.join(_norm(log_dir), name) if log_dir else None
+
+    def artifact(name: str) -> str:
+        """Путь к файлу, который открывает сам Portablizer.
+
+        В отличие от log_path он остаётся в синтаксисе текущей ОС: план
+        приводит его к виду Windows только для командной строки установщика.
+        """
+        return os.path.join(log_dir, name) if log_dir else ""
 
     attempts: List[SilentPlan] = []
     itype = detection.installer_type
@@ -425,6 +666,14 @@ def build_attempts(
             InstallerType.WIX_BURN, installer_path, target_dir,
             override_install_folder=False,
             log_file=log_path("install-retry.log"), extra_args=extra))
+    elif itype == InstallerType.INSTALLSHIELD:
+        attempts.extend(build_installshield_attempts(
+            detection, installer_path, target_dir,
+            response_file=response_file,
+            record_file=artifact("setup.iss"),
+            log_file=artifact("setup-installshield.log"),
+            extract_dir=layout_dir, extra_args=extra,
+            allow_assisted=allow_assisted))
     elif itype != InstallerType.UNKNOWN:
         attempts.append(build_silent_plan(
             itype, installer_path, target_dir,
@@ -485,7 +734,15 @@ def build_attempts(
             continue
         seen.add(key)
         unique.append(plan)
-    return unique[:MAX_ATTEMPTS]
+
+    # План с окном мастера требует человека у клавиатуры, поэтому он всегда
+    # последний и не должен вытесняться автоматическими вариантами при
+    # обрезке лестницы.
+    silent = [p for p in unique if not p.interactive]
+    interactive = [p for p in unique if p.interactive]
+    if interactive:
+        return silent[:max(1, MAX_ATTEMPTS - len(interactive))] + interactive
+    return silent[:MAX_ATTEMPTS]
 
 
 def candidate_silent_switches(installer_type: InstallerType) -> List[str]:

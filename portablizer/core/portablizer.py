@@ -1,7 +1,12 @@
 """Оркестратор процесса создания портативного приложения.
 
 Порядок работы:
-  1. detect          — определить движок установщика.
+  1. detect          — определить движок установщика (и поколение, если это
+                       InstallShield: у InstallScript 5/6 и обёртки над MSI
+                       несовместимые командные строки).
+  1b. response       — подготовить файл ответов setup.iss, если он нужен:
+                       скопировать с диска в портатив и подменить в нём путь
+                       установки на папку App.
   2. plan            — построить ЛЕСТНИЦУ команд тихой установки (несколько
                        вариантов от самого точного к самому общему).
   3. snapshot(before)— снять состояние реестра (Windows).
@@ -113,6 +118,105 @@ def _exit_code_hint(rc: Optional[int]) -> str:
     return _EXIT_CODE_HINTS.get(rc, "")
 
 
+# -- InstallShield InstallScript ---------------------------------------------
+#: Расшифровка [ResponseResult]/ResultCode из setup.log классического
+#: InstallShield. Без неё «код 0 и пустая папка» выглядит необъяснимо, хотя
+#: движок честно записал причину отказа в свой журнал.
+_INSTALLSHIELD_RESULT_HINTS: Dict[int, str] = {
+    0: "установка прошла успешно",
+    -1: "общая ошибка установки",
+    -2: "режим установки не поддерживается",
+    -3: "в файле ответов setup.iss нет нужных данных (или файла ответов нет)",
+    -4: "не хватило памяти",
+    -5: "файл ответов не найден",
+    -6: "не удалось записать файл ответов",
+    -7: "не удалось записать журнал (носитель только для чтения?)",
+    -8: "неверный путь к файлу ответов setup.iss",
+    -9: "недопустимый тип списка в файле ответов",
+    -10: "недопустимый тип данных в файле ответов",
+    -11: "неизвестная ошибка установщика",
+    -12: "диалоги в файле ответов не совпадают с диалогами этого установщика",
+    -51: "не удалось создать указанную папку",
+    -52: "нет доступа к указанному файлу или папке",
+    -53: "в файле ответов выбран недопустимый вариант",
+}
+
+#: Ключи файла ответов, в которых лежит путь установки. ``szFolder`` намеренно
+#: не трогаем: это имя группы в меню «Пуск», а не каталог.
+_ISS_TARGET_KEYS = ("szdir", "sztargetdir", "szdestpath", "szinstalldir")
+
+
+def read_installshield_result(log_path: str) -> Optional[int]:
+    """Читает ResultCode из setup.log, созданного InstallShield."""
+    if not log_path:
+        return None
+    try:
+        with open(log_path, "rb") as fh:
+            raw = fh.read(64 * 1024)
+    except OSError:
+        return None
+    text = _decode_installer_text(raw)
+    match = re.search(r"^\s*ResultCode\s*=\s*(-?\d+)", text,
+                      re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _decode_installer_text(raw: bytes) -> str:
+    """Декодирует ini-подобный файл установщика (ANSI/UTF-8/UTF-16)."""
+    if raw.startswith(b"\xff\xfe") or (len(raw) > 1 and raw[1:2] == b"\x00"):
+        return raw.decode("utf-16-le", "replace")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", "replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1251", "replace")
+
+
+def _encode_installer_text(text: str, sample: bytes) -> bytes:
+    """Кодирует текст обратно в том же виде, в каком файл был прочитан."""
+    if sample.startswith(b"\xff\xfe") or (len(sample) > 1
+                                          and sample[1:2] == b"\x00"):
+        prefix = b"\xff\xfe" if sample.startswith(b"\xff\xfe") else b""
+        body = text[1:] if text.startswith("\ufeff") else text
+        return prefix + body.encode("utf-16-le", "replace")
+    try:
+        return text.encode("cp1251")
+    except UnicodeEncodeError:
+        return text.encode("utf-8")
+
+
+def retarget_response_file(text: str, target_dir: str) -> Tuple[str, int]:
+    """Подменяет путь установки в файле ответов InstallShield.
+
+    Файл ответов — это ini: секция диалога и строки вида
+    ``szDir=C:\\Program Files\\Игра``. Командной строкой InstallScript папку
+    не принимает, зато уважает путь из файла ответов — так портатив получает
+    свои файлы сразу в ``App``, без переноса из Program Files.
+    """
+    lines = text.splitlines(keepends=True)
+    replaced = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith((";", "[")):
+            continue
+        key, sep, _value = stripped.partition("=")
+        if not sep or key.strip().casefold() not in _ISS_TARGET_KEYS:
+            continue
+        ending = ""
+        while line.endswith(("\r", "\n")):
+            ending = line[-1] + ending
+            line = line[:-1]
+        lines[index] = f"{key.strip()}={target_dir}{ending}"
+        replaced += 1
+    return "".join(lines), replaced
+
+
 def _burn_layout_payloads(layout_dir: str) -> "Tuple[List[str], List[str]]":
     """Находит в распакованном (/layout) бандле MSI-пакеты и прочие payload'ы.
 
@@ -160,6 +264,11 @@ class PortableOptions:
     extra_install_args: List[str] = field(default_factory=list)
     extra_env: Dict[str, str] = field(default_factory=dict)
     install_timeout: int = 1800        # сек
+    # Разрешить сценарий с видимым окном мастера. Нужен старым InstallShield
+    # InstallScript: тихий режим у них работает только по файлу ответов
+    # setup.iss, а записать его может лишь человек, прошедший мастер.
+    allow_assisted_install: bool = False
+    assisted_timeout: int = 3600       # сек: человек за клавиатурой не спешит
 
 
 @dataclass
@@ -219,6 +328,8 @@ class Portablizer:
         self._attempts_made = 0
         #: История лестницы попыток: (название сценария, код возврата).
         self._attempt_history: List[Tuple[str, Optional[int]]] = []
+        #: Последний ResultCode из setup.log классического InstallShield.
+        self._installshield_result: Optional[int] = None
 
     # -- вспомогательное ------------------------------------------------------
     def _check_cancel(self) -> None:
@@ -257,6 +368,7 @@ class Portablizer:
             "portable_machine.reg", "cleanup_host.reg", "install.log",
             "install-retry.log", "install-layout.log", "installer-engine.log",
             "installer-output.log", "portablizer.log", "_bundle_layout",
+            "setup-installshield.log",
         ):
             path = os.path.join(portable_dir, filename)
             try:
@@ -289,6 +401,7 @@ class Portablizer:
             self._run_started = time.time()
             self._attempts_made = 0
             self._attempt_history = []
+            self._installshield_result = None
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
                 raise FileNotFoundError(f"Установщик не найден: {opts.installer_path}")
@@ -325,6 +438,10 @@ class Portablizer:
                     "администратора»."
                 )
 
+            # 1c. Классический InstallShield: подготовка файла ответов.
+            response_file = self._prepare_response_file(
+                det, portable_dir, app_dir, opts)
+
             # 2. Лестница планов тихой установки
             self.progress(15, "Построение команды тихой установки")
             attempts = build_attempts(
@@ -332,6 +449,8 @@ class Portablizer:
                 log_dir=portable_dir,
                 extra_args=opts.extra_install_args,
                 layout_dir=os.path.join(portable_dir, "_bundle_layout"),
+                response_file=response_file,
+                allow_assisted=opts.allow_assisted_install,
             )
             result.plan = attempts[0] if attempts else None
             result.attempts_planned = len(attempts)
@@ -371,8 +490,22 @@ class Portablizer:
             # он накрывает все попытки сразу.
             self._check_cancel()
             self.progress(30, "Тихая установка в изолированном режиме")
+
+            def recover() -> bool:
+                """Забрать программу из каталога по умолчанию прямо в ходе
+                лестницы: движки, которые не принимают целевую папку
+                (InstallScript), иначе выглядели бы как неудача, и
+                Portablizer запускал бы следующий сценарий поверх уже
+                установленной программы."""
+                return self._recover_installed_app(
+                    app_dir=app_dir, data_dir=data_dir, app_name=name,
+                    installer_path=opts.installer_path,
+                    before=install_locations_before,
+                )
+
             install_rc, used_plan = self._run_attempts(
-                attempts, opts, app_dir, data_dir, portable_dir, name)
+                attempts, opts, app_dir, data_dir, portable_dir, name,
+                recover=recover)
             result.attempts_made = self._attempts_made
             if used_plan is not None:
                 result.plan = used_plan
@@ -425,7 +558,8 @@ class Portablizer:
             self.progress(75, "Поиск главного исполняемого файла")
             main_exe = self._find_main_exe(app_dir, name)
             if not main_exe:
-                result.hints = self._failure_hints(det, install_rc, opts)
+                result.hints = self._failure_hints(det, install_rc, opts,
+                                                   portable_dir)
                 result.attempt_outcomes = list(self._attempt_history)
                 raise RuntimeError(
                     self._failure_message(det, install_rc, result))
@@ -462,9 +596,132 @@ class Portablizer:
             self._save_run_log(result.portable_dir)
             return result
 
+    # -- классический InstallShield ------------------------------------------
+    def _record_command(self, det: DetectionResult, opts: PortableOptions,
+                        portable_dir: str) -> str:
+        """Готовая команда записи файла ответов — её можно скопировать в cmd.
+
+        Куда писать setup.iss, зависит от носителя: рядом с установщиком —
+        удобнее всего (Portablizer найдёт файл при любой сборке), но диск
+        может быть только для чтения; тогда предлагаем папку портатива, откуда
+        файл подхватится при следующем запуске.
+        """
+        media = det.media_dir or os.path.dirname(opts.installer_path)
+        if media and self._is_writable_dir(media):
+            target = os.path.join(media, "setup.iss")
+        elif portable_dir:
+            target = os.path.join(portable_dir, "setup.iss")
+        else:
+            target = os.path.join(os.path.expanduser("~"), "setup.iss")
+        return f'"{opts.installer_path}" /r /f1"{target}"'
+
+    def _prepare_response_file(self, det: DetectionResult, portable_dir: str,
+                               app_dir: str,
+                               opts: PortableOptions) -> str:
+        """Готовит файл ответов setup.iss для InstallShield InstallScript.
+
+        Тихий режим у этого поколения работает ТОЛЬКО по записанному файлу
+        ответов. Если файл лежит рядом с установщиком (так делают многие
+        корпоративные раздачи и репаки), Portablizer копирует его в портатив —
+        носитель может быть только для чтения — и подменяет в нём путь
+        установки на папку ``App``. Тогда программа сразу попадает в портатив,
+        а не в ``C:\\Program Files``.
+        """
+        if det.installer_type != InstallerType.INSTALLSHIELD:
+            return ""
+
+        if det.is_legacy_installshield:
+            self.log.info(
+                "InstallShield InstallScript 5/6: ключ /v этому поколению "
+                "неизвестен, целевую папку из командной строки оно не "
+                "принимает, а /s требует файл ответов setup.iss."
+            )
+        if det.media_dir and not self._is_writable_dir(det.media_dir):
+            self.log.warn(
+                f"Папка установщика доступна только для чтения: "
+                f"{det.media_dir}. Старые InstallShield пишут рядом с "
+                "setup.exe служебные файлы; журнал и файл ответов перенесены "
+                "в папку портатива."
+            )
+
+        # Файл ответов, записанный прошлым запуском, ценнее найденного на
+        # диске: он снят с ЭТОГО установщика на этой машине. Поэтому
+        # _prepare_output его не удаляет, а мы проверяем его первым.
+        recorded = os.path.join(portable_dir, "setup.iss")
+        source = recorded if os.path.isfile(recorded) else det.response_file
+        if not source:
+            if det.is_legacy_installshield and not opts.allow_assisted_install:
+                self.log.warn(
+                    "Файл ответов setup.iss не найден, а без него тихий режим "
+                    "этого поколения не работает. Запишите ответы один раз "
+                    f"командой {self._record_command(det, opts, portable_dir)} "
+                    "и повторите сборку — или включите галочку «Разрешить "
+                    "окно мастера установки», и Portablizer сделает это сам."
+                )
+            return ""
+
+        destination = os.path.join(portable_dir, "setup.iss")
+        try:
+            with open(source, "rb") as fh:
+                raw = fh.read(4 * 1024 * 1024)
+            text = _decode_installer_text(raw)
+            patched, replaced = retarget_response_file(text, app_dir)
+            with open(destination, "wb") as fh:
+                fh.write(_encode_installer_text(patched, raw))
+        except OSError as exc:
+            self.log.warn(f"Не удалось подготовить файл ответов: {exc}")
+            return ""
+
+        if os.path.normcase(source) == os.path.normcase(recorded):
+            self.log.ok(
+                f"Использую файл ответов, записанный прошлым запуском: {source}")
+        else:
+            self.log.ok(f"Найден файл ответов установщика: {source}")
+        if replaced:
+            self.log.info(
+                f"В копии файла ответов путь установки заменён на папку App "
+                f"({replaced} знач.): {app_dir}"
+            )
+        else:
+            self.log.info(
+                "В файле ответов нет строки с путём установки — программа "
+                "встанет в каталог по умолчанию, и Portablizer перенесёт её "
+                "в портатив сам."
+            )
+        return destination
+
+    @staticmethod
+    def _is_writable_dir(path: str) -> bool:
+        """Проверяет запись реальной пробой: у CD/ISO атрибуты обманчивы."""
+        if not path or not os.path.isdir(path):
+            return False
+        probe = os.path.join(path, f".portablizer-write-test-{os.getpid()}")
+        try:
+            with open(probe, "wb"):
+                pass
+            os.remove(probe)
+            return True
+        except OSError:
+            return False
+
+    def _report_installshield_log(self, plan: SilentPlan) -> Optional[int]:
+        """Расшифровывает setup.log InstallShield после попытки установки."""
+        code = read_installshield_result(plan.result_log)
+        if code is None:
+            return None
+        hint = _INSTALLSHIELD_RESULT_HINTS.get(code, "неизвестный код")
+        message = f"InstallShield записал в setup.log ResultCode={code} — {hint}."
+        if code == 0:
+            self.log.ok(message)
+        else:
+            self.log.warn(message)
+        self._installshield_result = code
+        return code
+
     # -- диагностика неудачи --------------------------------------------------
     def _failure_hints(self, det: DetectionResult, rc: Optional[int],
-                       opts: PortableOptions) -> List[str]:
+                       opts: PortableOptions,
+                       portable_dir: str = "") -> List[str]:
         """Формирует конкретные советы вместо общего «смотрите журнал».
 
         Пользователю бесполезно знать, что «код -1»; ему нужно знать, что
@@ -480,6 +737,9 @@ class Portablizer:
                 "установщику нужны повышенные права (правый клик по "
                 "Portablizer.exe → «Запуск от имени администратора»)."
             )
+
+        if det.installer_type == InstallerType.INSTALLSHIELD:
+            hints.extend(self._installshield_hints(det, opts, portable_dir))
 
         if det.installer_type == InstallerType.CUSTOM_CLI or det.has_switch(
                 "--accept-license-agreement", "--accept-licenses"):
@@ -518,6 +778,54 @@ class Portablizer:
             "лицензии и в тихом режиме не работают в принципе — такую "
             "программу портативной сделать нельзя."
         )
+        return hints
+
+    def _installshield_hints(self, det: DetectionResult,
+                             opts: PortableOptions,
+                             portable_dir: str = "") -> List[str]:
+        """Советы для InstallShield — с учётом поколения и setup.log."""
+        hints: List[str] = []
+        record_cmd = self._record_command(det, opts, portable_dir)
+
+        code = self._installshield_result
+        if code is not None and code != 0:
+            hint = _INSTALLSHIELD_RESULT_HINTS.get(code, "неизвестный код")
+            hints.append(
+                f"Сам InstallShield записал в setup.log ResultCode={code} — "
+                f"{hint}. Это точная причина отказа, а не догадка."
+            )
+
+        if det.is_legacy_installshield or code in (-3, -5, -12):
+            if det.response_file:
+                hints.append(
+                    "Файл ответов найден, но установщику он не подошёл "
+                    f"({det.response_file}). Файл ответов записывается для "
+                    "конкретной версии установщика: перезапишите его на этом "
+                    f"же ПК командой {record_cmd} и повторите сборку."
+                )
+            else:
+                hints.append(
+                    "Это InstallShield InstallScript 5/6 (диски и программы "
+                    "1998–2002 годов). Тихая установка у него возможна только "
+                    "по записанному файлу ответов: выполните один раз "
+                    f"{record_cmd}, пройдите мастер — и повторите сборку, "
+                    "Portablizer подхватит setup.iss автоматически."
+                )
+            if not opts.allow_assisted_install:
+                hints.append(
+                    "Либо включите галочку «Разрешить окно мастера "
+                    "установки»: Portablizer сам запустит мастер в режиме "
+                    "записи, сохранит setup.iss в папку портатива и перенесёт "
+                    "установленную программу в App."
+                )
+
+        if det.media_dir and not self._is_writable_dir(det.media_dir):
+            hints.append(
+                "Установщик запускается с носителя только для чтения "
+                f"({det.media_dir}). Скопируйте весь диск/папку установщика на "
+                "жёсткий диск и соберите портатив из копии: старым "
+                "InstallShield нужно место рядом с setup.exe."
+            )
         return hints
 
     def _failure_message(self, det: DetectionResult, rc: Optional[int],
@@ -808,8 +1116,17 @@ class Portablizer:
             except OSError:
                 console_handle = None
 
-        creationflags = 0x08000000  # CREATE_NO_WINDOW
-        self.log.info("Запуск установщика (тихо, изолированно)...")
+        # Интерактивный план (запись ответов InstallScript) обязан показать
+        # окно: пользователь должен пройти мастер, иначе записывать нечего.
+        creationflags = 0 if plan.interactive else 0x08000000  # CREATE_NO_WINDOW
+        timeout = (max(opts.install_timeout, opts.assisted_timeout)
+                   if plan.interactive else opts.install_timeout)
+        if plan.interactive:
+            self.log.info("Запуск установщика с окном мастера (изолированно)...")
+            for line in plan.instructions:
+                self.log.info(f"  → {line}")
+        else:
+            self.log.info("Запуск установщика (тихо, изолированно)...")
         rc: Optional[int] = None
         try:
             try:
@@ -839,14 +1156,15 @@ class Portablizer:
                 if self.cancel.is_set():
                     proc.terminate()
                     raise RuntimeError("Установка отменена пользователем.")
-                if time.time() - start > opts.install_timeout:
+                if time.time() - start > timeout:
                     proc.terminate()
                     raise RuntimeError("Превышено время ожидания установки.")
                 # плавный прогресс во время установки: progress_from -> progress_to
                 frac = min(1.0, (time.time() - start) / 60.0)
                 span = max(1, progress_to - progress_from)
                 self.progress(progress_from + int(span * frac),
-                              "Тихая установка...")
+                              "Установка в окне мастера..." if plan.interactive
+                              else "Тихая установка...")
                 time.sleep(0.5)
             rc = proc.returncode
         finally:
@@ -877,16 +1195,24 @@ class Portablizer:
         except OSError:
             entries = []
         if not entries:
-            self.log.warn(
-                "Целевая папка пуста. Установщик мог проигнорировать ключ папки; "
-                "проверяю перенаправленный профиль и системные каталоги установки."
-            )
+            if plan.ignores_target_dir:
+                self.log.info(
+                    "Этот движок не принимает целевую папку в командной "
+                    "строке — ищу установленную программу в каталогах по "
+                    "умолчанию, чтобы перенести её в App."
+                )
+            else:
+                self.log.warn(
+                    "Целевая папка пуста. Установщик мог проигнорировать ключ папки; "
+                    "проверяю перенаправленный профиль и системные каталоги установки."
+                )
         return rc
 
     # -- лестница попыток установки ------------------------------------------
     def _run_attempts(self, attempts: Sequence[SilentPlan],
                       opts: PortableOptions, app_dir: str, data_dir: str,
                       portable_dir: str, name: str,
+                      recover: Optional[Callable[[], bool]] = None,
                       ) -> Tuple[Optional[int], Optional[SilentPlan]]:
         """Выполняет варианты установки, пока в ``App`` не появятся файлы.
 
@@ -918,8 +1244,19 @@ class Portablizer:
                                    progress_from=start, progress_to=stop,
                                    console_log=console_log)
             last_rc = rc
+            # Классический InstallShield пишет причину отказа в свой
+            # setup.log — без неё «код 0 при пустой папке» необъясним.
+            self._report_installshield_log(plan)
             self._attempts_made += 1
             self._attempt_history.append((plan.label, rc))
+
+            if plan.interactive and plan.response_file \
+                    and os.path.isfile(plan.response_file):
+                self.log.ok(
+                    f"Ваши ответы сохранены в файл {plan.response_file}. "
+                    "Он лежит в папке портатива: следующая сборка этой же "
+                    "программы пройдёт полностью автоматически, без окон."
+                )
 
             # Распаковка бандла сама по себе файлов в App не даёт: из неё ещё
             # нужно вытащить MSI-пакеты.
@@ -938,6 +1275,19 @@ class Portablizer:
                 else:
                     self.log.ok("Тихая установка прошла успешно.")
                 return rc, plan
+
+            # Движок, не принимающий целевую папку (InstallScript 5/6),
+            # ставит программу в свой каталог по умолчанию. Это успех, а не
+            # неудача: забираем файлы сразу, иначе следующий сценарий начнёт
+            # ставить программу поверх уже установленной.
+            if plan.ignores_target_dir and recover is not None \
+                    and rc in (0, 3010):
+                if recover():
+                    self.log.ok(
+                        "Программа установлена в каталог по умолчанию и "
+                        f"перенесена в App. Сработал сценарий: {plan.label}"
+                    )
+                    return rc, plan
 
             if index + 1 < total:
                 self.log.warn(

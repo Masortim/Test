@@ -17,7 +17,8 @@ import batsim
 from portablizer.core import launcher as launcher_mod
 from portablizer.core import registry
 from portablizer.core.detect import (
-    TRUSTED_CONFIDENCE, DetectionResult, InstallerType, detect_installer,
+    TRUSTED_CONFIDENCE, DetectionResult, InstallerType, InstallShieldGeneration,
+    detect_installer, scan_media_layout,
 )
 from portablizer.core.launcher import (
     LauncherConfig, ensure_ascii_bat, render_bat, render_config_json,
@@ -26,11 +27,12 @@ from portablizer.core.launcher import (
 from portablizer.core.logutil import Logger
 from portablizer.core.portablizer import (
     PortableOptions, PortableResult, Portablizer, _burn_layout_payloads,
-    _exit_code_hint, _format_exit_code,
+    _exit_code_hint, _format_exit_code, read_installshield_result,
+    retarget_response_file,
 )
 from portablizer.core.silentargs import (
     SilentPlan, build_attempts, build_burn_layout_plan, build_custom_cli_plan,
-    build_silent_plan,
+    build_installscript_plan, build_installshield_msi_plan, build_silent_plan,
 )
 
 
@@ -1483,6 +1485,360 @@ class FailureDiagnosticsTests(unittest.TestCase):
                     attempt_outcomes=[("NSIS: /S /D", 4294967295),
                                       ("Универсальные ключи: /S", 0)],
                 )))
+
+
+class InstallShieldGenerationTests(unittest.TestCase):
+    """Регрессия на журнал пользователя: диск «American McGee's Alice».
+
+    Portablizer опознал InstallShield (85%) и отправил в него команду
+    современной обёртки над MSI — ``/s /v"/qn INSTALLDIR=…"``. Классический
+    InstallScript 5/6 ключа ``/v`` не знает: setup.exe вышел через две
+    секунды с кодом 0, папка App осталась пустой.
+    """
+
+    LEGACY_STRINGS = (b"InstallShield\x00_isres.dll\x00_setup.dll\x00"
+                      b"setup.ins\x00IKernel\x00")
+    MSI_STRINGS = (b"InstallShield\x00ISSetup.dll\x00MsiExec.exe\x00"
+                   b"Windows Installer\x00")
+
+    def _disc(self, temp, files, payload=LEGACY_STRINGS, name="Setup.exe"):
+        """Собирает раскладку установочного диска вокруг setup.exe."""
+        media = Path(temp, "disc")
+        media.mkdir(exist_ok=True)
+        _fake_pe(str(media / name), [".text", ".rsrc"], payload)
+        for filename in files:
+            (media / filename).write_bytes(b"payload" * 8)
+        return str(media / name)
+
+    def test_installscript_disc_is_recognized_by_its_media_layout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            det = detect_installer(self._disc(
+                temp, ["data1.hdr", "data1.cab", "data2.cab", "setup.ins",
+                       "_setup.dll", "setup.ini"]))
+
+            self.assertEqual(det.installer_type, InstallerType.INSTALLSHIELD)
+            self.assertEqual(det.installshield_generation,
+                             InstallShieldGeneration.INSTALLSCRIPT)
+            self.assertTrue(det.is_legacy_installshield)
+            self.assertGreaterEqual(det.confidence, TRUSTED_CONFIDENCE)
+            self.assertIn("InstallScript", det.human)
+
+    def test_msi_wrapper_is_not_mistaken_for_installscript(self):
+        with tempfile.TemporaryDirectory() as temp:
+            det = detect_installer(self._disc(
+                temp, ["ISSetup.dll", "Application.msi", "setup.ini"],
+                payload=self.MSI_STRINGS))
+
+            self.assertEqual(det.installshield_generation,
+                             InstallShieldGeneration.MSI)
+            self.assertFalse(det.is_legacy_installshield)
+
+    def test_lone_signature_leaves_the_generation_open(self):
+        with tempfile.TemporaryDirectory() as temp:
+            det = detect_installer(self._disc(
+                temp, [], payload=b"InstallShield Wizard"))
+
+            self.assertEqual(det.installshield_generation,
+                             InstallShieldGeneration.UNKNOWN)
+
+    def test_response_file_next_to_the_installer_is_found(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._disc(
+                temp, ["data1.hdr", "setup.ins", "other.iss", "setup.iss"])
+            det = detect_installer(installer)
+
+            self.assertEqual(os.path.basename(det.response_file), "setup.iss")
+            self.assertEqual(len(det.response_files), 2)
+
+    def test_media_layout_of_a_missing_folder_is_empty(self):
+        layout = scan_media_layout(os.path.join("/nowhere", "Setup.exe"))
+        self.assertEqual(layout.files, [])
+        self.assertEqual(layout.legacy_score, 0)
+
+
+class InstallShieldLadderTests(unittest.TestCase):
+    """Команды каждого поколения строятся по документации Revenera."""
+
+    APP = r"E:\Portable\Alice_Portable\App"
+    LOG = r"E:\Portable\Alice_Portable\setup-installshield.log"
+    ISS = r"E:\Portable\Alice_Portable\setup.iss"
+
+    def _detection(self, generation, response_files=()):
+        return DetectionResult(
+            InstallerType.INSTALLSHIELD, 0.9,
+            installshield_generation=generation,
+            response_files=list(response_files))
+
+    def test_installscript_never_receives_the_msi_switch(self):
+        plans = build_attempts(
+            self._detection(InstallShieldGeneration.INSTALLSCRIPT),
+            r"J:\Setup.exe", self.APP,
+            log_dir=r"E:\Portable\Alice_Portable")
+
+        self.assertTrue(plans)
+        for plan in plans:
+            self.assertNotIn("/v", plan.display(),
+                             "InstallScript 5/6 не понимает ключ /v")
+            self.assertNotIn("INSTALLDIR", plan.display())
+
+    def test_installscript_points_response_and_log_off_the_disc(self):
+        plan = build_installscript_plan(
+            r"J:\Setup.exe", self.APP, response_file=self.ISS,
+            log_file=self.LOG)
+
+        self.assertEqual(plan.args, ["/s"])
+        self.assertEqual(
+            plan.raw_tail,
+            f'/f1"{self.ISS}" /f2"{self.LOG}" /SMS')
+        self.assertTrue(plan.ignores_target_dir)
+        self.assertFalse(plan.interactive)
+        self.assertEqual(plan.result_log, self.LOG)
+
+    def test_msi_wrapper_quotes_exactly_as_documented(self):
+        plan = build_installshield_msi_plan(r"J:\Setup.exe", self.APP)
+
+        # Документированная форма: /v вне кавычек, внутренние экранированы.
+        self.assertEqual(
+            plan.raw_tail,
+            '/v"/qn INSTALLDIR=\\"E:\\Portable\\Alice_Portable\\App\\" /norestart"')
+        self.assertEqual(plan.args, ["/s"])
+
+    def test_unknown_generation_tries_both_dialects(self):
+        plans = build_attempts(
+            self._detection(InstallShieldGeneration.UNKNOWN),
+            r"J:\Setup.exe", self.APP,
+            log_dir=r"E:\Portable\Alice_Portable")
+        rendered = [p.display() for p in plans]
+
+        self.assertTrue(any("/v" in line for line in rendered))
+        self.assertTrue(any("/f2" in line for line in rendered))
+
+    def test_msi_generation_falls_back_to_extraction(self):
+        det = self._detection(InstallShieldGeneration.MSI)
+        det.switch_hints = ["/extract_all"]
+
+        plans = build_attempts(
+            det, r"J:\setup.exe", self.APP,
+            log_dir=r"E:\Portable\Alice_Portable",
+            layout_dir=r"E:\Portable\Alice_Portable\_bundle_layout")
+
+        self.assertIn("INSTALLDIR", plans[0].display())
+        self.assertNotIn("INSTALLDIR", plans[1].display())
+        # Распаковку забирает msiexec /a — система остаётся нетронутой.
+        self.assertTrue(plans[-1].extracts_only)
+        self.assertIn("/extract_all:", plans[-1].display())
+
+    def test_wizard_attempt_is_opt_in_and_always_last(self):
+        without = build_attempts(
+            self._detection(InstallShieldGeneration.INSTALLSCRIPT),
+            r"J:\Setup.exe", self.APP, log_dir=r"E:\Portable\Alice_Portable")
+        self.assertFalse(any(p.interactive for p in without))
+
+        with_wizard = build_attempts(
+            self._detection(InstallShieldGeneration.INSTALLSCRIPT),
+            r"J:\Setup.exe", self.APP, log_dir=r"E:\Portable\Alice_Portable",
+            response_file=self.ISS, allow_assisted=True)
+
+        self.assertTrue(with_wizard[-1].interactive)
+        self.assertIn("/r", with_wizard[-1].args)
+        self.assertEqual(sum(p.interactive for p in with_wizard), 1)
+        self.assertTrue(with_wizard[-1].instructions)
+
+
+class InstallShieldResponseFileTests(unittest.TestCase):
+    """Файл ответов — единственный способ задать папку у InstallScript."""
+
+    RESPONSE = (
+        "[InstallShield Silent]\r\n"
+        "Version=v6.00.000\r\n"
+        "File=Response File\r\n"
+        "[SdAskDestPath-0]\r\n"
+        "szDir=C:\\Program Files\\EA GAMES\\Alice\r\n"
+        "Result=1\r\n"
+        "[SdSelectFolder-0]\r\n"
+        "szFolder=EA GAMES\r\n"
+    )
+
+    def test_only_the_install_path_is_retargeted(self):
+        patched, replaced = retarget_response_file(
+            self.RESPONSE, r"E:\Portable\Alice_Portable\App")
+
+        self.assertEqual(replaced, 1)
+        self.assertIn(r"szDir=E:\Portable\Alice_Portable\App", patched)
+        # Группа меню «Пуск» — не путь, её трогать нельзя.
+        self.assertIn("szFolder=EA GAMES", patched)
+        self.assertIn("Version=v6.00.000", patched)
+        self.assertTrue(patched.endswith("\r\n"))
+
+    def test_disc_copy_is_written_into_the_portable_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            media = Path(temp, "disc")
+            media.mkdir()
+            (media / "setup.iss").write_text(self.RESPONSE, encoding="cp1251")
+            portable = Path(temp, "Alice_Portable")
+            app = portable / "App"
+            app.mkdir(parents=True)
+            det = DetectionResult(
+                InstallerType.INSTALLSHIELD, 0.9,
+                installshield_generation=InstallShieldGeneration.INSTALLSCRIPT,
+                response_files=[str(media / "setup.iss")],
+                media_dir=str(media))
+
+            engine = Portablizer(Logger())
+            prepared = engine._prepare_response_file(
+                det, str(portable), str(app),
+                PortableOptions(installer_path=str(media / "Setup.exe"),
+                                output_dir=temp))
+
+            self.assertEqual(prepared, str(portable / "setup.iss"))
+            text = (portable / "setup.iss").read_text(encoding="cp1251")
+            self.assertIn(f"szDir={app}", text)
+            # Оригинал на диске остаётся нетронутым.
+            self.assertIn("szDir=C:\\Program Files", (media / "setup.iss")
+                          .read_text(encoding="cp1251"))
+
+    def test_recorded_answers_survive_a_rebuild(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Alice_Portable")
+            app = portable / "App"
+            app.mkdir(parents=True)
+            (portable / "setup.iss").write_text(self.RESPONSE, encoding="cp1251")
+            (portable / "Launch.bat").write_text("old", encoding="ascii")
+
+            engine = Portablizer(Logger())
+            engine._prepare_output(str(portable), str(app),
+                                   str(portable / "PortableData"))
+
+            self.assertTrue((portable / "setup.iss").is_file(),
+                            "записанные ответы нельзя удалять между сборками")
+            self.assertFalse((portable / "Launch.bat").exists())
+
+    def test_setup_log_result_code_is_read_and_decoded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp, "setup-installshield.log")
+            log.write_text("[InstallShield Silent]\r\nVersion=v6.00.000\r\n"
+                           "[ResponseResult]\r\nResultCode=-3\r\n",
+                           encoding="cp1251")
+
+            self.assertEqual(read_installshield_result(str(log)), -3)
+            self.assertIsNone(read_installshield_result(
+                str(Path(temp, "missing.log"))))
+
+            engine = Portablizer(Logger())
+            engine._report_installshield_log(
+                SilentPlan(program="Setup.exe", result_log=str(log)))
+            self.assertIn("ResultCode=-3", engine.log.text)
+            self.assertIn("файле ответов", engine.log.text)
+
+
+class InstallShieldRunTests(unittest.TestCase):
+    """Сквозные сценарии старого InstallShield внутри run()."""
+
+    def _disc(self, temp):
+        media = Path(temp, "AliceCD")
+        media.mkdir()
+        _fake_pe(str(media / "Setup.exe"), [".text", ".rsrc"],
+                 InstallShieldGenerationTests.LEGACY_STRINGS)
+        for name in ("data1.hdr", "data1.cab", "setup.ins", "_setup.dll"):
+            (media / name).write_bytes(b"payload" * 8)
+        return str(media / "Setup.exe")
+
+    def test_program_installed_into_the_default_folder_is_recovered(self):
+        """InstallScript не принимает папку — файлы нужно забрать самим."""
+
+        class FakeInstallScript(Portablizer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.calls.append(plan)
+                # Движок ставит игру в каталог по умолчанию, а не в App.
+                default = Path(data_dir, "AppData", "Local", "Programs",
+                               "Alice")
+                default.mkdir(parents=True, exist_ok=True)
+                (default / "Alice.exe").write_bytes(b"MZ game")
+                (default / "data.dll").write_bytes(b"MZ data")
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._disc(temp)
+            output = Path(temp, "out")
+            output.mkdir()
+            engine = FakeInstallScript(Logger())
+            result = engine.run(PortableOptions(
+                installer_path=installer, output_dir=str(output),
+                app_name="Alice", capture_registry=False, cleanup_host=False))
+
+            self.assertTrue(result.success, "; ".join(result.messages))
+            self.assertEqual(len(engine.calls), 1,
+                             "после успеха лестница обязана остановиться")
+            self.assertEqual(result.main_exe_rel, os.path.join("App", "Alice.exe"))
+            self.assertTrue(Path(result.portable_dir, "App", "data.dll").is_file())
+            self.assertTrue(Path(result.portable_dir, "Launch.bat").is_file())
+
+    def test_failure_explains_the_response_file_instead_of_blaming_licenses(self):
+        class AlwaysEmpty(Portablizer):
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                # Ровно как в журнале пользователя: код 0, папка пуста,
+                # а движок записал причину в свой setup.log.
+                if plan.result_log:
+                    Path(plan.result_log).write_text(
+                        "[ResponseResult]\r\nResultCode=-3\r\n",
+                        encoding="cp1251")
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._disc(temp)
+            output = Path(temp, "out")
+            output.mkdir()
+            result = AlwaysEmpty(Logger()).run(PortableOptions(
+                installer_path=installer, output_dir=str(output),
+                app_name="Alice", capture_registry=False, cleanup_host=False))
+
+            self.assertFalse(result.success)
+            message = "; ".join(result.messages)
+            self.assertIn("ResultCode=-3", message)
+            self.assertIn("setup.iss", message)
+            self.assertIn("/r", message)
+            self.assertIn("окно мастера", message)
+            self.assertFalse(Path(result.portable_dir, "Launch.bat").exists())
+
+    def test_wizard_attempt_runs_only_when_allowed(self):
+        class Recorder(Portablizer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.calls.append(plan)
+                if plan.interactive:
+                    Path(app_dir, "Alice.exe").write_bytes(b"MZ game")
+                    Path(plan.response_file).write_text(
+                        "[SdAskDestPath-0]\r\nszDir=X\r\n", encoding="cp1251")
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._disc(temp)
+            output = Path(temp, "out")
+            output.mkdir()
+
+            quiet = Recorder(Logger())
+            quiet.run(PortableOptions(
+                installer_path=installer, output_dir=str(output),
+                app_name="Alice", capture_registry=False, cleanup_host=False))
+            self.assertFalse(any(p.interactive for p in quiet.calls))
+
+            assisted = Recorder(Logger())
+            result = assisted.run(PortableOptions(
+                installer_path=installer, output_dir=str(output),
+                app_name="Alice", capture_registry=False, cleanup_host=False,
+                allow_assisted_install=True))
+
+            self.assertTrue(result.success, "; ".join(result.messages))
+            self.assertTrue(assisted.calls[-1].interactive)
+            self.assertIn("Ваши ответы сохранены", assisted.log.text)
+            self.assertTrue(Path(result.portable_dir, "setup.iss").is_file())
 
 
 if __name__ == "__main__":
