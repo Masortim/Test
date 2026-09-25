@@ -210,11 +210,21 @@ class MainWindow(QMainWindow):
         self.cb_exelauncher = QCheckBox("Подготовить launcher.py для launcher.exe")
         self.cb_exelauncher.setToolTip(
             "Кладёт в портатив исходник лончера, который можно собрать в exe.")
+        self.cb_assisted = QCheckBox("Разрешить окно мастера установки")
+        self.cb_assisted.setToolTip(
+            "Нужно старым установщикам InstallShield InstallScript 5/6 "
+            "(программы и игры 1998–2002 годов): тихий режим у них работает "
+            "только по файлу ответов setup.iss, а записать его может лишь "
+            "человек. Если ни один тихий сценарий не сработал, Portablizer "
+            "покажет мастер, запишет ваши ответы в setup.iss и перенесёт "
+            "установленную программу в портатив. Требует вашего участия — "
+            "оставьте выключенным для полностью автоматической сборки.")
         checks.addWidget(self.cb_redirect, 0, 0)
         checks.addWidget(self.cb_registry, 0, 1)
         checks.addWidget(self.cb_cleanup, 1, 0)
         checks.addWidget(self.cb_integration, 1, 1)
         checks.addWidget(self.cb_exelauncher, 2, 0)
+        checks.addWidget(self.cb_assisted, 2, 1)
         checks.setColumnStretch(2, 1)
         lay.addLayout(checks)
 
@@ -401,6 +411,7 @@ class MainWindow(QMainWindow):
             build_exe_launcher=self.cb_exelauncher.isChecked(),
             cleanup_host=self.cb_cleanup.isChecked(),
             include_shell_integration=self.cb_integration.isChecked(),
+            allow_assisted_install=self.cb_assisted.isChecked(),
             extra_install_args=args,
             extra_env=self._parse_env(),
         )

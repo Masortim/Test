@@ -6,7 +6,9 @@
 
   * Inno Setup            -> /VERYSILENT /SUPPRESSMSGBOXES /DIR="..."
   * NSIS                  -> /S /D=...            (у /D особый синтаксис)
-  * InstallShield         -> /s /v"/qn INSTALLDIR=..."  (часто через setup.exe)
+  * InstallShield         -> зависит от ПОКОЛЕНИЯ (см. InstallShieldGeneration):
+                             обёртка над MSI   -> /s /v"/qn INSTALLDIR=..."
+                             InstallScript 5/6 -> /s /f1"setup.iss" /f2"setup.log"
   * WiX / MSI (msiexec)   -> /qn INSTALLDIR=... (через msiexec)
   * WiX Burn (bundle)     -> /quiet /install
   * InstallAware / Wise / install4j / BitRock / прочее -> эвристики
@@ -46,6 +48,29 @@ import zipfile
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple
+
+
+class InstallShieldGeneration(str, Enum):
+    """Поколение InstallShield.
+
+    Оба поколения дают на диске файл ``setup.exe`` с одинаковыми сигнатурами,
+    но синтаксис тихой установки у них НЕСОВМЕСТИМ:
+
+    * ``INSTALLSCRIPT`` — классический InstallScript (InstallShield 5/6,
+      1998–2002; ресурсная библиотека ``_isres.dll``, компилированный скрипт
+      ``setup.ins``, медиа ``data1.hdr``/``data1.cab``). Ключа ``/v`` он не
+      знает, целевую папку из командной строки не принимает вовсе, а ``/s``
+      работает ТОЛЬКО по заранее записанному файлу ответов ``setup.iss``
+      (``/r``). Без файла ответов setup.exe выходит за пару секунд с кодом 0,
+      оставив в ``setup.log`` ``ResultCode=-3``/``-5`` — ровно так выглядела
+      неудача с диском «American McGee's Alice».
+    * ``MSI`` — современная обёртка над MSI (Basic MSI / InstallScript MSI,
+      InstallShield 7+): ``setup.exe /s /v"/qn INSTALLDIR=\\"…\\""``.
+    """
+
+    UNKNOWN = "поколение не определено"
+    INSTALLSCRIPT = "InstallScript 5/6 (файл ответов setup.iss)"
+    MSI = "обёртка над MSI (Basic MSI / InstallScript MSI)"
 
 
 class InstallerType(str, Enum):
@@ -140,6 +165,33 @@ _SWITCH_TOKENS: Tuple[str, ...] = (
     # Имена публичных свойств целевой папки.
     "INSTALLDIR", "TARGETDIR", "InstallFolder", "APPDIR", "INSTALLLOCATION",
 )
+
+#: Строки-маркеры, которые не решают, ЧТО за движок, но говорят, КАКОГО ОН
+#: ПОКОЛЕНИЯ. Для InstallShield это принципиально: у InstallScript 5/6 и у
+#: обёртки над MSI командные строки несовместимы.
+_MARKER_TOKENS: Tuple[str, ...] = (
+    # Классический InstallScript (InstallShield 5/6).
+    "_isres", "_setup.dll", "setup.ins", "isprobe", "ikernel",
+    "_inst32i", "isdel.exe",
+    # Обёртка над Windows Installer.
+    "issetup.dll", "isscript.msi", "msiexec", "windows installer",
+    "installshield setup launcher",
+)
+
+#: Файлы медиа-раскладки рядом с setup.exe. На дисках и в распакованных
+#: образах они — самое надёжное доказательство поколения InstallShield:
+#: заглядывать внутрь упакованного exe для этого не нужно.
+_IS_LEGACY_MEDIA: Dict[str, int] = {
+    "data1.hdr": 2, "setup.ins": 2, "_inst32i.ex_": 2, "_isres.dll": 2,
+    "data1.cab": 1, "data2.cab": 1, "layout.bin": 1, "_sys1.cab": 1,
+    "_user1.cab": 1, "engine32.cab": 1, "ikernel.ex_": 1, "_setup.dll": 1,
+    "setup.ini": 0,
+}
+
+_IS_MSI_MEDIA: Dict[str, int] = {
+    "issetup.dll": 2, "isscript.msi": 2, "instmsia.exe": 1,
+    "instmsiw.exe": 1, "isscript11.msi": 2, "isscript1150.msi": 2,
+}
 
 #: Строка из встроенного манифеста: установщик обязательно требует UAC.
 _ADMIN_MARKERS: Tuple[bytes, ...] = (
@@ -286,6 +338,8 @@ class ScanResult:
     switches: List[str] = field(default_factory=list)
     urls: List[str] = field(default_factory=list)
     requires_admin: bool = False
+    #: Найденные строки-маркеры поколения (см. ``_MARKER_TOKENS``).
+    markers: Set[str] = field(default_factory=set)
 
 
 def _needles(text: str) -> Tuple[bytes, bytes]:
@@ -308,7 +362,9 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
         for itype, signatures in _SIGNATURES.items()
     }
     switch_needles = [(token, _needles(token)) for token in _SWITCH_TOKENS]
+    marker_needles = [(token, _needles(token)) for token in _MARKER_TOKENS]
     found_switches: Set[str] = set()
+    found_markers: Set[str] = set()
     urls: List[str] = []
     seen_urls: Set[str] = set()
 
@@ -317,6 +373,7 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
          [p for variants in signature_needles.values() for p in variants]
          for encoded in pair]
         + [len(encoded) for _t, pair in switch_needles for encoded in pair]
+        + [len(encoded) for _t, pair in marker_needles for encoded in pair]
         + [400]  # запас на URL, разрезанный границей чанка
     )
 
@@ -344,6 +401,12 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
                     if ascii_sig in data or wide_sig in data:
                         found_switches.add(token)
 
+                for token, (ascii_sig, wide_sig) in marker_needles:
+                    if token in found_markers:
+                        continue
+                    if ascii_sig in data or wide_sig in data:
+                        found_markers.add(token)
+
                 if not result.requires_admin:
                     result.requires_admin = any(m in data for m in _ADMIN_MARKERS)
 
@@ -361,6 +424,7 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
         return result
 
     result.switches = [t for t in _SWITCH_TOKENS if t in found_switches]
+    result.markers = found_markers
     result.urls = urls
     return result
 
@@ -372,6 +436,120 @@ def _decoded_views(data: bytes) -> List[str]:
         views.append(data.decode("utf-16-le", "replace"))
         views.append(data[1:].decode("utf-16-le", "replace"))
     return views
+
+
+# --- медиа-раскладка рядом с установщиком -------------------------------------
+
+@dataclass
+class MediaLayout:
+    """Что лежит в одной папке с установщиком.
+
+    Классические установщики на дисках (CD/DVD, распакованный ISO) — это не
+    один exe, а раскладка: ``setup.exe`` + ``data1.cab``/``data1.hdr`` +
+    ``setup.ins``. По ней поколение InstallShield определяется точнее, чем по
+    строкам внутри самого exe, и заодно находится готовый файл ответов
+    ``setup.iss``, если он есть на диске.
+    """
+
+    directory: str = ""
+    files: List[str] = field(default_factory=list)
+    #: Найденные файлы ответов InstallShield (*.iss).
+    response_files: List[str] = field(default_factory=list)
+    #: MSI-пакеты рядом с setup.exe (признак обёртки над Windows Installer).
+    msi_files: List[str] = field(default_factory=list)
+    legacy_hits: List[str] = field(default_factory=list)
+    msi_hits: List[str] = field(default_factory=list)
+
+    @property
+    def legacy_score(self) -> int:
+        return sum(_IS_LEGACY_MEDIA.get(name, 0) for name in self.legacy_hits)
+
+    @property
+    def msi_score(self) -> int:
+        score = sum(_IS_MSI_MEDIA.get(name, 0) for name in self.msi_hits)
+        return score + (2 if self.msi_files else 0)
+
+
+def scan_media_layout(path: str, limit: int = 4000) -> MediaLayout:
+    """Читает список файлов рядом с установщиком (без рекурсии)."""
+    layout = MediaLayout(directory=os.path.dirname(os.path.abspath(path)))
+    try:
+        with os.scandir(layout.directory) as entries:
+            for index, entry in enumerate(entries):
+                if index >= limit:
+                    break
+                if not entry.is_file():
+                    continue
+                layout.files.append(entry.name)
+    except OSError:
+        return layout
+
+    installer_name = os.path.basename(path).casefold()
+    for name in layout.files:
+        lowered = name.casefold()
+        if lowered == installer_name:
+            continue
+        if lowered.endswith(".iss"):
+            layout.response_files.append(os.path.join(layout.directory, name))
+        elif lowered.endswith(".msi"):
+            layout.msi_files.append(os.path.join(layout.directory, name))
+        if lowered in _IS_MSI_MEDIA:
+            layout.msi_hits.append(lowered)
+        elif lowered in _IS_LEGACY_MEDIA:
+            layout.legacy_hits.append(lowered)
+    # setup.iss рядом с setup.exe — то, что ищет `/s` по умолчанию.
+    layout.response_files.sort(
+        key=lambda p: (os.path.basename(p).casefold() != "setup.iss",
+                       os.path.basename(p).casefold()))
+    return layout
+
+
+def installshield_generation(
+    scan: ScanResult, layout: MediaLayout,
+) -> Tuple[InstallShieldGeneration, List[str]]:
+    """Определяет поколение InstallShield и объясняет, почему именно так."""
+    evidence: List[str] = []
+
+    legacy_markers = {"_isres": 2, "setup.ins": 2, "_inst32i": 2,
+                      "_setup.dll": 1, "ikernel": 1, "isprobe": 1,
+                      "isdel.exe": 1}
+    msi_markers = {"issetup.dll": 2, "isscript.msi": 2,
+                   "installshield setup launcher": 1, "msiexec": 1,
+                   "windows installer": 1}
+
+    legacy = sum(weight for token, weight in legacy_markers.items()
+                 if token in scan.markers)
+    msi = sum(weight for token, weight in msi_markers.items()
+              if token in scan.markers)
+    hit_names = [t for t in legacy_markers if t in scan.markers]
+    if hit_names:
+        evidence.append("строки InstallScript внутри setup.exe: "
+                        + ", ".join(hit_names))
+    msi_names = [t for t in msi_markers if t in scan.markers]
+    if msi_names:
+        evidence.append("строки обёртки над MSI: " + ", ".join(msi_names))
+
+    legacy += layout.legacy_score
+    msi += layout.msi_score
+    if layout.legacy_hits:
+        evidence.append("медиа-раскладка рядом с установщиком: "
+                        + ", ".join(sorted(set(layout.legacy_hits))))
+    if layout.msi_files:
+        evidence.append(
+            "рядом лежит MSI-пакет: "
+            + ", ".join(sorted(os.path.basename(m)
+                               for m in layout.msi_files)[:3]))
+    if layout.response_files:
+        evidence.append(
+            "найден готовый файл ответов: "
+            + ", ".join(sorted(os.path.basename(r)
+                               for r in layout.response_files)[:3]))
+
+    if msi >= 2 and msi >= legacy:
+        return InstallShieldGeneration.MSI, evidence
+    if legacy >= 2:
+        return InstallShieldGeneration.INSTALLSCRIPT, evidence
+    return InstallShieldGeneration.UNKNOWN, evidence
 
 
 # --- результат ----------------------------------------------------------------
@@ -397,12 +575,35 @@ class DetectionResult:
     sections: List[str] = field(default_factory=list)
     #: К файлу приклеен ZIP — его можно распаковать, не запуская установщик.
     has_zip_payload: bool = False
+    #: Поколение InstallShield: от него зависит весь синтаксис тишины.
+    installshield_generation: InstallShieldGeneration = (
+        InstallShieldGeneration.UNKNOWN)
+    #: Файлы ответов (*.iss), найденные рядом с установщиком.
+    response_files: List[str] = field(default_factory=list)
+    #: Папка с установщиком (медиа-раскладка диска).
+    media_dir: str = ""
 
     @property
     def human(self) -> str:
         prefix = f"{self.vendor_name}: " if self.vendor_name else ""
-        return (f"{prefix}{self.installer_type.value} "
+        suffix = ""
+        if (self.installer_type == InstallerType.INSTALLSHIELD
+                and self.installshield_generation
+                != InstallShieldGeneration.UNKNOWN):
+            suffix = f", {self.installshield_generation.value}"
+        return (f"{prefix}{self.installer_type.value}{suffix} "
                 f"(уверенность {int(self.confidence * 100)}%)")
+
+    @property
+    def is_legacy_installshield(self) -> bool:
+        """InstallScript 5/6: ни ``/v``, ни целевой папки в командной строке."""
+        return (self.installer_type == InstallerType.INSTALLSHIELD
+                and self.installshield_generation
+                == InstallShieldGeneration.INSTALLSCRIPT)
+
+    @property
+    def response_file(self) -> str:
+        return self.response_files[0] if self.response_files else ""
 
     def has_switch(self, *tokens: str) -> bool:
         available = {s.casefold() for s in self.switch_hints}
@@ -445,6 +646,7 @@ def detect_installer(path: str) -> DetectionResult:
 
     pe = read_pe_info(path)
     scan = scan_file(path)
+    layout = scan_media_layout(path)
 
     scores: Dict[InstallerType, float] = {}
     evidence: Dict[InstallerType, List[str]] = {}
@@ -506,6 +708,17 @@ def detect_installer(path: str) -> DetectionResult:
             cli_evidence.append(".NET-сборка (собственный bootstrapper)")
         evidence[InstallerType.CUSTOM_CLI] = cli_evidence
 
+    # Раскладка диска (``data1.hdr`` + ``setup.ins`` рядом с setup.exe) —
+    # доказательство не хуже сигнатуры: у упакованных или очень старых
+    # setup.exe строки внутри файла могут не найтись вовсе.
+    rival = max((score for itype, score in scores.items()
+                 if itype != InstallerType.INSTALLSHIELD), default=0.0)
+    if (layout.legacy_score >= 3 or layout.msi_score >= 3) and rival < 0.85:
+        proven = max(scores.get(InstallerType.INSTALLSHIELD, 0.0), 0.9)
+        scores[InstallerType.INSTALLSHIELD] = proven
+        evidence.setdefault(InstallerType.INSTALLSHIELD, []).append(
+            "рядом с установщиком лежит медиа-раскладка InstallShield")
+
     if not scores:
         result = DetectionResult(
             InstallerType.UNKNOWN, 0.2,
@@ -553,6 +766,24 @@ def detect_installer(path: str) -> DetectionResult:
     result.is_dotnet = pe.is_dotnet
     result.sections = list(pe.sections)
     result.has_zip_payload = _has_zip_payload(path)
+    result.media_dir = layout.directory
+    result.response_files = list(layout.response_files)
+
+    if result.installer_type == InstallerType.INSTALLSHIELD:
+        generation, generation_evidence = installshield_generation(scan, layout)
+        result.installshield_generation = generation
+        result.evidence.extend(generation_evidence)
+        if generation == InstallShieldGeneration.INSTALLSCRIPT:
+            result.evidence.append(
+                "InstallScript 5/6: ключ /v не поддерживается, целевая папка "
+                "из командной строки не принимается, а /s работает только по "
+                "записанному файлу ответов setup.iss"
+            )
+        elif generation == InstallShieldGeneration.UNKNOWN:
+            result.evidence.append(
+                "поколение InstallShield определить не удалось — будут "
+                "испробованы команды обоих поколений"
+            )
 
     if profile is None and result.switch_hints:
         result.evidence.append(
