@@ -10,7 +10,8 @@
 4. Аккуратно поработать с реестром: сохранить прежнее состояние чужого ПК,
    подставить настройки программы, а после выхода выгрузить их обратно в
    портатив и вернуть реестр в исходное состояние.
-5. Запустить программу, дождаться её завершения и вернуть её код возврата.
+5. Запустить программу (или её лаунчер/конфигуратор), дождаться завершения
+   и вернуть её код возврата.
 
 Почему ``Launch.bat`` строго ASCII
 ----------------------------------
@@ -31,6 +32,9 @@ cmd.exe читает .bat не построчно, а блоками, запом
 Мы генерируем несколько вариантов запуска:
   * ``Launch.bat``  — основной, не требует ничего, работает на любой Windows;
   * ``LaunchHidden.vbs`` — тот же запуск, но без окна консоли;
+  * ``Launch_Launcher.bat`` / ``Launch_Configurator.bat`` / ``Launch_<Tool>.bat``
+    — запуск вспомогательных лаунчеров и конфигураторов в изолированной среде;
+  * ``Launch_Menu.bat`` — интерактивное меню выбора программы;
   * ``launcher.py`` — та же логика на Python (для сборки launcher.exe).
 """
 from __future__ import annotations
@@ -47,7 +51,18 @@ from .. import __version__
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
 
 #: Максимум ключей реестра, обслуживаемых лончером (защита от «простыни»).
-MAX_REGISTRY_KEYS = 32
+MAX_REGISTRY_KEYS = 256
+
+
+@dataclass
+class TargetInfo:
+    """Информация об исполняемом файле в составе портативного приложения."""
+    name: str
+    rel_path: str
+    role: str = "main"        # "main", "launcher", "config", "tool", "auxiliary"
+    description: str = ""
+    bat_name: str = ""
+    vbs_name: str = ""
 
 
 @dataclass
@@ -75,6 +90,10 @@ class LauncherConfig:
     extra_env: Dict[str, str] = field(default_factory=dict)
     # Относительные папки, добавляемые в PATH.
     path_prepend: List[str] = field(default_factory=list)
+    # Все обнаруженные цели (главный exe, лаунчер, конфигуратор, утилиты)
+    targets: List[TargetInfo] = field(default_factory=list)
+    launcher_target_rel: str = ""
+    config_target_rel: str = ""
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -180,24 +199,38 @@ def _env_lines(cfg: LauncherConfig) -> str:
 def _target_lines(cfg: LauncherConfig) -> str:
     rel = _win_rel(cfg.target_exe_rel)
     if is_ascii_safe(rel):
-        return f'set "PORTABLE_TARGET=%PORTABLE_ROOT%\\{_bat_set_value(rel)}"'
-    # Не-ASCII путь: литерал сломал бы разбор .bat, поэтому имя ищется маской.
-    mask = _bat_set_value(_wildcard_mask(rel))
-    directory, _, filename = rel.rpartition("\\")
-    file_mask = _bat_set_value(_wildcard_mask(filename))
-    lines = [
-        "rem The executable name is not ASCII: resolve it through the file",
-        "rem system with a ? mask instead of writing it into this script.",
-        'set "PORTABLE_TARGET="',
-        f'for %%F in ("%PORTABLE_ROOT%\\{mask}") do '
-        'if not defined PORTABLE_TARGET set "PORTABLE_TARGET=%%~fF"',
-        "if not defined PORTABLE_TARGET for /f \"delims=\" %%F in "
-        f"('dir /b /s /a-d \"%PORTABLE_ROOT%\\{_bat_set_value(_win_rel(directory))}\\{file_mask}\" 2^>nul') do "
-        'if not defined PORTABLE_TARGET set "PORTABLE_TARGET=%%~fF"',
-        'if not defined PORTABLE_TARGET set "PORTABLE_TARGET=%PORTABLE_ROOT%\\'
-        + mask + '"',
+        base_lines = [f'set "PORTABLE_TARGET=%PORTABLE_ROOT%\\{_bat_set_value(rel)}"']
+    else:
+        # Не-ASCII путь: литерал сломал бы разбор .bat, поэтому имя ищется маской.
+        mask = _bat_set_value(_wildcard_mask(rel))
+        directory, _, filename = rel.rpartition("\\")
+        file_mask = _bat_set_value(_wildcard_mask(filename))
+        base_lines = [
+            "rem The executable name is not ASCII: resolve it through the file",
+            "rem system with a ? mask instead of writing it into this script.",
+            'set "PORTABLE_TARGET="',
+            f'for %%F in ("%PORTABLE_ROOT%\\{mask}") do '
+            'if not defined PORTABLE_TARGET set "PORTABLE_TARGET=%%~fF"',
+            "if not defined PORTABLE_TARGET for /f \"delims=\" %%F in "
+            f"('dir /b /s /a-d \"%PORTABLE_ROOT%\\{_bat_set_value(_win_rel(directory))}\\{file_mask}\" 2^>nul') do "
+            'if not defined PORTABLE_TARGET set "PORTABLE_TARGET=%%~fF"',
+            'if not defined PORTABLE_TARGET set "PORTABLE_TARGET=%PORTABLE_ROOT%\\'
+            + mask + '"',
+        ]
+
+    # Поддержка переопределения через --target / --launcher / --config
+    custom_lines = [
+        'if defined PORTABLE_CUSTOM_TARGET (',
+        '  if exist "%PORTABLE_ROOT%\\%PORTABLE_CUSTOM_TARGET%" (',
+        '    set "PORTABLE_TARGET=%PORTABLE_ROOT%\\%PORTABLE_CUSTOM_TARGET%"',
+        '  ) else if exist "%PORTABLE_CUSTOM_TARGET%" (',
+        '    set "PORTABLE_TARGET=%PORTABLE_CUSTOM_TARGET%"',
+        '  ) else if exist "%PORTABLE_ROOT%\\App\\%PORTABLE_CUSTOM_TARGET%" (',
+        '    set "PORTABLE_TARGET=%PORTABLE_ROOT%\\App\\%PORTABLE_CUSTOM_TARGET%"',
+        '  )',
+        ')',
     ]
-    return "\n".join(lines)
+    return "\n".join(base_lines + custom_lines)
 
 
 def usable_registry_keys(keys: Sequence[str]) -> List[str]:
@@ -215,6 +248,30 @@ def usable_registry_keys(keys: Sequence[str]) -> List[str]:
     return result
 
 
+def consolidate_root_keys(keys: Sequence[str]) -> List[str]:
+    """Возвращает минимальный набор корневых ключей для безопасного экспорта/импорта.
+
+    Если в списке есть 'HKCU\\Software\\Vendor' и 'HKCU\\Software\\Vendor\\App',
+    экспорт 'HKCU\\Software\\Vendor' уже рекурсивно покрывает все дочерние ветки.
+    """
+    cleaned = [k.rstrip("\\") for k in keys if k and is_ascii_safe(k)]
+    cleaned = sorted(set(cleaned), key=lambda s: (s.count("\\"), s.lower()))
+    roots: List[str] = []
+    for k in cleaned:
+        parts = k.split("\\")
+        if len(parts) <= 2:
+            roots.append(k)
+            continue
+        is_sub = False
+        for root in roots:
+            if k.lower() == root.lower() or k.lower().startswith(root.lower() + "\\"):
+                is_sub = True
+                break
+        if not is_sub:
+            roots.append(k)
+    return usable_registry_keys(roots)
+
+
 def _registry_load_block(cfg: LauncherConfig) -> str:
     if not cfg.apply_registry:
         return "rem (registry support is disabled for this portable app)\ngoto :eof"
@@ -227,7 +284,7 @@ def _registry_load_block(cfg: LauncherConfig) -> str:
 
     # Прежнее состояние чужого ПК сохраняем до любых изменений, чтобы после
     # выхода вернуть всё как было.
-    keys = usable_registry_keys(cfg.registry_keys)
+    keys = consolidate_root_keys(cfg.registry_keys)
     for index, key in enumerate(keys):
         backup = f'%PORTABLE_REG_BACKUP%\\k{index:02d}.reg'
         lines.append(
@@ -258,11 +315,11 @@ def _registry_load_block(cfg: LauncherConfig) -> str:
 def _registry_save_block(cfg: LauncherConfig) -> str:
     if not cfg.apply_registry:
         return "goto :eof"
-    keys = usable_registry_keys(cfg.registry_keys)
+    keys = consolidate_root_keys(cfg.registry_keys)
     if not keys:
         return "goto :eof"
 
-    created = set(usable_registry_keys(cfg.registry_created_keys))
+    created = set(consolidate_root_keys(cfg.registry_created_keys))
     lines: List[str] = [
         'if not defined PORTABLE_REGISTRY goto :eof',
         'if not defined PORTABLE_RESTORE goto :eof',
@@ -298,6 +355,11 @@ rem  no message at all. Keep every literal in this file ASCII-only.
 rem
 rem  Usage:
 rem    Launch.bat [options] [-- program arguments]
+rem      --target <path>   run a specific target executable inside the sandbox
+rem      --launcher        run the program's preinstalled launcher (if present)
+rem      --config          run the configuration/settings tool (if present)
+rem      --menu            show interactive menu to choose which program to run
+rem      --list            list all detected runnable executables
 rem      --nopause         never wait for a key press
 rem      --pause           always wait for a key press before closing
 rem      --no-registry     do not touch the registry at all
@@ -312,11 +374,14 @@ set "PORTABLE_RESTORE=1"
 set "PORTABLE_RESET="
 set "PORTABLE_ARGS="
 set "PORTABLE_RC=0"
+set "PORTABLE_CUSTOM_TARGET="
+set "PORTABLE_MENU="
 
 :portable_parse
 if "%~1" == "" goto portable_parsed
 if /i "%~1" == "--help" goto portable_help
 if /i "%~1" == "/?" goto portable_help
+if /i "%~1" == "--list" goto portable_list
 if /i "%~1" == "--nopause" (
   set "PORTABLE_PAUSE=never"
   shift
@@ -339,6 +404,19 @@ if /i "%~1" == "--keep-registry" (
 )
 if /i "%~1" == "--reset" (
   set "PORTABLE_RESET=1"
+  shift
+  goto portable_parse
+)
+if /i "%~1" == "--menu" (
+  set "PORTABLE_MENU=1"
+  shift
+  goto portable_parse
+)
+{launcher_arg_block}
+{config_arg_block}
+if /i "%~1" == "--target" (
+  set "PORTABLE_CUSTOM_TARGET=%~2"
+  shift
   shift
   goto portable_parse
 )
@@ -424,6 +502,13 @@ rem --- Custom environment variables ------------------------------------------
 rem --- Locate the program -----------------------------------------------------
 {target_lines}
 
+if defined PORTABLE_MENU goto portable_show_menu
+goto portable_target_ready
+
+:portable_show_menu
+{menu_block}
+
+:portable_target_ready
 if not exist "%PORTABLE_TARGET%" (
   echo [ERROR] Program not found:
   echo   "%PORTABLE_TARGET%"
@@ -465,6 +550,11 @@ echo {title} - portable launcher
 echo.
 echo   Launch.bat [options] [-- program arguments]
 echo.
+echo     --target ^<path^>   run a specific target executable inside the sandbox
+echo     --launcher        run the program's preinstalled launcher (if present)
+echo     --config          run the configuration/settings tool (if present)
+echo     --menu            show interactive menu to choose which program to run
+echo     --list            list all detected runnable executables
 echo     --nopause         never wait for a key press
 echo     --pause           always wait for a key press before closing
 echo     --no-registry     do not touch the registry at all
@@ -473,6 +563,14 @@ echo     --reset           forget the saved session settings and start clean
 echo     --help            show this help
 echo.
 echo All settings stay inside the {data_dir_name} folder next to this file.
+endlocal & exit /b 0
+
+:portable_list
+echo ===========================================================================
+echo  {title} (portable) - Detected Executables:
+echo ===========================================================================
+{list_items}
+echo ===========================================================================
 endlocal & exit /b 0
 
 :portable_registry_load
@@ -525,6 +623,91 @@ def render_bat(cfg: LauncherConfig) -> str:
     if not is_ascii_safe(data_dir):
         data_dir = "PortableData"
     args = _bat_args(cfg.target_args)
+
+    # Дополнительные аргументы --launcher и --config
+    launcher_rel = _win_rel(cfg.launcher_target_rel) if cfg.launcher_target_rel else ""
+    config_rel = _win_rel(cfg.config_target_rel) if cfg.config_target_rel else ""
+
+    if launcher_rel and is_ascii_safe(launcher_rel):
+        launcher_arg_block = (
+            'if /i "%~1" == "--launcher" (\n'
+            f'  set "PORTABLE_CUSTOM_TARGET={_bat_set_value(launcher_rel)}"\n'
+            '  shift\n'
+            '  goto portable_parse\n'
+            ')'
+        )
+    else:
+        launcher_arg_block = "rem (no standalone launcher detected)"
+
+    if config_rel and is_ascii_safe(config_rel):
+        config_arg_block = (
+            'if /i "%~1" == "--config" (\n'
+            f'  set "PORTABLE_CUSTOM_TARGET={_bat_set_value(config_rel)}"\n'
+            '  shift\n'
+            '  goto portable_parse\n'
+            ')\n'
+            'if /i "%~1" == "--settings" (\n'
+            f'  set "PORTABLE_CUSTOM_TARGET={_bat_set_value(config_rel)}"\n'
+            '  shift\n'
+            '  goto portable_parse\n'
+            ')'
+        )
+    else:
+        config_arg_block = "rem (no standalone configuration tool detected)"
+
+    # Интерактивное меню и список целей
+    all_targets = list(cfg.targets)
+    if not all_targets and cfg.target_exe_rel:
+        all_targets = [TargetInfo(name=title, rel_path=cfg.target_exe_rel, role="main")]
+
+    menu_lines: List[str] = [
+        "echo ===========================================================================",
+        f"echo  {_bat_echo(title)} (portable) - Launcher Menu",
+        "echo ===========================================================================",
+    ]
+    list_lines: List[str] = []
+    choice_branches: List[str] = []
+
+    for index, target in enumerate(all_targets, start=1):
+        target_name = ascii_display(target.name, fallback="target")
+        raw_rel = _win_rel(target.rel_path)
+        target_rel_safe = raw_rel if is_ascii_safe(raw_rel) else _wildcard_mask(raw_rel)
+        role_tag = f"[{target.role.upper()}]" if target.role != "main" else "[MAIN]"
+        menu_lines.append(f"echo   [{index}] {role_tag} {target_name} ({_bat_echo(target_rel_safe)})")
+        list_lines.append(f"echo   * {role_tag} {target_name}: {_bat_echo(target_rel_safe)}")
+        choice_branches += [
+            f'if "%PORTABLE_CHOICE%" == "{index}" (',
+            f'  set "PORTABLE_CUSTOM_TARGET={_bat_set_value(target_rel_safe)}"',
+            '  goto portable_menu_apply',
+            ')',
+        ]
+
+    menu_lines.append("echo   [0] Exit")
+    menu_lines.append("echo ===========================================================================")
+    menu_lines.append('set "PORTABLE_CHOICE=1"')
+    menu_lines.append(f'set /p "PORTABLE_CHOICE=Select program [0-{len(all_targets)}]: "')
+    menu_lines.append('if "%PORTABLE_CHOICE%" == "0" (\n  endlocal\n  exit /b 0\n)')
+    menu_lines.extend(choice_branches)
+    menu_lines.append("echo Invalid choice. Starting default program...")
+    menu_lines.append(":portable_menu_apply")
+    menu_lines.append("if defined PORTABLE_CUSTOM_TARGET (")
+    menu_lines.append('  if exist "%PORTABLE_ROOT%\\%PORTABLE_CUSTOM_TARGET%" (')
+    menu_lines.append('    set "PORTABLE_TARGET=%PORTABLE_ROOT%\\%PORTABLE_CUSTOM_TARGET%"')
+    menu_lines.append('  ) else if exist "%PORTABLE_CUSTOM_TARGET%" (')
+    menu_lines.append('    set "PORTABLE_TARGET=%PORTABLE_CUSTOM_TARGET%"')
+    menu_lines.append('  ) else if exist "%PORTABLE_ROOT%\\App\\%PORTABLE_CUSTOM_TARGET%" (')
+    menu_lines.append('    set "PORTABLE_TARGET=%PORTABLE_ROOT%\\App\\%PORTABLE_CUSTOM_TARGET%"')
+    menu_lines.append("  )")
+    menu_lines.append(")")
+    menu_lines.append("goto portable_target_ready")
+
+    safe_main_rel = _win_rel(cfg.target_exe_rel)
+    if not is_ascii_safe(safe_main_rel):
+        safe_main_rel = _wildcard_mask(safe_main_rel)
+
+    menu_block = "\n".join(menu_lines) if len(all_targets) >= 2 else "goto portable_target_ready"
+    list_items = "\n".join(list_lines) if list_lines else f"echo   * [MAIN] {title}: {_bat_echo(safe_main_rel)}"
+
     text = _BAT_TEMPLATE.format(
         title=_bat_echo(title),
         version=_bat_echo(__version__),
@@ -535,10 +718,12 @@ def render_bat(cfg: LauncherConfig) -> str:
         target_args=(args + " ") if args else "",
         registry_load=_registry_load_block(cfg),
         registry_save=_registry_save_block(cfg),
-        # Подпрограммы работы с реестром нужны, только если реестр вообще
-        # используется: иначе в файле не должно быть ни одной команды reg.
         registry_helpers=_REGISTRY_HELPERS if cfg.apply_registry else "",
         root_token=ROOT_TOKEN,
+        launcher_arg_block=launcher_arg_block,
+        config_arg_block=config_arg_block,
+        menu_block=menu_block,
+        list_items=list_items,
     )
     return ensure_ascii_bat(text)
 
@@ -563,6 +748,60 @@ shell.Run line, 0, False
 
 def render_vbs() -> str:
     return ensure_ascii_bat(_VBS_TEMPLATE)
+
+
+# --- Вспомогательные лаунчеры и меню ------------------------------------------
+
+def render_companion_bat(cfg: LauncherConfig, target: TargetInfo) -> str:
+    """Создаёт Launch_<Name>.bat для запуска вспомогательного файла в портативе."""
+    title = ascii_display(f"{cfg.app_name} - {target.name}")
+    rel = _win_rel(target.rel_path)
+    text = (
+        "@echo off\r\n"
+        "setlocal EnableExtensions\r\n"
+        "rem ===========================================================================\r\n"
+        f"rem  {title} - companion portable launcher\r\n"
+        f"rem  Target: {rel}\r\n"
+        "rem ===========================================================================\r\n"
+        "for %%I in (\"%~dp0.\") do set \"PORTABLE_LAUNCHER_DIR=%%~fI\"\r\n"
+        f"\"%PORTABLE_LAUNCHER_DIR%\\Launch.bat\" --target \"{_bat_set_value(rel)}\" %*\r\n"
+    )
+    return ensure_ascii_bat(text)
+
+
+def render_companion_vbs(cfg: LauncherConfig, target: TargetInfo) -> str:
+    """Создаёт Launch_<Name>.vbs для скрытого запуска вспомогательного файла."""
+    rel = _win_rel(target.rel_path)
+    text = (
+        "' Starts companion target without showing a console window.\r\n"
+        "Option Explicit\r\n"
+        "Dim shell, fso, root, args, i, line\r\n"
+        "Set shell = CreateObject(\"WScript.Shell\")\r\n"
+        "Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n"
+        "root = fso.GetParentFolderName(WScript.ScriptFullName)\r\n"
+        "args = \"\"\r\n"
+        "For i = 0 To WScript.Arguments.Count - 1\r\n"
+        "    args = args & \" \" & Chr(34) & WScript.Arguments(i) & Chr(34)\r\n"
+        "Next\r\n"
+        f"line = Chr(34) & root & \"\\Launch.bat\" & Chr(34) & \" --nopause --target \" & Chr(34) & \"{rel}\" & Chr(34) & args\r\n"
+        "shell.Run line, 0, False\r\n"
+    )
+    return ensure_ascii_bat(text)
+
+
+def render_menu_bat(cfg: LauncherConfig) -> str:
+    """Создаёт Launch_Menu.bat для интерактивного выбора программы."""
+    title = ascii_display(f"{cfg.app_name} - Menu")
+    text = (
+        "@echo off\r\n"
+        "setlocal EnableExtensions\r\n"
+        "rem ===========================================================================\r\n"
+        f"rem  {title} - portable interactive menu\r\n"
+        "rem ===========================================================================\r\n"
+        "for %%I in (\"%~dp0.\") do set \"PORTABLE_LAUNCHER_DIR=%%~fI\"\r\n"
+        "\"%PORTABLE_LAUNCHER_DIR%\\Launch.bat\" --menu %*\r\n"
+    )
+    return ensure_ascii_bat(text)
 
 
 # --- Python лончер (для сборки launcher.exe) ---------------------------------
@@ -685,12 +924,68 @@ def main():
             if registry.get("machine_file") and os.path.exists(machine):
                 reg("import", machine)
 
-    target = os.path.join(root, cfg["target_exe_rel"].replace("/", os.sep))
-    if not os.path.exists(target):
-        print("ERROR: program not found:", target)
-        return 1
+    # Разбор аргументов для выбора цели
+    target_rel = cfg["target_exe_rel"]
+    custom_target = None
+    argv = list(sys.argv[1:])
 
-    code = subprocess.run([target] + cfg.get("target_args", []) + sys.argv[1:],
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--launcher" and cfg.get("launcher_target_rel"):
+            custom_target = cfg["launcher_target_rel"]
+            argv.pop(i)
+            continue
+        if (arg == "--config" or arg == "--settings") and cfg.get("config_target_rel"):
+            custom_target = cfg["config_target_rel"]
+            argv.pop(i)
+            continue
+        if arg == "--target" and i + 1 < len(argv):
+            custom_target = argv[i + 1]
+            argv.pop(i)
+            argv.pop(i)
+            continue
+        if arg == "--list":
+            print(f"Detected targets in {cfg.get('app_name', 'App')}:")
+            for t in cfg.get("targets", []):
+                print(f"  [{t.get('role', 'target')}] {t.get('name')}: {t.get('rel_path')}")
+            return 0
+        if arg == "--menu":
+            targets = cfg.get("targets", [])
+            if targets:
+                print("=======================================================")
+                print(f" {cfg.get('app_name', 'App')} - Launcher Menu")
+                print("=======================================================")
+                for idx, t in enumerate(targets, 1):
+                    print(f"  [{idx}] {t.get('name')}: {t.get('rel_path')}")
+                print("  [0] Exit")
+                print("=======================================================")
+                try:
+                    choice = input(f"Select option [0-{len(targets)}]: ").strip()
+                    if choice == "0":
+                        return 0
+                    choice_num = int(choice)
+                    if 1 <= choice_num <= len(targets):
+                        custom_target = targets[choice_num - 1]["rel_path"]
+                except (ValueError, EOFError, KeyboardInterrupt):
+                    pass
+            argv.pop(i)
+            continue
+        i += 1
+
+    if custom_target:
+        target_rel = custom_target
+
+    target = os.path.join(root, target_rel.replace("/", os.sep))
+    if not os.path.exists(target):
+        alt = os.path.join(root, "App", target_rel.replace("/", os.sep))
+        if os.path.exists(alt):
+            target = alt
+        else:
+            print("ERROR: program not found:", target)
+            return 1
+
+    code = subprocess.run([target] + cfg.get("target_args", []) + argv,
                           cwd=os.path.dirname(target), env=env).returncode
 
     if active and registry.get("restore_on_exit", True):
@@ -718,10 +1013,24 @@ def render_py_launcher(cfg: LauncherConfig) -> str:
 
 
 def render_config_json(cfg: LauncherConfig) -> str:
+    targets_data = [
+        {
+            "name": t.name,
+            "rel_path": t.rel_path,
+            "role": t.role,
+            "description": t.description,
+            "bat_name": t.bat_name,
+            "vbs_name": t.vbs_name,
+        }
+        for t in cfg.targets
+    ]
     return json.dumps({
         "generated_by": f"Portablizer {__version__}",
         "app_name": cfg.app_name,
         "target_exe_rel": cfg.target_exe_rel,
+        "launcher_target_rel": cfg.launcher_target_rel,
+        "config_target_rel": cfg.config_target_rel,
+        "targets": targets_data,
         "target_args": cfg.target_args,
         "data_dir_name": cfg.data_dir_name,
         "extra_env": cfg.extra_env,
@@ -732,7 +1041,7 @@ def render_config_json(cfg: LauncherConfig) -> str:
             "machine_file": cfg.machine_reg_file_name,
             "root_token": ROOT_TOKEN if cfg.registry_has_root_token else "",
             "restore_on_exit": True,
-            "keys": usable_registry_keys(cfg.registry_keys),
-            "created_keys": usable_registry_keys(cfg.registry_created_keys),
+            "keys": consolidate_root_keys(cfg.registry_keys),
+            "created_keys": consolidate_root_keys(cfg.registry_created_keys),
         },
     }, ensure_ascii=False, indent=2)

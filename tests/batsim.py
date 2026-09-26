@@ -329,6 +329,23 @@ class BatchInterpreter:
                               for a in self._tokens(rest)] if rest.strip()
                              else [])
                 return ("call", name.lower())
+            program, _, args = target.partition(" ")
+            program = self.expand(program.strip('"'))
+            if self.fs.exists(program):
+                tokens = self._tokens(self.expand(args).strip())
+                parsed_args = [t.strip('"') for t in tokens]
+                child_text = self.fs.files.get(self.fs._norm(program), "")
+                sub = BatchInterpreter(child_text, program, self.fs,
+                                       argv=parsed_args,
+                                       env=dict(self.env),
+                                       program_exit_code=self.program_exit_code)
+                sub_res = sub.run()
+                self.result.launches.extend(sub_res.launches)
+                self.result.reg_commands.extend(sub_res.reg_commands)
+                self.result.output.extend(sub_res.output)
+                self.errorlevel = sub_res.exit_code or 0
+                self.env["ERRORLEVEL"] = str(self.errorlevel)
+                return None
             return None
         if low.startswith("exit"):
             match = re.search(r"/b\s*(-?\d+|%\w+%)?", command, re.IGNORECASE)
@@ -378,9 +395,24 @@ class BatchInterpreter:
             self.argv = self.argv[1:]
             return None
         if command.startswith('"'):
-            # Запуск внешней программы.
+            # Запуск внешней программы или другого .bat.
             program, _, args = command[1:].partition('"')
             program = self.expand(program)
+            if program.lower().endswith(".bat") and self.fs.exists(program):
+                tokens = self._tokens(self.expand(args).strip())
+                parsed_args = [t.strip('"') for t in tokens]
+                child_text = self.fs.files.get(self.fs._norm(program), "")
+                sub = BatchInterpreter(child_text, program, self.fs,
+                                       argv=parsed_args,
+                                       env=dict(self.env),
+                                       program_exit_code=self.program_exit_code)
+                sub_res = sub.run()
+                self.result.launches.extend(sub_res.launches)
+                self.result.reg_commands.extend(sub_res.reg_commands)
+                self.result.output.extend(sub_res.output)
+                self.errorlevel = sub_res.exit_code or 0
+                self.env["ERRORLEVEL"] = str(self.errorlevel)
+                return None
             if not self.fs.exists(program):
                 raise BatError(f"запуск несуществующего файла: {program}")
             self.result.launches.append(
@@ -396,6 +428,19 @@ class BatchInterpreter:
 
     def _exec_set(self, rest: str) -> None:
         rest = rest.strip()
+        if rest.lower().startswith("/p "):
+            rest = rest[3:].strip()
+            if rest.startswith('"') and rest.endswith('"'):
+                rest = rest[1:-1]
+            name, sep, prompt = rest.partition("=")
+            if name:
+                var_name = name.strip()
+                mock_key = f"INPUT_{var_name.upper()}"
+                if mock_key in self.env:
+                    self.env[var_name.upper()] = self.env[mock_key]
+                elif var_name.upper() not in self.env:
+                    self.env[var_name.upper()] = "1"
+            return
         if rest.startswith('"') and rest.endswith('"'):
             rest = rest[1:-1]
         name, sep, value = rest.partition("=")
@@ -489,14 +534,26 @@ class BatchInterpreter:
         raise BatError("незакрытая скобка в if")
 
     def _exec_body(self, body: str):
-        for raw in body.split("\n"):
-            line = raw.strip()
-            if not line:
+        lines = body.split("\n")
+        index = 0
+        while index < len(lines):
+            raw = lines[index].strip()
+            index += 1
+            if not raw or raw.startswith("::") or _LABEL_RE.match(raw):
                 continue
-            jump = self._exec(line)
+            block, index = self._read_block_from_list(lines, raw, index)
+            jump = self._exec(block)
             if jump is not None:
                 return jump
         return None
+
+    def _read_block_from_list(self, lines: List[str], line: str, index: int) -> Tuple[str, int]:
+        depth = self._depth(line)
+        while depth > 0 and index < len(lines):
+            line += "\n" + lines[index]
+            depth += self._depth(lines[index])
+            index += 1
+        return line, index
 
     def _exec_for(self, rest: str):
         match = re.match(r"%%(\w)\s+in\s*\((.*?)\)\s*do\s+(.*)$", rest,
