@@ -384,19 +384,31 @@ if "%PORTABLE_ROOT:~1,1%" == ":" (
   set "HOMEPATH=%PORTABLE_DATA:~2%\User"
 )
 
+rem Pre-create the whole profile tree. Some programs (game DRM/Steam emulators
+rem in particular) create their data folder without making intermediate
+rem directories first: if the parent is missing they abort with an obscure
+rem message such as "Internal error 0x06: System error!". Creating the usual
+rem folders up front keeps those programs happy.
 for %%D in (
   "%PORTABLE_DATA%"
   "%APPDATA%"
   "%LOCALAPPDATA%"
+  "%LOCALAPPDATA%\Temp"
   "%USERPROFILE%"
   "%TEMP%"
   "%PROGRAMDATA%"
   "%PUBLIC%"
   "%USERPROFILE%\Documents"
+  "%USERPROFILE%\Documents\My Games"
   "%USERPROFILE%\Desktop"
   "%USERPROFILE%\Downloads"
+  "%USERPROFILE%\Saved Games"
   "%USERPROFILE%\AppData\Roaming"
   "%USERPROFILE%\AppData\Local"
+  "%USERPROFILE%\AppData\LocalLow"
+  "%PUBLIC%\Documents"
+  "%PUBLIC%\Desktop"
+  "%PUBLIC%\Downloads"
   "%PORTABLE_REG_SESSION%"
   "%PORTABLE_REG_BACKUP%"
 ) do if not exist "%%~D" mkdir "%%~D" >nul 2>&1
@@ -601,10 +613,22 @@ def main():
     session = os.path.join(data, "Registry")
     backup = os.path.join(data, "RegistryHostBackup")
 
-    for path in (appdata, localappdata, userprofile, temp, programdata,
-                 session, backup,
+    public = os.path.join(data, "Public")
+    # Pre-create the whole profile tree. Some programs (game DRM / Steam
+    # emulators especially) create their data folder without first making the
+    # intermediate directories and abort with an obscure "Internal error 0x06:
+    # System error!" when a parent is missing. Creating them up front avoids it.
+    for path in (appdata, localappdata, os.path.join(localappdata, "Temp"),
+                 userprofile, temp, programdata, public, session, backup,
                  os.path.join(userprofile, "Documents"),
-                 os.path.join(userprofile, "Desktop")):
+                 os.path.join(userprofile, "Documents", "My Games"),
+                 os.path.join(userprofile, "Desktop"),
+                 os.path.join(userprofile, "Downloads"),
+                 os.path.join(userprofile, "Saved Games"),
+                 os.path.join(userprofile, "AppData", "LocalLow"),
+                 os.path.join(public, "Documents"),
+                 os.path.join(public, "Desktop"),
+                 os.path.join(public, "Downloads")):
         os.makedirs(path, exist_ok=True)
 
     env = dict(os.environ)
@@ -614,6 +638,7 @@ def main():
         "USERPROFILE": userprofile,
         "TEMP": temp, "TMP": temp,
         "PROGRAMDATA": programdata,
+        "PUBLIC": public,
         "USERNAME": "Portable",
         "PORTABLE_APP": "1",
     })

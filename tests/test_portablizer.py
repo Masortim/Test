@@ -331,6 +331,21 @@ class LaunchBatExecutionTests(unittest.TestCase):
             self.assertTrue(res.env[var].startswith(self.ROOT),
                             f"{var} указывает наружу: {res.env[var]}")
 
+    def test_public_and_my_games_directories_are_created(self):
+        # Регрессия на «Internal error 0x06: System error!»: программы (в т.ч.
+        # игровые Steam-эмуляторы) падают, если их каталог данных лежит внутри
+        # ещё не созданной папки профиля. Лончер должен создать дерево заранее.
+        fs = self._fs()
+        self._run(LauncherConfig(app_name="App",
+                                 target_exe_rel="App/MyApp.exe"), fs=fs)
+        for expected in (
+            rf"{self.ROOT}\PortableData\Public\Documents",
+            rf"{self.ROOT}\PortableData\User\Documents\My Games",
+            rf"{self.ROOT}\PortableData\User\Saved Games",
+        ):
+            self.assertTrue(fs.exists(expected),
+                            f"лончер не создал каталог {expected}")
+
     def test_no_pause_when_the_program_exits_successfully(self):
         res = self._run(LauncherConfig(app_name="App",
                                        target_exe_rel="App/MyApp.exe"))
@@ -499,6 +514,22 @@ class RegistryPortabilityTests(unittest.TestCase):
         self.assertIn('"New"=-', text)          # добавленное значение убираем
         self.assertIn('"Theme"="dark"', text)   # прежнее возвращаем
 
+    def test_cleanup_cmd_self_elevates_and_imports_the_reg(self):
+        cmd = registry.render_host_cleanup_cmd("cleanup_host.reg")
+        self.assertTrue(cmd.isascii(), "cleanup_host.cmd должен быть ASCII")
+        # Запрашивает права администратора через UAC и импортирует .reg.
+        self.assertIn("net session", cmd)
+        self.assertIn("-Verb RunAs", cmd)
+        self.assertIn('reg import "cleanup_host.reg"', cmd)
+
+    def test_cleanup_cmd_avoids_the_errorlevel_in_block_trap(self):
+        # %ERRORLEVEL% раскрывается при разборе блока в скобках, поэтому внутри
+        # блоков используется только «if errorlevel», иначе проверка прав
+        # всегда срабатывала бы ложно.
+        cmd = registry.render_host_cleanup_cmd("cleanup_host.reg")
+        self.assertNotIn("%ERRORLEVEL%", cmd)
+        self.assertIn("if errorlevel 1", cmd)
+
     def test_launcher_undo_never_restores_build_machine_values(self):
         before = {r"HKCU\Software\Vendor\App": {
             "Theme": (registry.REG_SZ, repr("dark"))}}
@@ -590,6 +621,13 @@ class RegistryCaptureIntegrationTests(unittest.TestCase):
         capture, files = self._capture()
         self.assertIn("cleanup_host.reg", files)
         self.assertIn("Uninstall", files["cleanup_host.reg"])
+
+    def test_self_elevating_cleanup_cmd_is_written_next_to_the_reg(self):
+        capture, _files = self._capture()
+        self.assertTrue(capture.cleanup_cmd_file.endswith("cleanup_host.cmd"))
+        text = Path(capture.cleanup_cmd_file).read_text(encoding="ascii")
+        self.assertIn("-Verb RunAs", text)
+        self.assertIn('reg import "cleanup_host.reg"', text)
 
     def test_shell_integration_is_skipped_by_default(self):
         capture, _files = self._capture()
