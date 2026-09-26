@@ -1879,5 +1879,216 @@ class InstallShieldRunTests(unittest.TestCase):
             self.assertTrue(Path(result.portable_dir, "setup.iss").is_file())
 
 
+class MultiExecutableDetectionTests(unittest.TestCase):
+    """Тесты распознавания и классификации главного exe, лаунчера и конфигуратора."""
+
+    def test_witcher_layout_classifies_main_launcher_config_and_tool(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app_dir = Path(temp, "App")
+            bin_dir = app_dir / "bin"
+            bin_dir.mkdir(parents=True)
+
+            (bin_dir / "WITCHER2.EXE").write_bytes(b"MZ" + b"\x00" * 20000)
+            (app_dir / "Launcher.exe").write_bytes(b"MZ" + b"\x00" * 5000)
+            (bin_dir / "Configurator.exe").write_bytes(b"MZ" + b"\x00" * 3000)
+            (bin_dir / "UserContentManager.exe").write_bytes(b"MZ" + b"\x00" * 2000)
+            (app_dir / "unins000.exe").write_bytes(b"MZ" + b"\x00" * 1000)
+
+            port = Portablizer(Logger())
+            main_exe, targets = port._discover_app_executables(str(app_dir), "The Witcher 2")
+
+            self.assertIsNotNone(main_exe)
+            self.assertTrue(main_exe.lower().endswith("witcher2.exe"))
+
+            roles = {t.name.lower(): t.role for t in targets}
+            self.assertEqual(roles.get("witcher2"), "main")
+            self.assertEqual(roles.get("launcher"), "launcher")
+            self.assertEqual(roles.get("configurator"), "config")
+            self.assertEqual(roles.get("usercontentmanager"), "tool")
+            self.assertNotIn("unins000", roles)
+
+    def test_classic_game_with_language_setup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app_dir = Path(temp, "App")
+            app_dir.mkdir()
+            (app_dir / "Game.exe").write_bytes(b"MZ" + b"\x00" * 15000)
+            (app_dir / "Language_Setup.exe").write_bytes(b"MZ" + b"\x00" * 4000)
+            (app_dir / "Graphic_Setup.exe").write_bytes(b"MZ" + b"\x00" * 4000)
+
+            port = Portablizer(Logger())
+            main_exe, targets = port._discover_app_executables(str(app_dir), "Game")
+
+            self.assertIsNotNone(main_exe)
+            self.assertTrue(main_exe.lower().endswith("game.exe"))
+
+            roles = {t.name.lower(): t.role for t in targets}
+            self.assertEqual(roles.get("game"), "main")
+            self.assertEqual(roles.get("language_setup"), "config")
+            self.assertEqual(roles.get("graphic_setup"), "config")
+
+
+class CompanionLauncherGenerationTests(unittest.TestCase):
+    """Тесты создания сопутствующих лончеров (Launch_Launcher.bat, Launch_Configurator.bat, Launch_Menu.bat)."""
+
+    def test_companion_launchers_and_menu_are_generated(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app_dir = Path(temp, "App")
+            bin_dir = app_dir / "bin"
+            bin_dir.mkdir(parents=True)
+
+            (bin_dir / "WITCHER2.EXE").write_bytes(b"MZ" + b"\x00" * 20000)
+            (app_dir / "Launcher.exe").write_bytes(b"MZ" + b"\x00" * 5000)
+            (bin_dir / "Configurator.exe").write_bytes(b"MZ" + b"\x00" * 3000)
+
+            port = Portablizer(Logger())
+            main_exe, targets = port._discover_app_executables(str(app_dir), "The Witcher 2")
+
+            opts = PortableOptions(
+                installer_path="fake.exe",
+                output_dir=temp,
+                app_name="The Witcher 2",
+            )
+            companion_files = port._write_launcher(
+                temp, "The Witcher 2", os.path.relpath(main_exe, temp),
+                opts, ["App/bin"], capture=None, targets=targets
+            )
+
+            self.assertIn("Launch.bat", companion_files)
+            self.assertIn("Launch_Launcher.bat", companion_files)
+            self.assertIn("Launch_Configurator.bat", companion_files)
+            self.assertIn("Launch_Menu.bat", companion_files)
+
+            # Проверяем, что все bat и vbs файлы — чистый ASCII
+            for fname in companion_files:
+                fpath = Path(temp, fname)
+                self.assertTrue(fpath.is_file(), f"{fname} is missing")
+                text = fpath.read_text(encoding="ascii")
+                self.assertTrue(text.isascii())
+
+            # Проверяем launcher_config.json
+            cfg_path = Path(temp, "launcher_config.json")
+            self.assertTrue(cfg_path.is_file())
+            import json
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertEqual(len(data["targets"]), 3)
+            self.assertTrue(any(t["role"] == "launcher" for t in data["targets"]))
+            self.assertTrue(any(t["role"] == "config" for t in data["targets"]))
+
+
+class CompanionLauncherExecutionTests(unittest.TestCase):
+    """Тесты исполнения Launch.bat с флагами --target, --launcher, --config, --menu в симуляторе."""
+
+    def test_launch_with_target_switch(self):
+        targets = [
+            launcher_mod.TargetInfo(name="WITCHER2", rel_path="App/bin/WITCHER2.EXE", role="main"),
+            launcher_mod.TargetInfo(name="Configurator", rel_path="App/bin/Configurator.exe", role="config"),
+        ]
+        cfg = launcher_mod.LauncherConfig(
+            app_name="The Witcher 2",
+            target_exe_rel="App/bin/WITCHER2.EXE",
+            targets=targets,
+            config_target_rel="App/bin/Configurator.exe",
+        )
+        bat = launcher_mod.render_bat(cfg)
+
+        fs = batsim.FakeFS()
+        fs.add_file(r"E:\Portable\App\bin\WITCHER2.EXE")
+        fs.add_file(r"E:\Portable\App\bin\Configurator.exe")
+
+        res = batsim.run_batch(bat, r"E:\Portable\Launch.bat", fs,
+                               argv=["--nopause", "--target", r"App\bin\Configurator.exe"])
+        self.assertEqual(res.exit_code, 0)
+        self.assertEqual(len(res.launches), 1)
+        self.assertTrue(res.launches[0].command.lower().endswith("configurator.exe"))
+        self.assertTrue(res.launches[0].cwd.rstrip("\\").lower().endswith(r"app\bin"))
+
+    def test_launch_with_config_switch(self):
+        targets = [
+            launcher_mod.TargetInfo(name="WITCHER2", rel_path="App/bin/WITCHER2.EXE", role="main"),
+            launcher_mod.TargetInfo(name="Configurator", rel_path="App/bin/Configurator.exe", role="config"),
+        ]
+        cfg = launcher_mod.LauncherConfig(
+            app_name="The Witcher 2",
+            target_exe_rel="App/bin/WITCHER2.EXE",
+            targets=targets,
+            config_target_rel="App/bin/Configurator.exe",
+        )
+        bat = launcher_mod.render_bat(cfg)
+
+        fs = batsim.FakeFS()
+        fs.add_file(r"E:\Portable\App\bin\WITCHER2.EXE")
+        fs.add_file(r"E:\Portable\App\bin\Configurator.exe")
+
+        res = batsim.run_batch(bat, r"E:\Portable\Launch.bat", fs,
+                               argv=["--nopause", "--config"])
+        self.assertEqual(res.exit_code, 0)
+        self.assertEqual(len(res.launches), 1)
+        self.assertTrue(res.launches[0].command.lower().endswith("configurator.exe"))
+
+    def test_companion_bat_delegates_to_launch_bat(self):
+        targets = [
+            launcher_mod.TargetInfo(name="WITCHER2", rel_path="App/bin/WITCHER2.EXE", role="main", bat_name="Launch.bat"),
+            launcher_mod.TargetInfo(name="Launcher", rel_path="App/Launcher.exe", role="launcher", bat_name="Launch_Launcher.bat"),
+        ]
+        cfg = launcher_mod.LauncherConfig(
+            app_name="The Witcher 2",
+            target_exe_rel="App/bin/WITCHER2.EXE",
+            targets=targets,
+            launcher_target_rel="App/Launcher.exe",
+        )
+        main_bat = launcher_mod.render_bat(cfg)
+        comp_bat = launcher_mod.render_companion_bat(cfg, targets[1])
+
+        fs = batsim.FakeFS()
+        fs.add_file(r"E:\Portable\App\bin\WITCHER2.EXE")
+        fs.add_file(r"E:\Portable\App\Launcher.exe")
+        fs.add_file(r"E:\Portable\Launch.bat", main_bat)
+
+        res = batsim.run_batch(comp_bat, r"E:\Portable\Launch_Launcher.bat", fs,
+                               argv=["--nopause"])
+        self.assertEqual(res.exit_code, 0)
+        self.assertEqual(len(res.launches), 1)
+        self.assertTrue(res.launches[0].command.lower().endswith("launcher.exe"))
+        self.assertTrue(res.launches[0].cwd.rstrip("\\").lower().endswith("app"))
+
+
+class RegistryVirtualizationTests(unittest.TestCase):
+    """Тесты UAC-виртуализации и слияния machine-настроек в HKCU."""
+
+    def test_virtualize_machine_snapshot_creates_virtualstore_and_hkcu(self):
+        snapshot = {
+            r"HKLM\Software\CD Projekt RED\The Witcher 2": {
+                "InstallDirectory": (1, r"'E:\Portable\App'"),
+                "Language": (1, "'RU'"),
+                "Speech": (1, "'RU'"),
+            }
+        }
+        machine_keys = [r"HKLM\Software\CD Projekt RED\The Witcher 2"]
+
+        v_snap, v_keys = registry.virtualize_machine_snapshot(snapshot, machine_keys)
+
+        vs_key = r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\CD Projekt RED\The Witcher 2"
+        hkcu_key = r"HKCU\Software\CD Projekt RED\The Witcher 2"
+
+        self.assertIn(vs_key, v_snap)
+        self.assertIn(hkcu_key, v_snap)
+        self.assertEqual(v_snap[vs_key]["Language"], (1, "'RU'"))
+        self.assertEqual(v_snap[hkcu_key]["InstallDirectory"], (1, r"'E:\Portable\App'"))
+
+    def test_consolidate_root_keys(self):
+        keys = [
+            r"HKCU\Software\CD Projekt RED\The Witcher 2",
+            r"HKCU\Software\CD Projekt RED\The Witcher 2\Audio",
+            r"HKCU\Software\CD Projekt RED\The Witcher 2\Video",
+            r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\CD Projekt RED\The Witcher 2",
+            r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\CD Projekt RED\The Witcher 2\DLC",
+        ]
+        roots = launcher_mod.consolidate_root_keys(keys)
+        self.assertEqual(len(roots), 2)
+        self.assertIn(r"HKCU\Software\CD Projekt RED\The Witcher 2", roots)
+        self.assertIn(r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\CD Projekt RED\The Witcher 2", roots)
+
+
 if __name__ == "__main__":
     unittest.main()

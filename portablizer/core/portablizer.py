@@ -315,6 +315,12 @@ class PortableResult:
         default_factory=list)
     #: Подсказки пользователю, если установка не удалась.
     hints: List[str] = field(default_factory=list)
+    #: Все обнаруженные цели (главный exe, лаунчер, конфигуратор, утилиты)
+    targets: List[launcher_mod.TargetInfo] = field(default_factory=list)
+    #: Список созданных дополнительных bat-файлов (Launch_Launcher.bat и т.д.)
+    companion_launchers: List[str] = field(default_factory=list)
+    launcher_exe_rel: str = ""
+    config_exe_rel: str = ""
 
 
 class Portablizer:
@@ -554,30 +560,39 @@ class Portablizer:
                 if recovered:
                     self.log.ok("Файлы программы перенесены в папку App.")
 
-            # 6. Поиск главного exe. Не создаём заведомо сломанный Launch.bat:
-            # отсутствие exe означает, что тихая установка фактически не дала
-            # портативного результата, даже если установщик вернул код 0.
+            # 6. Поиск главного exe и обнаружение всех вспомогательных программ
             self._check_cancel()
-            self.progress(75, "Поиск главного исполняемого файла")
-            main_exe = self._find_main_exe(app_dir, name)
+            self.progress(75, "Поиск главного исполняемого файла и лаунчеров")
+            main_exe, targets = self._discover_app_executables(app_dir, name)
             if not main_exe:
                 result.hints = self._failure_hints(det, install_rc, opts,
                                                    portable_dir)
                 result.attempt_outcomes = list(self._attempt_history)
                 raise RuntimeError(
                     self._failure_message(det, install_rc, result))
+            result.targets = targets
             result.main_exe_rel = os.path.relpath(main_exe, portable_dir)
             self.log.ok(f"Главный exe: {result.main_exe_rel}")
+
+            for t in targets:
+                if t.role == "launcher":
+                    result.launcher_exe_rel = os.path.relpath(
+                        os.path.join(portable_dir, t.rel_path), portable_dir)
+                elif t.role == "config":
+                    result.config_exe_rel = os.path.relpath(
+                        os.path.join(portable_dir, t.rel_path), portable_dir)
 
             # 7. Зависимости и переменные среды
             self.progress(85, "Учёт зависимостей и переменных среды")
             path_prepend = self._collect_dep_dirs(app_dir, portable_dir)
 
-            # 8. Генерация лончера
+            # 8. Генерация лончера и вспомогательных скриптов
             self._check_cancel()
-            self.progress(92, "Генерация портативного лончера")
-            self._write_launcher(portable_dir, name, result.main_exe_rel,
-                                 opts, path_prepend, capture)
+            self.progress(92, "Генерация портативного лончера и меню")
+            companion_files = self._write_launcher(
+                portable_dir, name, result.main_exe_rel,
+                opts, path_prepend, capture, targets)
+            result.companion_launchers = companion_files
 
             # 9. Уборка следов установки с ЭТОГО компьютера: программа не
             # должна остаться в списке «Установленные программы».
@@ -915,13 +930,23 @@ class Portablizer:
         user_keys = [k for k in portable_keys if k.startswith("HKCU")]
         machine_keys = [k for k in portable_keys if k.startswith("HKLM")]
 
+        # Виртуализация HKLM-ключей для бесправного доступа (UAC VirtualStore + HKCU mirror)
+        virtual_keys: List[str] = []
+        if machine_keys:
+            after_virtualized, virtual_keys = reg_mod.virtualize_machine_snapshot(
+                after, machine_keys)
+        else:
+            after_virtualized = after
+
+        all_user_keys = sorted(set(user_keys + virtual_keys))
+
         reg_path = os.path.join(portable_dir, "portable.reg")
-        user_text = reg_mod.render_keys(after, user_keys, tokens)
+        user_text = reg_mod.render_keys(after_virtualized, all_user_keys, tokens)
         if reg_mod.has_entries(user_text):
             reg_mod.write_reg_file(reg_path, user_text)
             capture.reg_file = reg_path
-            capture.has_root_token = launcher_mod.ROOT_TOKEN in user_text
 
+        machine_text = ""
         if machine_keys:
             machine_path = os.path.join(portable_dir, "portable_machine.reg")
             machine_text = reg_mod.render_keys(after, machine_keys, tokens)
@@ -929,9 +954,15 @@ class Portablizer:
                 reg_mod.write_reg_file(machine_path, machine_text)
                 capture.machine_reg_file = machine_path
 
-        capture.keys = launcher_mod.usable_registry_keys(portable_keys)
-        capture.created_keys = launcher_mod.usable_registry_keys(
-            [k for k in diff.new_keys if k in set(capture.keys)]
+        capture.has_root_token = (
+            launcher_mod.ROOT_TOKEN in user_text
+            or launcher_mod.ROOT_TOKEN in machine_text
+        )
+
+        all_portable_keys = sorted(set(portable_keys + virtual_keys))
+        capture.keys = launcher_mod.consolidate_root_keys(all_portable_keys)
+        capture.created_keys = launcher_mod.consolidate_root_keys(
+            [k for k in diff.new_keys if k in set(portable_keys)] + virtual_keys
         )
 
         # Всё, что установщик наследил на этом ПК: и следы, и перенесённые в
@@ -1772,40 +1803,132 @@ class Portablizer:
         return False
 
     # -- поиск главного exe ---------------------------------------------------
-    def _find_main_exe(self, app_dir: str, name: str) -> Optional[str]:
+    # -- поиск и классификация исполняемых файлов -----------------------------
+    def _discover_app_executables(self, app_dir: str, app_name: str
+                                  ) -> Tuple[Optional[str], List[launcher_mod.TargetInfo]]:
+        """Сканирует App/ и находит все запускаемые программы.
+
+        Классифицирует файлы по ролям:
+          - main: основной исполняемый файл (игра/приложение);
+          - launcher: предустановленный официальный лаунчер;
+          - config: утилита настройки графики, языка, звука;
+          - tool: редакторы, менеджеры модов/DLC, серверы;
+          - auxiliary: прочие вспомогательные бинарники.
+        """
         candidates: List[str] = []
         for root, _dirs, files in os.walk(app_dir):
             for f in files:
                 if f.lower().endswith(".exe"):
                     candidates.append(os.path.join(root, f))
         if not candidates:
-            return None
+            return None, []
 
-        name_l = name.lower()
-        # Отсеиваем очевидные вспомогательные утилиты.
-        bad = ("unins", "setup", "vcredist", "vc_redist", "dxsetup", "update",
-               "helper", "crashpad", "crashreport", "install", "redist")
+        bad_prefixes = (
+            "unins", "vcredist", "vc_redist", "dxsetup", "oalinst",
+            "crashpad", "crashreport", "unitycrashhandler", "werfault",
+            "bugreport", "epicwebhelper", "update", "helper", "feedback",
+        )
 
-        def score(p: str) -> int:
+        name_l = app_name.lower()
+        non_ignored: List[Tuple[int, str, str, str, str]] = []
+
+        for p in candidates:
             base = os.path.basename(p).lower()
-            s = 0
-            if name_l and name_l in base:
-                s += 100
-            if any(b in base for b in bad):
-                s -= 60
-            # exe в корне App/ обычно главный
-            depth = os.path.relpath(p, app_dir).count(os.sep)
-            s -= depth * 5
-            try:
-                s += min(30, int(os.path.getsize(p) / (1024 * 1024)))  # крупнее — вероятнее
-            except OSError:
-                pass
-            return s
+            stem = os.path.splitext(os.path.basename(p))[0]
+            if base.startswith("unins") or base == "uninstall.exe":
+                continue
+            if any(b in base for b in bad_prefixes):
+                continue
 
-        candidates.sort(key=score, reverse=True)
-        best = candidates[0]
-        # Один uninstaller/setup.exe не является запускаемым приложением.
-        return best if score(best) >= 0 else None
+            rel_app = os.path.relpath(p, app_dir)
+            depth = rel_app.count(os.sep)
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                size = 0
+
+            role = "main"
+            desc = stem
+            if any(k in base for k in ("launcher", "autorun")) or base in ("play.exe", "start.exe", "launch.exe", "gamelauncher.exe"):
+                role = "launcher"
+                desc = "Лаунчер программы"
+            elif any(k in base for k in ("config", "setting", "setup", "option", "language", "lang", "video", "graphics", "display", "resolution", "audio", "sound")):
+                role = "config"
+                desc = "Настройки графики и языка"
+            elif any(k in base for k in ("manager", "content", "mod", "editor", "edit", "tool", "bench", "maker", "builder", "patch", "server", "dedicated")):
+                role = "tool"
+                desc = f"Утилита ({stem})"
+
+            # Оценка вероятности быть главным исполняемым файлом
+            s = 0
+            if name_l and (name_l in base or base in name_l):
+                s += 100
+            if role == "main":
+                s += 30
+            # exe в корне App/ или в App/bin обычно важнее
+            s -= depth * 5
+            s += min(30, int(size / (1024 * 1024)))
+            non_ignored.append((s, p, stem, role, desc))
+
+        if not non_ignored:
+            return None, []
+
+        non_ignored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_path, _stem, _role, _ = non_ignored[0]
+        main_exe = best_path if best_score >= 0 else non_ignored[0][1]
+
+        def _safe_slug(s: str) -> str:
+            cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", s).strip("_")
+            return cleaned if cleaned else "App"
+
+        targets: List[launcher_mod.TargetInfo] = []
+        used_bat_names: Set[str] = set()
+
+        for _score, path, stem, role, desc in non_ignored:
+            rel_path = os.path.join("App", os.path.relpath(path, app_dir)).replace("\\", "/")
+            is_main = (path == main_exe)
+            actual_role = "main" if is_main else role
+
+            if is_main:
+                bat_name = "Launch.bat"
+                vbs_name = "LaunchHidden.vbs"
+            elif actual_role == "launcher":
+                bat_name = "Launch_Launcher.bat"
+                vbs_name = "Launch_Launcher.vbs"
+            elif actual_role == "config":
+                bat_base = "Launch_Configurator" if "config" in stem.lower() else ("Launch_Settings" if "setting" in stem.lower() else f"Launch_{_safe_slug(stem)}")
+                bat_name = f"{bat_base}.bat"
+                vbs_name = f"{bat_base}.vbs"
+            else:
+                bat_name = f"Launch_{_safe_slug(stem)}.bat"
+                vbs_name = f"Launch_{_safe_slug(stem)}.vbs"
+
+            # Гарантируем уникальность имён файлов лончеров
+            counter = 2
+            original_bat = bat_name
+            while bat_name in used_bat_names:
+                root_name, ext = os.path.splitext(original_bat)
+                bat_name = f"{root_name}_{counter}{ext}"
+                vbs_name = f"{root_name}_{counter}.vbs"
+                counter += 1
+            used_bat_names.add(bat_name)
+
+            targets.append(launcher_mod.TargetInfo(
+                name=stem,
+                rel_path=rel_path,
+                role=actual_role,
+                description=desc,
+                bat_name=bat_name,
+                vbs_name=vbs_name,
+            ))
+
+        # Главный exe первым, затем лаунчеры, конфигураторы и утилиты
+        targets.sort(key=lambda t: 0 if t.role == "main" else (1 if t.role == "launcher" else (2 if t.role == "config" else 3)))
+        return main_exe, targets
+
+    def _find_main_exe(self, app_dir: str, name: str) -> Optional[str]:
+        main_exe, _ = self._discover_app_executables(app_dir, name)
+        return main_exe
 
     # -- зависимости ----------------------------------------------------------
     def _collect_dep_dirs(self, app_dir: str, portable_dir: str) -> List[str]:
@@ -1831,11 +1954,17 @@ class Portablizer:
     # -- лончер ---------------------------------------------------------------
     def _write_launcher(self, portable_dir: str, name: str, main_exe_rel: str,
                         opts: PortableOptions, path_prepend: List[str],
-                        capture: Optional[RegistryCapture] = None) -> None:
+                        capture: Optional[RegistryCapture] = None,
+                        targets: Optional[List[launcher_mod.TargetInfo]] = None
+                        ) -> List[str]:
         has_registry = bool(
             capture and (capture.reg_file or capture.machine_reg_file
                          or capture.keys)
         )
+        all_targets = list(targets or [])
+        launcher_target = next((t.rel_path for t in all_targets if t.role == "launcher"), "")
+        config_target = next((t.rel_path for t in all_targets if t.role == "config"), "")
+
         cfg = launcher_mod.LauncherConfig(
             app_name=name,
             target_exe_rel=main_exe_rel.replace("\\", "/"),
@@ -1846,6 +1975,9 @@ class Portablizer:
             registry_has_root_token=bool(capture and capture.has_root_token),
             extra_env=opts.extra_env,
             path_prepend=path_prepend,
+            targets=all_targets,
+            launcher_target_rel=launcher_target,
+            config_target_rel=config_target,
         )
         # Launch.bat — CRLF, чистый ASCII и без BOM. cmd.exe читает .bat по
         # байтовым смещениям: BOM, LF-концы строк или многобайтовый символ
@@ -1856,6 +1988,38 @@ class Portablizer:
         # Запуск без окна консоли.
         self._write_text(os.path.join(portable_dir, "LaunchHidden.vbs"),
                          launcher_mod.render_vbs(), encoding="ascii")
+
+        created_launchers: List[str] = ["Launch.bat", "LaunchHidden.vbs"]
+
+        # Создаём вспомогательные лончеры для обнаруженных лаунчеров и конфигураторов
+        main_norm = main_exe_rel.replace("\\", "/").lower()
+        for t in all_targets:
+            if t.rel_path.replace("\\", "/").lower() == main_norm:
+                continue
+            t_bat_path = os.path.join(portable_dir, t.bat_name)
+            self._write_text(t_bat_path, launcher_mod.render_companion_bat(cfg, t),
+                             encoding="ascii")
+            t_vbs_path = os.path.join(portable_dir, t.vbs_name)
+            self._write_text(t_vbs_path, launcher_mod.render_companion_vbs(cfg, t),
+                             encoding="ascii")
+            created_launchers.extend([t.bat_name, t.vbs_name])
+
+            if t.role == "launcher":
+                self.log.ok(f"Обнаружен лаунчер программы: {t.rel_path} (создан {t.bat_name})")
+            elif t.role == "config":
+                self.log.ok(f"Обнаружен конфигуратор/настройки: {t.rel_path} (создан {t.bat_name})")
+            elif t.role == "tool":
+                self.log.ok(f"Обнаружена вспомогательная утилита: {t.rel_path} (создан {t.bat_name})")
+            else:
+                self.log.info(f"Дополнительный исполняемый файл: {t.rel_path} (создан {t.bat_name})")
+
+        if len(all_targets) >= 2:
+            menu_bat_path = os.path.join(portable_dir, "Launch_Menu.bat")
+            self._write_text(menu_bat_path, launcher_mod.render_menu_bat(cfg),
+                             encoding="ascii")
+            created_launchers.append("Launch_Menu.bat")
+            self.log.ok("Создано интерактивное меню выбора программ: Launch_Menu.bat")
+
         # config json (для launcher.exe)
         self._write_text(os.path.join(portable_dir, "launcher_config.json"),
                          launcher_mod.render_config_json(cfg), newline="\n")
@@ -1864,17 +2028,42 @@ class Portablizer:
             self._write_text(os.path.join(portable_dir, "launcher.py"),
                              launcher_mod.render_py_launcher(cfg),
                              newline="\n")
+
+        # Формируем описание дополнительных файлов в README
+        companion_lines = []
+        companion_files_desc = []
+        for t in all_targets:
+            if t.rel_path.replace("\\", "/").lower() == main_norm:
+                continue
+            companion_lines.append(f"  • {t.bat_name:<24} — запуск {t.description} ({t.rel_path})")
+            companion_files_desc.append(f"  {t.bat_name:<21} — запуск {t.name} ({t.rel_path})\n")
+
+        if len(all_targets) >= 2:
+            companion_lines.append("  • Launch_Menu.bat          — интерактивное меню выбора программы")
+            companion_files_desc.append("  Launch_Menu.bat       — интерактивное меню выбора исполняемого файла\n")
+
+        companion_section = ""
+        if companion_lines:
+            companion_section = "\nДополнительные варианты запуска:\n" + "\n".join(companion_lines) + "\n"
+        companion_files_list = "".join(companion_files_desc)
+
         # README
         registry_note = (
-            "portable.reg           - настройки программы (переносятся с папкой)\n"
+            "  portable.reg          — настройки программы (переносятся с папкой)\n"
             if capture and capture.reg_file else ""
         )
         self._write_text(
             os.path.join(portable_dir, "README_PORTABLE.txt"),
-            _README.format(app_name=name, main_exe_rel=main_exe_rel,
-                           registry_note=registry_note),
+            _README.format(
+                app_name=name,
+                main_exe_rel=main_exe_rel,
+                companion_section=companion_section,
+                companion_files_list=companion_files_list,
+                registry_note=registry_note,
+            ),
         )
         self.log.ok("Лончер и сопроводительные файлы созданы.")
+        return created_launchers
 
     @staticmethod
     def _write_text(path: str, text: str, encoding: str = "utf-8",
@@ -1890,7 +2079,7 @@ _README = """{app_name} — портативная версия
   1. Скопируйте ВСЮ эту папку на флешку, другой ПК или в любое место.
   2. Запустите Launch.bat — программа стартует в изолированном режиме.
      LaunchHidden.vbs запускает то же самое, но без окна консоли.
-
+{companion_section}
 Устанавливать ничего не нужно: программа не появляется в списке
 «Установленные программы» и не требует прав администратора.
 
@@ -1899,11 +2088,16 @@ _README = """{app_name} — портативная версия
   PortableData\\         — все пользовательские данные (AppData, Temp, настройки)
   Launch.bat            — портативный лончер (перенаправляет каталоги и env)
   LaunchHidden.vbs      — запуск без окна консоли
-  launcher_config.json  — параметры лончера
+{companion_files_list}  launcher_config.json  — параметры лончера
 {registry_note}  install.log           — подробный журнал установщика (если он поддерживается)
   portablizer.log       — журнал создания и диагностики портатива
 
 Ключи запуска (Launch.bat):
+  --target <путь>   запустить конкретный exe в изолированном окружении
+  --launcher        запустить встроенный лаунчер программы
+  --config          запустить конфигуратор/настройки программы
+  --menu            интерактивное меню выбора исполняемого файла
+  --list            список обнаруженных запускаемых файлов
   --nopause         не ждать нажатия клавиши
   --pause           всегда ждать нажатия клавиши перед закрытием
   --no-registry     вообще не трогать реестр
@@ -1916,8 +2110,9 @@ _README = """{app_name} — портативная версия
   • стандартные каталоги профиля (AppData, Temp, Документы и др.) на время
     работы перенаправляются в PortableData — программа не пишет в C:\\Users;
   • если программе нужны записи реестра, лончер перед стартом сохраняет
-    прежнее состояние чужого ПК, подставляет настройки из портатива, а после
-    выхода выгружает изменения обратно в папку и возвращает реестр как было;
+    прежнее состояние чужого ПК, подставляет настройки из портатива (включая
+    UAC VirtualStore для бесправного доступа к machine-ключам), а после выхода
+    выгружает изменения обратно в папку и возвращает реестр как было;
   • путь портативной папки внутри настроек хранится маркером, поэтому смена
     буквы диска или компьютера ничего не ломает.
 

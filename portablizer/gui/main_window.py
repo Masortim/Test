@@ -472,6 +472,19 @@ class MainWindow(QMainWindow):
                 "",
                 f"Папка: {result.portable_dir}",
                 "Запуск: Launch.bat (или LaunchHidden.vbs — без консоли)",
+            ]
+            if result.companion_launchers:
+                companion_bats = [
+                    f for f in result.companion_launchers
+                    if f.endswith(".bat") and f != "Launch.bat"
+                ]
+                if companion_bats:
+                    details += [
+                        "",
+                        "Дополнительные варианты (настройки, лаунчеры, меню):",
+                        *[f"  • {b}" for b in companion_bats],
+                    ]
+            details += [
                 "",
                 "Скопируйте папку целиком на флешку — установка на другом "
                 "компьютере не потребуется.",

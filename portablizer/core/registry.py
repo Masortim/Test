@@ -392,6 +392,71 @@ def _render(lines: Sequence[str]) -> str:
     return body.rstrip("\n") + "\n"
 
 
+def virtualize_machine_snapshot(snapshot: Mapping[str, Mapping[str, object]],
+                                machine_keys: Iterable[str]
+                                ) -> Tuple[Dict[str, KeyValues], List[str]]:
+    """Создаёт виртуализированные HKCU-ветки для HKLM-ключей.
+
+    Для 32-битных приложений (и для запуска без прав администратора) ключи
+    HKLM\\Software\\... отображаются в:
+      1. HKCU\\Software\\Classes\\VirtualStore\\MACHINE\\SOFTWARE\\...
+         (официальная UAC-виртуализация реестра Windows)
+      2. HKCU\\Software\\... (пользовательский fallback для приложений, ищущих
+         настройки в HKCU)
+    """
+    virtual_snapshot: Dict[str, KeyValues] = {
+        k: dict(v) for k, v in snapshot.items()  # type: ignore[misc]
+    }
+    virtual_keys: List[str] = []
+
+    for key in machine_keys:
+        if not key.upper().startswith("HKLM\\SOFTWARE"):
+            continue
+        tail = key[len("HKLM\\Software"):].strip("\\")
+        if not tail:
+            continue
+
+        values = dict(snapshot.get(key, {}))
+        if not values:
+            continue
+
+        # 1. VirtualStore
+        vs_key = f"HKCU\\Software\\Classes\\VirtualStore\\MACHINE\\SOFTWARE\\{tail}"
+        virtual_snapshot[vs_key] = values  # type: ignore[assignment]
+        if vs_key not in virtual_keys:
+            virtual_keys.append(vs_key)
+
+        # 2. Прямой HKCU fallback
+        hkcu_key = f"HKCU\\Software\\{tail}"
+        virtual_snapshot[hkcu_key] = values  # type: ignore[assignment]
+        if hkcu_key not in virtual_keys:
+            virtual_keys.append(hkcu_key)
+
+        # 3. Варианты с WOW6432Node и без него
+        if tail.lower().startswith("wow6432node\\"):
+            tail_no_wow = tail[len("wow6432node\\"):].strip("\\")
+            if tail_no_wow:
+                vs_no_wow = f"HKCU\\Software\\Classes\\VirtualStore\\MACHINE\\SOFTWARE\\{tail_no_wow}"
+                hkcu_no_wow = f"HKCU\\Software\\{tail_no_wow}"
+                virtual_snapshot[vs_no_wow] = values  # type: ignore[assignment]
+                virtual_snapshot[hkcu_no_wow] = values  # type: ignore[assignment]
+                if vs_no_wow not in virtual_keys:
+                    virtual_keys.append(vs_no_wow)
+                if hkcu_no_wow not in virtual_keys:
+                    virtual_keys.append(hkcu_no_wow)
+        else:
+            vs_wow = f"HKCU\\Software\\Classes\\VirtualStore\\MACHINE\\SOFTWARE\\WOW6432Node\\{tail}"
+            hkcu_wow = f"HKCU\\Software\\WOW6432Node\\{tail}"
+            virtual_snapshot[vs_wow] = values  # type: ignore[assignment]
+            virtual_snapshot[hkcu_wow] = values  # type: ignore[assignment]
+            if vs_wow not in virtual_keys:
+                virtual_keys.append(vs_wow)
+            if hkcu_wow not in virtual_keys:
+                virtual_keys.append(hkcu_wow)
+
+    return virtual_snapshot, virtual_keys
+
+
 def render_keys(after: Mapping[str, Mapping[str, object]],
                 keys: Iterable[str],
                 tokens: Sequence[Tuple[str, str]] = ()) -> str:
