@@ -283,6 +283,8 @@ class RegistryCapture:
     has_root_token: bool = False
     uninstall_entries: List[str] = field(default_factory=list)
     cleanup_file: str = ""
+    #: Самоповышающийся .cmd, применяющий cleanup_host.reg с правами админа.
+    cleanup_cmd_file: str = ""
     cleanup_keys: List[str] = field(default_factory=list)
 
 
@@ -365,7 +367,8 @@ class Portablizer:
         for filename in (
             "Launch.bat", "LaunchHidden.vbs", "launcher.py",
             "launcher_config.json", "README_PORTABLE.txt", "portable.reg",
-            "portable_machine.reg", "cleanup_host.reg", "install.log",
+            "portable_machine.reg", "cleanup_host.reg", "cleanup_host.cmd",
+            "install.log",
             "install-retry.log", "install-layout.log", "installer-engine.log",
             "installer-output.log", "portablizer.log", "_bundle_layout",
             "setup-installshield.log",
@@ -941,6 +944,16 @@ class Portablizer:
             cleanup_path = os.path.join(portable_dir, "cleanup_host.reg")
             reg_mod.write_reg_file(cleanup_path, cleanup_text)
             capture.cleanup_file = cleanup_path
+            # Самоповышающийся .cmd: двойной клик по .reg импортирует его без
+            # прав администратора и роняет ветки HKLM с ошибкой «не все данные
+            # были записаны». Скрипт сам запрашивает права и делает это чисто.
+            cleanup_cmd_path = os.path.join(portable_dir, "cleanup_host.cmd")
+            self._write_text(
+                cleanup_cmd_path,
+                reg_mod.render_host_cleanup_cmd("cleanup_host.reg"),
+                encoding="ascii", newline="",
+            )
+            capture.cleanup_cmd_file = cleanup_cmd_path
 
         capture.uninstall_entries = [
             name for _key, name
@@ -976,13 +989,21 @@ class Portablizer:
                 self.log.warn(
                     "Очистка отключена: программа осталась в списке "
                     f"«Установленные программы» ({', '.join(entries)}). "
-                    "Импортируйте cleanup_host.reg, чтобы убрать её."
+                    "Запустите cleanup_host.cmd, чтобы убрать её (он сам "
+                    "запросит права администратора)."
                 )
             return
         if not capture.cleanup_file or not IS_WINDOWS:
             return
 
         rc = self._reg_import(capture.cleanup_file)
+        # Часть следов (запись «Установленные программы», службы) лежит в HKLM
+        # и без прав администратора не удаляется. Если Portablizer запущен без
+        # повышения — сразу пробуем импорт через UAC, а не сдаёмся с ошибкой.
+        if rc != 0 and not is_elevated():
+            elevated = self._reg_import_elevated(capture.cleanup_file)
+            if elevated is not None:
+                rc = elevated
         if rc == 0:
             if entries:
                 self.log.ok(
@@ -995,10 +1016,11 @@ class Portablizer:
             return
 
         result.cleanup_pending = True
+        target = capture.cleanup_cmd_file or capture.cleanup_file
         self.log.warn(
             "Не удалось полностью удалить следы установки (обычно нужны права "
-            "администратора). Запустите cleanup_host.reg вручную: "
-            f"{capture.cleanup_file}"
+            "администратора). Запустите cleanup_host.cmd (он сам запросит права "
+            f"администратора): {target}"
         )
 
     # -- ярлыки ---------------------------------------------------------------
@@ -1078,6 +1100,65 @@ class Portablizer:
             return proc.returncode
         except OSError:
             return 1
+
+    @staticmethod
+    def _reg_import_elevated(path: str) -> Optional[int]:
+        """Импортирует .reg с правами администратора через UAC (ShellExecute).
+
+        Возвращает код возврата ``reg import`` или ``None``, если запустить
+        повышенный процесс не удалось (пользователь отклонил UAC, нет Windows).
+        Это позволяет автоматически убрать следы в HKLM без ручного запуска.
+        """
+        if not IS_WINDOWS:
+            return None
+        try:
+            import ctypes  # локальный импорт: модуль грузится и на Linux
+            from ctypes import wintypes
+
+            shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
+            SEE_MASK_NOCLOSEPROCESS = 0x00000040
+            SEE_MASK_NO_CONSOLE = 0x00008000
+
+            class SHELLEXECUTEINFOW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("fMask", ctypes.c_ulong),
+                    ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int),
+                    ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD),
+                    ("hIcon", wintypes.HANDLE),
+                    ("hProcess", wintypes.HANDLE),
+                ]
+
+            info = SHELLEXECUTEINFOW()
+            info.cbSize = ctypes.sizeof(info)
+            info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE
+            info.lpVerb = "runas"  # запрос повышения прав через UAC
+            info.lpFile = "reg.exe"
+            info.lpParameters = subprocess.list2cmdline(["import", path])
+            info.nShow = 0  # SW_HIDE
+
+            if not shell32.ShellExecuteExW(ctypes.byref(info)):
+                return None
+            if not info.hProcess:
+                return None
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
+            code = wintypes.DWORD()
+            kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+            kernel32.CloseHandle(info.hProcess)
+            return int(code.value)
+        except Exception:  # noqa: BLE001 - отказ UAC/любой сбой -> ручной путь
+            return None
 
     # -- установка ------------------------------------------------------------
     def _run_install(self, plan: SilentPlan, opts: PortableOptions,
@@ -1848,6 +1929,23 @@ _README = """{app_name} — портативная версия
     ошибки; при ненулевом коде возврата лончер сам делает паузу;
   • убедитесь, что папка App скопирована целиком вместе с Launch.bat;
   • подробности — в portablizer.log.
+
+Если программа выдаёт ошибку доступа к своим данным (например «Internal
+error 0x06: System error!» у игр со Steam-эмулятором):
+  • лончер заранее создаёт стандартные папки профиля (Документы, My Games,
+    Public\\Documents и др.) внутри PortableData, чтобы такие программы не
+    падали из-за отсутствующего каталога;
+  • если ошибка осталась, программе может требоваться доступ к реальным
+    системным каталогам — тогда запустите Launch.bat без изоляции профиля
+    (см. portablizer.log) или обратитесь к разработчику Portablizer.
+
+Очистка следов на ЭТОМ компьютере (где собирался портатив):
+  • cleanup_host.cmd убирает записи установки из реестра этого ПК (запись в
+    списке «Установленные программы» и т.п.). Он сам запрашивает права
+    администратора — двойного клика по cleanup_host.reg недостаточно, потому
+    что ветки HKLM без прав администратора не удаляются и Windows пишет
+    «Не все данные были успешно записаны в реестр»;
+  • на другом ПК этот файл не нужен — портатив ничего туда не устанавливает.
 
 Сгенерировано Portablizer.
 """

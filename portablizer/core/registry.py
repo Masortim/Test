@@ -474,6 +474,64 @@ def has_entries(reg_text: str) -> bool:
     return any(line.startswith("[") for line in reg_text.splitlines())
 
 
+def render_host_cleanup_cmd(reg_file_name: str = "cleanup_host.reg") -> str:
+    """Самоповышающийся .cmd для надёжного применения ``cleanup_host.reg``.
+
+    Двойной клик по самому ``.reg`` запускает regedit **без** прав
+    администратора, поэтому ветки ``HKLM`` (запись «Установленные программы»,
+    службы и т.п.) записать не удаётся, и Windows показывает пугающее «Не все
+    данные были успешно записаны в реестр». Этот скрипт:
+
+    * сам запрашивает права администратора через UAC;
+    * импортирует ``.reg`` уже с нужными правами (``reg import`` возвращает код,
+      а не показывает модальное окно regedit);
+    * молча пропускает ключи, которых уже нет, и сообщает об итоге понятным
+      текстом.
+
+    Файл строго ASCII — по той же причине, что и ``Launch.bat`` (см. модуль
+    ``core/launcher``): cmd.exe читает .bat по байтовым смещениям.
+    """
+    # ``if errorlevel N`` (не ``%ERRORLEVEL%``) читается во время исполнения,
+    # поэтому корректно работает и внутри блоков; переходы по меткам избавляют
+    # от классической ловушки cmd с ранним раскрытием %ERRORLEVEL% в скобках.
+    name = reg_file_name.replace('"', "")
+    return (
+        "@echo off\r\n"
+        "setlocal EnableExtensions\r\n"
+        "rem Removes the registry traces the installer left on THIS computer.\r\n"
+        "rem It self-elevates so HKLM entries (the Add/Remove Programs record,\r\n"
+        "rem services, etc.) can be removed without the scary regedit warning.\r\n"
+        "\r\n"
+        "net session >nul 2>&1\r\n"
+        "if not errorlevel 1 goto do_cleanup\r\n"
+        "echo Requesting administrator rights...\r\n"
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        "\"Start-Process -FilePath '%~f0' -Verb RunAs\" >nul 2>&1\r\n"
+        "if errorlevel 1 (\r\n"
+        "  echo.\r\n"
+        "  echo Could not obtain administrator rights automatically.\r\n"
+        "  echo Right-click this file and choose \"Run as administrator\".\r\n"
+        "  pause\r\n"
+        ")\r\n"
+        "exit /b 0\r\n"
+        "\r\n"
+        ":do_cleanup\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        f'if not exist "{name}" (\r\n'
+        f'  echo Nothing to clean up: {name} was not found next to this file.\r\n'
+        "  timeout /t 4 >nul 2>&1\r\n"
+        "  exit /b 0\r\n"
+        ")\r\n"
+        "\r\n"
+        f'reg import "{name}" >nul 2>&1\r\n'
+        "echo.\r\n"
+        "echo Cleanup finished. The install traces were removed from this PC.\r\n"
+        "echo Entries that were already gone are simply skipped - that is fine.\r\n"
+        "timeout /t 5 >nul 2>&1\r\n"
+        "exit /b 0\r\n"
+    )
+
+
 def write_reg_file(path: str, text: str) -> None:
     """Пишет .reg в UTF-16 LE с BOM и CRLF — как ожидает ``reg import``."""
     with open(path, "w", encoding="utf-16", newline="\r\n") as fh:
