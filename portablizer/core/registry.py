@@ -457,6 +457,80 @@ def virtualize_machine_snapshot(snapshot: Mapping[str, Mapping[str, object]],
     return virtual_snapshot, virtual_keys
 
 
+def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
+                           keys: Iterable[str], app_dir: str) -> Snapshot:
+    """Перенаправляет захваченные пути установки в портативную ``App``.
+
+    Некоторые установщики (в частности старые игры) не принимают переданную
+    папку и сначала устанавливаются в ``Program Files``. Затем Portablizer
+    переносит их файлы в ``App``, но значения вроде ``InstallFolder`` в
+    захваченном реестре раньше продолжали указывать на уже удалённый исходный
+    каталог. Основной exe часто обходится без этих значений, а комплектный
+    Launcher/Configurator считает установку недействительной и молча
+    закрывается.
+
+    Меняются только общеупотребительные значения каталога установки в явно
+    выбранных ключах приложения. Остальные строковые значения того же ключа
+    (например ``LAUNCHCOMMAND``) получают замену старого корня на новый. Для
+    GOG-подобной схемы значение ``EXE`` считается каталогом только когда рядом
+    присутствует ``EXEFILE`` — это не даёт переписать произвольный путь к exe.
+    """
+    result: Snapshot = {
+        key: {name: _as_entry(entry) for name, entry in values.items()}
+        for key, values in snapshot.items()
+    }
+    destination = os.path.normpath(app_dir)
+    install_names = {
+        "installdir", "installdirectory", "installfolder", "installlocation",
+    }
+
+    for key in keys:
+        values = result.get(key)
+        if not values:
+            continue
+        names = {name.casefold(): name for name in values}
+        path_names = [names[name] for name in install_names if name in names]
+        if "exe" in names and "exefile" in names:
+            path_names.append(names["exe"])
+        if not path_names:
+            continue
+
+        old_roots: List[str] = []
+        for name in path_names:
+            typ, _raw = values[name]
+            if typ not in (REG_SZ, REG_EXPAND_SZ):
+                continue
+            old = _entry_value(values[name])
+            if not isinstance(old, str) or not old.strip():
+                continue
+            old_roots.append(old.rstrip("\\/"))
+            trailing = "\\" if old.endswith(("\\", "/")) else ""
+            values[name] = (typ, repr(destination + trailing))
+
+        # Более длинный корень заменяется первым: C:\\Game\\bin не должен
+        # частично совпасть с C:\\Game раньше времени.
+        old_roots.sort(key=len, reverse=True)
+        for name, entry in list(values.items()):
+            typ, _raw = entry
+            if typ not in (REG_SZ, REG_EXPAND_SZ):
+                continue
+            value = _entry_value(entry)
+            if not isinstance(value, str):
+                continue
+            rewritten = value
+            for old in old_roots:
+                if old:
+                    rewritten = re.sub(
+                        re.escape(old),
+                        lambda _match: destination,
+                        rewritten,
+                        flags=re.IGNORECASE,
+                    )
+            if rewritten != value:
+                values[name] = (typ, repr(rewritten))
+    return result
+
+
 def render_keys(after: Mapping[str, Mapping[str, object]],
                 keys: Iterable[str],
                 tokens: Sequence[Tuple[str, str]] = ()) -> str:

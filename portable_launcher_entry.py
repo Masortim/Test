@@ -217,6 +217,7 @@ def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
         "USERNAME": "Portable",
         "PORTABLE_APP": "1",
         "PORTABLE_ROOT": str(root),
+        "PORTABLE_DOCUMENTS": str(userprofile / "Documents"),
     })
     root_text = str(root)
     if len(root_text) >= 2 and root_text[1] == ":":
@@ -230,6 +231,119 @@ def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
         if key:
             env[str(key)] = _expand_environment(value, env)
     return env
+
+
+class ShellFolderSession:
+    """Temporarily point the Windows Documents known folder at PortableData.
+
+    Changing ``USERPROFILE`` is not enough for applications using
+    SHGetKnownFolderPath/Environment.GetFolderPath (The Witcher 2 configurator
+    is one example).  The original values are persisted before the change, so
+    a launcher interrupted by a reboot/crash repairs them on its next start.
+    """
+
+    USER_SHELL = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+    LEGACY_SHELL = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+    DOCUMENTS_GUID = "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}"
+
+    def __init__(self, root: Path, cfg: Dict[str, Any]) -> None:
+        data = root / cfg.get("data_dir_name", "PortableData")
+        self.documents = data / "User" / "Documents"
+        self.backup_file = data / "RegistryHostBackup" / "shell-folders.json"
+        self.active = bool(cfg.get("redirect_known_folders")) and IS_WINDOWS
+        self.started = False
+
+    @classmethod
+    def _locations(cls) -> tuple[tuple[str, str], ...]:
+        return (
+            (cls.USER_SHELL, "Personal"),
+            (cls.USER_SHELL, cls.DOCUMENTS_GUID),
+            (cls.LEGACY_SHELL, "Personal"),
+            (cls.LEGACY_SHELL, cls.DOCUMENTS_GUID),
+        )
+
+    def restore(self) -> None:
+        if not self.active or not self.backup_file.is_file():
+            return
+        try:
+            import winreg
+
+            state = json.loads(self.backup_file.read_text(encoding="utf-8"))
+            for item in state.get("values", []):
+                subkey = str(item["subkey"])
+                name = str(item["name"])
+                with winreg.CreateKeyEx(
+                    winreg.HKEY_CURRENT_USER, subkey, 0, winreg.KEY_SET_VALUE
+                ) as key:
+                    if item.get("exists"):
+                        winreg.SetValueEx(
+                            key, name, 0, int(item["type"]), item.get("value", "")
+                        )
+                    else:
+                        try:
+                            winreg.DeleteValue(key, name)
+                        except FileNotFoundError:
+                            pass
+            self.backup_file.unlink()
+            self.started = False
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            # Keep the recovery file: a later start can retry instead of
+            # forgetting how the host profile looked before redirection.
+            return
+
+    def load(self) -> None:
+        if not self.active:
+            return
+        self.documents.mkdir(parents=True, exist_ok=True)
+        # Recover a previous interrupted run first. Never stack backups.
+        if self.backup_file.exists():
+            self.restore()
+            if self.backup_file.exists():
+                return
+
+        try:
+            import winreg
+
+            saved = []
+            for subkey, name in self._locations():
+                exists = False
+                typ = winreg.REG_SZ
+                value: Any = ""
+                try:
+                    with winreg.OpenKey(
+                        winreg.HKEY_CURRENT_USER, subkey, 0, winreg.KEY_QUERY_VALUE
+                    ) as key:
+                        value, typ = winreg.QueryValueEx(key, name)
+                        exists = True
+                except FileNotFoundError:
+                    pass
+                saved.append({
+                    "subkey": subkey, "name": name, "exists": exists,
+                    "type": int(typ), "value": value,
+                })
+
+            self.backup_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.backup_file.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps({"values": saved}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.backup_file)
+
+            for subkey, name in self._locations():
+                value_type = (winreg.REG_EXPAND_SZ
+                              if subkey == self.USER_SHELL else winreg.REG_SZ)
+                with winreg.CreateKeyEx(
+                    winreg.HKEY_CURRENT_USER, subkey, 0, winreg.KEY_SET_VALUE
+                ) as key:
+                    winreg.SetValueEx(
+                        key, name, 0, value_type, str(self.documents)
+                    )
+            self.started = True
+        except (OSError, TypeError, ValueError):
+            # If the backup exists, restore whatever was changed before
+            # allowing the target to start.
+            self.restore()
 
 
 class RegistrySession:
@@ -260,21 +374,25 @@ class RegistrySession:
                 _reg(("export", str(key), str(backup_file), "/y"))
 
         saved = sorted(self.session.glob("*.reg"))
+        initial_name = self.cfg.get("file", "portable.reg")
+        machine_name = self.cfg.get("machine_file", "portable_machine.reg")
+        sources = []
         if saved:
-            for index, source in enumerate(saved):
-                _reg(("import", str(_unpacked_reg(source, self.runtime, self.root, index))))
+            # A prior non-elevated game run can save HKCU/VirtualStore while
+            # being unable to export HKLM. Seed the captured machine install
+            # keys first; any later elevated session file overrides them.
+            if machine_name:
+                sources.append(self.root / str(machine_name))
+            sources.extend(saved)
         else:
-            sources = []
-            initial_name = self.cfg.get("file", "portable.reg")
-            machine_name = self.cfg.get("machine_file", "portable_machine.reg")
             if initial_name:
                 sources.append(self.root / str(initial_name))
             if machine_name:
                 sources.append(self.root / str(machine_name))
-            for index, source in enumerate(sources):
-                if source.is_file():
-                    imported = _unpacked_reg(source, self.runtime, self.root, index)
-                    _reg(("import", str(imported)))
+        for index, source in enumerate(sources):
+            if source.is_file():
+                imported = _unpacked_reg(source, self.runtime, self.root, index)
+                _reg(("import", str(imported)))
         self.started = True
 
     def save_and_restore(self) -> None:
@@ -311,32 +429,157 @@ class RegistrySession:
             pass
 
 
+def _select_target(cfg: Dict[str, Any], arguments: Sequence[str]
+                   ) -> tuple[str, list[str], bool]:
+    """Resolve launcher/configurator switches without passing them to the app."""
+    target_rel = str(cfg["target_exe_rel"])
+    selected_role = "main"
+    forwarded: list[str] = []
+    targets = list(cfg.get("targets", []))
+    by_path = {
+        str(item.get("rel_path", "")).replace("\\", "/").casefold(): item
+        for item in targets
+    }
+    index = 0
+    while index < len(arguments):
+        arg = str(arguments[index])
+        lowered = arg.casefold()
+        if lowered == "--elevated":
+            index += 1
+            continue
+        if lowered == "--machine-registry":
+            selected_role = selected_role if selected_role != "main" else "auxiliary"
+            index += 1
+            continue
+        if lowered == "--launcher" and cfg.get("launcher_target_rel"):
+            target_rel = str(cfg["launcher_target_rel"])
+            selected_role = "launcher"
+            index += 1
+            continue
+        if lowered in ("--config", "--settings") and cfg.get("config_target_rel"):
+            target_rel = str(cfg["config_target_rel"])
+            selected_role = "config"
+            index += 1
+            continue
+        if lowered == "--target" and index + 1 < len(arguments):
+            target_rel = str(arguments[index + 1])
+            item = by_path.get(target_rel.replace("\\", "/").casefold(), {})
+            selected_role = str(item.get("role", "auxiliary"))
+            index += 2
+            continue
+        forwarded.append(arg)
+        index += 1
+    return target_rel, forwarded, selected_role != "main"
+
+
+def _is_elevated() -> bool:
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+    except Exception:
+        return False
+
+
+def _run_elevated(arguments: Sequence[str]) -> Optional[int]:
+    """Relaunch this frozen EXE through UAC and wait for its exit code."""
+    if not IS_WINDOWS or not getattr(sys, "frozen", False):
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        SEE_MASK_NOCLOSEPROCESS = 0x00000040
+        SEE_MASK_NO_CONSOLE = 0x00008000
+
+        class SHELLEXECUTEINFOW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong),
+                ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+                ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+                ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+                ("hProcess", wintypes.HANDLE),
+            ]
+
+        info = SHELLEXECUTEINFOW()
+        info.cbSize = ctypes.sizeof(info)
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE
+        info.lpVerb = "runas"
+        info.lpFile = str(sys.executable)
+        info.lpParameters = subprocess.list2cmdline(
+            [*map(str, arguments), "--elevated"])
+        info.lpDirectory = str(_runtime_directory())
+        info.nShow = 1
+        shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
+        if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
+            return None
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
+        code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+        kernel32.CloseHandle(info.hProcess)
+        return int(code.value)
+    except Exception:
+        return None
+
+
 def run(argv: Optional[Sequence[str]] = None) -> int:
     root = find_portable_root()
     with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
         cfg: Dict[str, Any] = json.load(fh)
 
-    env = _prepare_environment(root, cfg)
-    target = _as_relative_path(root, cfg["target_exe_rel"])
-    if not target.is_file():
-        raise FileNotFoundError(f"Исполняемый файл программы не найден:\n{target}")
+    raw_arguments = list(argv if argv is not None else sys.argv[1:])
+    target_rel, forwarded, needs_machine = _select_target(cfg, raw_arguments)
+    already_elevated = any(
+        str(arg).casefold() == "--elevated" for arg in raw_arguments)
+    machine_name = str(cfg.get("registry", {}).get("machine_file", ""))
+    machine_available = bool(machine_name and (root / machine_name).is_file())
+    if needs_machine and machine_available and not already_elevated \
+            and not _is_elevated():
+        elevated_code = _run_elevated(raw_arguments)
+        if elevated_code is None:
+            raise PermissionError(
+                "Для запуска конфигуратора нужны захваченные параметры HKLM. "
+                "Разрешите запрос контроля учётных записей (UAC)."
+            )
+        return elevated_code
 
+    env = _prepare_environment(root, cfg)
+    target = _as_relative_path(root, target_rel)
+    if not target.is_file():
+        alternative = root / "App" / str(target_rel).replace("\\", os.sep)
+        if alternative.is_file():
+            target = alternative
+        else:
+            raise FileNotFoundError(
+                f"Исполняемый файл программы не найден:\n{target}")
+
+    shell_folders = ShellFolderSession(root, cfg)
     registry = RegistrySession(root, cfg)
-    registry.load()
+    shell_folders.load()
     try:
-        command = [
-            str(target),
-            *[str(arg) for arg in cfg.get("target_args", [])],
-            *list(argv if argv is not None else sys.argv[1:]),
-        ]
-        return subprocess.run(
-            command,
-            cwd=str(target.parent),
-            env=env,
-            check=False,
-        ).returncode
+        registry.load()
+        try:
+            command = [
+                str(target),
+                *[str(arg) for arg in cfg.get("target_args", [])],
+                *forwarded,
+            ]
+            return subprocess.run(
+                command,
+                cwd=str(target.parent),
+                env=env,
+                check=False,
+            ).returncode
+        finally:
+            registry.save_and_restore()
     finally:
-        registry.save_and_restore()
+        shell_folders.restore()
 
 
 def main() -> int:
