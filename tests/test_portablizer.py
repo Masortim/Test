@@ -72,6 +72,21 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertFalse((portable / "cleanup_host.reg").exists())
             self.assertTrue((data / "settings.json").exists())
 
+    def test_prepare_output_removes_stale_per_target_launchers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir()
+            for name in ("Launch_PerformanceTester.bat",
+                         "Launch_userContentManager.vbs", "Launch_Menu.bat"):
+                (portable / name).write_text("stale", encoding="ascii")
+
+            self.engine._prepare_output(str(portable), str(app), str(data))
+
+            self.assertFalse(any(portable.glob("Launch_*.*")))
+
     def test_recovers_program_written_to_redirected_local_appdata(self):
         with tempfile.TemporaryDirectory() as temp:
             portable = Path(temp, "Type_Portable")
@@ -330,9 +345,77 @@ class PortableExeLauncherTests(unittest.TestCase):
                         "PROGRAMDATA", "PUBLIC"):
                 self.assertTrue(env[key].startswith(str(root)), key)
             self.assertEqual(env["PORTABLE_ROOT"], str(root))
+            self.assertEqual(
+                env["PORTABLE_DOCUMENTS"],
+                str(root / "PortableData" / "User" / "Documents"),
+            )
             self.assertEqual(env["PROGRAM_HOME"], f"{root}/App")
             self.assertTrue((root / "PortableData" / "User" /
                              "Documents" / "My Games").is_dir())
+
+    def test_saved_user_settings_do_not_hide_required_machine_registry_seed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, _app, _target = self._portable(temp)
+            session = root / "PortableData" / "Registry"
+            session.mkdir(parents=True)
+            machine = root / "portable_machine.reg"
+            saved = session / "k01.reg"
+            machine.write_text("machine", encoding="utf-8")
+            saved.write_text("saved", encoding="utf-8")
+            cfg = {
+                "data_dir_name": "PortableData",
+                "registry": {
+                    "enabled": True,
+                    "machine_file": machine.name,
+                    "keys": [],
+                },
+            }
+            calls = []
+
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(
+                        exe_launcher, "_unpacked_reg",
+                        side_effect=lambda source, *_args: source,
+                    ), mock.patch.object(
+                        exe_launcher, "_reg",
+                        side_effect=lambda args: calls.append(tuple(args)) or 0,
+                    ):
+                exe_launcher.RegistrySession(root, cfg).load()
+
+            imports = [call for call in calls if call[0] == "import"]
+            self.assertEqual(Path(imports[0][1]), machine)
+            self.assertEqual(Path(imports[1][1]), saved)
+
+    def test_config_switch_runs_configurator_in_the_same_portable_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, app, _target = self._portable(temp)
+            configurator = app / "bin" / "Configurator.exe"
+            configurator.parent.mkdir()
+            configurator.write_bytes(b"MZ config")
+            config_path = root / "launcher_config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config.update({
+                "config_target_rel": "App/bin/Configurator.exe",
+                "targets": [
+                    {"rel_path": "App/Program.exe", "role": "main"},
+                    {"rel_path": "App/bin/Configurator.exe", "role": "config"},
+                ],
+            })
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            completed = mock.Mock(returncode=0)
+
+            with mock.patch.object(exe_launcher, "find_portable_root",
+                                   return_value=root), mock.patch(
+                "portable_launcher_entry.subprocess.run", return_value=completed
+            ) as run_process:
+                rc = exe_launcher.run(["--config"])
+
+            self.assertEqual(rc, 0)
+            command = run_process.call_args.args[0]
+            self.assertEqual(command[0], str(configurator))
+            self.assertNotIn("--config", command)
+            self.assertEqual(run_process.call_args.kwargs["cwd"],
+                             str(configurator.parent))
 
 
 class LaunchBatSafetyTests(unittest.TestCase):
@@ -412,6 +495,28 @@ class LaunchBatSafetyTests(unittest.TestCase):
         for switch in ("--nopause", "--pause", "--no-registry",
                        "--keep-registry", "--reset", "--help"):
             self.assertIn(switch, bat)
+
+    def test_generated_game_launcher_redirects_windows_documents_known_folder(self):
+        bat = self._bat(redirect_known_folders=True)
+        self.assertIn("User Shell Folders", bat)
+        self.assertIn("PORTABLE_DOCUMENTS", bat)
+        self.assertIn("shell-user.reg", bat)
+        # The host value is restored after the child process exits.
+        self.assertIn('reg import "%PORTABLE_DOC_USER_BACKUP%"', bat)
+
+    def test_auxiliary_target_can_request_machine_registry_through_uac(self):
+        target = launcher_mod.TargetInfo(
+            name="Configurator", rel_path="App/bin/Configurator.exe",
+            role="config")
+        cfg = LauncherConfig(
+            app_name="Game", target_exe_rel="App/bin/Game.exe",
+            targets=[target], config_target_rel=target.rel_path)
+        bat = render_bat(cfg)
+        companion = launcher_mod.render_companion_bat(cfg, target)
+        self.assertIn("--machine-registry", companion)
+        self.assertIn('call "%PORTABLE_LAUNCHER_DIR%\\Launch.bat"', companion)
+        self.assertIn("Start-Process", bat)
+        self.assertIn("-Verb RunAs", bat)
 
 
 class LaunchBatExecutionTests(unittest.TestCase):
@@ -704,6 +809,24 @@ class RegistryPortabilityTests(unittest.TestCase):
         self.assertIn('"m"=hex(7):', text)
         self.assertIn('"b"=hex:01,02', text)
         self.assertIn('"e"=hex(2):', text)
+
+    def test_install_folder_is_retargeted_after_program_files_recovery(self):
+        key = r"HKLM\Software\Wow6432Node\CD Projekt RED\The Witcher 2"
+        old = r"C:\Program Files (x86)\The Witcher 2"
+        snapshot = {key: {
+            "InstallFolder": (registry.REG_SZ, repr(old)),
+            "Launcher": (registry.REG_SZ, repr(old + r"\Launcher.exe")),
+            "Language": (registry.REG_SZ, repr("RU")),
+        }}
+        moved = registry.retarget_install_paths(
+            snapshot, [key], r"E:\Portable\Witcher2_Portable\App")
+        text = registry.render_keys(moved, [key])
+        self.assertIn(
+            '"InstallFolder"="E:\\\\Portable\\\\Witcher2_Portable\\\\App"',
+            text)
+        self.assertIn("App\\\\Launcher.exe", text)
+        self.assertNotIn("Program Files", text)
+        self.assertIn('"Language"="RU"', text)
 
 
 class RegistryCaptureIntegrationTests(unittest.TestCase):
@@ -2069,6 +2192,10 @@ class CompanionLauncherGenerationTests(unittest.TestCase):
             (bin_dir / "WITCHER2.EXE").write_bytes(b"MZ" + b"\x00" * 20000)
             (app_dir / "Launcher.exe").write_bytes(b"MZ" + b"\x00" * 5000)
             (bin_dir / "Configurator.exe").write_bytes(b"MZ" + b"\x00" * 3000)
+            (bin_dir / "PerformanceTester.exe").write_bytes(
+                b"MZ" + b"\x00" * 2000)
+            (bin_dir / "userContentManager.exe").write_bytes(
+                b"MZ" + b"\x00" * 2000)
 
             port = Portablizer(Logger())
             main_exe, targets = port._discover_app_executables(str(app_dir), "The Witcher 2")
@@ -2087,8 +2214,14 @@ class CompanionLauncherGenerationTests(unittest.TestCase):
             self.assertIn("Launch_Launcher.bat", companion_files)
             self.assertIn("Launch_Configurator.bat", companion_files)
             self.assertIn("Launch_Menu.bat", companion_files)
+            # Для редких tools больше не создаётся по паре однотипных файлов:
+            # они доступны из общего меню.
+            self.assertNotIn("Launch_PerformanceTester.bat", companion_files)
+            self.assertNotIn("Launch_userContentManager.bat", companion_files)
+            self.assertFalse(Path(temp, "Launch_PerformanceTester.bat").exists())
+            self.assertFalse(Path(temp, "Launch_userContentManager.vbs").exists())
 
-            # Проверяем, что все bat и vbs файлы — чистый ASCII
+            # Проверяем, что все созданные файлы — чистый ASCII
             for fname in companion_files:
                 fpath = Path(temp, fname)
                 self.assertTrue(fpath.is_file(), f"{fname} is missing")
@@ -2101,7 +2234,8 @@ class CompanionLauncherGenerationTests(unittest.TestCase):
             import json
             with open(cfg_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            self.assertEqual(len(data["targets"]), 3)
+            self.assertEqual(len(data["targets"]), 5)
+            self.assertTrue(data["redirect_known_folders"])
             self.assertTrue(any(t["role"] == "launcher" for t in data["targets"]))
             self.assertTrue(any(t["role"] == "config" for t in data["targets"]))
 

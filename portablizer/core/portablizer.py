@@ -335,7 +335,7 @@ class PortableResult:
     hints: List[str] = field(default_factory=list)
     #: Все обнаруженные цели (главный exe, лаунчер, конфигуратор, утилиты)
     targets: List[launcher_mod.TargetInfo] = field(default_factory=list)
-    #: Список созданных дополнительных bat-файлов (Launch_Launcher.bat и т.д.)
+    #: Созданные варианты запуска (только launcher/configurator и общее меню).
     companion_launchers: List[str] = field(default_factory=list)
     #: Готовый EXE для запуска портатива двойным кликом из папки App.
     portable_launcher_exe_rel: str = ""
@@ -408,6 +408,26 @@ class Portablizer:
             except OSError as exc:
                 raise RuntimeError(
                     f"Не удалось очистить старый файл результата: {path}: {exc}"
+                ) from exc
+
+        # Набор обнаруженных exe меняется от сборки к сборке. Удаляем старые
+        # сгенерированные Launch_<Target>.bat/.vbs, иначе после упрощения меню
+        # в корне остаются нерабочие Launch_PerformanceTester и подобные файлы.
+        try:
+            root_files = os.listdir(portable_dir)
+        except OSError:
+            root_files = []
+        for filename in root_files:
+            if not re.fullmatch(r"Launch_.+\.(?:bat|vbs)", filename,
+                                flags=re.IGNORECASE):
+                continue
+            path = os.path.join(portable_dir, filename)
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Не удалось очистить старый лончер: {path}: {exc}"
                 ) from exc
 
     def _save_run_log(self, portable_dir: str) -> None:
@@ -955,13 +975,23 @@ class Portablizer:
         user_keys = [k for k in portable_keys if k.startswith("HKCU")]
         machine_keys = [k for k in portable_keys if k.startswith("HKLM")]
 
-        # Виртуализация HKLM-ключей для бесправного доступа (UAC VirtualStore + HKCU mirror)
+        # Если установщик сначала писал в Program Files, а затем его файлы были
+        # перенесены в App, InstallFolder не должен остаться направленным в
+        # старый/удалённый каталог. Именно из-за такого значения The Witcher 2
+        # запускался напрямую, но Launcher.exe и Configurator.exe считали
+        # установку недействительной и сразу закрывались.
+        portable_after = reg_mod.retarget_install_paths(
+            after, portable_keys, os.path.join(portable_dir, "App"))
+
+        # Виртуализация HKLM-ключей остаётся бесправным fallback. Для программ
+        # с manifest (у них Windows отключает VirtualStore) вспомогательные
+        # лончеры ниже запросят UAC и временно применят portable_machine.reg.
         virtual_keys: List[str] = []
         if machine_keys:
             after_virtualized, virtual_keys = reg_mod.virtualize_machine_snapshot(
-                after, machine_keys)
+                portable_after, machine_keys)
         else:
-            after_virtualized = after
+            after_virtualized = portable_after
 
         all_user_keys = sorted(set(user_keys + virtual_keys))
 
@@ -974,7 +1004,8 @@ class Portablizer:
         machine_text = ""
         if machine_keys:
             machine_path = os.path.join(portable_dir, "portable_machine.reg")
-            machine_text = reg_mod.render_keys(after, machine_keys, tokens)
+            machine_text = reg_mod.render_keys(
+                portable_after, machine_keys, tokens)
             if reg_mod.has_entries(machine_text):
                 reg_mod.write_reg_file(machine_path, machine_text)
                 capture.machine_reg_file = machine_path
@@ -2043,6 +2074,7 @@ class Portablizer:
             registry_has_root_token=bool(capture and capture.has_root_token),
             extra_env=opts.extra_env,
             path_prepend=path_prepend,
+            redirect_known_folders=True,
             targets=all_targets,
             launcher_target_rel=launcher_target,
             config_target_rel=config_target,
@@ -2059,27 +2091,31 @@ class Portablizer:
 
         created_launchers: List[str] = ["Launch.bat", "LaunchHidden.vbs"]
 
-        # Создаём вспомогательные лончеры для обнаруженных лаунчеров и конфигураторов
+        # Отдельные файлы нужны только для двух частых действий: официальный
+        # launcher и окно настроек. Раньше BAT+VBS создавались для каждого
+        # PerformanceTester/UserContentManager/helper, загромождая корень
+        # десятком почти одинаковых файлов. Редкие утилиты остаются доступны
+        # из единого Launch_Menu.bat.
         main_norm = main_exe_rel.replace("\\", "/").lower()
-        for t in all_targets:
-            if t.rel_path.replace("\\", "/").lower() == main_norm:
-                continue
+        companion_targets = [
+            t for t in all_targets
+            if t.rel_path.replace("\\", "/").lower() != main_norm
+            and t.role in ("launcher", "config")
+        ]
+        for t in companion_targets:
             t_bat_path = os.path.join(portable_dir, t.bat_name)
             self._write_text(t_bat_path, launcher_mod.render_companion_bat(cfg, t),
                              encoding="ascii")
-            t_vbs_path = os.path.join(portable_dir, t.vbs_name)
-            self._write_text(t_vbs_path, launcher_mod.render_companion_vbs(cfg, t),
-                             encoding="ascii")
-            created_launchers.extend([t.bat_name, t.vbs_name])
+            created_launchers.append(t.bat_name)
 
             if t.role == "launcher":
-                self.log.ok(f"Обнаружен лаунчер программы: {t.rel_path} (создан {t.bat_name})")
-            elif t.role == "config":
-                self.log.ok(f"Обнаружен конфигуратор/настройки: {t.rel_path} (создан {t.bat_name})")
-            elif t.role == "tool":
-                self.log.ok(f"Обнаружена вспомогательная утилита: {t.rel_path} (создан {t.bat_name})")
+                self.log.ok(
+                    f"Обнаружен лаунчер программы: {t.rel_path} "
+                    f"(создан {t.bat_name})")
             else:
-                self.log.info(f"Дополнительный исполняемый файл: {t.rel_path} (создан {t.bat_name})")
+                self.log.ok(
+                    f"Обнаружен конфигуратор/настройки: {t.rel_path} "
+                    f"(создан {t.bat_name})")
 
         if len(all_targets) >= 2:
             menu_bat_path = os.path.join(portable_dir, "Launch_Menu.bat")
@@ -2097,11 +2133,11 @@ class Portablizer:
         # Формируем описание дополнительных файлов в README
         companion_lines = []
         companion_files_desc = []
-        for t in all_targets:
-            if t.rel_path.replace("\\", "/").lower() == main_norm:
-                continue
-            companion_lines.append(f"  • {t.bat_name:<24} — запуск {t.description} ({t.rel_path})")
-            companion_files_desc.append(f"  {t.bat_name:<21} — запуск {t.name} ({t.rel_path})\n")
+        for t in companion_targets:
+            companion_lines.append(
+                f"  • {t.bat_name:<24} — запуск {t.description} ({t.rel_path})")
+            companion_files_desc.append(
+                f"  {t.bat_name:<21} — запуск {t.name} ({t.rel_path})\n")
 
         if len(all_targets) >= 2:
             companion_lines.append("  • Launch_Menu.bat          — интерактивное меню выбора программы")
@@ -2162,7 +2198,14 @@ _README = """{app_name} — портативная версия
   1. Скопируйте ВСЮ эту папку на флешку, другой ПК или в любое место.
 {exe_launcher_step}{companion_section}
 Устанавливать ничего не нужно: программа не появляется в списке
-«Установленные программы» и не требует прав администратора.
+«Установленные программы». Обычный запуск не требует прав администратора;
+старый комплектный launcher/configurator может один раз показать UAC, чтобы
+временно применить обязательный InstallFolder из HKLM.
+
+Если есть Launch_Configurator.bat, сначала запустите его, выберите графику,
+язык и разрешение, сохраните настройки и закройте окно. Затем запускайте игру
+через App\\LaunchPortable.exe или Launch.bat. Оба запуска используют один
+портативный каталог Documents, поэтому выбранные настройки применятся в игре.
 
 Что внутри:
   App\\                  — установленная программа ({main_exe_rel})
@@ -2190,6 +2233,8 @@ _README = """{app_name} — портативная версия
 Как это работает:
   • стандартные каталоги профиля (AppData, Temp, Документы и др.) на время
     работы перенаправляются в PortableData — программа не пишет в C:\\Users;
+  • Windows Known Folder Documents тоже временно направляется в PortableData,
+    поэтому Configurator.exe и сама игра используют один файл настроек;
   • если программе нужны записи реестра, лончер перед стартом сохраняет
     прежнее состояние чужого ПК, подставляет настройки из портатива (включая
     UAC VirtualStore для бесправного доступа к machine-ключам), а после выхода

@@ -34,9 +34,9 @@ cmd.exe читает .bat не построчно, а блоками, запом
     бинарник собирается отдельно и копируется оркестратором;
   * ``Launch.bat`` — запасной вариант, работает на любой Windows;
   * ``LaunchHidden.vbs`` — тот же запасной запуск, но без окна консоли;
-  * ``Launch_Launcher.bat`` / ``Launch_Configurator.bat`` / ``Launch_<Tool>.bat``
-    — запуск вспомогательных лаунчеров и конфигураторов в изолированной среде;
-  * ``Launch_Menu.bat`` — интерактивное меню выбора программы;
+  * ``Launch_Launcher.bat`` / ``Launch_Configurator.bat`` — два полезных
+    коротких вызова официального лаунчера и окна настроек;
+  * ``Launch_Menu.bat`` — единое меню всех целей, включая редкие утилиты;
   * ``launcher.py`` — та же логика на Python (для сборки launcher.exe).
 """
 from __future__ import annotations
@@ -92,6 +92,10 @@ class LauncherConfig:
     extra_env: Dict[str, str] = field(default_factory=dict)
     # Относительные папки, добавляемые в PATH.
     path_prepend: List[str] = field(default_factory=list)
+    # Временно перенаправлять Windows Known Folder «Документы». Одного
+    # USERPROFILE недостаточно: .NET/WinAPI-конфигураторы читают путь через
+    # SHGetKnownFolderPath и иначе пишут настройки в реальный профиль.
+    redirect_known_folders: bool = False
     # Все обнаруженные цели (главный exe, лаунчер, конфигуратор, утилиты)
     targets: List[TargetInfo] = field(default_factory=list)
     launcher_target_rel: str = ""
@@ -294,17 +298,18 @@ def _registry_load_block(cfg: LauncherConfig) -> str:
         )
 
     # Настройки прошлого запуска имеют приоритет над исходным снимком.
+    initial = '%PORTABLE_ROOT%\\' + _bat_set_value(cfg.reg_file_name)
+    machine = '%PORTABLE_ROOT%\\' + _bat_set_value(cfg.machine_reg_file_name)
     lines += [
         'if defined PORTABLE_SESSION_FOUND (',
+        '  rem Always seed required HKLM install data. A previous normal game',
+        '  rem run may have saved only HKCU/VirtualStore files; skipping the',
+        '  rem machine seed made a later Configurator still see no installation.',
+        f'  if exist "{machine}" call :portable_registry_import "{machine}"',
         '  for %%F in ("%PORTABLE_REG_SESSION%\\*.reg") do '
         'call :portable_registry_import "%%~fF"',
         '  goto :eof',
         ')',
-    ]
-
-    initial = '%PORTABLE_ROOT%\\' + _bat_set_value(cfg.reg_file_name)
-    machine = '%PORTABLE_ROOT%\\' + _bat_set_value(cfg.machine_reg_file_name)
-    lines += [
         f'if exist "{initial}" call :portable_registry_import "{initial}"',
         'rem HKLM entries need administrator rights; keep them in a separate',
         'rem file so a failure here cannot abort the user-level import.',
@@ -344,6 +349,87 @@ def _registry_save_block(cfg: LauncherConfig) -> str:
     return "\n".join(lines)
 
 
+def _machine_elevation_block(cfg: LauncherConfig) -> str:
+    """UAC только для целей, которым действительно нужен захваченный HKLM."""
+    if not cfg.machine_reg_file_name:
+        return "goto :eof"
+    machine = _bat_set_value(cfg.machine_reg_file_name)
+    return "\n".join([
+        'if not defined PORTABLE_MACHINE_REGISTRY goto :eof',
+        'if defined PORTABLE_ELEVATED goto :eof',
+        f'if not exist "%PORTABLE_ROOT%\\{machine}" goto :eof',
+        'net session >nul 2>&1',
+        'if not errorlevel 1 goto :eof',
+        'set "PORTABLE_SELF=%~f0"',
+        'set "PORTABLE_ELEVATION_TARGET=%PORTABLE_TARGET%"',
+        'echo This settings tool needs the captured machine registry data.',
+        'echo Requesting administrator rights for this run only...',
+        'powershell -NoProfile -ExecutionPolicy Bypass -Command "$q=[char]34; $a=\'--nopause --elevated --machine-registry --target \'+$q+$env:PORTABLE_ELEVATION_TARGET+$q; $p=Start-Process -FilePath $env:PORTABLE_SELF -ArgumentList $a -Verb RunAs -Wait -PassThru; exit $p.ExitCode"',
+        'set "PORTABLE_RELAUNCH_RC=%ERRORLEVEL%"',
+        'set "PORTABLE_RELAUNCHED=1"',
+        'if not "%PORTABLE_RELAUNCH_RC%" == "0" (',
+        '  echo.',
+        '  echo [ERROR] Administrator rights were not granted or the tool failed.',
+        '  if not "%PORTABLE_PAUSE%" == "never" pause',
+        ')',
+        'goto :eof',
+    ])
+
+
+_DOCUMENTS_USER_KEY = (
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+)
+_DOCUMENTS_LEGACY_KEY = (
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+)
+_DOCUMENTS_GUID = "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}"
+
+
+def _documents_load_block(cfg: LauncherConfig) -> str:
+    """Временно направляет WinAPI Known Folder Documents внутрь портатива."""
+    if not cfg.redirect_known_folders:
+        return "goto :eof"
+    return "\n".join([
+        'set "PORTABLE_DOC_USER_BACKUP=%PORTABLE_REG_BACKUP%\\shell-user.reg"',
+        'set "PORTABLE_DOC_LEGACY_BACKUP=%PORTABLE_REG_BACKUP%\\shell-legacy.reg"',
+        'rem Recover an interrupted previous run before taking a new backup.',
+        'if exist "%PORTABLE_DOC_USER_BACKUP%" call :portable_documents_restore',
+        'if not defined PORTABLE_REGISTRY goto :eof',
+        f'reg export "{_DOCUMENTS_USER_KEY}" "%PORTABLE_DOC_USER_BACKUP%" /y >nul 2>&1',
+        'if not exist "%PORTABLE_DOC_USER_BACKUP%" goto :eof',
+        f'reg add "{_DOCUMENTS_USER_KEY}" /v "Personal" /t REG_EXPAND_SZ /d "%PORTABLE_DOCUMENTS%" /f >nul 2>&1',
+        f'reg add "{_DOCUMENTS_USER_KEY}" /v "{_DOCUMENTS_GUID}" /t REG_EXPAND_SZ /d "%PORTABLE_DOCUMENTS%" /f >nul 2>&1',
+        f'reg export "{_DOCUMENTS_LEGACY_KEY}" "%PORTABLE_DOC_LEGACY_BACKUP%" /y >nul 2>&1',
+        'if exist "%PORTABLE_DOC_LEGACY_BACKUP%" (',
+        f'  reg add "{_DOCUMENTS_LEGACY_KEY}" /v "Personal" /t REG_SZ /d "%PORTABLE_DOCUMENTS%" /f >nul 2>&1',
+        f'  reg add "{_DOCUMENTS_LEGACY_KEY}" /v "{_DOCUMENTS_GUID}" /t REG_SZ /d "%PORTABLE_DOCUMENTS%" /f >nul 2>&1',
+        ')',
+        'goto :eof',
+    ])
+
+
+def _documents_restore_block(cfg: LauncherConfig) -> str:
+    if not cfg.redirect_known_folders:
+        return "goto :eof"
+    return "\n".join([
+        'if not defined PORTABLE_DOC_USER_BACKUP set "PORTABLE_DOC_USER_BACKUP=%PORTABLE_REG_BACKUP%\\shell-user.reg"',
+        'if not defined PORTABLE_DOC_LEGACY_BACKUP set "PORTABLE_DOC_LEGACY_BACKUP=%PORTABLE_REG_BACKUP%\\shell-legacy.reg"',
+        'if exist "%PORTABLE_DOC_USER_BACKUP%" (',
+        f'  reg delete "{_DOCUMENTS_USER_KEY}" /v "Personal" /f >nul 2>&1',
+        f'  reg delete "{_DOCUMENTS_USER_KEY}" /v "{_DOCUMENTS_GUID}" /f >nul 2>&1',
+        '  reg import "%PORTABLE_DOC_USER_BACKUP%" >nul 2>&1',
+        '  del /f /q "%PORTABLE_DOC_USER_BACKUP%" >nul 2>&1',
+        ')',
+        'if exist "%PORTABLE_DOC_LEGACY_BACKUP%" (',
+        f'  reg delete "{_DOCUMENTS_LEGACY_KEY}" /v "Personal" /f >nul 2>&1',
+        f'  reg delete "{_DOCUMENTS_LEGACY_KEY}" /v "{_DOCUMENTS_GUID}" /f >nul 2>&1',
+        '  reg import "%PORTABLE_DOC_LEGACY_BACKUP%" >nul 2>&1',
+        '  del /f /q "%PORTABLE_DOC_LEGACY_BACKUP%" >nul 2>&1',
+        ')',
+        'goto :eof',
+    ])
+
+
 _BAT_TEMPLATE = r"""@echo off
 setlocal EnableExtensions DisableDelayedExpansion
 rem ===========================================================================
@@ -378,6 +464,8 @@ set "PORTABLE_ARGS="
 set "PORTABLE_RC=0"
 set "PORTABLE_CUSTOM_TARGET="
 set "PORTABLE_MENU="
+set "PORTABLE_MACHINE_REGISTRY="
+set "PORTABLE_ELEVATED="
 
 :portable_parse
 if "%~1" == "" goto portable_parsed
@@ -411,6 +499,17 @@ if /i "%~1" == "--reset" (
 )
 if /i "%~1" == "--menu" (
   set "PORTABLE_MENU=1"
+  shift
+  goto portable_parse
+)
+rem Internal switches used by generated companion launchers.
+if /i "%~1" == "--machine-registry" (
+  set "PORTABLE_MACHINE_REGISTRY=1"
+  shift
+  goto portable_parse
+)
+if /i "%~1" == "--elevated" (
+  set "PORTABLE_ELEVATED=1"
   shift
   goto portable_parse
 )
@@ -455,6 +554,7 @@ set "TEMP=%PORTABLE_DATA%\Temp"
 set "TMP=%PORTABLE_DATA%\Temp"
 set "PROGRAMDATA=%PORTABLE_DATA%\ProgramData"
 set "PUBLIC=%PORTABLE_DATA%\Public"
+set "PORTABLE_DOCUMENTS=%PORTABLE_DATA%\User\Documents"
 set "USERNAME=Portable"
 set "PORTABLE_APP=1"
 
@@ -522,6 +622,15 @@ if not exist "%PORTABLE_TARGET%" (
   exit /b 1
 )
 
+rem Launchers/configurators of older games often require their captured HKLM
+rem InstallFolder. VirtualStore is ignored by manifest-aware programs, so only
+rem those auxiliary targets are relaunched with UAC when a machine file exists.
+call :portable_elevate_for_machine
+if defined PORTABLE_RELAUNCHED (
+  endlocal & exit /b %PORTABLE_RELAUNCH_RC%
+)
+
+call :portable_documents_load
 call :portable_registry_load
 
 for %%I in ("%PORTABLE_TARGET%") do set "PORTABLE_TARGET_DIR=%%~dpI"
@@ -532,6 +641,7 @@ set "PORTABLE_RC=%ERRORLEVEL%"
 popd
 
 call :portable_registry_save
+call :portable_documents_restore
 
 if not "%PORTABLE_RC%" == "0" (
   echo.
@@ -574,6 +684,15 @@ echo ===========================================================================
 {list_items}
 echo ===========================================================================
 endlocal & exit /b 0
+
+:portable_elevate_for_machine
+{machine_elevation}
+
+:portable_documents_load
+{documents_load}
+
+:portable_documents_restore
+{documents_restore}
 
 :portable_registry_load
 {registry_load}
@@ -634,6 +753,7 @@ def render_bat(cfg: LauncherConfig) -> str:
         launcher_arg_block = (
             'if /i "%~1" == "--launcher" (\n'
             f'  set "PORTABLE_CUSTOM_TARGET={_bat_set_value(launcher_rel)}"\n'
+            '  set "PORTABLE_MACHINE_REGISTRY=1"\n'
             '  shift\n'
             '  goto portable_parse\n'
             ')'
@@ -645,11 +765,13 @@ def render_bat(cfg: LauncherConfig) -> str:
         config_arg_block = (
             'if /i "%~1" == "--config" (\n'
             f'  set "PORTABLE_CUSTOM_TARGET={_bat_set_value(config_rel)}"\n'
+            '  set "PORTABLE_MACHINE_REGISTRY=1"\n'
             '  shift\n'
             '  goto portable_parse\n'
             ')\n'
             'if /i "%~1" == "--settings" (\n'
             f'  set "PORTABLE_CUSTOM_TARGET={_bat_set_value(config_rel)}"\n'
+            '  set "PORTABLE_MACHINE_REGISTRY=1"\n'
             '  shift\n'
             '  goto portable_parse\n'
             ')'
@@ -680,6 +802,10 @@ def render_bat(cfg: LauncherConfig) -> str:
         choice_branches += [
             f'if "%PORTABLE_CHOICE%" == "{index}" (',
             f'  set "PORTABLE_CUSTOM_TARGET={_bat_set_value(target_rel_safe)}"',
+        ]
+        if target.role != "main":
+            choice_branches.append('  set "PORTABLE_MACHINE_REGISTRY=1"')
+        choice_branches += [
             '  goto portable_menu_apply',
             ')',
         ]
@@ -726,6 +852,9 @@ def render_bat(cfg: LauncherConfig) -> str:
         config_arg_block=config_arg_block,
         menu_block=menu_block,
         list_items=list_items,
+        machine_elevation=_machine_elevation_block(cfg),
+        documents_load=_documents_load_block(cfg),
+        documents_restore=_documents_restore_block(cfg),
     )
     return ensure_ascii_bat(text)
 
@@ -755,9 +884,15 @@ def render_vbs() -> str:
 # --- Вспомогательные лаунчеры и меню ------------------------------------------
 
 def render_companion_bat(cfg: LauncherConfig, target: TargetInfo) -> str:
-    """Создаёт Launch_<Name>.bat для запуска вспомогательного файла в портативе."""
+    """Создаёт надёжный короткий вызов общего портативного лончера.
+
+    ``call`` здесь обязателен: обычный запуск одного BAT из другого передаёт
+    управление навсегда и скрывает код ошибки. Вспомогательным GUI также
+    разрешается временно импортировать machine-настройки через UAC.
+    """
     title = ascii_display(f"{cfg.app_name} - {target.name}")
     rel = _win_rel(target.rel_path)
+    machine = " --machine-registry" if target.role != "main" else ""
     text = (
         "@echo off\r\n"
         "setlocal EnableExtensions\r\n"
@@ -766,7 +901,9 @@ def render_companion_bat(cfg: LauncherConfig, target: TargetInfo) -> str:
         f"rem  Target: {rel}\r\n"
         "rem ===========================================================================\r\n"
         "for %%I in (\"%~dp0.\") do set \"PORTABLE_LAUNCHER_DIR=%%~fI\"\r\n"
-        f"\"%PORTABLE_LAUNCHER_DIR%\\Launch.bat\" --target \"{_bat_set_value(rel)}\" %*\r\n"
+        f"call \"%PORTABLE_LAUNCHER_DIR%\\Launch.bat\"{machine} --target \"{_bat_set_value(rel)}\" %*\r\n"
+        "set \"PORTABLE_COMPANION_RC=%ERRORLEVEL%\"\r\n"
+        "endlocal & exit /b %PORTABLE_COMPANION_RC%\r\n"
     )
     return ensure_ascii_bat(text)
 
@@ -905,7 +1042,11 @@ def main():
             if not os.path.exists(path):
                 reg("export", key, path, "/y")
         saved = [f for f in os.listdir(session) if f.lower().endswith(".reg")]
+        machine = os.path.join(root, registry.get("machine_file", ""))
         if saved:
+            # A non-elevated run may have no saved HKLM export. Seed it first.
+            if registry.get("machine_file") and os.path.exists(machine):
+                reg("import", machine)
             for name in sorted(saved):
                 reg("import", os.path.join(session, name))
         else:
@@ -922,7 +1063,6 @@ def main():
                         fh.write(text)
                     initial = runtime
                 reg("import", initial)
-            machine = os.path.join(root, registry.get("machine_file", ""))
             if registry.get("machine_file") and os.path.exists(machine):
                 reg("import", machine)
 
@@ -1037,6 +1177,7 @@ def render_config_json(cfg: LauncherConfig) -> str:
         "data_dir_name": cfg.data_dir_name,
         "extra_env": cfg.extra_env,
         "path_prepend": cfg.path_prepend,
+        "redirect_known_folders": cfg.redirect_known_folders,
         "registry": {
             "enabled": cfg.apply_registry,
             "file": cfg.reg_file_name,

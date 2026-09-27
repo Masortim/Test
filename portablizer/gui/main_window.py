@@ -498,6 +498,18 @@ class MainWindow(QMainWindow):
                         "Дополнительные варианты (настройки, лаунчеры, меню):",
                         *[f"  • {b}" for b in companion_bats],
                     ]
+                    configurators = [
+                        name for name in companion_bats
+                        if "config" in name.casefold()
+                        or "setting" in name.casefold()
+                    ]
+                    if configurators:
+                        details += [
+                            "",
+                            "Сначала запустите конфигуратор, сохраните графику "
+                            "и разрешение, затем запускайте игру обычным "
+                            "способом. Настройки будут общими.",
+                        ]
             details += [
                 "",
                 "Скопируйте папку целиком на флешку — установка на другом "
