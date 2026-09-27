@@ -80,7 +80,8 @@ class PortablizerOutputTests(unittest.TestCase):
             app.mkdir(parents=True)
             data.mkdir()
             for name in ("Launch_PerformanceTester.bat",
-                         "Launch_userContentManager.vbs", "Launch_Menu.bat"):
+                         "Launch_userContentManager.vbs", "Launch_Configurator.exe",
+                         "Launch_Menu.bat"):
                 (portable / name).write_text("stale", encoding="ascii")
 
             self.engine._prepare_output(str(portable), str(app), str(data))
@@ -385,6 +386,40 @@ class PortableExeLauncherTests(unittest.TestCase):
             imports = [call for call in calls if call[0] == "import"]
             self.assertEqual(Path(imports[0][1]), machine)
             self.assertEqual(Path(imports[1][1]), saved)
+
+    def test_named_exe_copy_selects_configurator_without_forwarding_alias(self):
+        cfg = {
+            "target_exe_rel": "App/Game.exe",
+            "launcher_aliases": {
+                "Launch_Configurator.exe": "App/bin/Configurator.exe",
+            },
+            "targets": [
+                {"rel_path": "App/Game.exe", "role": "main"},
+                {"rel_path": "App/bin/Configurator.exe", "role": "config"},
+            ],
+        }
+        arguments = exe_launcher._arguments_with_executable_alias(
+            cfg, ["--user-option"], "launch_configurator.EXE"
+        )
+        target, forwarded, needs_machine = exe_launcher._select_target(
+            cfg, arguments
+        )
+
+        self.assertEqual(target, "App/bin/Configurator.exe")
+        self.assertEqual(forwarded, ["--user-option"])
+        self.assertTrue(needs_machine)
+
+    def test_explicit_target_overrides_named_exe_copy(self):
+        cfg = {
+            "target_exe_rel": "App/Game.exe",
+            "launcher_aliases": {
+                "Launch_Configurator.exe": "App/bin/Configurator.exe",
+            },
+        }
+        arguments = exe_launcher._arguments_with_executable_alias(
+            cfg, ["--target", "App/Other.exe"], "Launch_Configurator.exe"
+        )
+        self.assertEqual(arguments, ["--target", "App/Other.exe"])
 
     def test_config_switch_runs_configurator_in_the_same_portable_profile(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2219,6 +2254,8 @@ class CompanionLauncherGenerationTests(unittest.TestCase):
             self.assertIn("Launch.bat", companion_files)
             self.assertIn("Launch_Launcher.bat", companion_files)
             self.assertIn("Launch_Configurator.bat", companion_files)
+            self.assertIn("Launch_Launcher.exe", companion_files)
+            self.assertIn("Launch_Configurator.exe", companion_files)
             self.assertIn("Launch_Menu.bat", companion_files)
             # Для редких tools больше не создаётся по паре однотипных файлов:
             # они доступны из общего меню.
@@ -2227,12 +2264,16 @@ class CompanionLauncherGenerationTests(unittest.TestCase):
             self.assertFalse(Path(temp, "Launch_PerformanceTester.bat").exists())
             self.assertFalse(Path(temp, "Launch_userContentManager.vbs").exists())
 
-            # Проверяем, что все созданные файлы — чистый ASCII
+            # Текстовые лончеры остаются чистым ASCII, а отдельные EXE являются
+            # готовыми MZ-копиями универсального портативного лончера.
             for fname in companion_files:
                 fpath = Path(temp, fname)
                 self.assertTrue(fpath.is_file(), f"{fname} is missing")
-                text = fpath.read_text(encoding="ascii")
-                self.assertTrue(text.isascii())
+                if fname.lower().endswith(".exe"):
+                    self.assertEqual(fpath.read_bytes()[:2], b"MZ")
+                else:
+                    text = fpath.read_text(encoding="ascii")
+                    self.assertTrue(text.isascii())
 
             # Проверяем launcher_config.json
             cfg_path = Path(temp, "launcher_config.json")
@@ -2244,6 +2285,14 @@ class CompanionLauncherGenerationTests(unittest.TestCase):
             self.assertTrue(data["redirect_known_folders"])
             self.assertTrue(any(t["role"] == "launcher" for t in data["targets"]))
             self.assertTrue(any(t["role"] == "config" for t in data["targets"]))
+            self.assertEqual(
+                data["launcher_aliases"]["Launch_Launcher.exe"],
+                "App/Launcher.exe",
+            )
+            self.assertEqual(
+                data["launcher_aliases"]["Launch_Configurator.exe"],
+                "App/bin/Configurator.exe",
+            )
 
 
 class CompanionLauncherExecutionTests(unittest.TestCase):

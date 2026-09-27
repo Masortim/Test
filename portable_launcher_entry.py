@@ -429,6 +429,41 @@ class RegistrySession:
             pass
 
 
+def _arguments_with_executable_alias(
+    cfg: Dict[str, Any], arguments: Sequence[str], executable_name: Optional[str] = None
+) -> list[str]:
+    """Select the target assigned to this copy of the generic launcher.
+
+    Portablizer copies the same signed/self-contained binary under names such
+    as ``Launch_Launcher.exe`` and ``Launch_Configurator.exe``.  The relative
+    target is kept in launcher_config.json, so moving the portable folder or
+    changing its drive letter cannot invalidate the shortcut.  Explicit CLI
+    selectors still take precedence, which keeps these copies scriptable.
+    """
+    result = [str(arg) for arg in arguments]
+    selectors = {"--target", "--launcher", "--config", "--settings"}
+    if any(arg.casefold() in selectors for arg in result):
+        return result
+
+    name = executable_name
+    if name is None and getattr(sys, "frozen", False):
+        name = Path(sys.executable).name
+    if not name:
+        return result
+
+    aliases = cfg.get("launcher_aliases", {})
+    if not isinstance(aliases, dict):
+        return result
+    target = next(
+        (str(value) for key, value in aliases.items()
+         if str(key).casefold() == str(name).casefold()),
+        "",
+    )
+    if not target:
+        return result
+    return ["--machine-registry", "--target", target, *result]
+
+
 def _select_target(cfg: Dict[str, Any], arguments: Sequence[str]
                    ) -> tuple[str, list[str], bool]:
     """Resolve launcher/configurator switches without passing them to the app."""
@@ -533,7 +568,9 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
         cfg: Dict[str, Any] = json.load(fh)
 
-    raw_arguments = list(argv if argv is not None else sys.argv[1:])
+    raw_arguments = _arguments_with_executable_alias(
+        cfg, list(argv if argv is not None else sys.argv[1:])
+    )
     target_rel, forwarded, needs_machine = _select_target(cfg, raw_arguments)
     already_elevated = any(
         str(arg).casefold() == "--elevated" for arg in raw_arguments)
