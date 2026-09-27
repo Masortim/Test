@@ -449,6 +449,8 @@ class PortableExeLauncherTests(unittest.TestCase):
 
             with mock.patch.object(exe_launcher, "find_portable_root",
                                    return_value=root), \
+                    mock.patch.object(exe_launcher, "_is_elevated",
+                                      return_value=False), \
                     mock.patch.object(exe_launcher, "_run_elevated",
                                       return_value=None) as elevate, \
                     mock.patch("portable_launcher_entry.subprocess.run",
@@ -481,6 +483,8 @@ class PortableExeLauncherTests(unittest.TestCase):
 
             with mock.patch.object(exe_launcher, "find_portable_root",
                                    return_value=root), \
+                    mock.patch.object(exe_launcher, "_is_elevated",
+                                      return_value=False), \
                     mock.patch.object(exe_launcher, "_run_elevated",
                                       return_value=3) as elevate, \
                     mock.patch("portable_launcher_entry.subprocess.run") as run_process:
