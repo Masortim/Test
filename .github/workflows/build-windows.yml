@@ -54,6 +54,11 @@ jobs:
           '```text' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           Get-Content test-output.log -Tail 160 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ($testStatus -ne 0) {
+            $diagnostic = (Get-Content test-output.log -Tail 80) -join "`n"
+            $diagnostic = $diagnostic.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows unit tests failed::$diagnostic"
+          }
           exit $testStatus
 
       - name: Smoke test (import only)
