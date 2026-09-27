@@ -7,7 +7,8 @@
 нечем, поэтому здесь реализовано подмножество семантики cmd.exe, достаточное
 для наших шаблонов:
 
-* метки, ``goto``, ``call :label``, ``goto :eof``;
+* метки, ``goto``, ``call :label``, ``goto :eof`` (внутри подпрограммы
+  ``%0`` — это метка, ровно как в настоящем cmd.exe);
 * ``set "K=V"``, ``set "K="``, подстановка ``%VAR%`` и ``%VAR:~a,b%``;
 * аргументы ``%1``/``%~1``/``%~f1``, ``shift``;
 * ``if``/``if not`` с ``==``, ``/i``, ``exist``, ``defined``;
@@ -15,6 +16,11 @@
 * ``for %%I in (...) do ...`` по списку значений;
 * ``mkdir``, ``del``, ``copy``, ``pushd``/``popd``, ``echo``, ``rem``, ``title``;
 * ``exit /b N`` и ``endlocal & exit /b N``;
+* ``net session`` / ``reg query "HKU\\S-1-5-19"`` — проверки прав
+  администратора (управляются флагом ``admin``);
+* ``powershell ...`` — фиксируется в ``Result.powershell`` (и в
+  ``Result.powershell_resolved``, где ``$env:VAR`` уже подставлены) и
+  возвращает заданный ``powershell_exit_code``;
 * запуск внешней программы (``"%TARGET%" args``) — фиксируется, не выполняется.
 
 Неизвестная команда — это ошибка теста: так мы ловим опечатки в шаблоне.
@@ -101,6 +107,10 @@ class Result:
     output: List[str] = field(default_factory=list)
     launches: List[Launch] = field(default_factory=list)
     reg_commands: List[str] = field(default_factory=list)
+    powershell: List[str] = field(default_factory=list)
+    #: Те же команды, но с подставленными $env:VAR — именно это увидит
+    #: PowerShell, унаследовав окружение cmd.exe.
+    powershell_resolved: List[str] = field(default_factory=list)
     env: Dict[str, str] = field(default_factory=dict)
     paused: int = 0
 
@@ -124,7 +134,9 @@ class BatchInterpreter:
     def __init__(self, text: str, script_path: str, fs: FakeFS,
                  argv: Optional[List[str]] = None,
                  env: Optional[Dict[str, str]] = None,
-                 program_exit_code: int = 0) -> None:
+                 program_exit_code: int = 0,
+                 admin: bool = False,
+                 powershell_exit_code: int = 0) -> None:
         if not text.isascii():
             raise BatError("файл содержит не-ASCII байты: cmd.exe собьёт разбор")
         self.lines = text.replace("\r\n", "\n").split("\n")
@@ -138,11 +150,16 @@ class BatchInterpreter:
             **(env or {}),
         }
         self.program_exit_code = program_exit_code
+        self.admin = admin
+        self.powershell_exit_code = powershell_exit_code
         self.result = Result(env=self.env)
         self.cwd = ntpath.dirname(script_path)
         self.dir_stack: List[str] = []
         self.call_stack: List[int] = []
         self.call_argv_stack: List[List[str]] = []
+        # %0 внутри ``call :label`` — это сама метка (а не файл скрипта).
+        self.arg0 = script_path
+        self.call_arg0_stack: List[str] = []
         self.errorlevel = 0
         self.labels = self._index_labels()
 
@@ -160,7 +177,7 @@ class BatchInterpreter:
         # %~dp0 / %~f0 и аргументы %1..%9 с модификаторами.
         def arg_sub(match: "re.Match[str]") -> str:
             mods, index = match.group(1) or "", int(match.group(2))
-            value = (self.script_path if index == 0
+            value = (self.arg0 if index == 0
                      else (self.argv[index - 1] if index <= len(self.argv) else ""))
             if "~" in mods:
                 value = value.strip('"')
@@ -227,6 +244,8 @@ class BatchInterpreter:
                         index = self.call_stack.pop()
                         if self.call_argv_stack:
                             self.argv = self.call_argv_stack.pop()
+                        if self.call_arg0_stack:
+                            self.arg0 = self.call_arg0_stack.pop()
                         continue
                     self.result.exit_code = self.errorlevel
                     return self.result
@@ -237,6 +256,8 @@ class BatchInterpreter:
                 if payload not in self.labels:
                     raise BatError(f"call на несуществующую метку :{payload}")
                 self.call_stack.append(index)
+                self.call_arg0_stack.append(self.arg0)
+                self.arg0 = ":" + payload
                 index = self.labels[payload] + 1
         self.result.exit_code = self.errorlevel
         return self.result
@@ -338,10 +359,15 @@ class BatchInterpreter:
                 sub = BatchInterpreter(child_text, program, self.fs,
                                        argv=parsed_args,
                                        env=dict(self.env),
-                                       program_exit_code=self.program_exit_code)
+                                       program_exit_code=self.program_exit_code,
+                                       admin=self.admin,
+                                       powershell_exit_code=self.powershell_exit_code)
                 sub_res = sub.run()
                 self.result.launches.extend(sub_res.launches)
                 self.result.reg_commands.extend(sub_res.reg_commands)
+                self.result.powershell.extend(sub_res.powershell)
+                self.result.powershell_resolved.extend(
+                    sub_res.powershell_resolved)
                 self.result.output.extend(sub_res.output)
                 self.errorlevel = sub_res.exit_code or 0
                 self.env["ERRORLEVEL"] = str(self.errorlevel)
@@ -385,11 +411,27 @@ class BatchInterpreter:
                 self.cwd = self.dir_stack.pop()
             return None
         if low.startswith("reg "):
-            self.result.reg_commands.append(self.expand(command))
-            self.errorlevel = 0
+            expanded = self.expand(command)
+            self.result.reg_commands.append(expanded)
+            if re.search(r'query\s+"?hku\\s-1-5-19"?', expanded, re.IGNORECASE):
+                # Эта ветка читается только с правами администратора.
+                self.errorlevel = 0 if self.admin else 1
+            else:
+                self.errorlevel = 0
+            return None
+        if low.startswith("net session"):
+            self.errorlevel = 0 if self.admin else 2
             return None
         if low.startswith("powershell"):
-            self.errorlevel = 0
+            expanded = self.expand(command)
+            self.result.powershell.append(expanded)
+            self.result.powershell_resolved.append(
+                re.sub(r"\$env:(\w+)",
+                       lambda m: self.env.get(m.group(1).upper(),
+                                              self.env.get(m.group(1), "")),
+                       expanded))
+            self.errorlevel = self.powershell_exit_code
+            self.env["ERRORLEVEL"] = str(self.errorlevel)
             return None
         if low.startswith("shift"):
             self.argv = self.argv[1:]
@@ -405,10 +447,15 @@ class BatchInterpreter:
                 sub = BatchInterpreter(child_text, program, self.fs,
                                        argv=parsed_args,
                                        env=dict(self.env),
-                                       program_exit_code=self.program_exit_code)
+                                       program_exit_code=self.program_exit_code,
+                                       admin=self.admin,
+                                       powershell_exit_code=self.powershell_exit_code)
                 sub_res = sub.run()
                 self.result.launches.extend(sub_res.launches)
                 self.result.reg_commands.extend(sub_res.reg_commands)
+                self.result.powershell.extend(sub_res.powershell)
+                self.result.powershell_resolved.extend(
+                    sub_res.powershell_resolved)
                 self.result.output.extend(sub_res.output)
                 self.errorlevel = sub_res.exit_code or 0
                 self.env["ERRORLEVEL"] = str(self.errorlevel)
@@ -467,7 +514,12 @@ class BatchInterpreter:
                 break
 
         low = rest.lower()
-        if low.startswith("exist "):
+        if low.startswith("errorlevel "):
+            rest = rest[11:].strip()
+            token, rest = self._take_token(rest)
+            # cmd.exe: "if errorlevel N" истинно при errorlevel >= N.
+            condition = self.errorlevel >= int(self.expand(token).strip('"'))
+        elif low.startswith("exist "):
             rest = rest[6:].strip()
             token, rest = self._take_token(rest)
             condition = self.fs.exists(self.expand(token))

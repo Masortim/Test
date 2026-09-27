@@ -350,28 +350,83 @@ def _registry_save_block(cfg: LauncherConfig) -> str:
 
 
 def _machine_elevation_block(cfg: LauncherConfig) -> str:
-    """UAC только для целей, которым действительно нужен захваченный HKLM."""
+    """UAC только для целей, которым действительно нужен захваченный HKLM.
+
+    Важные тонкости cmd.exe, из-за которых прошлая версия всегда падала:
+
+    * внутри ``call :label`` переменная ``%0`` — это **метка**, а не файл
+      скрипта. ``%~f0`` давал путь вида ``D:\\Portable\\:portable_elevate...``,
+      Start-Process не находил такой файл и лончер сообщал «Administrator
+      rights were not granted». Поэтому путь к самому .bat берётся из
+      ``PORTABLE_SELF``, который выставляется в основном теле скрипта;
+    * ``net session`` требует запущенной службы «Сервер»: там, где она
+      отключена, проверка врала и админ получал повторный запрос UAC.
+      Дополнительно спрашиваем ``HKU\\S-1-5-19`` — эта ветка читается только
+      с правами администратора;
+    * отказ от UAC больше не считается фатальной ошибкой: программа
+      запускается с пользовательскими настройками, а не закрывается.
+    """
     if not cfg.machine_reg_file_name:
         return "goto :eof"
     machine = _bat_set_value(cfg.machine_reg_file_name)
+    powershell = (
+        'powershell -NoProfile -ExecutionPolicy Bypass -Command '
+        '"$q=[char]34; $a=\'/d /c call \'+$q+$env:PORTABLE_SELF+$q+'
+        '\' --nopause --elevated --machine-registry --target \''
+        '+$q+$env:PORTABLE_ELEVATION_TARGET+$q; '
+        'try { $p=Start-Process -FilePath $env:ComSpec -ArgumentList $a '
+        '-Verb RunAs -WindowStyle Normal -Wait -PassThru } '
+        'catch { exit 1223 }; '
+        'if ($p -eq $null) { exit 1223 }; exit $p.ExitCode"'
+    )
     return "\n".join([
         'if not defined PORTABLE_MACHINE_REGISTRY goto :eof',
         'if defined PORTABLE_ELEVATED goto :eof',
         f'if not exist "%PORTABLE_ROOT%\\{machine}" goto :eof',
-        'net session >nul 2>&1',
-        'if not errorlevel 1 goto :eof',
-        'set "PORTABLE_SELF=%~f0"',
+        'call :portable_check_admin',
+        'if defined PORTABLE_IS_ADMIN goto :eof',
+        'rem The script path is captured in the main body: inside a called',
+        'rem subroutine cmd.exe reports the label instead of this file.',
+        'if not defined PORTABLE_SELF set "PORTABLE_SELF=%PORTABLE_ROOT%\\Launch.bat"',
+        'if not exist "%PORTABLE_SELF%" set "PORTABLE_SELF=%PORTABLE_ROOT%\\Launch.bat"',
+        'if not exist "%PORTABLE_SELF%" goto portable_elevation_unavailable',
         'set "PORTABLE_ELEVATION_TARGET=%PORTABLE_TARGET%"',
         'echo This settings tool needs the captured machine registry data.',
         'echo Requesting administrator rights for this run only...',
-        'powershell -NoProfile -ExecutionPolicy Bypass -Command "$q=[char]34; $a=\'/d /c call \'+$q+$env:PORTABLE_SELF+$q+\' --nopause --elevated --machine-registry --target \'+$q+$env:PORTABLE_ELEVATION_TARGET+$q; $p=Start-Process -FilePath $env:ComSpec -ArgumentList $a -Verb RunAs -WindowStyle Normal -Wait -PassThru; exit $p.ExitCode"',
+        powershell,
         'set "PORTABLE_RELAUNCH_RC=%ERRORLEVEL%"',
+        'if "%PORTABLE_RELAUNCH_RC%" == "1223" goto portable_elevation_declined',
+        'if "%PORTABLE_RELAUNCH_RC%" == "9009" goto portable_elevation_unavailable',
         'set "PORTABLE_RELAUNCHED=1"',
-        'if not "%PORTABLE_RELAUNCH_RC%" == "0" (',
-        '  echo.',
-        '  echo [ERROR] Administrator rights were not granted or the tool failed.',
-        '  if not "%PORTABLE_PAUSE%" == "never" pause',
-        ')',
+        'goto :eof',
+        '',
+        ':portable_elevation_declined',
+        'rem The user closed the UAC prompt. Starting without the machine',
+        'rem settings is still far better than refusing to start at all.',
+        'echo.',
+        'echo [INFO] Administrator rights were not granted.',
+        'echo Starting with the user-level settings only. If the program does',
+        'echo not find its installation, start this file as administrator.',
+        'echo.',
+        'set "PORTABLE_RELAUNCH_RC=0"',
+        'goto :eof',
+        '',
+        ':portable_elevation_unavailable',
+        'echo.',
+        'echo [INFO] Could not request administrator rights on this system.',
+        'echo Starting with the user-level settings only.',
+        'echo.',
+        'set "PORTABLE_RELAUNCH_RC=0"',
+        'goto :eof',
+        '',
+        ':portable_check_admin',
+        'set "PORTABLE_IS_ADMIN="',
+        'net session >nul 2>&1',
+        'if not errorlevel 1 set "PORTABLE_IS_ADMIN=1"',
+        'if defined PORTABLE_IS_ADMIN goto :eof',
+        'rem "net session" needs the Server service; this key does not.',
+        'reg query "HKU\\S-1-5-19" >nul 2>&1',
+        'if not errorlevel 1 set "PORTABLE_IS_ADMIN=1"',
         'goto :eof',
     ])
 
@@ -443,7 +498,7 @@ rem  no message at all. Keep every literal in this file ASCII-only.
 rem
 rem  Usage:
 rem    Launch.bat [options] [-- program arguments]
-rem      --target <path>   run a specific target executable inside the sandbox
+rem      --target PATH     run a specific target executable inside the sandbox
 rem      --launcher        run the program's preinstalled launcher (if present)
 rem      --config          run the configuration/settings tool (if present)
 rem      --menu            show interactive menu to choose which program to run
@@ -540,6 +595,11 @@ title {title} (portable)
 
 rem --- Root of the portable folder (works from any drive letter) -------------
 for %%I in ("%~dp0.") do set "PORTABLE_ROOT=%%~fI"
+rem Capture the path of THIS file here and nowhere else. Inside a called
+rem subroutine cmd.exe replaces the script argument with the subroutine
+rem label, so there it would expand to a non-existent file name and the UAC
+rem relaunch below would fail before it even started.
+set "PORTABLE_SELF=%~f0"
 set "PORTABLE_DATA=%PORTABLE_ROOT%\{data_dir_name}"
 set "PORTABLE_REG_SESSION=%PORTABLE_DATA%\Registry"
 set "PORTABLE_REG_BACKUP=%PORTABLE_DATA%\RegistryHostBackup"
@@ -627,7 +687,8 @@ rem InstallFolder. VirtualStore is ignored by manifest-aware programs, so only
 rem those auxiliary targets are relaunched with UAC when a machine file exists.
 call :portable_elevate_for_machine
 if defined PORTABLE_RELAUNCHED (
-  endlocal & exit /b %PORTABLE_RELAUNCH_RC%
+  set "PORTABLE_RC=%PORTABLE_RELAUNCH_RC%"
+  goto portable_finished
 )
 
 call :portable_documents_load
@@ -643,6 +704,7 @@ popd
 call :portable_registry_save
 call :portable_documents_restore
 
+:portable_finished
 if not "%PORTABLE_RC%" == "0" (
   echo.
   echo [WARNING] The program exited with code %PORTABLE_RC%.
@@ -703,8 +765,10 @@ endlocal & exit /b 0
 {registry_helpers}"""
 
 _REGISTRY_HELPERS = r""":portable_registry_import
-rem Imports %1 after replacing the location marker with this folder, so the
-rem settings keep working after the folder moves to another drive or PC.
+rem Imports the given .reg after replacing the location marker with this
+rem folder, so the settings keep working after the folder moves to another
+rem drive or PC. Comments here stay free of redirection characters: the
+rem cmd.exe parser looks at them before it notices the rem command.
 set "PORTABLE_REG_SRC=%~f1"
 set "PORTABLE_REG_OUT=%TEMP%\portable_import_%RANDOM%.reg"
 call :portable_registry_rewrite unpack
@@ -729,8 +793,8 @@ if exist "%PORTABLE_REG_OUT%" (
 goto :eof
 
 :portable_registry_rewrite
-rem %1 = pack   : absolute path  -> marker
-rem %1 = unpack : marker         -> absolute path
+rem First argument "pack"   : the absolute path becomes the marker.
+rem First argument "unpack" : the marker becomes the absolute path.
 set "PORTABLE_REG_MODE=%~1"
 set "PORTABLE_REG_TOKEN=%PORTABLE_REG_MARKER%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $p=[IO.File]::ReadAllBytes($env:PORTABLE_REG_SRC); $e=if($p.Length -ge 2 -and $p[0] -eq 255 -and $p[1] -eq 254){[Text.Encoding]::Unicode}else{[Text.Encoding]::UTF8}; $t=$e.GetString($p).TrimStart([char]0xFEFF); $r=$env:PORTABLE_ROOT.Replace('\','\\'); if($env:PORTABLE_REG_MODE -eq 'pack'){ $t=$t.Replace($r,$env:PORTABLE_REG_TOKEN); $t=$t.Replace($env:PORTABLE_ROOT,$env:PORTABLE_REG_TOKEN) } else { $t=$t.Replace($env:PORTABLE_REG_TOKEN,$r) }; [IO.File]::WriteAllText($env:PORTABLE_REG_OUT,$t,[Text.Encoding]::Unicode) } catch { exit 1 }" >nul 2>&1

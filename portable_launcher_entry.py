@@ -68,15 +68,14 @@ def _show_error(message: str) -> None:
         pass
 
 
-def _write_error_log(root: Optional[Path], message: str) -> None:
+def _write_error_log(root: Optional[Path], message: str,
+                     name: str = "launcher-exe-error.log") -> None:
     if root is None:
         return
     try:
         data = root / "PortableData"
         data.mkdir(parents=True, exist_ok=True)
-        (data / "launcher-exe-error.log").write_text(
-            message + "\n", encoding="utf-8"
-        )
+        (data / name).write_text(message + "\n", encoding="utf-8")
     except OSError:
         pass
 
@@ -542,12 +541,19 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     if needs_machine and machine_available and not already_elevated \
             and not _is_elevated():
         elevated_code = _run_elevated(raw_arguments)
-        if elevated_code is None:
-            raise PermissionError(
-                "Для запуска конфигуратора нужны захваченные параметры HKLM. "
-                "Разрешите запрос контроля учётных записей (UAC)."
-            )
-        return elevated_code
+        if elevated_code is not None:
+            return elevated_code
+        # UAC отклонён (или недоступен). Раньше здесь было исключение, и
+        # лаунчер/конфигуратор просто показывал окно с ошибкой. Запускаемся
+        # без HKLM: пользовательских настроек и VirtualStore обычно хватает,
+        # а если нет — программа сама подскажет, и её можно перезапустить от
+        # имени администратора.
+        _write_error_log(
+            root,
+            "Права администратора не получены: запуск продолжен без "
+            "импорта portable_machine.reg (HKLM).",
+            name="launcher-elevation.log",
+        )
 
     env = _prepare_environment(root, cfg)
     target = _as_relative_path(root, target_rel)

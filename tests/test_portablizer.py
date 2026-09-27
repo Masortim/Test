@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -418,6 +419,78 @@ class PortableExeLauncherTests(unittest.TestCase):
                              str(configurator.parent))
 
 
+    def test_declined_uac_still_starts_the_configurator(self):
+        """Отказ от UAC больше не показывает окно с ошибкой.
+
+        Раньше LaunchPortable.exe в этом случае бросал PermissionError и
+        пользователь видел «Не удалось запустить портативную программу».
+        Теперь конфигуратор стартует с пользовательскими настройками.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root, app, _target = self._portable(temp)
+            configurator = app / "bin" / "Configurator.exe"
+            configurator.parent.mkdir()
+            configurator.write_bytes(b"MZ config")
+            (root / "portable_machine.reg").write_text("machine",
+                                                       encoding="utf-8")
+            config_path = root / "launcher_config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config.update({
+                "config_target_rel": "App/bin/Configurator.exe",
+                "registry": {"enabled": False,
+                             "machine_file": "portable_machine.reg"},
+                "targets": [
+                    {"rel_path": "App/Program.exe", "role": "main"},
+                    {"rel_path": "App/bin/Configurator.exe", "role": "config"},
+                ],
+            })
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            completed = mock.Mock(returncode=0)
+
+            with mock.patch.object(exe_launcher, "find_portable_root",
+                                   return_value=root), \
+                    mock.patch.object(exe_launcher, "_run_elevated",
+                                      return_value=None) as elevate, \
+                    mock.patch("portable_launcher_entry.subprocess.run",
+                               return_value=completed) as run_process:
+                rc = exe_launcher.run(["--config"])
+
+            self.assertEqual(rc, 0)
+            elevate.assert_called_once()
+            self.assertEqual(run_process.call_args.args[0][0],
+                             str(configurator))
+            note = root / "PortableData" / "launcher-elevation.log"
+            self.assertTrue(note.is_file())
+
+    def test_granted_uac_returns_the_elevated_exit_code(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, app, _target = self._portable(temp)
+            configurator = app / "bin" / "Configurator.exe"
+            configurator.parent.mkdir()
+            configurator.write_bytes(b"MZ config")
+            (root / "portable_machine.reg").write_text("machine",
+                                                       encoding="utf-8")
+            config_path = root / "launcher_config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config.update({
+                "config_target_rel": "App/bin/Configurator.exe",
+                "registry": {"enabled": False,
+                             "machine_file": "portable_machine.reg"},
+            })
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            with mock.patch.object(exe_launcher, "find_portable_root",
+                                   return_value=root), \
+                    mock.patch.object(exe_launcher, "_run_elevated",
+                                      return_value=3) as elevate, \
+                    mock.patch("portable_launcher_entry.subprocess.run") as run_process:
+                rc = exe_launcher.run(["--config"])
+
+            self.assertEqual(rc, 3)
+            elevate.assert_called_once()
+            run_process.assert_not_called()
+
+
 class LaunchBatSafetyTests(unittest.TestCase):
     """Регрессии на «окно мигнуло и закрылось»."""
 
@@ -450,6 +523,28 @@ class LaunchBatSafetyTests(unittest.TestCase):
         self.assertTrue(bat.isascii())
         self.assertIn("PORTABLE_TARGET", bat)
         self.assertIn("?", bat)
+
+    def test_comment_lines_are_parser_safe(self):
+        """rem — это команда, а не комментарий.
+
+        Документация Microsoft прямо запрещает ``<``, ``>`` и ``|`` в
+        комментариях .bat, а ``%`` в них раскрывается ещё до того, как cmd.exe
+        поймёт, что строка закомментирована.
+        """
+        bat = self._bat(registry_keys=[r"HKCU\Software\V\A"],
+                        registry_has_root_token=True)
+        for line in bat.splitlines():
+            if not line.strip().lower().startswith("rem"):
+                continue
+            outside = ""
+            in_quotes = False
+            for ch in line:
+                if ch == '"':
+                    in_quotes = not in_quotes
+                elif not in_quotes:
+                    outside += ch
+            self.assertNotRegex(outside, r"[<>|]", line)
+            self.assertNotIn("%", outside, line)
 
     def test_every_jump_has_a_label(self):
         bat = self._bat(registry_keys=[r"HKCU\Software\V\A"],
@@ -2321,6 +2416,210 @@ class CompanionLauncherExecutionTests(unittest.TestCase):
         self.assertEqual(len(res.launches), 1)
         self.assertTrue(res.launches[0].command.lower().endswith("launcher.exe"))
         self.assertTrue(res.launches[0].cwd.rstrip("\\").lower().endswith("app"))
+
+
+class CompanionElevationExecutionTests(unittest.TestCase):
+    """Лаунчер/конфигуратор игры с захваченным HKLM обязан запускаться.
+
+    Регрессия: ``set "PORTABLE_SELF=%~f0"`` стояло внутри подпрограммы, а
+    cmd.exe подставляет в ``%0`` имя метки. UAC-перезапуск пытался стартовать
+    файл ``...\\:portable_elevate_for_machine``, и вместо конфигуратора
+    пользователь получал «[ERROR] Administrator rights were not granted».
+    """
+
+    ROOT = r"E:\Portable"
+
+    def _cfg(self):
+        targets = [
+            launcher_mod.TargetInfo(name="WITCHER2",
+                                    rel_path="App/bin/WITCHER2.EXE",
+                                    role="main", bat_name="Launch.bat"),
+            launcher_mod.TargetInfo(name="Configurator",
+                                    rel_path="App/bin/Configurator.exe",
+                                    role="config",
+                                    bat_name="Launch_Configurator.bat"),
+        ]
+        return launcher_mod.LauncherConfig(
+            app_name="The Witcher 2",
+            target_exe_rel="App/bin/WITCHER2.EXE",
+            targets=targets,
+            config_target_rel="App/bin/Configurator.exe",
+            registry_keys=[r"HKCU\Software\CD Projekt RED\The Witcher 2"],
+        )
+
+    def _fs(self, cfg):
+        fs = batsim.FakeFS()
+        fs.add_file(rf"{self.ROOT}\App\bin\WITCHER2.EXE")
+        fs.add_file(rf"{self.ROOT}\App\bin\Configurator.exe")
+        fs.add_file(rf"{self.ROOT}\Launch.bat", launcher_mod.render_bat(cfg))
+        # Захваченные параметры установки (HKLM) — именно они требуют UAC.
+        fs.add_file(rf"{self.ROOT}\portable_machine.reg", "machine")
+        return fs
+
+    def _run_companion(self, **kwargs):
+        cfg = self._cfg()
+        fs = self._fs(cfg)
+        companion = launcher_mod.render_companion_bat(cfg, cfg.targets[1])
+        return batsim.run_batch(companion,
+                                rf"{self.ROOT}\Launch_Configurator.bat", fs,
+                                **kwargs)
+
+    def test_uac_relaunch_points_at_the_real_launch_bat(self):
+        res = self._run_companion(admin=False)
+
+        self.assertEqual(res.exit_code, 0)
+        elevation = [c for c in res.powershell_resolved if "RunAs" in c]
+        self.assertTrue(elevation, "UAC-перезапуск даже не был запрошен")
+        command = elevation[0]
+        self.assertIn(r"E:\Portable\Launch.bat", command)
+        self.assertIn(r"E:\Portable\App\bin\Configurator.exe", command)
+        self.assertNotIn(":portable_elevate", command)
+        self.assertNotIn("[ERROR]", res.text)
+        # Программу запускает уже повышенный экземпляр скрипта.
+        self.assertEqual(res.launches, [])
+
+    def test_declined_uac_still_starts_the_tool(self):
+        # 1223 = ERROR_CANCELLED: пользователь закрыл запрос UAC.
+        res = self._run_companion(admin=False, powershell_exit_code=1223)
+
+        self.assertEqual(res.exit_code, 0)
+        self.assertNotIn("[ERROR]", res.text)
+        self.assertEqual(len(res.launches), 1)
+        self.assertTrue(
+            res.launches[0].command.lower().endswith("configurator.exe"))
+
+    def test_missing_powershell_does_not_block_the_tool(self):
+        # 9009 = cmd.exe не нашёл powershell.
+        res = self._run_companion(admin=False, powershell_exit_code=9009)
+
+        self.assertEqual(res.exit_code, 0)
+        self.assertNotIn("[ERROR]", res.text)
+        self.assertEqual(len(res.launches), 1)
+
+    def test_administrator_run_skips_the_uac_prompt(self):
+        res = self._run_companion(admin=True)
+
+        self.assertEqual([c for c in res.powershell if "RunAs" in c], [])
+        self.assertEqual(res.exit_code, 0)
+        self.assertEqual(len(res.launches), 1)
+        self.assertTrue(
+            res.launches[0].command.lower().endswith("configurator.exe"))
+
+    def test_admin_check_survives_a_disabled_server_service(self):
+        # "net session" на такой машине возвращает ошибку даже у админа,
+        # поэтому есть второй признак — чтение ветки HKU\S-1-5-19.
+        bat = launcher_mod.render_bat(self._cfg())
+        self.assertIn(r'reg query "HKU\S-1-5-19"', bat)
+
+    def test_elevated_instance_runs_the_tool_with_machine_settings(self):
+        """Повышенный экземпляр — это то, что запускает сам cmd после UAC."""
+        cfg = self._cfg()
+        fs = self._fs(cfg)
+        res = batsim.run_batch(
+            launcher_mod.render_bat(cfg), rf"{self.ROOT}\Launch.bat", fs,
+            argv=["--nopause", "--elevated", "--machine-registry",
+                  "--target", rf"{self.ROOT}\App\bin\Configurator.exe"],
+            admin=True)
+
+        self.assertEqual(res.exit_code, 0)
+        self.assertEqual([c for c in res.powershell if "RunAs" in c], [])
+        self.assertEqual(len(res.launches), 1)
+        self.assertTrue(
+            res.launches[0].command.lower().endswith("configurator.exe"))
+        self.assertTrue(
+            any("portable_machine.reg" in c for c in res.reg_commands),
+            "захваченные параметры HKLM не импортированы")
+
+    def test_main_target_never_triggers_elevation(self):
+        cfg = self._cfg()
+        fs = self._fs(cfg)
+        res = batsim.run_batch(launcher_mod.render_bat(cfg),
+                               rf"{self.ROOT}\Launch.bat", fs,
+                               argv=["--nopause"], admin=False)
+
+        self.assertEqual([c for c in res.powershell if "RunAs" in c], [])
+        self.assertEqual(len(res.launches), 1)
+        self.assertTrue(res.launches[0].command.lower().endswith("witcher2.exe"))
+
+
+@unittest.skipUnless(sys.platform.startswith("win"),
+                     "нужен настоящий cmd.exe (выполняется в Windows-CI)")
+class RealCmdLauncherTests(unittest.TestCase):
+    """Сгенерированные лончеры исполняются настоящим cmd.exe.
+
+    Симулятор ловит логику, но только реальный интерпретатор проверяет разбор
+    файла целиком: метки, комментарии, кавычки и байтовые смещения. Реестр
+    здесь не трогается (``apply_registry=False``), зато ``portable_machine.reg``
+    на месте — значит отрабатывает и ветка проверки прав администратора.
+    """
+
+    ARGS = ["/d", "/c", "set PORTABLE_APP>portable-marker.txt"]
+
+    def _build(self, root: Path):
+        app = root / "App"
+        (app / "tools").mkdir(parents=True)
+        comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        shutil.copy2(comspec, app / "cmd.exe")
+        shutil.copy2(comspec, app / "tools" / "cmd.exe")
+
+        targets = [
+            launcher_mod.TargetInfo(name="Main", rel_path="App/cmd.exe",
+                                    role="main", bat_name="Launch.bat"),
+            launcher_mod.TargetInfo(name="Configurator",
+                                    rel_path="App/tools/cmd.exe",
+                                    role="config",
+                                    bat_name="Launch_Configurator.bat"),
+        ]
+        cfg = launcher_mod.LauncherConfig(
+            app_name="Smoke Test", target_exe_rel="App/cmd.exe",
+            target_args=list(self.ARGS), apply_registry=False,
+            targets=targets, config_target_rel="App/tools/cmd.exe")
+
+        def write(name, text):
+            with open(root / name, "w", encoding="ascii", newline="\r\n") as fh:
+                fh.write(text)
+
+        write("Launch.bat", launcher_mod.render_bat(cfg))
+        write("Launch_Configurator.bat",
+              launcher_mod.render_companion_bat(cfg, targets[1]))
+        with open(root / "launcher_config.json", "w", encoding="utf-8") as fh:
+            fh.write(launcher_mod.render_config_json(cfg))
+        # Наличие этого файла включает ветку UAC для вспомогательных целей.
+        (root / "portable_machine.reg").write_text(
+            "Windows Registry Editor Version 5.00\r\n", encoding="utf-16")
+        return app
+
+    def _run(self, bat: Path):
+        comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        return subprocess.run(
+            [comspec, "/d", "/c", str(bat), "--nopause"],
+            capture_output=True, text=True, timeout=180,
+            cwd=str(bat.parent), stdin=subprocess.DEVNULL)
+
+    def test_launch_bat_starts_the_program(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "Portable")
+            app = self._build(root)
+            result = self._run(root / "Launch.bat")
+
+            self.assertNotIn("[ERROR]", result.stdout)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            marker = app / "portable-marker.txt"
+            self.assertTrue(marker.is_file(), result.stdout)
+            self.assertIn("PORTABLE_APP=1", marker.read_text(errors="replace"))
+
+    def test_companion_configurator_starts_without_errors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "Portable")
+            app = self._build(root)
+            result = self._run(root / "Launch_Configurator.bat")
+
+            # Именно здесь ломался UAC-перезапуск: сообщение об отказе прав
+            # появлялось даже тогда, когда права были или не требовались.
+            self.assertNotIn("[ERROR]", result.stdout)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            marker = app / "tools" / "portable-marker.txt"
+            self.assertTrue(marker.is_file(), result.stdout)
 
 
 class RegistryVirtualizationTests(unittest.TestCase):
