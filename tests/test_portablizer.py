@@ -123,6 +123,38 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertTrue(recovered)
             self.assertTrue((app / "Type.exe").exists())
 
+    def test_recovery_does_not_take_similarly_named_preinstalled_program(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            host = Path(temp, "ProgramFiles")
+            unrelated = host / "TypeScript"
+            app.mkdir(parents=True)
+            data.mkdir()
+            unrelated.mkdir(parents=True)
+            (unrelated / "TypeScript.exe").write_bytes(b"MZ unrelated")
+
+            roots = [(str(host), 110, False)]
+            before = {
+                os.path.normcase(os.path.abspath(str(host))): {
+                    os.path.normcase(os.path.abspath(str(unrelated))),
+                    os.path.normcase(os.path.abspath(
+                        str(unrelated / "TypeScript.exe"))),
+                }
+            }
+            with mock.patch.object(
+                self.engine, "_install_search_roots", return_value=roots
+            ):
+                recovered = self.engine._recover_installed_app(
+                    app_dir=str(app), data_dir=str(data), app_name="Type",
+                    installer_path=str(Path(temp, "TypeSetup.exe")),
+                    before=before,
+                )
+
+            self.assertFalse(recovered)
+            self.assertEqual(list(app.iterdir()), [])
+
     def test_empty_install_does_not_create_broken_launcher(self):
         with tempfile.TemporaryDirectory() as temp, mock.patch(
             "portablizer.core.portablizer.IS_WINDOWS", False

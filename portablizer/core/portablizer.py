@@ -1782,7 +1782,13 @@ class Portablizer:
             for path, entry_name, is_dir, is_file in self._location_entries(root):
                 entry_path = os.path.abspath(path)
                 is_new = os.path.normcase(entry_path) not in old_entries
-                name_match = self._name_score(entry_name, keys) > 0
+                # Для уже существующего каталога совпадение должно быть
+                # точным. Короткое имя приложения вроде "Type" раньше
+                # совпадало с системным "TypeScript" и Portablizer мог забрать
+                # чужую предустановленную программу, объявив неудачную сборку
+                # успешной. Нечёткое совпадение допустимо только для реально
+                # нового каталога, появившегося после запуска установщика.
+                name_match = self._name_score(entry_name, keys) >= 200
                 if not (is_new or name_match):
                     continue
                 # Прямой exe безопасно копируем отдельно. Для каталога берём
