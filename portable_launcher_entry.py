@@ -81,6 +81,28 @@ def _write_error_log(root: Optional[Path], message: str) -> None:
         pass
 
 
+def _run_log(root: Optional[Path], message: str) -> None:
+    """Append one diagnostic line to PortableData/launcher-run.log.
+
+    Old games (The Witcher, GOG editions in particular) simply exit with code 1
+    when something they need is missing.  Without a trace of what was started,
+    with which registry data and what the child process did afterwards, the
+    user only sees "nothing happens".  The log makes that debuggable.
+    """
+    if root is None:
+        return
+    try:
+        import time
+
+        data = root / "PortableData"
+        data.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with (data / "launcher-run.log").open("a", encoding="utf-8") as fh:
+            fh.write(f"[{stamp}] {message}\n")
+    except OSError:
+        pass
+
+
 def _reg(args: Sequence[str]) -> int:
     """Run reg.exe without flashing a console window."""
     if not IS_WINDOWS:
@@ -392,7 +414,12 @@ class RegistrySession:
         for index, source in enumerate(sources):
             if source.is_file():
                 imported = _unpacked_reg(source, self.runtime, self.root, index)
-                _reg(("import", str(imported)))
+                code = _reg(("import", str(imported)))
+                _run_log(
+                    self.root,
+                    f"registry import {source.name}: "
+                    f"{'ok' if code == 0 else f'FAILED (reg.exe rc={code})'}",
+                )
         self.started = True
 
     def save_and_restore(self) -> None:
@@ -507,6 +534,143 @@ def _select_target(cfg: Dict[str, Any], arguments: Sequence[str]
     return target_rel, forwarded, selected_role != "main"
 
 
+def _machine_file_needs_admin(path: Path) -> bool:
+    """True when the captured machine file really contains HKLM sections."""
+    try:
+        text = _decode_reg(path.read_bytes())
+    except OSError:
+        return False
+    lowered = text.casefold()
+    return "[hkey_local_machine" in lowered
+
+
+def _hklm_key_missing(keys: Iterable[str]) -> bool:
+    """True when at least one captured HKLM key is absent on this computer.
+
+    Games such as The Witcher read their install path from HKLM and quit with
+    exit code 1 when the value is not there.  The captured machine file can
+    only be imported with administrator rights, so the launcher has to know
+    whether the data is already in place before deciding to ask for UAC.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - Windows only
+        return False
+
+    roots = {
+        "HKLM": winreg.HKEY_LOCAL_MACHINE,
+        "HKEY_LOCAL_MACHINE": winreg.HKEY_LOCAL_MACHINE,
+    }
+    checked = False
+    for key in keys:
+        head, _, tail = str(key).replace("/", "\\").partition("\\")
+        handle = roots.get(head.upper())
+        if handle is None or not tail:
+            continue
+        checked = True
+        for access in (winreg.KEY_READ,
+                       winreg.KEY_READ | getattr(winreg, "KEY_WOW64_32KEY", 0),
+                       winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)):
+            try:
+                winreg.CloseKey(winreg.OpenKey(handle, tail, 0, access))
+                break
+            except OSError:
+                continue
+        else:
+            return True
+    return False if checked else False
+
+
+def _portable_processes(root: Path) -> int:
+    """Count running processes whose executable lives inside the portable folder."""
+    if not IS_WINDOWS:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot in (0, -1, None):
+            return 0
+        prefix = str(root).rstrip("\\").casefold() + "\\"
+        own = os.getpid()
+        found = 0
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while more:
+                pid = int(entry.th32ProcessID)
+                if pid not in (0, 4, own):
+                    handle = kernel32.OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                    if handle:
+                        try:
+                            size = wintypes.DWORD(32768)
+                            buffer = ctypes.create_unicode_buffer(size.value)
+                            if kernel32.QueryFullProcessImageNameW(
+                                    handle, 0, buffer, ctypes.byref(size)):
+                                if buffer.value.casefold().startswith(prefix):
+                                    found += 1
+                        finally:
+                            kernel32.CloseHandle(handle)
+                more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return found
+    except Exception:
+        return 0
+
+
+def _wait_for_portable_processes(root: Path, grace: float = 6.0,
+                                 limit: float = 86400.0) -> int:
+    """Wait until nothing inside the portable folder is running any more.
+
+    Official game launchers (The Witcher's ``Launcher.exe``, GOG splash
+    screens, Configurator windows) start the real executable and exit
+    immediately.  If the portable session restored the registry and removed the
+    redirected environment at that moment, the game that had just been spawned
+    lost its install keys and died silently.  So after the direct child exits we
+    keep the sandbox alive while any process started from this folder lives.
+    """
+    if not IS_WINDOWS:
+        return 0
+    import time
+
+    deadline = time.monotonic() + limit
+    waited = 0
+    # Give the launcher a moment to spawn the real program.
+    spawn_deadline = time.monotonic() + grace
+    while time.monotonic() < spawn_deadline:
+        if _portable_processes(root):
+            break
+        time.sleep(0.5)
+    while _portable_processes(root) and time.monotonic() < deadline:
+        waited += 1
+        time.sleep(1.0)
+    return waited
+
+
 def _is_elevated() -> bool:
     if not IS_WINDOWS:
         return False
@@ -574,17 +738,33 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     target_rel, forwarded, needs_machine = _select_target(cfg, raw_arguments)
     already_elevated = any(
         str(arg).casefold() == "--elevated" for arg in raw_arguments)
-    machine_name = str(cfg.get("registry", {}).get("machine_file", ""))
-    machine_available = bool(machine_name and (root / machine_name).is_file())
+    registry_cfg = cfg.get("registry", {})
+    machine_name = str(registry_cfg.get("machine_file", ""))
+    machine_path = root / machine_name if machine_name else None
+    machine_available = bool(machine_path and machine_path.is_file())
+
+    # Not only launchers and configurators need the captured HKLM data: old
+    # games (The Witcher and other GOG re-releases) read their install path
+    # from HKLM themselves and quit with exit code 1 when it is not there.
+    # VirtualStore covers un-manifested programs only, so when the keys really
+    # are missing on this computer the machine file has to be imported for
+    # real - and that needs administrator rights, once, for this run.
+    if not needs_machine and machine_available and bool(registry_cfg.get("enabled")) \
+            and _machine_file_needs_admin(machine_path) \
+            and _hklm_key_missing(registry_cfg.get("keys", [])):
+        needs_machine = True
+        _run_log(root, "captured HKLM keys are missing on this PC: "
+                       "the machine registry file has to be imported")
+
     if needs_machine and machine_available and not already_elevated \
             and not _is_elevated():
         elevated_code = _run_elevated(raw_arguments)
-        if elevated_code is None:
-            raise PermissionError(
-                "Для запуска конфигуратора нужны захваченные параметры HKLM. "
-                "Разрешите запрос контроля учётных записей (UAC)."
-            )
-        return elevated_code
+        if elevated_code is not None:
+            return elevated_code
+        # UAC refused or unavailable: keep going with the VirtualStore
+        # fallback instead of refusing to start the program at all.
+        _run_log(root, "elevation was refused or unavailable; "
+                       "continuing without the HKLM import")
 
     env = _prepare_environment(root, cfg)
     target = _as_relative_path(root, target_rel)
@@ -607,12 +787,23 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 *[str(arg) for arg in cfg.get("target_args", [])],
                 *forwarded,
             ]
-            return subprocess.run(
+            _run_log(root, "start: " + subprocess.list2cmdline(command)
+                     + f" (cwd={target.parent}, elevated={_is_elevated()})")
+            code = subprocess.run(
                 command,
                 cwd=str(target.parent),
                 env=env,
                 check=False,
             ).returncode
+            _run_log(root, f"{target.name} exited with code {code}")
+            # The official launcher usually starts the game and exits at once.
+            # Restoring the registry right now would pull the install keys out
+            # from under the game that is just starting, so wait for it.
+            waited = _wait_for_portable_processes(root)
+            if waited:
+                _run_log(root, f"waited {waited}s for programs started from "
+                               f"the portable folder to finish")
+            return code
         finally:
             registry.save_and_restore()
     finally:

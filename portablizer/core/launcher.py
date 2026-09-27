@@ -358,7 +358,26 @@ def _machine_elevation_block(cfg: LauncherConfig) -> str:
     if not cfg.machine_reg_file_name:
         return "goto :eof"
     machine = _bat_set_value(cfg.machine_reg_file_name)
+    # Old games read their own install path from HKLM and exit with code 1 when
+    # it is missing (The Witcher and other GOG re-releases behave exactly like
+    # that). VirtualStore only helps un-manifested programs, so when the
+    # captured HKLM keys are really absent here, the machine file must be
+    # imported for real - which needs administrator rights for this run.
+    machine_keys = [
+        key for key in consolidate_root_keys(cfg.registry_keys)
+        if key.upper().startswith("HKLM\\") or key.upper().startswith("HKEY_LOCAL_MACHINE\\")
+    ]
+    probe: List[str] = []
+    if machine_keys:
+        probe.append(f'if exist "%PORTABLE_ROOT%\\{machine}" (')
+        for key in machine_keys:
+            probe.append(
+                f'  reg query "{key}" >nul 2>&1 || '
+                'set "PORTABLE_MACHINE_REGISTRY=1"'
+            )
+        probe.append(')')
     return "\n".join([
+        *probe,
         'if not defined PORTABLE_MACHINE_REGISTRY goto :eof',
         'if defined PORTABLE_ELEVATED goto :eof',
         f'if not exist "%PORTABLE_ROOT%\\{machine}" goto :eof',
@@ -644,6 +663,12 @@ echo Starting {title} from the portable folder...
 set "PORTABLE_RC=%ERRORLEVEL%"
 popd
 
+rem Official launchers (game launcher windows, GOG splash screens) start the
+rem real program and exit immediately. Restoring the registry at that moment
+rem would pull the install keys out from under the program that is just
+rem starting, so wait while anything from this folder is still running.
+call :portable_wait_children
+
 call :portable_registry_save
 call :portable_documents_restore
 
@@ -691,6 +716,12 @@ endlocal & exit /b 0
 
 :portable_elevate_for_machine
 {machine_elevation}
+
+:portable_wait_children
+rem Waits until no process started from this portable folder is left. The first
+rem seconds are a grace period: a launcher needs a moment to spawn the game.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$r=$env:PORTABLE_ROOT.TrimEnd('\')+'\'; $grace=8; $t=0; $seen=$false; while($t -lt 86400){{ $n=0; foreach($p in [Diagnostics.Process]::GetProcesses()){{ if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $n++ }} }} }}; if($n -gt 0){{ $seen=$true }} elseif($seen -or $t -ge $grace){{ break }}; Start-Sleep -Seconds 1; $t++ }}" >nul 2>&1
+goto :eof
 
 :portable_documents_load
 {documents_load}
