@@ -2372,6 +2372,64 @@ class CompanionLauncherExecutionTests(unittest.TestCase):
         self.assertTrue(res.launches[0].cwd.rstrip("\\").lower().endswith("app"))
 
 
+class GameLauncherHandoffTests(unittest.TestCase):
+    """Игра, запущенная официальным лаунчером, и её ключи HKLM.
+
+    The Witcher (GOG) читает путь установки из HKLM и молча выходит с кодом 1,
+    если ключа нет, а его Launcher.exe стартует игру и сразу завершается.
+    """
+
+    def _witcher_cfg(self):
+        return launcher_mod.LauncherConfig(
+            app_name="The Witcher",
+            target_exe_rel="App/System/witcher.exe",
+            launcher_target_rel="App/Launcher.exe",
+            registry_keys=[
+                r"HKLM\Software\Wow6432Node\CD Projekt Red\The Witcher",
+                r"HKCU\Software\CD Projekt Red\The Witcher",
+            ],
+        )
+
+    def test_bat_waits_for_programs_started_by_the_official_launcher(self):
+        bat = launcher_mod.render_bat(self._witcher_cfg())
+        self.assertIn("call :portable_wait_children", bat)
+        # Ожидание обязано стоять до восстановления реестра, иначе игра
+        # теряет ключи установки сразу после выхода лаунчера.
+        self.assertLess(bat.index("call :portable_wait_children"),
+                        bat.index("call :portable_registry_save"))
+        self.assertTrue(bat.isascii())
+
+    def test_missing_hklm_key_triggers_elevation_for_the_game_itself(self):
+        bat = launcher_mod.render_bat(self._witcher_cfg())
+        self.assertIn(
+            'reg query "HKLM\\Software\\Wow6432Node\\CD Projekt Red\\The Witcher"',
+            bat,
+        )
+        self.assertIn('set "PORTABLE_MACHINE_REGISTRY=1"', bat)
+
+    def test_no_hklm_keys_means_no_extra_uac_probe(self):
+        cfg = launcher_mod.LauncherConfig(
+            app_name="Alice", target_exe_rel="App/alice.exe",
+            registry_keys=[r"HKCU\Software\Alice"],
+        )
+        self.assertNotIn("reg query", launcher_mod.render_bat(cfg))
+
+    def test_machine_file_without_hklm_section_needs_no_admin(self):
+        with tempfile.TemporaryDirectory() as temp:
+            user_only = Path(temp, "user.reg")
+            user_only.write_text(
+                "Windows Registry Editor Version 5.00\n\n"
+                "[HKEY_CURRENT_USER\\Software\\Alice]\n", encoding="utf-8")
+            machine = Path(temp, "portable_machine.reg")
+            machine.write_text(
+                "Windows Registry Editor Version 5.00\n\n"
+                "[HKEY_LOCAL_MACHINE\\SOFTWARE\\CD Projekt Red]\n",
+                encoding="utf-8")
+
+            self.assertFalse(exe_launcher._machine_file_needs_admin(user_only))
+            self.assertTrue(exe_launcher._machine_file_needs_admin(machine))
+
+
 class RegistryVirtualizationTests(unittest.TestCase):
     """Тесты UAC-виртуализации и слияния machine-настроек в HKCU."""
 
