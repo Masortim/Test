@@ -8,6 +8,9 @@ on:
       - "portablizer/**"
       - "app.py"
       - "portablizer.spec"
+      - "portable_launcher.spec"
+      - "portable_launcher_entry.py"
+      - "build.bat"
       - "requirements.txt"
       - "tests/**"
       - ".github/workflows/build-windows.yml"
@@ -33,11 +36,81 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Build portable App launcher
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean portable_launcher.spec
+          Copy-Item -Force dist/PortableLauncher.exe portablizer/resources/portable_launcher.exe
+
       - name: Build EXE
         run: pyinstaller --noconfirm --clean portablizer.spec
 
       - name: Run tests
-        run: python -m unittest discover -s tests -v
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests 2>&1 | Tee-Object -FilePath test-output.log
+          $testStatus = $LASTEXITCODE
+          "## Windows test output" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          '```text' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Get-Content test-output.log -Tail 160 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ($testStatus -ne 0) {
+            $diagnostic = (Get-Content test-output.log -Tail 80) -join "`n"
+            $diagnostic = $diagnostic.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows unit tests failed::$diagnostic"
+          }
+          exit $testStatus
+
+      - name: Smoke test portable App EXE
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "Portable Launcher Smoke"
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "App") | Out-Null
+          Copy-Item dist/PortableLauncher.exe (Join-Path $root "App/LaunchPortable.exe")
+          Copy-Item $env:ComSpec (Join-Path $root "App/cmd.exe")
+          # cmd.exe keeps localized messages in a sibling MUI file. Preserve it
+          # when copying cmd outside System32 so the smoke target remains valid.
+          $culture = (Get-UICulture).Name
+          $muiSource = Join-Path (Split-Path $env:ComSpec) "$culture/cmd.exe.mui"
+          if (Test-Path $muiSource) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $root "App/$culture") | Out-Null
+            Copy-Item $muiSource (Join-Path $root "App/$culture/cmd.exe.mui")
+          }
+          @{
+            app_name = "Smoke"
+            target_exe_rel = "App/cmd.exe"
+            target_args = @()
+            data_dir_name = "PortableData"
+            path_prepend = @("App")
+            extra_env = @{}
+            registry = @{ enabled = $false }
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $root "launcher_config.json")
+          # Start-Process -Wait is intentional: PowerShell can return immediately
+          # for a windowed (GUI-subsystem) EXE and leave $LASTEXITCODE unset.
+          $process = Start-Process -FilePath (Join-Path $root "App/LaunchPortable.exe") `
+            -ArgumentList '/d /c "set PORTABLE_APP>launcher-smoke.txt"' `
+            -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            $errorLog = Join-Path $root "PortableData/launcher-exe-error.log"
+            $details = if (Test-Path $errorLog) { Get-Content $errorLog -Raw } else { "no launcher error log" }
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=LaunchPortable.exe smoke failure::exit=$($process.ExitCode); $details"
+            throw "LaunchPortable.exe returned $($process.ExitCode)"
+          }
+          $markerPath = Join-Path $root "App/launcher-smoke.txt"
+          if (-not (Test-Path $markerPath)) {
+            Write-Host "::error title=LaunchPortable.exe smoke failure::target marker was not created"
+            throw "Target marker was not created"
+          }
+          $marker = (Get-Content $markerPath -Raw).Trim()
+          if ($marker -ne "PORTABLE_APP=1") {
+            Write-Host "::error title=LaunchPortable.exe smoke failure::portable environment marker is '$marker'"
+            throw "Portable environment was not passed to target: $marker"
+          }
+          if (-not (Test-Path (Join-Path $root "PortableData/User/Documents/My Games"))) {
+            Write-Host "::error title=LaunchPortable.exe smoke failure::portable profile tree was not created"
+            throw "Portable profile tree was not created"
+          }
 
       - name: Smoke test (import only)
         run: |
@@ -66,7 +139,7 @@ jobs:
           cp dist/Portablizer.exe dist-windows/Portablizer.exe
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f dist-windows/Portablizer.exe
-          git commit -m "ci: build Portablizer.exe [skip ci]" || echo "no changes"
+          git add -f dist-windows/Portablizer.exe portablizer/resources/portable_launcher.exe
+          git commit -m "ci: build Windows executables [skip ci]" || echo "no changes"
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin HEAD:"${GITHUB_REF_NAME}"

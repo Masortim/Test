@@ -207,9 +207,12 @@ class MainWindow(QMainWindow):
             "По умолчанию выключено: ассоциации меняют настройки чужой "
             "системы и портативности не добавляют. Включайте, только если без "
             "них программа не работает.")
-        self.cb_exelauncher = QCheckBox("Подготовить launcher.py для launcher.exe")
+        self.cb_exelauncher = QCheckBox("Создать LaunchPortable.exe в папке App")
+        self.cb_exelauncher.setChecked(True)
         self.cb_exelauncher.setToolTip(
-            "Кладёт в портатив исходник лончера, который можно собрать в exe.")
+            "Кладёт готовый самодостаточный EXE в папку App. Его можно запускать "
+            "двойным кликом: Python и ручная сборка не нужны, а изоляция "
+            "AppData и реестра сохраняется.")
         self.cb_assisted = QCheckBox("Разрешить окно мастера установки")
         self.cb_assisted.setToolTip(
             "Нужно старым установщикам InstallShield InstallScript 5/6 "
@@ -471,8 +474,19 @@ class MainWindow(QMainWindow):
                 "Портативное приложение создано!",
                 "",
                 f"Папка: {result.portable_dir}",
-                "Запуск: Launch.bat (или LaunchHidden.vbs — без консоли)",
             ]
+            if result.portable_launcher_exe_rel:
+                details.append(
+                    "Запуск из EXE: " + result.portable_launcher_exe_rel
+                    + " (рекомендуется)"
+                )
+                details.append(
+                    "Запасной запуск: Launch.bat или LaunchHidden.vbs"
+                )
+            else:
+                details.append(
+                    "Запуск: Launch.bat (или LaunchHidden.vbs — без консоли)"
+                )
             if result.companion_launchers:
                 companion_bats = [
                     f for f in result.companion_launchers
