@@ -7,6 +7,10 @@ block_cipher = None
 datas = [
     (os.path.join("portablizer", "resources", "app.ico"), os.path.join("resources")),
     (os.path.join("portablizer", "resources", "app_256.png"), os.path.join("resources")),
+    # Готовый нативный лончер, который Portablizer копирует в App/ каждого
+    # результата. Сначала собирается portable_launcher.spec (см. build.bat/CI).
+    (os.path.join("portablizer", "resources", "portable_launcher.exe"),
+     os.path.join("resources")),
 ]
 
 a = Analysis(

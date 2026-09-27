@@ -14,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import batsim
+import portable_launcher_entry as exe_launcher
 from portablizer.core import launcher as launcher_mod
 from portablizer.core import registry
 from portablizer.core.detect import (
@@ -203,6 +204,96 @@ class PortablizerOutputTests(unittest.TestCase):
             text = readme.read_text(encoding="utf-8")
             self.assertIn("Установленные программы", text)
             self.assertIn("--nopause", text)
+
+    def test_ready_exe_launcher_is_copied_into_app(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            app = portable / "App"
+            app.mkdir(parents=True)
+            template = Path(temp, "PortableLauncher.exe")
+            template.write_bytes(b"MZ" + b"portable launcher")
+
+            with mock.patch(
+                "portablizer.core.portablizer.bundled_exe_launcher_path",
+                return_value=str(template),
+            ):
+                rel = self.engine._copy_exe_launcher(str(portable))
+
+            generated = app / "LaunchPortable.exe"
+            self.assertEqual(rel, os.path.join("App", "LaunchPortable.exe"))
+            self.assertEqual(generated.read_bytes(), template.read_bytes())
+
+    def test_invalid_exe_launcher_resource_is_not_copied(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            (portable / "App").mkdir(parents=True)
+            template = Path(temp, "not-an-exe.bin")
+            template.write_bytes(b"invalid")
+
+            with mock.patch(
+                "portablizer.core.portablizer.bundled_exe_launcher_path",
+                return_value=str(template),
+            ):
+                rel = self.engine._copy_exe_launcher(str(portable))
+
+            self.assertEqual(rel, "")
+            self.assertFalse((portable / "App" / "LaunchPortable.exe").exists())
+
+
+class PortableExeLauncherTests(unittest.TestCase):
+    """The App EXE must find the root and launch with the portable profile."""
+
+    def _portable(self, temp):
+        root = Path(temp, "My App_Portable")
+        app = root / "App"
+        app.mkdir(parents=True)
+        target = app / "Program.exe"
+        target.write_bytes(b"MZ target")
+        config = {
+            "app_name": "Program",
+            "target_exe_rel": "App/Program.exe",
+            "target_args": ["--from-config"],
+            "data_dir_name": "PortableData",
+            "path_prepend": ["App"],
+            "extra_env": {"PROGRAM_HOME": "%PORTABLE_ROOT%/App"},
+            "registry": {"enabled": False},
+        }
+        (root / "launcher_config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        (root / "Launch.bat").write_text("@echo off", encoding="ascii")
+        return root, app, target
+
+    def test_finds_root_from_exe_inside_app(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, app, _target = self._portable(temp)
+            self.assertEqual(exe_launcher.find_portable_root(app), root.resolve())
+
+    def test_launches_real_program_with_portable_environment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, app, target = self._portable(temp)
+            completed = mock.Mock(returncode=17)
+            with mock.patch.object(exe_launcher, "find_portable_root",
+                                   return_value=root), mock.patch(
+                "portable_launcher_entry.subprocess.run", return_value=completed
+            ) as run_process:
+                rc = exe_launcher.run(["--user-argument"])
+
+            self.assertEqual(rc, 17)
+            args, kwargs = run_process.call_args
+            self.assertEqual(
+                args[0],
+                [str(target), "--from-config", "--user-argument"],
+            )
+            self.assertEqual(kwargs["cwd"], str(app))
+            env = kwargs["env"]
+            for key in ("APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP",
+                        "PROGRAMDATA", "PUBLIC"):
+                self.assertTrue(env[key].startswith(str(root)), key)
+            self.assertEqual(env["PORTABLE_ROOT"], str(root))
+            self.assertEqual(env["PROGRAM_HOME"], f"{root}/App")
+            self.assertTrue((root / "PortableData" / "User" /
+                             "Documents" / "My Games").is_dir())
 
 
 class LaunchBatSafetyTests(unittest.TestCase):

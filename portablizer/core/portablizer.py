@@ -15,7 +15,8 @@
   5. snapshot(after) — снять состояние реестра и сохранить diff в portable.reg.
   6. detect_main_exe — найти главный exe установленной программы.
   7. gather_deps     — эвристически собрать/скопировать зависимости (VC++ и т.п.).
-  8. launcher        — сгенерировать Launch.bat / launcher_config.json / launcher.py.
+  8. launcher        — сгенерировать Launch.bat / launcher_config.json и
+                       скопировать готовый App/LaunchPortable.exe.
 
 Почему именно лестница попыток
 ------------------------------
@@ -53,6 +54,20 @@ from .silentargs import SilentPlan, build_attempts, build_silent_plan
 ProgressCB = Callable[[int, str], None]
 
 IS_WINDOWS = sys.platform.startswith("win")
+
+# Имя готового EXE-лончера внутри App/. Сам бинарник собирается из
+# portable_launcher_entry.py, встраивается в Portablizer.exe как ресурс и не
+# требует Python на компьютере, где запускают готовый портатив.
+APP_EXE_LAUNCHER_NAME = "LaunchPortable.exe"
+
+
+def bundled_exe_launcher_path() -> str:
+    """Путь к шаблону LaunchPortable.exe в исходниках или PyInstaller EXE."""
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    if frozen_root:
+        return os.path.join(frozen_root, "resources", "portable_launcher.exe")
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(package_root, "resources", "portable_launcher.exe")
 
 
 # -- коды возврата установщиков ---------------------------------------------
@@ -254,7 +269,10 @@ class PortableOptions:
     app_name: str = ""                 # имя приложения (для папки/лончера)
     redirect_userdirs: bool = True     # изолировать AppData/Temp/...
     capture_registry: bool = True      # захватывать изменения реестра
-    build_exe_launcher: bool = False   # генерировать launcher.py для сборки exe
+    # Копировать готовый LaunchPortable.exe в App/. Он запускает программу с
+    # теми же переносимыми AppData/реестром, что и Launch.bat, но обычным
+    # двойным кликом по EXE и без установленного Python.
+    build_exe_launcher: bool = True
     # Удалять следы установки (в т.ч. запись в «Установленные программы») с
     # компьютера, на котором создаётся портатив.
     cleanup_host: bool = True
@@ -319,6 +337,8 @@ class PortableResult:
     targets: List[launcher_mod.TargetInfo] = field(default_factory=list)
     #: Список созданных дополнительных bat-файлов (Launch_Launcher.bat и т.д.)
     companion_launchers: List[str] = field(default_factory=list)
+    #: Готовый EXE для запуска портатива двойным кликом из папки App.
+    portable_launcher_exe_rel: str = ""
     launcher_exe_rel: str = ""
     config_exe_rel: str = ""
 
@@ -593,6 +613,11 @@ class Portablizer:
                 portable_dir, name, result.main_exe_rel,
                 opts, path_prepend, capture, targets)
             result.companion_launchers = companion_files
+            exe_launcher = os.path.join(
+                portable_dir, "App", APP_EXE_LAUNCHER_NAME)
+            if os.path.isfile(exe_launcher):
+                result.portable_launcher_exe_rel = os.path.relpath(
+                    exe_launcher, portable_dir)
 
             # 9. Уборка следов установки с ЭТОГО компьютера: программа не
             # должна остаться в списке «Установленные программы».
@@ -1952,6 +1977,43 @@ class Portablizer:
         return dep_dirs[:12]
 
     # -- лончер ---------------------------------------------------------------
+    def _copy_exe_launcher(self, portable_dir: str) -> str:
+        """Копирует самодостаточный EXE-лончер непосредственно в App/.
+
+        В отличие от прежнего ``launcher.py``, готовый файл не требует Python
+        и не нуждается в ручной сборке. Он сам находит родительскую портативную
+        папку, читает ``launcher_config.json`` и применяет то же изолированное
+        окружение и восстановление реестра, что Launch.bat.
+        """
+        source = bundled_exe_launcher_path()
+        if not os.path.isfile(source):
+            self.log.warn(
+                "В сборке Portablizer отсутствует встроенный "
+                "portable_launcher.exe; LaunchPortable.exe в App не создан. "
+                "Пересоберите проект через build.bat (он сначала выполняет "
+                "portable_launcher.spec)."
+            )
+            return ""
+        try:
+            with open(source, "rb") as fh:
+                if fh.read(2) != b"MZ":
+                    raise RuntimeError("ресурс не является Windows EXE (нет заголовка MZ)")
+            app_dir = os.path.join(portable_dir, "App")
+            os.makedirs(app_dir, exist_ok=True)
+            destination = os.path.join(app_dir, APP_EXE_LAUNCHER_NAME)
+            temporary = destination + ".tmp"
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        except (OSError, RuntimeError) as exc:
+            self.log.warn(f"Не удалось создать {APP_EXE_LAUNCHER_NAME}: {exc}")
+            return ""
+        rel = os.path.relpath(destination, portable_dir)
+        self.log.ok(
+            f"Создан EXE-лончер в папке App: {rel}. Его можно запускать "
+            "двойным кликом без Python и без Launch.bat."
+        )
+        return rel
+
     def _write_launcher(self, portable_dir: str, name: str, main_exe_rel: str,
                         opts: PortableOptions, path_prepend: List[str],
                         capture: Optional[RegistryCapture] = None,
@@ -2020,14 +2082,11 @@ class Portablizer:
             created_launchers.append("Launch_Menu.bat")
             self.log.ok("Создано интерактивное меню выбора программ: Launch_Menu.bat")
 
-        # config json (для launcher.exe)
+        # Общий config читают и корневые скрипты, и готовый EXE в App/.
         self._write_text(os.path.join(portable_dir, "launcher_config.json"),
                          launcher_mod.render_config_json(cfg), newline="\n")
-        # launcher.py (опционально — для сборки launcher.exe)
         if opts.build_exe_launcher:
-            self._write_text(os.path.join(portable_dir, "launcher.py"),
-                             launcher_mod.render_py_launcher(cfg),
-                             newline="\n")
+            self._copy_exe_launcher(portable_dir)
 
         # Формируем описание дополнительных файлов в README
         companion_lines = []
@@ -2060,6 +2119,24 @@ class Portablizer:
                 companion_section=companion_section,
                 companion_files_list=companion_files_list,
                 registry_note=registry_note,
+                exe_launcher_step=(
+                    "  2. Запустите App\\LaunchPortable.exe — это готовый EXE, "
+                    "который сохраняет изоляцию.\n"
+                    "     Launch.bat и LaunchHidden.vbs в корне — запасные "
+                    "варианты запуска.\n"
+                    if os.path.isfile(os.path.join(
+                        portable_dir, "App", APP_EXE_LAUNCHER_NAME))
+                    else
+                    "  2. Запустите Launch.bat (или LaunchHidden.vbs без "
+                    "окна консоли).\n"
+                ),
+                exe_launcher_file=(
+                    "  App\\LaunchPortable.exe — основной запуск из EXE с "
+                    "портативным окружением\n"
+                    if os.path.isfile(os.path.join(
+                        portable_dir, "App", APP_EXE_LAUNCHER_NAME))
+                    else ""
+                ),
             ),
         )
         self.log.ok("Лончер и сопроводительные файлы созданы.")
@@ -2077,15 +2154,13 @@ _README = """{app_name} — портативная версия
 
 Как пользоваться:
   1. Скопируйте ВСЮ эту папку на флешку, другой ПК или в любое место.
-  2. Запустите Launch.bat — программа стартует в изолированном режиме.
-     LaunchHidden.vbs запускает то же самое, но без окна консоли.
-{companion_section}
+{exe_launcher_step}{companion_section}
 Устанавливать ничего не нужно: программа не появляется в списке
 «Установленные программы» и не требует прав администратора.
 
 Что внутри:
   App\\                  — установленная программа ({main_exe_rel})
-  PortableData\\         — все пользовательские данные (AppData, Temp, настройки)
+{exe_launcher_file}  PortableData\\         — все пользовательские данные (AppData, Temp, настройки)
   Launch.bat            — портативный лончер (перенаправляет каталоги и env)
   LaunchHidden.vbs      — запуск без окна консоли
 {companion_files_list}  launcher_config.json  — параметры лончера
