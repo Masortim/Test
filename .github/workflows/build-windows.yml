@@ -61,6 +61,30 @@ jobs:
           }
           exit $testStatus
 
+      - name: Smoke test portable App EXE
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "Portable Launcher Smoke"
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "App") | Out-Null
+          Copy-Item dist/PortableLauncher.exe (Join-Path $root "App/LaunchPortable.exe")
+          Copy-Item $env:ComSpec (Join-Path $root "App/Target.exe")
+          @{
+            app_name = "Smoke"
+            target_exe_rel = "App/Target.exe"
+            target_args = @()
+            data_dir_name = "PortableData"
+            path_prepend = @("App")
+            extra_env = @{}
+            registry = @{ enabled = $false }
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $root "launcher_config.json")
+          & (Join-Path $root "App/LaunchPortable.exe") /d /c 'echo %PORTABLE_APP%>launcher-smoke.txt'
+          if ($LASTEXITCODE -ne 0) { throw "LaunchPortable.exe returned $LASTEXITCODE" }
+          $marker = (Get-Content (Join-Path $root "App/launcher-smoke.txt") -Raw).Trim()
+          if ($marker -ne "1") { throw "Portable environment was not passed to target: $marker" }
+          if (-not (Test-Path (Join-Path $root "PortableData/User/Documents/My Games"))) {
+            throw "Portable profile tree was not created"
+          }
+
       - name: Smoke test (import only)
         run: |
           python -c "import portablizer, portablizer.core.portablizer, portablizer.gui.main_window; print('import OK')"

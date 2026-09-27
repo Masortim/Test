@@ -211,6 +211,13 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertTrue(all(b < 128 for b in bat))
 
             self.assertTrue((portable / "LaunchHidden.vbs").exists())
+            exe_launcher_path = portable / "App" / "LaunchPortable.exe"
+            self.assertTrue(exe_launcher_path.is_file())
+            self.assertEqual(exe_launcher_path.read_bytes()[:2], b"MZ")
+            self.assertEqual(
+                result.portable_launcher_exe_rel,
+                os.path.join("App", "LaunchPortable.exe"),
+            )
             config = json.loads(
                 (portable / "launcher_config.json").read_text(encoding="utf-8"))
             self.assertEqual(
