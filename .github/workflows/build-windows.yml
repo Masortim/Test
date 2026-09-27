@@ -67,10 +67,18 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP "Portable Launcher Smoke"
           New-Item -ItemType Directory -Force -Path (Join-Path $root "App") | Out-Null
           Copy-Item dist/PortableLauncher.exe (Join-Path $root "App/LaunchPortable.exe")
-          Copy-Item $env:ComSpec (Join-Path $root "App/Target.exe")
+          Copy-Item $env:ComSpec (Join-Path $root "App/cmd.exe")
+          # cmd.exe keeps localized messages in a sibling MUI file. Preserve it
+          # when copying cmd outside System32 so the smoke target remains valid.
+          $culture = (Get-UICulture).Name
+          $muiSource = Join-Path (Split-Path $env:ComSpec) "$culture/cmd.exe.mui"
+          if (Test-Path $muiSource) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $root "App/$culture") | Out-Null
+            Copy-Item $muiSource (Join-Path $root "App/$culture/cmd.exe.mui")
+          }
           @{
             app_name = "Smoke"
-            target_exe_rel = "App/Target.exe"
+            target_exe_rel = "App/cmd.exe"
             target_args = @()
             data_dir_name = "PortableData"
             path_prepend = @("App")
