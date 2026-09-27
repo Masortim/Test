@@ -364,7 +364,7 @@ def _machine_elevation_block(cfg: LauncherConfig) -> str:
         'set "PORTABLE_ELEVATION_TARGET=%PORTABLE_TARGET%"',
         'echo This settings tool needs the captured machine registry data.',
         'echo Requesting administrator rights for this run only...',
-        'powershell -NoProfile -ExecutionPolicy Bypass -Command "$q=[char]34; $a=\'--nopause --elevated --machine-registry --target \'+$q+$env:PORTABLE_ELEVATION_TARGET+$q; $p=Start-Process -FilePath $env:PORTABLE_SELF -ArgumentList $a -Verb RunAs -Wait -PassThru; exit $p.ExitCode"',
+        'powershell -NoProfile -ExecutionPolicy Bypass -Command "$q=[char]34; $a=\'/d /c call \'+$q+$env:PORTABLE_SELF+$q+\' --nopause --elevated --machine-registry --target \'+$q+$env:PORTABLE_ELEVATION_TARGET+$q; $p=Start-Process -FilePath $env:ComSpec -ArgumentList $a -Verb RunAs -WindowStyle Normal -Wait -PassThru; exit $p.ExitCode"',
         'set "PORTABLE_RELAUNCH_RC=%ERRORLEVEL%"',
         'set "PORTABLE_RELAUNCHED=1"',
         'if not "%PORTABLE_RELAUNCH_RC%" == "0" (',
