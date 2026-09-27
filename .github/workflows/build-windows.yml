@@ -82,10 +82,25 @@ jobs:
           $process = Start-Process -FilePath (Join-Path $root "App/LaunchPortable.exe") `
             -ArgumentList '/d /c "echo %PORTABLE_APP%>launcher-smoke.txt"' `
             -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw "LaunchPortable.exe returned $($process.ExitCode)" }
-          $marker = (Get-Content (Join-Path $root "App/launcher-smoke.txt") -Raw).Trim()
-          if ($marker -ne "1") { throw "Portable environment was not passed to target: $marker" }
+          if ($process.ExitCode -ne 0) {
+            $errorLog = Join-Path $root "PortableData/launcher-exe-error.log"
+            $details = if (Test-Path $errorLog) { Get-Content $errorLog -Raw } else { "no launcher error log" }
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=LaunchPortable.exe smoke failure::exit=$($process.ExitCode); $details"
+            throw "LaunchPortable.exe returned $($process.ExitCode)"
+          }
+          $markerPath = Join-Path $root "App/launcher-smoke.txt"
+          if (-not (Test-Path $markerPath)) {
+            Write-Host "::error title=LaunchPortable.exe smoke failure::target marker was not created"
+            throw "Target marker was not created"
+          }
+          $marker = (Get-Content $markerPath -Raw).Trim()
+          if ($marker -ne "1") {
+            Write-Host "::error title=LaunchPortable.exe smoke failure::portable environment marker is '$marker'"
+            throw "Portable environment was not passed to target: $marker"
+          }
           if (-not (Test-Path (Join-Path $root "PortableData/User/Documents/My Games"))) {
+            Write-Host "::error title=LaunchPortable.exe smoke failure::portable profile tree was not created"
             throw "Portable profile tree was not created"
           }
 
