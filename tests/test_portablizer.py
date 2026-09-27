@@ -517,6 +517,12 @@ class LaunchBatSafetyTests(unittest.TestCase):
         self.assertIn('call "%PORTABLE_LAUNCHER_DIR%\\Launch.bat"', companion)
         self.assertIn("Start-Process", bat)
         self.assertIn("-Verb RunAs", bat)
+        # A .bat file is not a process that ShellExecuteEx can reliably wait
+        # for or report an exit code from. Elevate cmd.exe and call the batch
+        # file explicitly; otherwise the UAC branch reports a failure even
+        # after the user approved the prompt.
+        self.assertIn("-FilePath $env:ComSpec", bat)
+        self.assertIn("/d /c call ", bat)
 
 
 class LaunchBatExecutionTests(unittest.TestCase):
