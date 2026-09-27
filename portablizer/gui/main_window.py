@@ -488,18 +488,28 @@ class MainWindow(QMainWindow):
                     "Запуск: Launch.bat (или LaunchHidden.vbs — без консоли)"
                 )
             if result.companion_launchers:
-                companion_bats = [
+                companion_files = [
                     f for f in result.companion_launchers
-                    if f.endswith(".bat") and f != "Launch.bat"
+                    if (f.endswith(".exe") or f.endswith(".bat"))
+                    and f not in ("Launch.bat", "Launch_Menu.bat")
                 ]
-                if companion_bats:
+                # Показываем оконные EXE как основной вариант, BAT с тем же
+                # именем оставляем запасным и не дублируем в диалоге.
+                companion_exes = {os.path.splitext(f)[0].casefold()
+                                  for f in companion_files if f.endswith(".exe")}
+                companion_files = [
+                    f for f in companion_files
+                    if f.endswith(".exe")
+                    or os.path.splitext(f)[0].casefold() not in companion_exes
+                ]
+                if companion_files:
                     details += [
                         "",
-                        "Дополнительные варианты (настройки, лаунчеры, меню):",
-                        *[f"  • {b}" for b in companion_bats],
+                        "Дополнительные портативные запуски:",
+                        *[f"  • {b}" for b in companion_files],
                     ]
                     configurators = [
-                        name for name in companion_bats
+                        name for name in companion_files
                         if "config" in name.casefold()
                         or "setting" in name.casefold()
                     ]

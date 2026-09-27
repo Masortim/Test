@@ -100,6 +100,10 @@ class LauncherConfig:
     targets: List[TargetInfo] = field(default_factory=list)
     launcher_target_rel: str = ""
     config_target_rel: str = ""
+    # Имя отдельного EXE-лончера в корне портатива -> запускаемая цель.
+    # Все эти файлы являются копиями одного PortableLauncher.exe, поэтому
+    # выбор цели хранится в переносимом JSON, а не в абсолютном пути.
+    launcher_aliases: Dict[str, str] = field(default_factory=dict)
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -1172,6 +1176,7 @@ def render_config_json(cfg: LauncherConfig) -> str:
         "target_exe_rel": cfg.target_exe_rel,
         "launcher_target_rel": cfg.launcher_target_rel,
         "config_target_rel": cfg.config_target_rel,
+        "launcher_aliases": cfg.launcher_aliases,
         "targets": targets_data,
         "target_args": cfg.target_args,
         "data_dir_name": cfg.data_dir_name,

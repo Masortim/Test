@@ -411,14 +411,14 @@ class Portablizer:
                 ) from exc
 
         # Набор обнаруженных exe меняется от сборки к сборке. Удаляем старые
-        # сгенерированные Launch_<Target>.bat/.vbs, иначе после упрощения меню
-        # в корне остаются нерабочие Launch_PerformanceTester и подобные файлы.
+        # сгенерированные Launch_<Target>.bat/.vbs/.exe, иначе после повторной
+        # сборки в корне остаются лончеры уже отсутствующих компонентов.
         try:
             root_files = os.listdir(portable_dir)
         except OSError:
             root_files = []
         for filename in root_files:
-            if not re.fullmatch(r"Launch_.+\.(?:bat|vbs)", filename,
+            if not re.fullmatch(r"Launch_.+\.(?:bat|vbs|exe)", filename,
                                 flags=re.IGNORECASE):
                 continue
             path = os.path.join(portable_dir, filename)
@@ -2014,13 +2014,16 @@ class Portablizer:
         return dep_dirs[:12]
 
     # -- лончер ---------------------------------------------------------------
-    def _copy_exe_launcher(self, portable_dir: str) -> str:
-        """Копирует самодостаточный EXE-лончер непосредственно в App/.
+    def _copy_exe_launcher(
+        self, portable_dir: str,
+        destination_rel: str = os.path.join("App", APP_EXE_LAUNCHER_NAME),
+    ) -> str:
+        """Копирует самодостаточный EXE-лончер в указанное место портатива.
 
-        В отличие от прежнего ``launcher.py``, готовый файл не требует Python
-        и не нуждается в ручной сборке. Он сам находит родительскую портативную
-        папку, читает ``launcher_config.json`` и применяет то же изолированное
-        окружение и восстановление реестра, что Launch.bat.
+        Один бинарник используется и для главной программы, и для отдельных
+        ``Launch_Launcher.exe``/``Launch_Configurator.exe``. При запуске копия
+        находит своё имя в ``launcher_config.json`` и выбирает относительный
+        путь цели, сохраняя изоляцию профиля и переносимость между дисками.
         """
         source = bundled_exe_launcher_path()
         if not os.path.isfile(source):
@@ -2035,18 +2038,20 @@ class Portablizer:
             with open(source, "rb") as fh:
                 if fh.read(2) != b"MZ":
                     raise RuntimeError("ресурс не является Windows EXE (нет заголовка MZ)")
-            app_dir = os.path.join(portable_dir, "App")
-            os.makedirs(app_dir, exist_ok=True)
-            destination = os.path.join(app_dir, APP_EXE_LAUNCHER_NAME)
+            destination = os.path.abspath(os.path.join(portable_dir, destination_rel))
+            portable_abs = os.path.abspath(portable_dir)
+            if os.path.commonpath((portable_abs, destination)) != portable_abs:
+                raise RuntimeError("путь EXE-лончера выходит за пределы портатива")
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
             temporary = destination + ".tmp"
             shutil.copy2(source, temporary)
             os.replace(temporary, destination)
-        except (OSError, RuntimeError) as exc:
-            self.log.warn(f"Не удалось создать {APP_EXE_LAUNCHER_NAME}: {exc}")
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.log.warn(f"Не удалось создать {destination_rel}: {exc}")
             return ""
         rel = os.path.relpath(destination, portable_dir)
         self.log.ok(
-            f"Создан EXE-лончер в папке App: {rel}. Его можно запускать "
+            f"Создан переносимый EXE-лончер: {rel}. Его можно запускать "
             "двойным кликом без Python и без Launch.bat."
         )
         return rel
@@ -2107,6 +2112,10 @@ class Portablizer:
             self._write_text(t_bat_path, launcher_mod.render_companion_bat(cfg, t),
                              encoding="ascii")
             created_launchers.append(t.bat_name)
+            # Отдельный оконный EXE надёжнее цепочки BAT -> PowerShell -> UAC
+            # и при этом использует в точности тот же портативный профиль.
+            exe_name = os.path.splitext(t.bat_name)[0] + ".exe"
+            cfg.launcher_aliases[exe_name] = t.rel_path
 
             if t.role == "launcher":
                 self.log.ok(
@@ -2129,15 +2138,26 @@ class Portablizer:
                          launcher_mod.render_config_json(cfg), newline="\n")
         if opts.build_exe_launcher:
             self._copy_exe_launcher(portable_dir)
+            for exe_name in cfg.launcher_aliases:
+                if self._copy_exe_launcher(portable_dir, exe_name):
+                    created_launchers.append(exe_name)
 
         # Формируем описание дополнительных файлов в README
         companion_lines = []
         companion_files_desc = []
         for t in companion_targets:
+            exe_name = os.path.splitext(t.bat_name)[0] + ".exe"
+            preferred_name = (
+                exe_name if os.path.isfile(os.path.join(portable_dir, exe_name))
+                else t.bat_name
+            )
             companion_lines.append(
-                f"  • {t.bat_name:<24} — запуск {t.description} ({t.rel_path})")
+                f"  • {preferred_name:<24} — запуск {t.description} ({t.rel_path})")
+            if preferred_name != t.bat_name:
+                companion_files_desc.append(
+                    f"  {preferred_name:<21} — переносимый EXE-запуск {t.name}\n")
             companion_files_desc.append(
-                f"  {t.bat_name:<21} — запуск {t.name} ({t.rel_path})\n")
+                f"  {t.bat_name:<21} — запасной запуск {t.name} ({t.rel_path})\n")
 
         if len(all_targets) >= 2:
             companion_lines.append("  • Launch_Menu.bat          — интерактивное меню выбора программы")
@@ -2202,8 +2222,9 @@ _README = """{app_name} — портативная версия
 старый комплектный launcher/configurator может один раз показать UAC, чтобы
 временно применить обязательный InstallFolder из HKLM.
 
-Если есть Launch_Configurator.bat, сначала запустите его, выберите графику,
-язык и разрешение, сохраните настройки и закройте окно. Затем запускайте игру
+Если есть Launch_Configurator.exe (или его запасной Launch_Configurator.bat),
+сначала запустите его, выберите графику, язык и разрешение, сохраните настройки
+и закройте окно. Затем запускайте игру
 через App\\LaunchPortable.exe или Launch.bat. Оба запуска используют один
 портативный каталог Documents, поэтому выбранные настройки применятся в игре.
 
