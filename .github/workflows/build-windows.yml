@@ -88,7 +88,7 @@ jobs:
           # Start-Process -Wait is intentional: PowerShell can return immediately
           # for a windowed (GUI-subsystem) EXE and leave $LASTEXITCODE unset.
           $process = Start-Process -FilePath (Join-Path $root "App/LaunchPortable.exe") `
-            -ArgumentList '/d /c "echo %PORTABLE_APP%>launcher-smoke.txt"' `
+            -ArgumentList '/d /c "set PORTABLE_APP>launcher-smoke.txt"' `
             -Wait -PassThru
           if ($process.ExitCode -ne 0) {
             $errorLog = Join-Path $root "PortableData/launcher-exe-error.log"
@@ -103,7 +103,7 @@ jobs:
             throw "Target marker was not created"
           }
           $marker = (Get-Content $markerPath -Raw).Trim()
-          if ($marker -ne "1") {
+          if ($marker -ne "PORTABLE_APP=1") {
             Write-Host "::error title=LaunchPortable.exe smoke failure::portable environment marker is '$marker'"
             throw "Portable environment was not passed to target: $marker"
           }
