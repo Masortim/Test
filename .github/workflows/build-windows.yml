@@ -46,7 +46,15 @@ jobs:
         run: pyinstaller --noconfirm --clean portablizer.spec
 
       - name: Run tests
-        run: python -m unittest discover -s tests -v
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests 2>&1 | Tee-Object -FilePath test-output.log
+          $testStatus = $LASTEXITCODE
+          "## Windows test output" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          '```text' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Get-Content test-output.log -Tail 160 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          exit $testStatus
 
       - name: Smoke test (import only)
         run: |

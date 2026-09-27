@@ -116,10 +116,13 @@ def _rewrite_reg(source: Path, destination: Path, replacements: Iterable[tuple[s
         for old, new in replacements:
             if old:
                 text = text.replace(old, new)
+        # TextIO translates every \n when newline="\r\n". Normalize first so
+        # an exported CRLF file does not turn into CRCRLF after rewriting.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(text, encoding="utf-16", newline="\r\n")
         return True
-    except OSError:
+    except (OSError, UnicodeError):
         return False
 
 
