@@ -77,8 +77,12 @@ jobs:
             extra_env = @{}
             registry = @{ enabled = $false }
           } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $root "launcher_config.json")
-          & (Join-Path $root "App/LaunchPortable.exe") /d /c 'echo %PORTABLE_APP%>launcher-smoke.txt'
-          if ($LASTEXITCODE -ne 0) { throw "LaunchPortable.exe returned $LASTEXITCODE" }
+          # Start-Process -Wait is intentional: PowerShell can return immediately
+          # for a windowed (GUI-subsystem) EXE and leave $LASTEXITCODE unset.
+          $process = Start-Process -FilePath (Join-Path $root "App/LaunchPortable.exe") `
+            -ArgumentList '/d /c "echo %PORTABLE_APP%>launcher-smoke.txt"' `
+            -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "LaunchPortable.exe returned $($process.ExitCode)" }
           $marker = (Get-Content (Join-Path $root "App/launcher-smoke.txt") -Raw).Trim()
           if ($marker -ne "1") { throw "Portable environment was not passed to target: $marker" }
           if (-not (Test-Path (Join-Path $root "PortableData/User/Documents/My Games"))) {
