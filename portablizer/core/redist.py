@@ -256,13 +256,25 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
     ),
     RedistPackage(
         key="vb6",
-        title="Visual Basic 6 Runtime (msvbvm60.dll)",
-        pattern=r"(?:msvbvm[56]0|vb6[a-z]*|comcat|mswinsck)\.dll",
+        title="Visual Basic 6 Runtime и common controls (msvbvm60.dll, "
+              "MSCOMCTL.OCX и т. п.)",
+        ascii_title="Visual Basic 6 Runtime and common controls "
+                    "(msvbvm60.dll, MSCOMCTL.OCX)",
+        pattern=r"(?:(?:msvbvm[56]0|vb6[a-z]*|comcat|mswinsck|msstdfmt)"
+                r"\.dll"
+                r"|(?:mscomctl|comdlg32|mshflxgd|tabctl32|threed32"
+                r"|richtx32|msflxgrd|msinet|msadodc|dblist32|pics32"
+                r"|msmask32)\.ocx)",
         downloads={},
         page="https://learn.microsoft.com/previous-versions/visualstudio/"
              "visual-basic-6/vb6-support",
         note="Runtime Visual Basic 6 входит в состав Windows, но на "
-             "урезанных сборках может отсутствовать.",
+             "урезанных сборках может отсутствовать. Элементы управления "
+             "(MSCOMCTL.OCX, COMDLG32.OCX и другие .ocx) отдельного "
+             "установщика от Microsoft не имеют и распространяются только "
+             "рядом с программой — именно так выглядит ошибка "
+             "«Component 'MSCOMCTL.OCX' or one of its dependent files is "
+             "not correctly registered».",
     ),
     RedistPackage(
         key="gfwl",

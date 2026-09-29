@@ -132,12 +132,23 @@ class RedistCatalogTests(unittest.TestCase):
             "dplayx.dll": "directx_jun2010",
             "dpnet.dll": "directx_jun2010",
             "dpvoice.dll": "directx_jun2010",
+            "mscomctl.ocx": "vb6", "comdlg32.ocx": "vb6",
+            "mshflxgd.ocx": "vb6", "tabctl32.ocx": "vb6",
+            "msflxgrd.ocx": "vb6", "msmask32.ocx": "vb6",
         }
         for dll, key in cases.items():
             with self.subTest(dll=dll):
                 package = redist.find_package(dll)
                 self.assertIsNotNone(package, dll)
                 self.assertEqual(package.key, key)
+
+    def test_ocx_control_is_distinguished_from_the_system_dll_of_the_same_stem(self):
+        # comdlg32.dll — системная библиотека диалогов Windows; comdlg32.ocx —
+        # элемент управления VB6, который система не даёт и который нужно
+        # приносить в портатив отдельно.
+        self.assertEqual(redist.classify_dll("comdlg32.dll"), "system")
+        self.assertEqual(redist.classify_dll("comdlg32.ocx"), "redist")
+        self.assertEqual(redist.find_package("comdlg32.ocx").key, "vb6")
 
     def test_case_and_path_do_not_matter(self):
         self.assertEqual(redist.normalize_dll(r"C:\Windows\XINPUT1_3.DLL"),

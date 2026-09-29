@@ -282,7 +282,9 @@ Portablizer закрывает это **заранее**, на четырёх у
 (`d3dx9_24…43`, `d3dx10_*`, `d3dx11_*`, `d3dcompiler_33…43`, `xinput1_1…1_3`,
 `xaudio2_0…2_7`, `x3daudio1_*`, `xapofx1_*`, XACT, DirectPlay — `dplayx`,
 `dpnet`, `dpnsvr` и соседи, Direct3D Retained Mode — `d3drm`), MFC/ATL,
-OpenMP, OpenAL, PhysX, VB6-runtime и Games for Windows – LIVE.
+OpenMP, OpenAL, PhysX, VB6-runtime (включая элементы управления `.ocx` —
+`MSCOMCTL.OCX`, `COMDLG32.OCX`, `MSFLXGRD.OCX`, `TABCTL32.OCX` и соседние,
+отдельно от системной `comdlg32.dll`) и Games for Windows – LIVE.
 
 **3. Лестница источников** — от самого точного к самому общему:
 
