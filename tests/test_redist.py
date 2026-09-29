@@ -1121,8 +1121,8 @@ class SilentInstallTests(unittest.TestCase):
             self.assertEqual(redist.silent_commands(burn)[0][1:],
                              ["/install", "/quiet", "/norestart"])
             legacy = make("vcredist_x86.exe")
-            self.assertEqual(redist.silent_commands(legacy)[0][1:],
-                             ["/q", "/norestart"])
+            self.assertEqual(redist.silent_commands(legacy),
+                             [[legacy, "/q"]])
             dx = make("DXSETUP.exe")
             self.assertEqual(redist.silent_commands(dx)[0][1:], ["/silent"])
             msi = make("xnafx40_redist.msi")
@@ -1134,6 +1134,19 @@ class SilentInstallTests(unittest.TestCase):
             self.assertEqual(redist.installer_kind(inno), "inno")
             self.assertIn("/VERYSILENT", redist.silent_commands(inno)[0])
 
+    def test_vc2005_script_discards_the_invalid_norestart_option(self):
+        text = redist.render_silent_install_script([{
+            "file": "Redist/vcredist_x86.exe",
+            "title": "Microsoft Visual C++ 2005 Redistributable (x86)",
+            "kind": "vcredist_legacy",
+            # Metadata written by older versions contained this invalid pair.
+            "args": "/q /norestart",
+        }])
+        install_line = next(line for line in text.splitlines()
+                            if "start \"\" /wait" in line)
+        self.assertTrue(install_line.endswith(" /q"), install_line)
+        self.assertNotIn("/norestart", install_line)
+
     def test_exit_codes_are_read_the_way_microsoft_means_them(self):
         self.assertEqual(redist.classify_exit_code(0), "installed")
         self.assertEqual(redist.classify_exit_code(1638), "already")
@@ -1142,7 +1155,7 @@ class SilentInstallTests(unittest.TestCase):
         self.assertEqual(redist.classify_exit_code(1603), "failed")
         self.assertEqual(redist.classify_exit_code(None), "failed")
 
-    def test_switches_are_tried_until_one_of_them_works(self):
+    def test_vc2005_only_gets_the_safe_quiet_switch(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp, "vcredist_x86.exe")
             path.write_bytes(b"MZ")
@@ -1150,14 +1163,15 @@ class SilentInstallTests(unittest.TestCase):
 
             def runner(args):
                 seen.append(list(args))
-                # Старый пакет не знает /norestart, зато понимает голое /q.
-                return 0 if list(args)[1:] == ["/q"] else 1603
+                return 0
 
             outcome = redist.run_silent_install(str(path), runner=runner)
 
             self.assertEqual(outcome.status, "installed")
-            self.assertEqual(seen[0][1:], ["/q", "/norestart"])
-            self.assertEqual(seen[-1][1:], ["/q"])
+            self.assertEqual([command[1:] for command in seen], [["/q"]])
+            # /norestart makes VC++ 2005 display a modal
+            # "Command line option syntax error" dialog.
+            self.assertNotIn("/norestart", seen[0])
 
     # -- предусловия дистрибутива -------------------------------------------
     def test_prerequisites_next_to_the_installer_are_installed_silently(self):
@@ -1974,7 +1988,9 @@ class LauncherSilentInstallTests(unittest.TestCase):
             self.assertEqual(left, [])
             self.assertEqual(len(calls), 1)
             self.assertTrue(calls[0][0].endswith("vcredist_x86.exe"))
-            self.assertEqual(calls[0][1:], ["/q", "/norestart"])
+            # The old config still contains /norestart; the launcher must
+            # discard it because VC++ 2005 shows a modal syntax-error dialog.
+            self.assertEqual(calls[0][1:], ["/q"])
 
     def test_failed_installation_still_warns_the_user_once(self):
         with tempfile.TemporaryDirectory() as temp:

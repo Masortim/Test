@@ -1539,12 +1539,12 @@ SILENT_SWITCHES: Dict[str, Tuple[Tuple[str, ...], ...]] = {
              ("/quiet", "/norestart"),
              ("/layout", "{dest}", "/quiet", "/norestart"),
              ("/q", "/norestart")),
-    # IExpress-обёртки VC++ 2005/2008/2010: у каждого поколения свой ключ.
-    "vcredist_legacy": (("/q", "/norestart"),
-                        ("/q",),
-                        ("/qb",),
-                        ("/Q",),
-                        ("/quiet", "/norestart")),
+    # IExpress-обёртки VC++ 2005/2008/2010 понимают голый /q. В частности,
+    # VC++ 2005 НЕ понимает /norestart и показывает модальное окно
+    # «Command line option syntax error», даже если процесс запущен скрыто.
+    # Не передаём ему современные ключи и не перебираем сомнительные
+    # варианты: /q является общим безопасным ключом для всех трёх версий.
+    "vcredist_legacy": (("/q",),),
     # DXSETUP понимает ровно один ключ; на любом другом он показывает окно
     # «Установка DirectX — Неверная операция командной строки» и ждёт мышку,
     # поэтому перебирать варианты для него запрещено (см. silent_commands).
@@ -1646,8 +1646,11 @@ def silent_commands(path: str, kind: str = "",
         return []
     commands = [[path, *switches]
                 for switches in SILENT_SWITCHES.get(kind, SILENT_SWITCHES[""])]
-    if kind and kind not in ("dxsetup", "directx_bundle"):
+    if kind and kind not in ("dxsetup", "directx_bundle", "vcredist_legacy"):
         # Подстраховка: если «правильные» ключи не сработали, пробуем общие.
+        # Для старого vcredist такая лестница небезопасна: VC++ 2005 выводит
+        # модальное «Command line option syntax error» на /norestart и
+        # современные варианты, поэтому для него разрешён только голый /q.
         for switches in SILENT_SWITCHES[""]:
             candidate = [path, *switches]
             if candidate not in commands:
@@ -1856,6 +1859,11 @@ def render_silent_install_script(entries: Sequence[Dict[str, str]]) -> str:
             ]
         elif kind == "dxsetup" or relative.lower().endswith("dxsetup.exe"):
             body = [f'start "" /wait {target} /silent']
+        elif kind == "vcredist_legacy":
+            # VC++ 2005 rejects `/q /norestart` with a visible modal syntax
+            # error. Ignore stale metadata too, so a regenerated script fixes
+            # portable configs made by older Portablizer versions.
+            body = [f'start "" /wait {target} /q']
         else:
             body = [f'start "" /wait {target} {args}'.rstrip()]
         lines += [

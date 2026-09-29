@@ -210,6 +210,12 @@ def _runtime_install_commands(root: Path,
         # handed over to DXSETUP, which answers with a modal "Invalid
         # command line operation" box.  Unpack first, then DXSETUP /silent.
         return _directx_commands(path)
+    if kind == "vcredist_legacy":
+        # VC++ 2005 accepts /q, but rejects the commonly used /norestart with
+        # a visible "Command line option syntax error" dialog.  Do not trust
+        # stale args saved by an older Portablizer and do not try modern
+        # fallbacks against this legacy IExpress wrapper.
+        return [[str(path), "/q"]]
     args = str(entry.get("args", "")).split()
     commands = [[str(path), *args]] if args else []
     for fallback in (["/quiet", "/norestart"], ["/q", "/norestart"],
