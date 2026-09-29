@@ -124,6 +124,14 @@ QProgressBar::chunk {{
     background: {ACCENT};
     border-radius: 7px;
 }}
+QProgressBar#DetailProgress {{
+    height: 12px;
+    font-size: 10px;
+}}
+QProgressBar#DetailProgress::chunk {{
+    background: {ACCENT_HOVER};
+    border-radius: 6px;
+}}
 QPlainTextEdit#Log {{
     font-family: "Cascadia Mono", "Consolas", monospace;
     font-size: 12px;

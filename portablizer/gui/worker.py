@@ -12,6 +12,7 @@ from ..core.portablizer import PortableOptions, PortableResult, Portablizer
 class PortableWorker(QThread):
     log_line = Signal(str, str)          # level, message
     progress = Signal(int, str)          # percent, stage
+    detail = Signal(int, str)            # percent (-1 — неизвестен), операция
     finished_result = Signal(object)     # PortableResult
 
     def __init__(self, opts: PortableOptions) -> None:
@@ -29,6 +30,7 @@ class PortableWorker(QThread):
             logger=self.logger,
             progress=lambda p, s: self.progress.emit(p, s),
             cancel_event=self.cancel_event,
+            detail=lambda p, s: self.detail.emit(p, s),
         )
         result: PortableResult = engine.run(self.opts)
         self.finished_result.emit(result)

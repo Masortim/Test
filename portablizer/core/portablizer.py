@@ -53,6 +53,10 @@ from .logutil import Logger
 from .silentargs import SilentPlan, build_attempts, build_silent_plan
 
 ProgressCB = Callable[[int, str], None]
+#: Ход текущей операции: ``(процент или -1, подпись)``. ``-1`` означает, что
+#: величину заранее узнать нельзя (сервер не сообщил размер файла и т. п.) —
+#: интерфейс показывает «бегущую» полосу вместо замершего числа.
+DetailCB = Callable[[int, str], None]
 
 IS_WINDOWS = sys.platform.startswith("win")
 
@@ -382,9 +386,13 @@ class PortableResult:
 class Portablizer:
     def __init__(self, logger: Logger,
                  progress: Optional[ProgressCB] = None,
-                 cancel_event: Optional[threading.Event] = None) -> None:
+                 cancel_event: Optional[threading.Event] = None,
+                 detail: Optional[DetailCB] = None) -> None:
         self.log = logger
-        self.progress = progress or (lambda p, s: None)
+        #: Колбэк общего хода сборки, как его передал вызывающий код.
+        self._progress_cb: ProgressCB = progress or (lambda p, s: None)
+        #: Подробный ход текущей операции (загрузка пакета, распаковка).
+        self.detail = detail or (lambda p, s: None)
         self.cancel = cancel_event or threading.Event()
         #: Время начала run() — по нему отбираются журналы установщика.
         self._run_started: Optional[float] = None
@@ -396,6 +404,42 @@ class Portablizer:
         self._installshield_result: Optional[int] = None
 
     # -- вспомогательное ------------------------------------------------------
+    def progress(self, percent: int, stage: str) -> None:
+        """Переход к новому этапу сборки: подробности прошлого больше не нужны."""
+        self._emit_progress(percent, stage)
+        self._detail(0, "")
+
+    def _emit_progress(self, percent: int, stage: str) -> None:
+        try:
+            self._progress_cb(int(percent), stage)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _detail(self, percent: int, text: str) -> None:
+        """Показывает ход текущей операции, не роняя сборку на ошибке GUI."""
+        try:
+            self.detail(int(percent), text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _stage_progress(self, start: int, stop: int) -> Callable[[float, str, int], None]:
+        """Колбэк для долгого этапа: доля этапа → общий процент + подробности.
+
+        Именно из-за отсутствия такого колбэка сборка выглядела зависшей на
+        «82%»: загрузка DirectX идёт минутами и раньше ничего о себе не
+        сообщала.
+        """
+        span = max(1, stop - start)
+
+        def report(fraction: float, text: str, detail: int = -1) -> None:
+            value = start + int(span * max(0.0, min(1.0, fraction)))
+            self._emit_progress(min(stop, value),
+                                text or "Распространяемые компоненты")
+            if text:
+                self._detail(detail, text)
+
+        return report
+
     def _check_cancel(self) -> None:
         if self.cancel.is_set():
             raise RuntimeError("Операция отменена пользователем.")
@@ -1380,11 +1424,20 @@ class Portablizer:
                     proc.terminate()
                     raise RuntimeError("Превышено время ожидания установки.")
                 # плавный прогресс во время установки: progress_from -> progress_to
-                frac = min(1.0, (time.time() - start) / 60.0)
+                elapsed = time.time() - start
+                frac = min(1.0, elapsed / 60.0)
                 span = max(1, progress_to - progress_from)
-                self.progress(progress_from + int(span * frac),
-                              "Установка в окне мастера..." if plan.interactive
-                              else "Тихая установка...")
+                title = ("Установка в окне мастера..." if plan.interactive
+                         else "Тихая установка...")
+                self._emit_progress(progress_from + int(span * frac), title)
+                # Установщик о себе процентов не сообщает, поэтому подробная
+                # строка показывает прошедшее время и предел ожидания —
+                # видно, что процесс жив, и сколько он ещё может идти.
+                self._detail(
+                    min(99, int(elapsed * 100 / max(1, timeout))),
+                    f"{title} идёт "
+                    f"{redist_mod.format_duration(elapsed)} "
+                    f"(предел {redist_mod.format_duration(timeout)})")
                 time.sleep(0.5)
             rc = proc.returncode
         finally:
@@ -2182,7 +2235,9 @@ class Portablizer:
         provisioner = redist_mod.RuntimeProvisioner(
             self.log, source_dirs=sources,
             allow_download=opts.download_runtimes,
-            allow_install=opts.silent_runtime_install)
+            allow_install=opts.silent_runtime_install,
+            progress=self._stage_progress(82, 87),
+            cancel=self.cancel.is_set)
         try:
             report = provisioner.provision(
                 scan, app_dir, portable_dir, name,
