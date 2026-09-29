@@ -477,7 +477,14 @@ def render_runtime_script(report: RuntimeReport) -> str:
         elif "2013" in name:
             package_id = "vc2013"
         package = _PACKAGE_BY_ID.get(package_id)
-        args = package.silent_args if package else ("/install", "/quiet", "/norestart")
+        if package:
+            args = package.silent_args
+        elif name.startswith("vcredist"):
+            # The 2005--2013 installers use the older /q switch; unlike the
+            # v14 bundle they do not consistently accept /install.
+            args = ("/q", "/norestart")
+        else:
+            args = ("/install", "/quiet", "/norestart")
         rel = relative.replace("/", "\\")
         arg_text = " ".join(args)
         lines.extend([
