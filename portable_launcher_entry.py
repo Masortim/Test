@@ -880,10 +880,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             # The official launcher usually starts the game and exits at once.
             # Restoring the registry right now would pull the install keys out
             # from under the game that is just starting, so wait for it.
-            waited = _wait_for_portable_processes(root)
-            if waited:
-                _run_log(root, f"waited {waited}s for programs started from "
-                               f"the portable folder to finish")
+            if bool(cfg.get("wait_for_children", True)):
+                waited = _wait_for_portable_processes(root)
+                if waited:
+                    _run_log(root, f"waited {waited}s for programs started from "
+                                   f"the portable folder to finish")
             return code
         finally:
             registry.save_and_restore()

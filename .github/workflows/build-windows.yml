@@ -84,6 +84,9 @@ jobs:
             path_prepend = @("App")
             extra_env = @{}
             registry = @{ enabled = $false }
+            # cmd.exe is only a marker target; do not wait for descendants in
+            # this CI smoke test. Real generated portables keep the default.
+            wait_for_children = $false
           } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $root "launcher_config.json")
           # Start-Process -Wait is intentional: PowerShell can return immediately
           # for a windowed (GUI-subsystem) EXE and leave $LASTEXITCODE unset.

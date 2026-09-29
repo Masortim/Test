@@ -1217,6 +1217,7 @@ def render_config_json(cfg: LauncherConfig) -> str:
         "extra_env": cfg.extra_env,
         "path_prepend": cfg.path_prepend,
         "redirect_known_folders": cfg.redirect_known_folders,
+        "wait_for_children": True,
         "runtime": {
             "manifest": cfg.runtime_manifest_name,
             "install_script": cfg.runtime_install_script_name,
