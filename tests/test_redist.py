@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import batsim
 import portable_launcher_entry as exe_launcher
+from cabbuild import make_cabinet, make_self_extracting_exe
 from pebuild import MACHINE_X64, MACHINE_X86, write_pe, write_runtime_dll
 from portablizer.core import redist
 from portablizer.core.launcher import (
@@ -451,8 +452,11 @@ class RuntimeProvisionTests(unittest.TestCase):
                 self.log, system_dirs=[], sxs_dir="", allow_download=True,
                 downloader=downloader,
             ).provision(scan, str(app), str(portable), "Game")
-            self.assertEqual(len(calls), 1)
+            # Основная ссылка не сработала - перебираются запасные, но
+            # каждая ровно один раз и только в пределах этого пакета.
+            self.assertGreaterEqual(len(calls), 1)
             self.assertIn("vcredist_x86.exe", calls[0])
+            self.assertEqual(len(calls), len(set(calls)))
 
     def test_directx_package_is_unpacked_and_only_the_needed_cab_is_touched(self):
         """Из пакета DirectX достаётся ровно нужный кабинет.
@@ -504,7 +508,9 @@ class RuntimeProvisionTests(unittest.TestCase):
 
     def test_downloaded_package_is_kept_as_an_offline_fallback(self):
         def downloader(url, destination):
-            Path(destination).write_bytes(b"MZ fake vcredist")
+            # Правдоподобный по сигнатуре и размеру пакет, но без кабинета
+            # внутри: распаковать его не выйдет ни одним способом.
+            Path(destination).write_bytes(b"MZ" + b"\x00" * (128 * 1024))
             return True
 
         with tempfile.TemporaryDirectory() as temp:
@@ -1356,7 +1362,9 @@ class PackageExtractionTests(unittest.TestCase):
         calls = []
 
         def downloader(url, destination):
-            Path(destination).write_bytes(b"MZ fake vcredist")
+            # Правдоподобный по сигнатуре и размеру пакет, но без кабинета
+            # внутри: распаковать его не выйдет ни одним способом.
+            Path(destination).write_bytes(b"MZ" + b"\x00" * (128 * 1024))
             return True
 
         def runner(args):
@@ -1419,7 +1427,9 @@ class PackageExtractionTests(unittest.TestCase):
     def test_mfc80_is_delivered_with_a_private_manifest(self):
         """VC++ 2005 рядом с exe работает только вместе с манифестом сборки."""
         def downloader(url, destination):
-            Path(destination).write_bytes(b"MZ fake vcredist")
+            # Правдоподобный по сигнатуре и размеру пакет, но без кабинета
+            # внутри: распаковать его не выйдет ни одним способом.
+            Path(destination).write_bytes(b"MZ" + b"\x00" * (128 * 1024))
             return True
 
         def runner(args):
@@ -1458,6 +1468,146 @@ class PackageExtractionTests(unittest.TestCase):
             written = app / "Microsoft.VC80.MFC.manifest"
             self.assertTrue(written.is_file())
             self.assertIn("8.0.50727.762", written.read_text(encoding="utf-8"))
+
+    # -- распаковка без внешних программ -------------------------------------
+    def _package_bytes(self, files):
+        """Настоящий самораспаковывающийся пакет: PE + кабинет."""
+        return make_self_extracting_exe(files)
+
+    def test_package_is_unpacked_without_running_anything(self):
+        """Ни сам пакет, ни expand не запускаются — и всё равно распаковано.
+
+        Ровно эта жалоба: «пакет скачан, но распаковать его автоматически
+        не удалось». Теперь кабинет внутри пакета читается напрямую.
+        """
+        def runner(args):
+            self.fail("внешняя программа не должна понадобиться: "
+                      + " ".join(str(a) for a in args))
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("msvcp110.dll",))
+            source = Path(temp, "src")
+            source.mkdir()
+            write_runtime_dll(source / "msvcp110.dll")
+            dll = (source / "msvcp110.dll").read_bytes()
+
+            def downloader(url, destination):
+                Path(destination).write_bytes(self._package_bytes({
+                    "msvcp110.dll": dll,
+                    "payload.bin": os.urandom(100 * 1024),
+                }))
+                return True
+
+            scan = redist.scan_app_runtime(str(app))
+            with mock.patch.object(redist, "IS_WINDOWS", True):
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="", allow_download=True,
+                    downloader=downloader, runner=runner,
+                ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertEqual(report.missing, [])
+            self.assertEqual([r.dll for r in report.provided],
+                             ["msvcp110.dll"])
+            self.assertEqual((app / "msvcp110.dll").read_bytes(), dll)
+
+    def test_nested_cabinet_of_the_legacy_vcredist_is_unpacked(self):
+        """VC++ 2005-2010: exe → vc_red.cab → библиотека под именем MSI."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            manifest = (
+                '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" '
+                'manifestVersion="1.0"><dependency><dependentAssembly>'
+                '<assemblyIdentity type="win32" name="Microsoft.VC80.MFC" '
+                'version="8.0.50727.762" processorArchitecture="x86" '
+                'publicKeyToken="1fc8b3b9a1e18e3b"/>'
+                '</dependentAssembly></dependency></assembly>'
+            )
+            write_pe(app / "game.exe", imports=("mfc80.dll",),
+                     manifest=manifest)
+            source = Path(temp, "src")
+            source.mkdir()
+            write_runtime_dll(source / "mfc80.dll")
+            dll = (source / "mfc80.dll").read_bytes()
+
+            inner = make_cabinet({
+                "FL_mfc80_dll_01_8.0.50727.762_x-ww_1b4fc1e7": dll,
+                "FL_mfc80u_dll_01_8.0.50727.762_x-ww_1b4fc1e7": dll,
+            })
+            shipped = Path(temp, "_CommonRedist", "vcredist", "2005")
+            shipped.mkdir(parents=True)
+            (shipped / "vcredist_x86.exe").write_bytes(
+                self._package_bytes({"vc_red.cab": inner,
+                                     "vc_red.msi": b"\xd0\xcf\x11\xe0" * 4096}))
+
+            scan = redist.scan_app_runtime(str(app))
+            report = redist.RuntimeProvisioner(
+                self.log, source_dirs=[str(shipped)], system_dirs=[],
+                sxs_dir="",
+            ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertEqual([r.dll for r in report.provided], ["mfc80.dll"])
+            self.assertEqual((app / "mfc80.dll").read_bytes(), dll)
+            self.assertTrue((app / "Microsoft.VC80.MFC.manifest").is_file())
+
+    # -- проверка скачанного -------------------------------------------------
+    def test_a_web_page_is_never_mistaken_for_a_package(self):
+        with tempfile.TemporaryDirectory() as temp:
+            page = Path(temp, "vcredist_x86.exe")
+            page.write_bytes(b"<!DOCTYPE html><html>404</html>")
+            self.assertIn("веб-страницу", redist.package_file_problem(str(page)))
+
+            cut = Path(temp, "vcredist_x64.exe")
+            cut.write_bytes(b"MZ" + b"\x00" * 1000)
+            self.assertIn("мал", redist.package_file_problem(str(cut)))
+
+            good = Path(temp, "ok.exe")
+            good.write_bytes(b"MZ" + b"\x00" * (128 * 1024))
+            self.assertEqual(redist.package_file_problem(str(good)), "")
+
+    def test_broken_link_falls_back_to_a_mirror(self):
+        """Ссылка отдала страницу-заглушку — берём пакет с запасной ссылки."""
+        source = []
+
+        def downloader(url, destination):
+            source.append(url)
+            if len(source) == 1:
+                Path(destination).write_bytes(b"<html>gone</html>")
+            else:
+                Path(destination).write_bytes(b"MZ" + b"\x00" * (128 * 1024))
+            return True
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("msvcp110.dll",))
+            scan = redist.scan_app_runtime(str(app))
+            report = redist.RuntimeProvisioner(
+                self.log, system_dirs=[], sxs_dir="", allow_download=True,
+                downloader=downloader,
+            ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertGreaterEqual(len(source), 2)
+            self.assertNotEqual(source[0], source[1])
+            # Страница-заглушка выброшена, в Redist лежит файл со второй
+            # ссылки — на целевом ПК его можно поставить вручную.
+            staged = portable / redist.REDIST_DIR_NAME / "vcredist_x86.exe"
+            self.assertTrue(staged.is_file())
+            self.assertEqual(staged.read_bytes()[:2], b"MZ")
+            self.assertEqual(report.packages, ["vcredist_x86.exe"])
+
+    def test_every_visual_cpp_package_has_a_spare_link(self):
+        for package in redist.REDIST_PACKAGES:
+            if not package.key.startswith("vc2"):
+                continue
+            for arch in ("x86", "x64"):
+                self.assertGreaterEqual(
+                    len(package.urls(arch)), 2,
+                    f"{package.key}/{arch}: запасной ссылки нет")
+
+    def test_system_tools_are_looked_up_by_absolute_path_on_windows(self):
+        # На не-Windows имя остаётся именем: тесты и Linux-сборка не должны
+        # зависеть от наличия System32.
+        self.assertEqual(redist.system_tool("expand"), "expand")
 
     # -- DirectX -------------------------------------------------------------
     def test_directx_bundle_is_never_given_a_switch_it_cannot_parse(self):
@@ -1506,6 +1656,32 @@ class PackageExtractionTests(unittest.TestCase):
                 if command[0].lower().endswith("directx_jun2010_redist.exe"):
                     self.assertNotIn("/quiet", command)
                     self.assertNotIn("/silent", command)
+
+    def test_directx_bundle_is_opened_by_the_built_in_reader(self):
+        """Бандл не запускается: кабинет внутри него читается напрямую."""
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp, "directx_Jun2010_redist.exe")
+            bundle.write_bytes(make_self_extracting_exe({
+                "DXSETUP.exe": b"MZ" + os.urandom(20000),
+                "Jun2010_d3dx9_43_x86.cab": make_cabinet(
+                    {"d3dx9_43.dll": b"MZ" + os.urandom(1000)}),
+            }))
+
+            with mock.patch.object(redist, "IS_WINDOWS", True):
+                outcome = redist.run_silent_install(str(bundle), runner=runner)
+
+            self.assertEqual(outcome.status, "installed")
+            # Единственный запуск — DXSETUP с единственным ключом, который
+            # он понимает.
+            self.assertEqual(len(calls), 1, calls)
+            self.assertTrue(calls[0][0].lower().endswith("dxsetup.exe"))
+            self.assertEqual(calls[0][1:], ["/silent"])
 
     def test_target_pc_script_installs_directx_in_two_steps(self):
         text = redist.render_silent_install_script([
