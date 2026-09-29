@@ -157,6 +157,31 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f dist-windows/Portablizer.exe portablizer/resources/portable_launcher.exe
-          git commit -m "ci: build Windows executables [skip ci]" || echo "no changes"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin HEAD:"${GITHUB_REF_NAME}"
+          if git diff --cached --quiet; then
+            echo "Собранные бинарники не отличаются от закоммиченных — обновлять нечего."
+            exit 0
+          fi
+          git commit -m "ci: build Windows executables [skip ci]"
+
+          # Ветка могла уехать вперёд (или вообще исчезнуть после merge PR),
+          # пока шла сборка. Поэтому пушим с повторами: при отказе
+          # подтягиваем ветку и переносим коммит с бинарниками поверх неё.
+          # Конфликты по бинарникам всегда решаем в пользу свежей сборки.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:"${GITHUB_REF_NAME}"; then
+              echo "Бинарники запушены в ${GITHUB_REF_NAME} (попытка ${attempt})."
+              exit 0
+            fi
+            echo "Пуш отклонён, синхронизируюсь с origin/${GITHUB_REF_NAME}..."
+            if ! git fetch origin "${GITHUB_REF_NAME}"; then
+              echo "::warning title=Built EXE not committed::ветка ${GITHUB_REF_NAME} больше не существует на origin (PR уже влит?). Бинарник доступен только как артефакт сборки."
+              exit 0
+            fi
+            if ! git rebase -X theirs FETCH_HEAD; then
+              git rebase --abort || true
+              echo "::warning title=Built EXE not committed::не удалось перенести коммит с бинарниками поверх origin/${GITHUB_REF_NAME}."
+              exit 0
+            fi
+          done
+          echo "::error title=Built EXE not committed::не удалось запушить бинарники в ${GITHUB_REF_NAME} за 3 попытки"
+          exit 1
