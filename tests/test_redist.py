@@ -518,9 +518,12 @@ class RuntimeProvisionTests(unittest.TestCase):
 
             # Распаковать пакет без Windows нельзя, но сам он уже скачан:
             # пользователю остаётся запустить его на целевом ПК без интернета.
-            self.assertEqual(report.packages, ["vcredist_x86.exe"])
+            # Имя файла содержит ключ пакета (vc2012-...): у VC++
+            # 2008/2010/2012 совпадает upstream-имя "vcredist_x86.exe", и без
+            # префикса второй скачанный пакет считался бы уже загруженным.
+            self.assertEqual(report.packages, ["vc2012-vcredist_x86.exe"])
             self.assertTrue((portable / redist.REDIST_DIR_NAME
-                             / "vcredist_x86.exe").is_file())
+                             / "vc2012-vcredist_x86.exe").is_file())
             self.assertIn("Redist", redist.render_report(report))
 
     def test_report_names_the_package_and_the_link(self):
@@ -1215,7 +1218,13 @@ class SilentInstallTests(unittest.TestCase):
                              ["msvcp110.dll"])
             self.assertTrue((app / "msvcp110.dll").is_file())
             self.assertTrue(commands, "пакет так и не был запущен")
-            self.assertIn("/q", commands[0])
+            # msvcp110.dll — это VC++ 2012, а он ставится через WiX Burn
+            # (/install /quiet /norestart), а не через старый ключ /q:
+            # "vcredist_x86.exe" называется и у VC++ 2008/2010 (старый
+            # стаб), но движок для СВОЕГО пакета Portablizer знает заранее
+            # и не путает эти два по одинаковому имени файла.
+            self.assertIn("/install", commands[0])
+            self.assertIn("/quiet", commands[0])
             self.assertTrue(report.installed[0].ok)
             self.assertIn("тихом режиме",
                           redist.render_report(report))
@@ -1315,7 +1324,7 @@ class LauncherSilentInstallTests(unittest.TestCase):
             root = self._portable(temp)
             calls = []
 
-            def fake_hidden(command, timeout=900):
+            def fake_hidden(command, timeout=900, cwd=None):
                 calls.append(list(command))
                 # «Установка»: библиотека появляется рядом с программой.
                 (root / "App" / "msvcp110.dll").write_bytes(b"MZ")
@@ -1338,7 +1347,7 @@ class LauncherSilentInstallTests(unittest.TestCase):
             root = self._portable(temp, with_script=False)
             calls = []
 
-            def fake_hidden(command, timeout=900):
+            def fake_hidden(command, timeout=900, cwd=None):
                 calls.append(list(command))
                 (root / "App" / "msvcp110.dll").write_bytes(b"MZ")
                 return 0
@@ -1362,7 +1371,7 @@ class LauncherSilentInstallTests(unittest.TestCase):
             missing = [{"dll": "msvcp110.dll", "title": "Visual C++ 2012"}]
             with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
                     mock.patch.object(exe_launcher, "_run_hidden",
-                                      lambda command, timeout=900: 1603), \
+                                      lambda command, timeout=900, cwd=None: 1603), \
                     mock.patch.object(exe_launcher, "_is_elevated",
                                       lambda: True):
                 left = exe_launcher.install_missing_runtime(

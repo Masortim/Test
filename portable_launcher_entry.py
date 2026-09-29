@@ -170,12 +170,24 @@ def _runtime_install_commands(root: Path,
     return commands
 
 
-def _run_hidden(command: Sequence[str], timeout: int = 900) -> Optional[int]:
-    """Run an installer with no console and no window at all."""
+def _run_hidden(command: Sequence[str], timeout: int = 900,
+                cwd: Optional[Path] = None) -> Optional[int]:
+    """Run an installer with no console and no window at all.
+
+    ``cwd`` matters more than it looks: some runtime installers (DXSETUP.exe
+    above all) look for their companion files (dxupdate.cab, DXSETUP.dat,
+    the actual library cabinets) in the *current* directory of the process,
+    not next to their own executable. Launched with an unrelated working
+    directory, DXSETUP.exe does not report "file not found" - it reports the
+    misleading "Invalid command line switch", even though the switch itself
+    (/silent) is correct. Defaulting to the installer's own folder avoids
+    the whole class of failures.
+    """
     try:
         completed = subprocess.run(
             [str(part) for part in command], timeout=timeout,
             creationflags=NO_WINDOW, check=False,
+            cwd=str(cwd) if cwd is not None else None,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return int(completed.returncode)
     except (OSError, subprocess.SubprocessError):
@@ -183,7 +195,8 @@ def _run_hidden(command: Sequence[str], timeout: int = 900) -> Optional[int]:
 
 
 def _run_hidden_elevated(program: str,
-                         arguments: Sequence[str]) -> Optional[int]:
+                         arguments: Sequence[str],
+                         cwd: Optional[Path] = None) -> Optional[int]:
     """Run a program through UAC with no window, and wait for it.
 
     One prompt for the whole batch of runtime packages: after the user has
@@ -218,6 +231,7 @@ def _run_hidden_elevated(program: str,
         info.lpFile = str(program)
         info.lpParameters = subprocess.list2cmdline(
             [str(part) for part in arguments])
+        info.lpDirectory = str(cwd) if cwd is not None else None
         info.nShow = SW_HIDE
         shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
         if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
@@ -257,9 +271,10 @@ def install_missing_runtime(root: Path, cfg: Dict[str, Any],
         path = root / script.replace("/", os.sep)
         if path.is_file():
             command = ["cmd.exe", "/c", str(path)]
-            code = (_run_hidden(command) if _is_elevated()
+            code = (_run_hidden(command, cwd=path.parent) if _is_elevated()
                     else _run_hidden_elevated("cmd.exe",
-                                              ["/c", str(path)]))
+                                              ["/c", str(path)],
+                                              cwd=path.parent))
             _run_log(root, f"silent runtime install script -> {code}")
             still = [item for item in missing
                      if not _library_present(root, str(item.get("dll", "")))]
@@ -276,8 +291,10 @@ def install_missing_runtime(root: Path, cfg: Dict[str, Any],
                    if name.strip()}
         if covered and not (covered & wanted):
             continue
+        relative = str(entry.get("file", "")).replace("/", os.sep)
+        installer_dir = (root / relative).parent if relative else root
         for command in _runtime_install_commands(root, entry):
-            code = _run_hidden(command)
+            code = _run_hidden(command, cwd=installer_dir)
             _run_log(root, f"silent runtime install: "
                            f"{subprocess.list2cmdline(command)} -> {code}")
             if code is not None and (code & 0xFFFFFFFF) in RUNTIME_OK_CODES:

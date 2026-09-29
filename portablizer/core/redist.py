@@ -105,6 +105,13 @@ class RedistPackage:
     #: обрабатываются и вне этого списка.
     archs: Tuple[str, ...] = ("x86", "x64")
     note: str = ""
+    #: Движок официального установщика (``"iexpress"``/``"vcredist_legacy"``/
+    #: ``"burn"``…) — известен заранее, поскольку файл скачан по конкретной
+    #: ссылке именно для этого пакета. Использовать его вместо угадывания по
+    #: имени файла важно: у Microsoft ``vcredist_x86.exe`` называются и VC++
+    #: 2008/2010 (старый самораспаковывающийся стаб), и VC++ 2012 (уже WiX
+    #: Burn) — одно и то же имя, разные ключи командной строки.
+    installer_engine: str = ""
 
     def matches(self, dll: str) -> bool:
         return re.fullmatch(self.pattern, dll.lower()) is not None
@@ -132,10 +139,19 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         key="vc2005",
         title="Microsoft Visual C++ 2005 SP1 Redistributable (VC++ 8.0)",
         pattern=r"(?:msvc[rpm]80|mfcm?80u?|mfc80[a-z]{3}|atl80|vcomp80)\.dll",
-        downloads={},
+        # Официальная страница id=26347 больше не даёт прямых ссылок на
+        # выбор языка без JS, но сами файлы по старым URL download.microsoft.com
+        # ещё отдаются (это MFC Security Update, последняя версия 8.0 пакета).
+        downloads={
+            "x86": "https://download.microsoft.com/download/8/B/4/"
+                   "8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x86.EXE",
+            "x64": "https://download.microsoft.com/download/8/B/4/"
+                   "8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x64.EXE",
+        },
         page="https://www.microsoft.com/download/details.aspx?id=26347",
         sxs="Microsoft.VC80",
         note=_VC_LICENSE_NOTE,
+        installer_engine="iexpress",
     ),
     RedistPackage(
         key="vc2008",
@@ -150,6 +166,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         page="https://www.microsoft.com/download/details.aspx?id=26368",
         sxs="Microsoft.VC90",
         note=_VC_LICENSE_NOTE,
+        installer_engine="vcredist_legacy",
     ),
     RedistPackage(
         key="vc2010",
@@ -163,6 +180,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         },
         page="https://www.microsoft.com/download/details.aspx?id=26999",
         note=_VC_LICENSE_NOTE,
+        installer_engine="vcredist_legacy",
     ),
     RedistPackage(
         key="vc2012",
@@ -177,6 +195,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         },
         page="https://www.microsoft.com/download/details.aspx?id=30679",
         note=_VC_LICENSE_NOTE,
+        installer_engine="burn",
     ),
     RedistPackage(
         key="vc2013",
@@ -189,6 +208,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         },
         page="https://www.microsoft.com/download/details.aspx?id=40784",
         note=_VC_LICENSE_NOTE,
+        installer_engine="burn",
     ),
     RedistPackage(
         key="vc14",
@@ -206,6 +226,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         archs=("x86", "x64", "arm64"),
         note="Универсальная среда выполнения C (UCRT) входит в Windows 10 и "
              "новее; на Windows 7/8.1 её приносит этот же пакет. " + _VC_LICENSE_NOTE,
+        installer_engine="burn",
     ),
     RedistPackage(
         key="vc_legacy",
@@ -236,6 +257,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         note="Сама DirectX в Windows уже есть; пакет добавляет старые "
              "side-by-side компоненты (D3DX9/10/11, XInput 1.3, XAudio 2.7, "
              "XACT), которые Windows не содержит.",
+        installer_engine="iexpress",
     ),
     RedistPackage(
         key="d3dcompiler_modern",
@@ -1080,6 +1102,13 @@ def _download_file(url: str, destination: str, timeout: int = 120) -> bool:
         return False
 
 
+#: Таймаут одной попытки распаковки/expand/msiexec во время сборки. Заметно
+#: короче, чем таймаут настоящей тихой установки (см. SILENT_INSTALL_TIMEOUT
+#: ниже) — распаковка не должна идти минутами, а неверный ключ командной
+#: строки не должен превращать сборку в многоминутное ожидание диалога.
+EXTRACT_RUN_TIMEOUT = 120
+
+
 def _run_quiet(args: Sequence[str], timeout: int = 600) -> int:
     """Запускает внешний инструмент (expand/msiexec) без окна консоли."""
     if not IS_WINDOWS:
@@ -1337,16 +1366,22 @@ class SilentInstall:
 def run_silent_install(path: str, *,
                        runner: Optional[Callable[[Sequence[str]], int]] = None,
                        title: str = "", package_key: str = "", arch: str = "",
-                       log=None) -> SilentInstall:
+                       kind: str = "", log=None) -> SilentInstall:
     """Ставит один распространяемый пакет **молча**, перебирая ключи.
 
     Ни одно окно при этом не появляется: запуск идёт с ``CREATE_NO_WINDOW``,
     а ключи подобраны так, чтобы установщик не задавал вопросов. Если пакет
     всё же решил показать мастер, его прервёт таймаут — сборка продолжится.
+
+    ``kind`` можно передать явно — это важно для «своих» пакетов: имя файла
+    вроде ``vcredist_x86.exe`` не отличает VC++ 2008/2010 (старый стаб,
+    ключ ``/q``) от VC++ 2012 (уже WiX Burn, нужен ``/install /quiet
+    /norestart``). Без подсказки движок приходится угадывать по имени/
+    сигнатуре — угадывать необязательно, если пакет известен заранее.
     """
     run = runner or (lambda args: _run_quiet(args, SILENT_INSTALL_TIMEOUT))
     rule = installer_rule(path)
-    kind = installer_kind(path)
+    kind = kind or installer_kind(path)
     outcome = SilentInstall(
         path=os.path.abspath(path), kind=kind, arch=arch,
         title=title or (rule.title if rule else os.path.basename(path)),
@@ -1408,12 +1443,24 @@ def render_silent_install_script(entries: Sequence[Dict[str, str]]) -> str:
         kind = str(entry.get("kind", ""))
         args = str(entry.get("args", ""))
         target = f'"%REDIST_ROOT%\\{relative}"'
+        # Каталог самого установщика: некоторые из них (в первую очередь
+        # DXSETUP.exe) ищут свои файлы-спутники (dxupdate.cab, DXSETUP.dat,
+        # кабинеты с библиотеками) в ТЕКУЩЕМ каталоге процесса, а не рядом со
+        # своим exe. Если Install-Redist.cmd запущен не из этой папки (а его
+        # обычно запускает лончер из корня портатива), файлы не находятся, и
+        # DXSETUP вместо тихой установки падает с "Invalid command line
+        # switch" — сообщение вводит в заблуждение, реальная причина не в
+        # ключе, а в рабочем каталоге. "start /D" явно задаёт его новому
+        # процессу, не трогая каталог самого cmd-скрипта.
+        folder = relative.rsplit("\\", 1)[0] if "\\" in relative else ""
+        workdir = f"%REDIST_ROOT%\\{folder}" if folder else "%REDIST_ROOT%"
         if kind == "msi":
             command = f"msiexec /i {target} /qn /norestart"
         elif kind == "msu":
             command = f"wusa {target} /quiet /norestart"
         else:
-            command = f'start "" /wait {target} {args}'.rstrip()
+            command = (f'start "" /D "{workdir}" /wait {target} {args}'
+                      .rstrip())
         lines += [
             "",
             f"rem --- {relative}",
@@ -1562,7 +1609,12 @@ class RuntimeProvisioner:
         #: System32/WinSxS, откуда их уже можно взять в портатив.
         self.allow_install = allow_install
         self._download = downloader or _download_file
-        self._run = runner or _run_quiet
+        # Ограниченный таймаут: это распаковка/expand/msiexec, а не полноценная
+        # тихая установка. Если движку подсунули неверный ключ, установщик
+        # иногда вместо тихого выхода показывает окно с ошибкой и висит —
+        # без лимита это превращалось в 10 минут ожидания на КАЖДУЮ из трёх
+        # неудачных попыток распаковки (VC++ 2008/2010/2012 в одной сборке).
+        self._run = runner or (lambda args: _run_quiet(args, EXTRACT_RUN_TIMEOUT))
         self._install_run = installer_runner
         self._index: Optional[Dict[str, List[str]]] = None
         self._extracted: Dict[str, str] = {}
@@ -1663,19 +1715,50 @@ class RuntimeProvisioner:
 
     # -- распаковка пакетов ---------------------------------------------------
     def _extract_installer(self, archive: str, destination: str,
-                           wanted: str = "") -> bool:
-        """Распаковывает пакет Microsoft, не устанавливая его в систему."""
+                           wanted: str = "", engine: str = "") -> bool:
+        """Распаковывает пакет Microsoft, не устанавливая его в систему.
+
+        Ключ распаковки зависит от движка бутстрап-стаба, и ключи эти нигде
+        официально не задокументированы. Если движок не передан явно
+        (``engine`` — его для «своих» пакетов знает ``RedistPackage.
+        installer_engine``, задан заранее по официальной ссылке загрузки),
+        файл опознаётся по имени/сигнатуре (``installer_kind``), и для него
+        сразу пробуется правильный ключ — вместо того чтобы вслепую
+        перебирать все варианты на любом пакете. Угадывать по имени файла
+        рискованно: ``vcredist_x86.exe`` называются и VC++ 2008/2010
+        (старый самораспаковывающийся стаб), и VC++ 2012 (уже WiX Burn) —
+        одно и то же имя, разные ключи. ``vcredist_legacy`` (VC++
+        2005/2008/2010) распаковывается ключом ``/extract:<path>``, а не
+        ``/x:<path>`` — второй иногда тоже срабатывает, но именно первый
+        подтверждён и Microsoft, и содержимым самого стаба (``sfxcab``/
+        ``wextract``: список его внутренних свойств включает ``extract``,
+        ``quiet``, ``passive``, но не ``x``). Общий перебор остаётся как
+        подстраховка для файлов, чей движок распознать не удалось.
+        """
         if not IS_WINDOWS or not os.path.isfile(archive):
             return False
         os.makedirs(destination, exist_ok=True)
-        attempts: List[List[str]] = [
-            # IExpress: DirectX redist и старые самораспаковывающиеся пакеты.
-            [archive, "/Q", "/C", f"/T:{destination}"],
-            # vcredist 2005/2008/2010.
+
+        iexpress_attempt = [archive, "/Q", "/C", f"/T:{destination}"]
+        vcredist_attempts = [
+            [archive, f"/extract:{destination}", "/quiet", "/passive"],
             [archive, "/q", f"/x:{destination}"],
-            # WiX Burn: vcredist 2012 и новее.
-            [archive, "/quiet", "/layout", destination],
         ]
+        burn_attempt = [archive, "/layout", destination, "/quiet", "/norestart"]
+
+        kind = engine or installer_kind(archive)
+        if kind == "iexpress":
+            attempts: List[List[str]] = [iexpress_attempt, *vcredist_attempts,
+                                         burn_attempt]
+        elif kind == "vcredist_legacy":
+            attempts = [*vcredist_attempts, iexpress_attempt, burn_attempt]
+        elif kind == "burn":
+            attempts = [burn_attempt, *vcredist_attempts, iexpress_attempt]
+        else:
+            # Движок неизвестен (например, скачанный файл ещё не переименован
+            # так, чтобы совпасть с REDIST_INSTALLERS) — перебираем всё.
+            attempts = [iexpress_attempt, *vcredist_attempts, burn_attempt]
+
         for attempt in attempts:
             self._run(attempt)
             if _has_files(destination):
@@ -1795,7 +1878,8 @@ class RuntimeProvisioner:
                     extracted = extracted or _has_files(destination)
                 elif lower.endswith((".exe", ".msi")):
                     extracted = self._extract_installer(
-                        archive, destination, requirement.dll) or extracted
+                        archive, destination, requirement.dll,
+                        engine=package.installer_engine) or extracted
                 if os.path.isfile(os.path.join(destination, requirement.dll)):
                     break
             if not extracted:
@@ -1840,7 +1924,8 @@ class RuntimeProvisioner:
             destination = os.path.join(work_dir, "download", package.key,
                                        requirement.arch or "any")
             if not self._extract_installer(archive, destination,
-                                           requirement.dll):
+                                           requirement.dll,
+                                           engine=package.installer_engine):
                 self.log.warn(
                     f"{package.title}: пакет скачан, но распаковать его "
                     "автоматически не удалось. Он сохранён в папке "
@@ -1880,9 +1965,17 @@ class RuntimeProvisioner:
         if cached is not None:
             return cached
         redist_dir = os.path.join(portable_dir, REDIST_DIR_NAME)
-        filename = url.rsplit("/", 1)[-1] or f"{package.key}.exe"
-        if not filename.lower().endswith((".exe", ".msi", ".cab", ".zip")):
-            filename = f"{package.key}_{arch or 'any'}.exe"
+        upstream_name = url.rsplit("/", 1)[-1] or f"{package.key}.exe"
+        if not upstream_name.lower().endswith((".exe", ".msi", ".cab", ".zip")):
+            upstream_name = f"{arch or 'any'}.exe"
+        # Разные версии VC++ отдают файл с ОДИНАКОВЫМ именем — у 2008, 2010
+        # и 2012 это буквально одно и то же "vcredist_x86.exe" (а у 2005 —
+        # тот же файл в другом регистре расширения, что на Windows совпадает
+        # с ним же). Без префикса пакета второй скачанный файл считался бы
+        # уже загруженным и подменял собой первый: сборка тихо ставила бы
+        # не тот рантайм и не находила в нём нужную библиотеку. Префикс
+        # ключом пакета делает имя уникальным для каждой версии.
+        filename = f"{package.key}-{upstream_name}"
         archive = os.path.join(redist_dir, filename)
         try:
             os.makedirs(redist_dir, exist_ok=True)
@@ -1936,7 +2029,8 @@ class RuntimeProvisioner:
                 "режиме (окон не будет).")
             outcome = run_silent_install(
                 archive, runner=self._install_run, title=package.title,
-                package_key=package.key, arch=requirement.arch, log=self.log)
+                package_key=package.key, arch=requirement.arch,
+                kind=package.installer_engine, log=self.log)
             self.installs.append(outcome)
             if outcome.ok:
                 self.log.ok(f"  • {outcome.describe()}")
@@ -2205,7 +2299,13 @@ class RuntimeProvisioner:
                     f"Не удалось положить {os.path.basename(archive)} в "
                     f"{REDIST_DIR_NAME}: {exc}")
                 continue
-            kind = installer_kind(archive)
+            # Имя файла не отличает движки одноимённых пакетов (у VC++
+            # 2008/2010/2012 совпадает "vcredist_x86.exe"), поэтому для
+            # известного пакета движок берётся из RedistPackage напрямую —
+            # так же, как при распаковке и при тихой установке во время
+            # сборки. Это уходит в Install-Redist.cmd и в конфиг лончера,
+            # то есть определяет, чем этот пакет ставится уже на чужом ПК.
+            kind = package.installer_engine or installer_kind(archive)
             first = (silent_commands(archive, kind) or [[archive]])[0]
             entry = {
                 "file": f"{REDIST_DIR_NAME}/{os.path.basename(archive)}",
