@@ -10,7 +10,7 @@
 * метки, ``goto``, ``call :label``, ``goto :eof``;
 * ``set "K=V"``, ``set "K="``, подстановка ``%VAR%`` и ``%VAR:~a,b%``;
 * аргументы ``%1``/``%~1``/``%~f1``, ``shift``;
-* ``if``/``if not`` с ``==``, ``/i``, ``exist``, ``defined``;
+* ``if``/``if not`` с ``==``, ``/i``, ``exist``, ``defined``, ``errorlevel N``;
 * многострочные блоки в скобках и ``else``;
 * ``for %%I in (...) do ...`` по списку значений;
 * ``mkdir``, ``del``, ``copy``, ``pushd``/``popd``, ``echo``, ``rem``, ``title``;
@@ -471,6 +471,15 @@ class BatchInterpreter:
             rest = rest[6:].strip()
             token, rest = self._take_token(rest)
             condition = self.fs.exists(self.expand(token))
+        elif low.startswith("errorlevel "):
+            # cmd.exe: «if errorlevel N» истинно при коде >= N.
+            rest = rest[11:].strip()
+            token, rest = self._take_token(rest)
+            try:
+                threshold = int(self.expand(token).strip('"'))
+            except ValueError:
+                raise BatError(f"errorlevel ждёт число: {token!r}")
+            condition = int(self.env.get("ERRORLEVEL", "0") or 0) >= threshold
         elif low.startswith("defined "):
             rest = rest[8:].strip()
             token, rest = self._take_token(rest)
