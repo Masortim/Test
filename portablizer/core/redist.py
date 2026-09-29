@@ -78,6 +78,11 @@ REPORT_NAME = "redistributables.txt"
 #: Папка, куда складываются скачанные установщики пакетов (offline-запас).
 REDIST_DIR_NAME = "Redist"
 
+#: Колбэк хода работ: ``(доля этапа 0..1, подпись операции, её процент)``.
+#: Процент ``-1`` означает «величина неизвестна» — интерфейс показывает
+#: «бегущую» полосу вместо замершей цифры.
+ProgressCB = Callable[[float, str, int], None]
+
 
 # =============================================================================
 #  1. Знание о пакетах
@@ -110,6 +115,10 @@ class RedistPackage:
     #: Visual Basic 6 — под x64. Обнаруженные таблицей импорта требования
     #: обрабатываются и вне этого списка.
     archs: Tuple[str, ...] = ("x86", "x64")
+    #: Примерный размер пакета в байтах. Нужен только для честного текста в
+    #: логе («около 96 МБ»): большие загрузки без предупреждения выглядят
+    #: как зависание.
+    size_hint: int = 0
     note: str = ""
 
     def matches(self, dll: str) -> bool:
@@ -297,6 +306,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
                    "84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe",
         },
         page="https://www.microsoft.com/download/details.aspx?id=8109",
+        size_hint=103_000_000,
         note="Сама DirectX в Windows уже есть; пакет добавляет старые "
              "side-by-side компоненты (D3DX9/10/11, XInput 1.3, XAudio 2.7, "
              "XACT), которые Windows не содержит.",
@@ -1168,8 +1178,89 @@ def package_file_problem(path: str) -> str:
     return ""
 
 
-def _download_file(url: str, destination: str, timeout: int = 120) -> bool:
-    """Скачивает файл во временное имя и переименовывает его по готовности."""
+def format_size(size: float) -> str:
+    """Человеческий размер файла: ``97.8 МБ`` вместо ``102537240``."""
+    if size < 0:
+        return "?"
+    for unit, step in (("Б", 1), ("КБ", 1024), ("МБ", 1024 ** 2),
+                       ("ГБ", 1024 ** 3)):
+        if size < step * 1024 or unit == "ГБ":
+            value = size / step
+            return f"{value:.0f} {unit}" if unit == "Б" else f"{value:.1f} {unit}"
+    return f"{size:.0f} Б"
+
+
+def format_duration(seconds: float) -> str:
+    """Оставшееся время в виде ``0:42`` / ``3:05``."""
+    if seconds < 0 or seconds != seconds or seconds == float("inf"):
+        return "?"
+    seconds = int(seconds + 0.5)
+    if seconds >= 3600:
+        return f"{seconds // 3600}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def describe_download(done: int, total: int, elapsed: float) -> Tuple[int, str]:
+    """Процент и человеческое описание хода загрузки.
+
+    Возвращает ``(percent, text)``; ``percent`` равен ``-1``, если сервер не
+    сообщил размер файла (тогда полоса в интерфейсе становится «бегущей»).
+    """
+    speed = done / elapsed if elapsed > 0.2 else 0.0
+    parts: List[str] = []
+    if total > 0:
+        percent = min(100, int(done * 100 / total))
+        parts.append(f"{format_size(done)} из {format_size(total)}")
+    else:
+        percent = -1
+        parts.append(format_size(done))
+    if speed > 0:
+        parts.append(f"{format_size(speed)}/с")
+        if total > done:
+            parts.append(f"осталось ~{format_duration((total - done) / speed)}")
+    return percent, ", ".join(parts)
+
+
+def _accepts_keyword(func: Callable, name: str) -> bool:
+    """Принимает ли функция такой именованный аргумент.
+
+    Загрузчик подменяется в тестах и во внешних сценариях функцией из двух
+    аргументов — ей нельзя передавать ``progress``/``cancel``.
+    """
+    import inspect
+
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == name and parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY):
+            return True
+    return False
+
+
+#: Как часто обновляем ход загрузки (секунды) — чаще незачем, реже «висит».
+DOWNLOAD_TICK_SECONDS = 0.5
+
+
+def _download_file(url: str, destination: str, timeout: int = 120,
+                   progress: Optional[Callable[[int, int, float], None]] = None,
+                   cancel: Optional[Callable[[], bool]] = None) -> bool:
+    """Скачивает файл во временное имя и переименовывает его по готовности.
+
+    Читает поток кусками и после каждого куска сообщает ``progress(done,
+    total, elapsed)``: без этого большие пакеты (DirectX June 2010 — почти
+    100 МБ) выглядели как зависание на одном и том же проценте. ``timeout``
+    здесь — предел ожидания **одной порции данных**, а не всей загрузки:
+    замолчавший сервер обрывает её ошибкой, а не держит сборку часами.
+    Оборванная закачка (получено меньше, чем обещал ``Content-Length``)
+    считается неудачей — иначе в ``Redist`` оседал бы огрызок пакета.
+    """
+    import time
     import urllib.request
 
     temporary = destination + ".part"
@@ -1179,9 +1270,31 @@ def _download_file(url: str, destination: str, timeout: int = 120) -> bool:
             "Accept": "*/*",
             "Accept-Encoding": "identity",
         })
+        started = time.monotonic()
+        done = 0
+        total = -1
         with urllib.request.urlopen(request, timeout=timeout) as response, \
                 open(temporary, "wb") as fh:
-            shutil.copyfileobj(response, fh, 1024 * 256)
+            length = response.headers.get("Content-Length")
+            try:
+                total = int(length) if length else -1
+            except (TypeError, ValueError):
+                total = -1
+            if progress is not None:
+                progress(0, total, 0.0)
+            while True:
+                if cancel is not None and cancel():
+                    raise RuntimeError("загрузка отменена пользователем")
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                if progress is not None:
+                    progress(done, total, time.monotonic() - started)
+        if total > 0 and done < total:
+            raise IOError(
+                f"получено {done} Б из {total} Б — соединение оборвалось")
         os.replace(temporary, destination)
         return True
     except Exception:  # noqa: BLE001 — сеть не должна ронять сборку
@@ -2073,9 +2186,15 @@ class RuntimeProvisioner:
                  allow_install: bool = False,
                  downloader: Optional[Callable[[str, str], bool]] = None,
                  runner: Optional[Callable[[Sequence[str]], int]] = None,
-                 installer_runner: Optional[Callable[[Sequence[str]], int]] = None
+                 installer_runner: Optional[Callable[[Sequence[str]], int]] = None,
+                 progress: Optional["ProgressCB"] = None,
+                 cancel: Optional[Callable[[], bool]] = None,
                  ) -> None:
         self.log = log
+        #: ``progress(fraction, text, detail)`` — доля этапа 0..1, подпись
+        #: текущей операции и её собственный процент (``-1`` — неизвестен).
+        self._progress = progress
+        self._cancel = cancel
         self.source_dirs = [d for d in source_dirs if d and os.path.isdir(d)]
         self._system_dirs = list(system_dirs) if system_dirs is not None else None
         self._sxs_dir = sxs_dir if sxs_dir is not None else winsxs_dir()
@@ -2095,6 +2214,67 @@ class RuntimeProvisioner:
         #: Кэш «пакет+разрядность → путь к установщику» (в т. ч. неудачи).
         self._archives: Dict[str, str] = {}
         self._install_tried: set = set()
+        #: Доля этапа, достигнутая на данный момент (0..1).
+        self._stage_fraction = 0.0
+
+    # -- ход работ ------------------------------------------------------------
+    def _report(self, fraction: Optional[float] = None, text: str = "",
+                detail: int = -1) -> None:
+        """Сообщает наверх, что происходит прямо сейчас.
+
+        Нужна именно частая отчётность: самая долгая ступень лестницы —
+        загрузка стомегабайтного пакета с сайта Microsoft, и без неё
+        интерфейс замирал на «82%» на минуты, выглядя зависшим.
+        """
+        if fraction is not None:
+            self._stage_fraction = max(0.0, min(1.0, fraction))
+        if self._progress is None:
+            return
+        try:
+            self._progress(self._stage_fraction, text, detail)
+        except Exception:  # noqa: BLE001 — интерфейс не должен ронять сборку
+            pass
+
+    def _cancelled(self) -> bool:
+        if self._cancel is None:
+            return False
+        try:
+            return bool(self._cancel())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _fetch(self, url: str, destination: str, title: str) -> bool:
+        """Скачивает пакет, показывая проценты в логе и в интерфейсе.
+
+        Загрузчик подменяется в тестах функцией из двух аргументов, поэтому
+        расширенные параметры передаются только тем, кто их принимает.
+        """
+        import time
+
+        state = {"tick": 0.0, "percent": -2}
+
+        def on_progress(done: int, total: int, elapsed: float) -> None:
+            now = time.monotonic()
+            percent, human = describe_download(done, total, elapsed)
+            finished = total > 0 and done >= total
+            if not finished and now - state["tick"] < DOWNLOAD_TICK_SECONDS:
+                return
+            state["tick"] = now
+            self._report(None, f"Скачиваю {title}: {human}", percent)
+            step = percent if percent >= 0 else -1
+            if step >= 0 and step // 5 == state["percent"] // 5 and not finished:
+                return
+            state["percent"] = step
+            prefix = f"{percent}%" if percent >= 0 else "идёт загрузка"
+            self.log.info(f"  {title}: {prefix} ({human})")
+
+        self._report(None, f"Скачиваю {title}…", 0)
+        extra: Dict[str, object] = {}
+        if _accepts_keyword(self._download, "progress"):
+            extra["progress"] = on_progress
+        if _accepts_keyword(self._download, "cancel"):
+            extra["cancel"] = self._cancel
+        return bool(self._download(url, destination, **extra))
 
     # -- индекс источников ----------------------------------------------------
     def _source_index(self) -> Dict[str, List[str]]:
@@ -2204,6 +2384,7 @@ class RuntimeProvisioner:
         if not os.path.isfile(archive):
             return False
         os.makedirs(destination, exist_ok=True)
+        self._report(None, f"Распаковываю {os.path.basename(archive)}…", -1)
 
         # Ступень 1: читаем кабинеты сами.
         try:
@@ -2270,18 +2451,33 @@ class RuntimeProvisioner:
 
         targeted = [path for path in cabinets
                     if stem and stem in os.path.basename(path).lower()]
+        rest = [path for path in cabinets if path not in targeted]
+        total = len(targeted) + len(rest) + len(installers)
+        done = 0
+
+        def tick(path: str) -> None:
+            nonlocal done
+            done += 1
+            if total > 1:
+                self._report(
+                    None,
+                    f"Распаковываю {os.path.basename(path)} "
+                    f"({done} из {total})",
+                    int(done * 100 / total))
+
         for path in targeted:
             self._expand_one(path, os.path.dirname(path))
+            tick(path)
         if stem and targeted and _find_file(directory, wanted):
             return
 
-        for path in cabinets:
-            if path in targeted:
-                continue
+        for path in rest:
             self._expand_one(path, os.path.dirname(path))
+            tick(path)
             if stem and _find_file(directory, wanted):
                 break
         for path in installers:
+            tick(path)
             target = os.path.join(os.path.dirname(path), "_msi")
             os.makedirs(target, exist_ok=True)
             # Внутри MSI кабинет часто лежит отдельным потоком — свой
@@ -2514,10 +2710,16 @@ class RuntimeProvisioner:
         # Ссылки перебираются по очереди: раздачи Microsoft периодически
         # переезжают, и «скачано» ещё не значит «скачан пакет».
         for index, url in enumerate(urls):
-            self.log.info(f"Скачиваю {package.title} ({url})…")
-            if not self._download(url, archive):
+            size_hint = (f", около {format_size(package.size_hint)}"
+                         if package.size_hint else "")
+            self.log.info(
+                f"Скачиваю {package.title}{size_hint} ({url})… "
+                "Ход загрузки виден в процентах ниже.")
+            if not self._fetch(url, archive, package.title):
                 self.log.debug(f"Загрузка не удалась: {url}")
+                self._report(None, f"{package.title}: загрузка не удалась", -1)
                 continue
+            self._report(None, f"{package.title}: проверяю файл", 100)
             problem = package_file_problem(archive)
             if not problem:
                 self._archives[key] = archive
@@ -2720,7 +2922,21 @@ class RuntimeProvisioner:
         if full_kit:
             requirements += self._stock_requirements(scan, anchors)
 
-        for requirement in requirements:
+        total = max(1, len(requirements))
+        for index, requirement in enumerate(requirements):
+            if self._cancelled():
+                # Пользователь нажал «Отмена»: доносить остаток компонентов
+                # незачем, дальше сборку всё равно прервут.
+                self.log.warn("Сборка отменена — доставка компонентов "
+                              "остановлена.")
+                break
+            # Этап длинный (скачивание и распаковка пакетов Microsoft идут
+            # минутами), поэтому доля считается по числу разобранных
+            # библиотек — полоса движется, а не замирает на одном проценте.
+            self._report(index / total,
+                         f"Компоненты: {requirement.dll} "
+                         f"({index + 1} из {total})",
+                         int(index * 100 / total))
             if requirement.proactive:
                 # Рядом с целевыми exe библиотека уже лежит (принёс
                 # установщик или предыдущая сборка) — запас не нужен.
@@ -2783,8 +2999,10 @@ class RuntimeProvisioner:
             (report.stock if requirement.proactive
              else report.provided).append(requirement)
 
+        self._report(0.95, "Компоненты: базовые библиотеки UCRT", 95)
         self._provide_ucrt_base(report, app_dir, portable_dir, work_dir)
         report.installed = list(self.installs)
+        self._report(0.98, "Компоненты: пакеты в папку Redist", 98)
         self._stage_installers(report, portable_dir)
 
         redist_dir = os.path.join(portable_dir, REDIST_DIR_NAME)
@@ -2797,6 +3015,7 @@ class RuntimeProvisioner:
         if os.path.isdir(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
 
+        self._report(1.0, "Компоненты: готово", 100)
         if scan.dotnet:
             report.notes.append(
                 "Программа собрана для .NET Framework. Сам .NET перенести в "

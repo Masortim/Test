@@ -301,6 +301,19 @@ class MainWindow(QMainWindow):
         self.progress.setFormat("Ожидание…")
         lay.addWidget(self.progress)
 
+        # Вторая полоса — ход текущей операции. Скачивание DirectX (около
+        # 100 МБ) и распаковка сотни кабинетов идут минутами: без отдельного
+        # индикатора общая полоса замирала на одном проценте, и сборка
+        # выглядела зависшей.
+        self.detail_progress = QProgressBar()
+        self.detail_progress.setObjectName("DetailProgress")
+        self.detail_progress.setRange(0, 100)
+        self.detail_progress.setValue(0)
+        self.detail_progress.setTextVisible(True)
+        self.detail_progress.setFormat("")
+        self.detail_progress.setVisible(False)
+        lay.addWidget(self.detail_progress)
+
         self.status_label = QLabel("Готов к работе.")
         self.status_label.setObjectName("Hint")
         lay.addWidget(self.status_label)
@@ -484,11 +497,13 @@ class MainWindow(QMainWindow):
             return
         self.log_view.clear()
         self.progress.setValue(0)
+        self._on_detail(0, "")
         self._set_running(True)
 
         self.worker = PortableWorker(opts)
         self.worker.log_line.connect(self._on_log)
         self.worker.progress.connect(self._on_progress)
+        self.worker.detail.connect(self._on_detail)
         self.worker.finished_result.connect(self._on_finished)
         self.worker.start()
 
@@ -516,12 +531,35 @@ class MainWindow(QMainWindow):
         self.progress.setFormat(f"{stage} — {percent}%")
         self.status_label.setText(stage)
 
+    def _on_detail(self, percent: int, text: str) -> None:
+        """Ход текущей операции: проценты загрузки или распаковки.
+
+        ``text`` пустой — операция закончилась, полоса прячется. ``percent``
+        меньше нуля — размер заранее неизвестен, показываем «бегущую»
+        полосу, а не замерший ноль.
+        """
+        if not text:
+            self.detail_progress.setVisible(False)
+            self.detail_progress.setRange(0, 100)
+            self.detail_progress.setValue(0)
+            self.detail_progress.setFormat("")
+            return
+        self.detail_progress.setVisible(True)
+        if percent < 0:
+            self.detail_progress.setRange(0, 0)  # «бегущая» полоса
+            self.detail_progress.setFormat(text)
+        else:
+            self.detail_progress.setRange(0, 100)
+            self.detail_progress.setValue(max(0, min(100, percent)))
+            self.detail_progress.setFormat(f"{text} — {percent}%")
+
     def _on_finished(self, result: PortableResult) -> None:
         self.last_result = result
         self._set_running(False)
         self.open_btn.setEnabled(
             bool(result.portable_dir and os.path.isdir(result.portable_dir))
         )
+        self._on_detail(0, "")
         if result.success:
             self.progress.setFormat("Готово — 100%")
             self.status_label.setText(

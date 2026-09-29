@@ -28,6 +28,12 @@ from portablizer.core.launcher import (
 from portablizer.core.logutil import Logger
 from portablizer.core.portablizer import PortableOptions, Portablizer
 
+with open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "portablizer", "core", "portablizer.py"), encoding="utf-8") as _handle:
+    PROGRESS_SOURCE = _handle.read()
+
+
 def tool_name(command) -> str:
     """Имя штатной утилиты Windows из команды, без пути и расширения.
 
@@ -2186,6 +2192,182 @@ class GuiWiringTests(unittest.TestCase):
                      "result.runtime_packages", "result.runtime_report_rel",
                      "result.runtime_stock"):
             self.assertIn(name, self.source)
+
+
+class DownloadProgressTests(unittest.TestCase):
+    """Проценты загрузки: «висящий 82%» — это баг, а не долгая закачка.
+
+    Пакет DirectX June 2010 весит около 100 МБ. Пока он качался, интерфейс
+    молчал, и пользователь видел зависание на одном и том же проценте.
+    Теперь о ходе загрузки сообщают и журнал, и полоса прогресса.
+    """
+
+    def setUp(self):
+        self.log = Logger()
+
+    def test_human_readable_size_and_time(self):
+        self.assertEqual(redist.format_size(512), "512 Б")
+        self.assertEqual(redist.format_size(103_000_000), "98.2 МБ")
+        self.assertEqual(redist.format_duration(75), "1:15")
+        self.assertEqual(redist.format_duration(3725), "1:02:05")
+
+    def test_description_of_a_download_has_percent_speed_and_eta(self):
+        percent, text = redist.describe_download(50, 100, 1.0)
+        self.assertEqual(percent, 50)
+        self.assertIn("из", text)
+        self.assertIn("/с", text)
+        self.assertIn("осталось", text)
+        # Размер неизвестен — процент отрицательный: полоса «бегущая».
+        percent, text = redist.describe_download(50, -1, 1.0)
+        self.assertEqual(percent, -1)
+        self.assertNotIn("осталось", text)
+
+    def test_downloader_reports_every_chunk_and_checks_the_length(self):
+        payload = b"MZ" + b"x" * (600 * 1024)
+        seen = []
+
+        class FakeResponse:
+            headers = {"Content-Length": str(len(payload))}
+
+            def __init__(self):
+                self._rest = payload
+
+            def read(self, size):
+                chunk, self._rest = self._rest[:size], self._rest[size:]
+                return chunk
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with tempfile.TemporaryDirectory() as temp:
+            destination = os.path.join(temp, "package.exe")
+            with mock.patch("urllib.request.urlopen",
+                            return_value=FakeResponse()):
+                ok = redist._download_file(
+                    "https://example.test/package.exe", destination,
+                    progress=lambda done, total, elapsed: seen.append(
+                        (done, total)))
+            self.assertTrue(ok)
+            self.assertEqual(os.path.getsize(destination), len(payload))
+            self.assertFalse(os.path.exists(destination + ".part"))
+            # Первый вызов — нулевой (сразу показать 0%), последний — полный.
+            self.assertEqual(seen[0], (0, len(payload)))
+            self.assertEqual(seen[-1], (len(payload), len(payload)))
+            self.assertGreater(len(seen), 2)
+
+    def test_truncated_download_is_a_failure_not_a_broken_package(self):
+        class ShortResponse:
+            headers = {"Content-Length": "1000000"}
+
+            def __init__(self):
+                self._sent = False
+
+            def read(self, size):
+                if self._sent:
+                    return b""
+                self._sent = True
+                return b"MZ" + b"x" * 1024
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with tempfile.TemporaryDirectory() as temp:
+            destination = os.path.join(temp, "package.exe")
+            with mock.patch("urllib.request.urlopen",
+                            return_value=ShortResponse()):
+                ok = redist._download_file("https://example.test/p.exe",
+                                           destination)
+            self.assertFalse(ok)
+            self.assertFalse(os.path.exists(destination))
+            self.assertFalse(os.path.exists(destination + ".part"))
+
+    def test_provisioner_reports_stage_and_download_progress(self):
+        events = []
+
+        def downloader(url, destination, progress=None, cancel=None):
+            if progress is not None:
+                total = 4 * 1024 * 1024
+                for step in range(1, 5):
+                    progress(step * 1024 * 1024, total, step * 1.0)
+            return False
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Game_Portable")
+            app = portable / "App"
+            app.mkdir(parents=True)
+            write_pe(app / "game.exe", imports=("msvcp110.dll",))
+            scan = redist.scan_app_runtime(str(app))
+            redist.RuntimeProvisioner(
+                self.log, system_dirs=[], sxs_dir="", allow_download=True,
+                downloader=downloader,
+                progress=lambda frac, text, detail: events.append(
+                    (frac, text, detail)),
+            ).provision(scan, str(app), str(portable), "Game")
+
+        self.assertTrue(events, "этап обязан сообщать о ходе работ")
+        downloads = [e for e in events if "Скачиваю" in e[1]]
+        self.assertTrue(downloads, "ход загрузки не показан")
+        self.assertIn(100, [e[2] for e in downloads])
+        # Доля этапа не убывает и заканчивается на единице.
+        fractions = [e[0] for e in events]
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertAlmostEqual(fractions[-1], 1.0)
+
+    def test_simple_two_argument_downloader_still_works(self):
+        """Внешний загрузчик из двух аргументов ломаться не должен."""
+        calls = []
+
+        def downloader(url, destination):
+            calls.append(url)
+            return False
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Game_Portable")
+            app = portable / "App"
+            app.mkdir(parents=True)
+            write_pe(app / "game.exe", imports=("msvcp110.dll",))
+            scan = redist.scan_app_runtime(str(app))
+            redist.RuntimeProvisioner(
+                self.log, system_dirs=[], sxs_dir="", allow_download=True,
+                downloader=downloader,
+                progress=lambda *a: None,
+            ).provision(scan, str(app), str(portable), "Game")
+        self.assertTrue(calls)
+
+
+class ProgressWiringTests(unittest.TestCase):
+    """Проценты доходят до окна: ядро → воркер → вторая полоса прогресса."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "portablizer", "gui", "worker.py"),
+                  encoding="utf-8") as handle:
+            cls.worker = handle.read()
+        with open(os.path.join(root, "portablizer", "gui", "main_window.py"),
+                  encoding="utf-8") as handle:
+            cls.window = handle.read()
+
+    def test_worker_forwards_detailed_progress(self):
+        self.assertIn("detail = Signal(int, str)", self.worker)
+        self.assertIn("detail=lambda p, s: self.detail.emit(p, s)",
+                      self.worker)
+
+    def test_window_has_a_second_progress_bar(self):
+        self.assertIn("self.detail_progress = QProgressBar()", self.window)
+        self.assertIn("self.worker.detail.connect(self._on_detail)",
+                      self.window)
+        self.assertIn("setRange(0, 0)", self.window)  # «бегущая» полоса
+
+    def test_core_maps_the_runtime_stage_to_82_87(self):
+        self.assertIn("progress=self._stage_progress(82, 87)",
+                      PROGRESS_SOURCE)
 
 
 if __name__ == "__main__":
