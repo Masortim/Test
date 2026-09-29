@@ -291,6 +291,12 @@ class PortableOptions:
     # Приносить в портатив распространяемые компоненты (Visual C++, DirectX и
     # т. п.), чтобы на чужом ПК не возникало «отсутствует MSVCP110.dll».
     bundle_runtimes: bool = True
+    # Полный комплект «про запас»: не только то, что нашлось в таблицах
+    # импорта, а все известные библиотеки всех версий (VC++ 2005–2022, весь
+    # DirectX июня 2010, OpenAL, PhysX…). Закрывает динамические загрузки,
+    # плагины и моды: ошибки «отсутствует XINPUT1_3.dll / d3dx9_38.dll» не
+    # возникают изначально. Портатив становится заметно больше.
+    full_runtimes: bool = True
     # Докачивать недостающие пакеты с сайта Microsoft. По умолчанию выключено:
     # сборка не должна молча ходить в сеть.
     download_runtimes: bool = False
@@ -352,6 +358,10 @@ class PortableResult:
     runtime_provided: List[str] = field(default_factory=list)
     #: То, чего принести не удалось: нужен пакет на целевом ПК.
     runtime_missing: List[str] = field(default_factory=list)
+    #: Библиотеки, принесённые «про запас» полным комплектом (все версии
+    #: VC++ и DirectX) — программа их прямо не требует, но плагины и
+    #: динамические загрузки могут попросить.
+    runtime_stock: List[str] = field(default_factory=list)
     #: Пакеты, которые придётся установить (человеческие названия + ссылки).
     runtime_packages: List[str] = field(default_factory=list)
     #: Отчёт по распространяемым компонентам внутри портатива.
@@ -642,7 +652,8 @@ class Portablizer:
             self._check_cancel()
             self.progress(82, "Распространяемые компоненты (VC++, DirectX)")
             runtime_report = self._provision_runtimes(
-                app_dir, portable_dir, opts, name, result)
+                app_dir, portable_dir, opts, name, result,
+                main_exe=main_exe, targets=targets)
 
             # 7b. Зависимости и переменные среды
             self.progress(87, "Учёт зависимостей и переменных среды")
@@ -2039,7 +2050,8 @@ class Portablizer:
     # -- распространяемые компоненты -----------------------------------------
     def _provision_runtimes(
         self, app_dir: str, portable_dir: str, opts: PortableOptions,
-        name: str, result: PortableResult,
+        name: str, result: PortableResult, main_exe: str = "",
+        targets: Optional[List["launcher_mod.TargetInfo"]] = None,
     ) -> Optional["redist_mod.ProvisionReport"]:
         """Приносит в портатив VC++/DirectX и прочие системные библиотеки.
 
@@ -2048,6 +2060,13 @@ class Portablizer:
         MSVCP110.dll». Здесь список нужных библиотек берётся из таблиц импорта
         самих exe/dll программы, а файлы — из комплекта установщика, системных
         папок этого ПК, WinSxS или (по желанию) с сайта Microsoft.
+
+        Поверх точного списка разворачивается **полный комплект «про запас»**
+        (``full_runtimes``): все известные библиотеки всех версий рядом с
+        каждым exe программы. Таблица импорта не видит библиотек, которые
+        грузятся по имени, собранному строкой, или подключаются плагинами и
+        модами, — полный комплект закрывает и их. Ненайденное «про запас»
+        ошибкой не считается.
         """
         if not opts.bundle_runtimes:
             self.log.info(
@@ -2069,6 +2088,20 @@ class Portablizer:
             f"{len(scan.requirements)}; из них требует внимания: "
             f"{len(scan.needed)}.")
 
+        # Куда раскладывать полный комплект: рядом с каждым exe программы.
+        anchors: List[str] = []
+        anchor_paths = [main_exe] + [
+            os.path.join(portable_dir, t.rel_path) for t in (targets or [])]
+        for path in anchor_paths:
+            if not path:
+                continue
+            rel = os.path.relpath(path, app_dir)
+            if rel.startswith(".."):
+                continue
+            rel = rel.replace("\\", "/")
+            if rel not in anchors:
+                anchors.append(rel)
+
         sources = redist_mod.installer_source_dirs(opts.installer_path, app_dir)
         if sources:
             self.log.debug(
@@ -2078,7 +2111,9 @@ class Portablizer:
             self.log, source_dirs=sources,
             allow_download=opts.download_runtimes)
         try:
-            report = provisioner.provision(scan, app_dir, portable_dir, name)
+            report = provisioner.provision(
+                scan, app_dir, portable_dir, name,
+                full_kit=opts.full_runtimes, anchors=anchors)
         except Exception as exc:  # noqa: BLE001
             self.log.warn(
                 f"Не удалось перенести распространяемые компоненты: {exc}")
@@ -2090,6 +2125,18 @@ class Portablizer:
                 f"[{requirement.arch or '?'}] — {requirement.title} "
                 f"({requirement.source})")
         result.runtime_provided = [r.dll for r in report.provided]
+        result.runtime_stock = [r.dll for r in report.stock]
+        if report.stock:
+            self.log.ok(
+                f"Полный комплект «про запас»: рядом с exe дополнительно "
+                f"разложено {len(report.stock)} библиотек — все версии "
+                "VC++ и DirectX, какие удалось найти. Плагинам и "
+                "динамическим загрузкам хватит всего.")
+        if report.stock_missing:
+            self.log.info(
+                f"Полный комплект: ещё {len(report.stock_missing)} библиотек "
+                "не нашлись на этом ПК. Программе они, скорее всего, не "
+                "нужны; список — в " + redist_mod.REPORT_NAME + ".")
 
         packages: List[str] = []
         for requirement in report.missing:
@@ -2112,7 +2159,7 @@ class Portablizer:
                 self.log.info(
                     "Совет: включите «Скачивать недостающие пакеты», и "
                     "Portablizer возьмёт файлы прямо с сайта Microsoft.")
-        elif report.provided:
+        elif report.provided or report.stock:
             self.log.ok(
                 "Все системные компоненты, нужные программе, теперь лежат "
                 "внутри портатива — установка на чужом ПК не потребуется.")
