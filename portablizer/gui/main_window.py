@@ -213,6 +213,24 @@ class MainWindow(QMainWindow):
             "Кладёт готовый самодостаточный EXE в папку App. Его можно запускать "
             "двойным кликом: Python и ручная сборка не нужны, а изоляция "
             "AppData и реестра сохраняется.")
+        self.cb_runtimes = QCheckBox("Встраивать Visual C++ / DirectX в портатив")
+        self.cb_runtimes.setChecked(True)
+        self.cb_runtimes.setToolTip(
+            "Читает таблицы импорта установленной программы и приносит в "
+            "портатив системные библиотеки, которых может не оказаться на "
+            "чужом ПК: MSVCP110.dll, MSVCR100.dll, XINPUT1_3.dll, "
+            "d3dx9_39.dll и подобные. Файлы берутся из комплекта установщика "
+            "и из этого компьютера, а всё ненайденное попадает в отчёт "
+            "redistributables.txt.")
+        self.cb_fetch_runtimes = QCheckBox(
+            "Скачивать недостающие пакеты с сайта Microsoft")
+        self.cb_fetch_runtimes.setToolTip(
+            "Если библиотеки нет ни в комплекте установщика, ни на этом ПК, "
+            "Portablizer скачает официальный пакет (Visual C++ "
+            "Redistributable, DirectX End-User Runtime) и достанет нужные "
+            "файлы из него. Требуется интернет; по умолчанию выключено, "
+            "чтобы сборка не ходила в сеть без спроса.")
+        self.cb_runtimes.toggled.connect(self.cb_fetch_runtimes.setEnabled)
         self.cb_assisted = QCheckBox("Разрешить окно мастера установки")
         self.cb_assisted.setToolTip(
             "Нужно старым установщикам InstallShield InstallScript 5/6 "
@@ -228,6 +246,8 @@ class MainWindow(QMainWindow):
         checks.addWidget(self.cb_integration, 1, 1)
         checks.addWidget(self.cb_exelauncher, 2, 0)
         checks.addWidget(self.cb_assisted, 2, 1)
+        checks.addWidget(self.cb_runtimes, 3, 0)
+        checks.addWidget(self.cb_fetch_runtimes, 3, 1)
         checks.setColumnStretch(2, 1)
         lay.addLayout(checks)
 
@@ -415,6 +435,9 @@ class MainWindow(QMainWindow):
             cleanup_host=self.cb_cleanup.isChecked(),
             include_shell_integration=self.cb_integration.isChecked(),
             allow_assisted_install=self.cb_assisted.isChecked(),
+            bundle_runtimes=self.cb_runtimes.isChecked(),
+            download_runtimes=(self.cb_runtimes.isChecked()
+                               and self.cb_fetch_runtimes.isChecked()),
             extra_install_args=args,
             extra_env=self._parse_env(),
         )
@@ -520,6 +543,25 @@ class MainWindow(QMainWindow):
                             "и разрешение, затем запускайте игру обычным "
                             "способом. Настройки будут общими.",
                         ]
+            if result.runtime_provided:
+                details += [
+                    "",
+                    "В портатив добавлены системные библиотеки "
+                    f"({len(result.runtime_provided)} шт.): "
+                    + ", ".join(sorted(set(result.runtime_provided))[:8])
+                    + ("…" if len(set(result.runtime_provided)) > 8 else ""),
+                ]
+            if result.runtime_missing:
+                details += [
+                    "",
+                    "⚠ Не удалось найти файлы: "
+                    + ", ".join(sorted(set(result.runtime_missing))[:8])
+                    + ".",
+                    "Если программа не запустится на другом ПК, установите "
+                    "там пакеты:",
+                    *[f"  • {p}" for p in result.runtime_packages[:4]],
+                    f"Полный список — в {result.runtime_report_rel or 'redistributables.txt'}.",
+                ]
             details += [
                 "",
                 "Скопируйте папку целиком на флешку — установка на другом "
@@ -579,8 +621,12 @@ class MainWindow(QMainWindow):
         for w in (self.installer_edit, self.output_edit, self.name_edit,
                   self.args_edit, self.env_edit, self.cb_redirect,
                   self.cb_registry, self.cb_exelauncher, self.cb_cleanup,
-                  self.cb_integration):
+                  self.cb_integration, self.cb_runtimes,
+                  self.cb_fetch_runtimes, self.cb_assisted):
             w.setEnabled(not running)
+        # Загрузка пакетов имеет смысл только вместе с самим переносом.
+        self.cb_fetch_runtimes.setEnabled(
+            not running and self.cb_runtimes.isChecked())
 
 
 def run() -> int:

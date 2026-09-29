@@ -21,6 +21,7 @@ ROOT_TOKEN = "@@PORTABLE_ROOT@@"
 IS_WINDOWS = sys.platform.startswith("win")
 NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 ERROR_ICON = 0x00000010
+WARNING_ICON = 0x00000030
 
 
 def _runtime_directory() -> Path:
@@ -66,6 +67,129 @@ def _show_error(message: str) -> None:
         print(message, file=sys.stderr)
     except Exception:
         pass
+
+
+def _show_warning(message: str) -> None:
+    """Show a non-fatal warning; the program is still started afterwards."""
+    if IS_WINDOWS:
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(  # type: ignore[attr-defined]
+                None, message, "Portable Launcher", WARNING_ICON
+            )
+            return
+        except Exception:
+            pass
+    try:
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _library_search_dirs(root: Path, target: Path,
+                         env: Dict[str, str]) -> list[Path]:
+    """Folders Windows will really look into when resolving a DLL."""
+    dirs: list[Path] = [target.parent, root / "App", root]
+    for entry in str(env.get("PATH", "")).split(os.pathsep)[:48]:
+        entry = entry.strip().strip('"')
+        if entry:
+            dirs.append(Path(entry))
+    windir = env.get("SystemRoot") or env.get("WINDIR") or r"C:\Windows"
+    dirs.append(Path(windir) / "System32")
+    dirs.append(Path(windir) / "SysWOW64")
+    unique: list[Path] = []
+    seen = set()
+    for item in dirs:
+        key = str(item).rstrip("\\/").lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def missing_runtime_components(root: Path, cfg: Dict[str, Any], target: Path,
+                               env: Dict[str, str]) -> list[Dict[str, str]]:
+    """Redistributable libraries that are absent on THIS computer.
+
+    Portablizer bundles everything it can find while building the portable
+    folder.  Whatever is left over is listed in ``launcher_config.json``;
+    checking it here turns the cryptic Windows box ("MSVCR110.dll is
+    missing") into the name of the package and a link to it.
+    """
+    requirements = cfg.get("runtime_requirements") or []
+    if not isinstance(requirements, list) or not requirements:
+        return []
+    search_dirs = _library_search_dirs(root, target, env)
+    missing: list[Dict[str, str]] = []
+    for item in requirements[:32]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("dll", "")).strip()
+        if not name:
+            continue
+        found = False
+        for directory in search_dirs:
+            try:
+                if (directory / name).is_file():
+                    found = True
+                    break
+            except OSError:
+                continue
+        if not found:
+            missing.append(item)
+    return missing
+
+
+def _runtime_warning_is_new(root: Path, cfg: Dict[str, Any],
+                            missing: Sequence[Dict[str, Any]]) -> bool:
+    """True when this exact warning has not been acknowledged yet.
+
+    The message box must not become a nuisance: after the user has seen it
+    once for this portable folder it is only repeated when the list itself
+    changes - which is exactly what happens on a different computer.
+    """
+    stamp = (root / str(cfg.get("data_dir_name", "PortableData"))
+             / "runtime-warning.txt")
+    current = ",".join(sorted(str(item.get("dll", "")).lower()
+                              for item in missing))
+    try:
+        if stamp.is_file() and stamp.read_text(
+                encoding="utf-8", errors="replace").strip() == current:
+            return False
+    except OSError:
+        return True
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(current, encoding="utf-8")
+    except OSError:
+        pass
+    return True
+
+
+def _warn_about_runtime(root: Path, missing: Sequence[Dict[str, Any]]) -> None:
+    lines = [
+        "На этом компьютере не хватает системных компонентов, которые нужны "
+        "программе:",
+        "",
+    ]
+    for item in missing:
+        title = str(item.get("title") or "распространяемый пакет Microsoft")
+        lines.append(f"  • {item.get('dll')} — {title}")
+        url = str(item.get("url") or "")
+        if url:
+            lines.append(f"      {url}")
+    lines += [
+        "",
+        "Подробности и ссылки — в файле redistributables.txt рядом с "
+        "портативной папкой.",
+        "Программа всё равно будет запущена: часть компонентов нужна не "
+        "всегда.",
+    ]
+    text = "\n".join(lines)
+    _run_log(root, "missing runtime components: "
+             + ", ".join(str(item.get("dll")) for item in missing))
+    _show_warning(text)
 
 
 def _write_error_log(root: Optional[Path], message: str) -> None:
@@ -775,6 +899,13 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         else:
             raise FileNotFoundError(
                 f"Исполняемый файл программы не найден:\n{target}")
+
+    # Предстартовая проверка распространяемых компонентов: лучше назвать
+    # пакет, чем оставить пользователя наедине с окном Windows
+    # «отсутствует MSVCR110.dll».
+    missing_runtime = missing_runtime_components(root, cfg, target, env)
+    if missing_runtime and _runtime_warning_is_new(root, cfg, missing_runtime):
+        _warn_about_runtime(root, missing_runtime)
 
     shell_folders = ShellFolderSession(root, cfg)
     registry = RegistrySession(root, cfg)
