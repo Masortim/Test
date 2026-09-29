@@ -1543,8 +1543,21 @@ def extraction_commands(archive: str, destination: str,
             seen.add(key)
             commands.append(list(command))
 
+    # wextract/IExpress (VC++ 2005/2008, dxwebsetup, WMF runtime) отвечает
+    # модальным «Command line option syntax error» на любой незнакомый ключ —
+    # даже в «тихом» режиме. Такому архиву можно передавать только /Q, /C и
+    # /T:; рунги с /x:, /extract:, /quiet и 7z-стилем для него вычёркиваются
+    # (VC++ 2010 — уже sfxcab без сигнатуры wextract, ему /x: остаётся).
+    engine = sniff_engine(archive) if lower.endswith(".exe") else ""
+
+    def wextract_safe(switches: Sequence[str]) -> bool:
+        return all(item.split(":", 1)[0].upper() in ("/Q", "/C", "/T")
+                   for item in switches)
+
     for key in (kind, ""):
         for switches in EXTRACT_SWITCHES.get(key, ()):
+            if engine == "iexpress" and not wextract_safe(switches):
+                continue
             add([archive] + [item.format(dest=destination)
                              for item in switches])
     # Самораспаковывающийся exe — это CAB с PE-заголовком: штатные
@@ -1662,7 +1675,10 @@ SILENT_SWITCHES: Dict[str, Tuple[Tuple[str, ...], ...]] = {
     # «Установка DirectX — Неверная операция командной строки» и ждёт мышку,
     # поэтому перебирать варианты для него запрещено (см. silent_commands).
     "dxsetup": (("/silent",),),
-    "iexpress": (("/Q",), ("/q",), ("/quiet",)),
+    # wextract/IExpress понимает только /Q, /q и формы /q:a, /q:u. На любой
+    # другой ключ (включая /quiet и /norestart) — модальное окно
+    # «Command line option syntax error». Никаких «современных» вариантов.
+    "iexpress": (("/Q",), ("/q",), ("/q:a",)),
     "inno": (("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"),
              ("/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART")),
     "nsis": (("/S",), ("/s",)),
@@ -1719,20 +1735,37 @@ def sniff_engine(path: str, limit: int = 2 * 1024 * 1024) -> str:
 
 
 def installer_kind(path: str) -> str:
-    """Тип пакета: ``msi``/``msu``/``burn``/``dxsetup``/… — что запускать и с чем."""
+    """Тип пакета: ``msi``/``msu``/``burn``/``dxsetup``/… — что запускать и с чем.
+
+    Белый список по имени файла главнее сигнатуры движка. Настоящие
+    ``vcredist_x86.exe`` 2005/2008 — это wextract/IExpress-обёртки, и сниф
+    по сигнатуре честно отвечает «iexpress». Но правило ``vcredist_legacy``
+    существует именно потому, что этим обёрткам нельзя передавать общие
+    IExpress-лестницы: VC++ 2005 на ``/quiet`` и ``/norestart`` показывает
+    модальное «Command line option syntax error» и ждёт мышку. Если сниф
+    победит правило, вся защита от этого окна молча выключится.
+
+    Единственное исключение — сигнатура ``.wixburn``: VC++ 2012/2013
+    называются тем же именем ``vcredist_x86.exe``, но внутри это WiX Burn,
+    и ему нужны современные ключи.
+    """
     lower = os.path.basename(str(path)).lower()
     if lower.endswith((".msi", ".msp")):
         return "msi"
     if lower.endswith(".msu"):
         return "msu"
-    if lower.endswith(".exe"):
-        engine = sniff_engine(path)
-        if engine:
-            return engine
     rule = installer_rule(path)
     kind = rule.kind if rule else ""
     if kind == "msi_or_exe":
         kind = "msi" if lower.endswith(".msi") else ""
+    if lower.endswith(".exe"):
+        engine = sniff_engine(path)
+        if engine == "burn":
+            return "burn"
+        if kind:
+            return kind
+        if engine:
+            return engine
     return kind
 
 
@@ -1759,11 +1792,13 @@ def silent_commands(path: str, kind: str = "",
         return []
     commands = [[path, *switches]
                 for switches in SILENT_SWITCHES.get(kind, SILENT_SWITCHES[""])]
-    if kind and kind not in ("dxsetup", "directx_bundle", "vcredist_legacy"):
+    if kind and kind not in ("dxsetup", "directx_bundle", "vcredist_legacy",
+                             "iexpress"):
         # Подстраховка: если «правильные» ключи не сработали, пробуем общие.
-        # Для старого vcredist такая лестница небезопасна: VC++ 2005 выводит
-        # модальное «Command line option syntax error» на /norestart и
-        # современные варианты, поэтому для него разрешён только голый /q.
+        # Для старого vcredist и любых wextract/IExpress-обёрток такая
+        # лестница небезопасна: VC++ 2005 выводит модальное «Command line
+        # option syntax error» на /norestart и современные варианты, поэтому
+        # для них разрешены только родные ключи wextract.
         for switches in SILENT_SWITCHES[""]:
             candidate = [path, *switches]
             if candidate not in commands:
@@ -1952,6 +1987,14 @@ def render_silent_install_script(entries: Sequence[Dict[str, str]]) -> str:
         kind = str(entry.get("kind", ""))
         args = str(entry.get("args", ""))
         target = f'"%REDIST_ROOT%\\{relative}"'
+        base_name = relative.rsplit("\\", 1)[-1].lower()
+        # Старые версии Portablizer записывали для vcredist 2005–2010 kind
+        # «iexpress» (сниф побеждал белый список) и args вида «/q /norestart».
+        # Пересозданный скрипт обязан лечить такие сборки: любой
+        # vcredist_*.exe, кроме WiX Burn (2012+ тоже принимает голый /q,
+        # так что имя решает), ставится единственным безопасным ключом.
+        legacy_vcredist_name = bool(re.fullmatch(r"vcredist[^\\]*\.exe",
+                                                 base_name))
         if kind == "msi":
             body = [f"msiexec /i {target} /qn /norestart"]
         elif kind == "msu":
@@ -1972,10 +2015,17 @@ def render_silent_install_script(entries: Sequence[Dict[str, str]]) -> str:
             ]
         elif kind == "dxsetup" or relative.lower().endswith("dxsetup.exe"):
             body = [f'start "" /wait {target} /silent']
-        elif kind == "vcredist_legacy":
+        elif kind == "vcredist_legacy" or legacy_vcredist_name:
             # VC++ 2005 rejects `/q /norestart` with a visible modal syntax
             # error. Ignore stale metadata too, so a regenerated script fixes
-            # portable configs made by older Portablizer versions.
+            # portable configs made by older Portablizer versions. Bare /q is
+            # also a valid silent switch for the Burn-based 2012/2013
+            # packages that reuse the vcredist_x86.exe name.
+            body = [f'start "" /wait {target} /q']
+        elif kind == "iexpress":
+            # wextract wrappers understand only /Q, /q and /q:a - anything
+            # else (including /quiet and /norestart) raises the same modal
+            # "Command line option syntax error" box.
             body = [f'start "" /wait {target} /q']
         else:
             body = [f'start "" /wait {target} {args}'.rstrip()]

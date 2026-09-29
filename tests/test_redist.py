@@ -1140,6 +1140,42 @@ class SilentInstallTests(unittest.TestCase):
             self.assertEqual(redist.installer_kind(inno), "inno")
             self.assertIn("/VERYSILENT", redist.silent_commands(inno)[0])
 
+    def test_real_wextract_vcredist_stays_legacy_despite_the_signature(self):
+        """Настоящий vcredist 2005/2008 — это wextract-обёртка: сниф движка
+        не должен перебивать белый список, иначе лестница снова получает
+        /quiet и /norestart — и модальное «Command line option syntax error»."""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "vcredist_x86.exe")
+            path.write_bytes(b"MZ" + b"\x00" * 64 + b"wextract_cleanup" +
+                             b"\x00" * 64)
+            self.assertEqual(redist.installer_kind(str(path)),
+                             "vcredist_legacy")
+            self.assertEqual(redist.silent_commands(str(path)),
+                             [[str(path), "/q"]])
+
+    def test_burn_vcredist_with_the_legacy_name_is_detected_as_burn(self):
+        """VC++ 2012/2013 тоже называются vcredist_x86.exe, но внутри WiX
+        Burn — сигнатура .wixburn главнее имени."""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "vcredist_x86.exe")
+            path.write_bytes(b"MZ" + b"\x00" * 64 + b".wixburn" + b"\x00" * 64)
+            self.assertEqual(redist.installer_kind(str(path)), "burn")
+            self.assertEqual(redist.silent_commands(str(path))[0][1:],
+                             ["/install", "/quiet", "/norestart"])
+
+    def test_iexpress_ladder_never_contains_modal_switches(self):
+        """wextract понимает только /Q, /q и /q:a — на всё прочее модальное
+        окно с ошибкой, поэтому общий фолбэк для iexpress запрещён."""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "wmfdist95.exe")
+            path.write_bytes(b"MZ")
+            commands = redist.silent_commands(str(path))
+            self.assertTrue(commands)
+            for command in commands:
+                for switch in command[1:]:
+                    self.assertIn(switch.split(":", 1)[0].upper(),
+                                  ("/Q",), command)
+
     def test_vc2005_script_discards_the_invalid_norestart_option(self):
         text = redist.render_silent_install_script([{
             "file": "Redist/vcredist_x86.exe",
@@ -1152,6 +1188,28 @@ class SilentInstallTests(unittest.TestCase):
                             if "start \"\" /wait" in line)
         self.assertTrue(install_line.endswith(" /q"), install_line)
         self.assertNotIn("/norestart", install_line)
+
+    def test_script_heals_stale_iexpress_metadata_for_legacy_vcredist(self):
+        """Старые сборки записывали kind «iexpress» и args «/quiet /norestart»
+        — пересозданный скрипт всё равно обязан ставить vcredist голым /q."""
+        text = redist.render_silent_install_script([{
+            "file": "Redist/vcredist_x86.exe",
+            "title": "Microsoft Visual C++ 2005 Redistributable (x86)",
+            "kind": "iexpress",
+            "args": "/quiet /norestart",
+        }, {
+            "file": "Redist/vcredist/2008/vcredist_x64.exe",
+            "title": "Microsoft Visual C++ 2008 Redistributable (x64)",
+            "kind": "",
+            "args": "",
+        }])
+        install_lines = [line for line in text.splitlines()
+                         if "start \"\" /wait" in line]
+        self.assertEqual(len(install_lines), 2)
+        for line in install_lines:
+            self.assertTrue(line.endswith(" /q"), line)
+            self.assertNotIn("/norestart", line)
+            self.assertNotIn("/quiet", line)
 
     def test_exit_codes_are_read_the_way_microsoft_means_them(self):
         self.assertEqual(redist.classify_exit_code(0), "installed")
@@ -1349,6 +1407,18 @@ class PackageExtractionTests(unittest.TestCase):
             # WiX Burn не знает ни /T:, ни /x: — только /layout.
             self.assertIn("/layout", burn[0])
             self.assertIn(dest, burn[0])
+
+            # Настоящая wextract-обёртка (VC++ 2005/2008): незнакомый ключ —
+            # это модальное «Command line option syntax error», поэтому сам
+            # архив запускается только с /Q, /C и /T:.
+            wextract = make("vcredist_x86.exe",
+                            b"MZ" + b"\x00" * 32 + b"wextract" + b"\x00" * 32)
+            for command in redist.extraction_commands(wextract, dest):
+                if command[0] != wextract:
+                    continue  # expand/extrac32/7z безопасны всегда
+                for switch in command[1:]:
+                    self.assertIn(switch.split(":", 1)[0].upper(),
+                                  ("/Q", "/C", "/T"), command)
 
             msi = redist.extraction_commands(make("xnafx40_redist.msi"), dest)
             self.assertEqual(tool_name(msi[0]), "msiexec")
@@ -1915,6 +1985,50 @@ class PackageExtractionTests(unittest.TestCase):
             self.assertIn("DXSETUP.exe", line)
             self.assertIn("/silent", line)
             self.assertNotIn("/quiet", line)
+
+    def test_launcher_heals_stale_metadata_for_legacy_vcredist(self):
+        """kind «iexpress»/пустой и args «/q /norestart» из старых сборок не
+        должны приводить к «Command line option syntax error» на целевом ПК."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = root / "Redist" / "vcredist_x86.exe"
+            package.parent.mkdir(parents=True)
+            package.write_bytes(b"MZ" + b"\x00" * 32 + b"wextract" +
+                                b"\x00" * 32)
+            for stale in ({"kind": "iexpress", "args": "/quiet /norestart"},
+                          {"kind": "", "args": "/q /norestart"}):
+                commands = exe_launcher._runtime_install_commands(
+                    root, {"file": "Redist/vcredist_x86.exe", **stale})
+                self.assertEqual(commands, [[str(package), "/q"]], stale)
+
+    def test_launcher_never_gives_a_wextract_wrapper_modern_switches(self):
+        """Любой wextract-пакет (не только vcredist) получает лишь /Q и /q."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = root / "Redist" / "wmfdist95.exe"
+            package.parent.mkdir(parents=True)
+            package.write_bytes(b"MZ" + b"\x00" * 32 + b"wextract" +
+                                b"\x00" * 32)
+            commands = exe_launcher._runtime_install_commands(
+                root, {"file": "Redist/wmfdist95.exe", "kind": "",
+                       "args": ""})
+            self.assertEqual(commands,
+                             [[str(package), "/Q"], [str(package), "/q"]])
+
+    def test_launcher_keeps_burn_switches_for_the_burn_based_vcredist(self):
+        """vcredist_x86.exe 2012/2013 — WiX Burn: современные ключи законны."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = root / "Redist" / "vcredist_x86.exe"
+            package.parent.mkdir(parents=True)
+            package.write_bytes(b"MZ" + b"\x00" * 32 + b".wixburn" +
+                                b"\x00" * 32)
+            commands = exe_launcher._runtime_install_commands(
+                root, {"file": "Redist/vcredist_x86.exe", "kind": "",
+                       "args": "/install /quiet /norestart"})
+            self.assertEqual(commands[0],
+                             [str(package), "/install", "/quiet",
+                              "/norestart"])
 
 
 class LauncherSilentInstallTests(unittest.TestCase):

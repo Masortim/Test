@@ -184,6 +184,38 @@ def _directx_commands(path: Path) -> list[list[str]]:
     return [["cmd.exe", "/v:on", "/c", line]]
 
 
+#: Engine signatures inside an installer exe.  ".wixburn" is the section
+#: name of a WiX Burn bundle (VC++ 2012+); "wextract" marks the IExpress
+#: wrapper used by VC++ 2005/2008, dxwebsetup and the WMF runtime.
+_ENGINE_MARKS: tuple[tuple[bytes, str], ...] = ((b".wixburn", "burn"),
+                                                (b"wextract", "iexpress"))
+
+
+def _sniff_installer_engine(path: Path) -> str:
+    """Best-effort engine detection ("burn"/"iexpress"/"") by file content.
+
+    The kind recorded at build time can be stale or wrong (older Portablizer
+    versions saved "iexpress" for legacy vcredist packages).  Feeding a
+    wextract wrapper anything but /Q, /q or /q:a pops up a modal
+    "Command line option syntax error" box - visible even when the process
+    is started with CREATE_NO_WINDOW - so the launcher double-checks.
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            head = fh.read(2 * 1024 * 1024)
+            tail = b""
+            if size > 2 * 1024 * 1024:
+                fh.seek(max(0, size - 131072))
+                tail = fh.read(131072)
+    except OSError:
+        return ""
+    for mark, engine in _ENGINE_MARKS:
+        if mark in head or (tail and mark in tail):
+            return engine
+    return ""
+
+
 def _runtime_install_commands(root: Path,
                               entry: Dict[str, Any]) -> list[list[str]]:
     """Command line that installs one package without showing anything."""
@@ -216,6 +248,18 @@ def _runtime_install_commands(root: Path,
         # stale args saved by an older Portablizer and do not try modern
         # fallbacks against this legacy IExpress wrapper.
         return [[str(path), "/q"]]
+    engine = "" if kind == "burn" else _sniff_installer_engine(path)
+    if engine != "burn" and re.fullmatch(r"vcredist[^\\/]*\.exe", lower_name):
+        # Stale metadata net: older builds recorded kind "iexpress" (or
+        # nothing) for vcredist 2005-2010.  Bare /q is the one switch that
+        # is silent on every vcredist generation, including the Burn-based
+        # 2012/2013 packages that reuse this file name.
+        return [[str(path), "/q"]]
+    if kind == "iexpress" or engine == "iexpress":
+        # wextract understands only /Q, /q and /q:a; anything else (the
+        # generic /quiet + /norestart ladder below included) answers with
+        # the modal "Command line option syntax error" box.
+        return [[str(path), "/Q"], [str(path), "/q"]]
     args = str(entry.get("args", "")).split()
     commands = [[str(path), *args]] if args else []
     for fallback in (["/quiet", "/norestart"], ["/q", "/norestart"],
