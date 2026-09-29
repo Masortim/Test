@@ -132,7 +132,14 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         key="vc2005",
         title="Microsoft Visual C++ 2005 SP1 Redistributable (VC++ 8.0)",
         pattern=r"(?:msvc[rpm]80|mfcm?80u?|mfc80[a-z]{3}|atl80|vcomp80)\.dll",
-        downloads={},
+        # Последняя официальная сборка 2005 SP1 (MFC Security Update,
+        # 8.0.50727.6195): именно в ней лежат mfc80.dll/mfc80u.dll/atl80.dll.
+        downloads={
+            "x86": "https://download.microsoft.com/download/8/B/4/"
+                   "8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x86.EXE",
+            "x64": "https://download.microsoft.com/download/8/B/4/"
+                   "8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x64.EXE",
+        },
         page="https://www.microsoft.com/download/details.aspx?id=26347",
         sxs="Microsoft.VC80",
         note=_VC_LICENSE_NOTE,
@@ -1095,6 +1102,220 @@ def _run_quiet(args: Sequence[str], timeout: int = 600) -> int:
 
 
 # =============================================================================
+#  4a. Распаковка пакетов: пути, пригодные для командной строки
+# =============================================================================
+#
+# Самораспаковывающиеся пакеты Microsoft (wextract/IExpress у VC++ 2005–2010,
+# WiX Burn у VC++ 2012+) получают путь распаковки **внутри одного аргумента**:
+# ``/T:C:\путь``, ``/x:C:\путь``, ``/layout C:\путь``. Этот разбор делает сам
+# пакет, и он ломается там, где обычный CreateProcess справился бы:
+#
+# * пробел в пути обрывает аргумент (``/T:C:\Мои игры\…`` → цель ``C:\Мои``);
+# * кириллица в пути (а у русского пользователя каталог профиля — кириллица)
+#   разбирается старыми wextract-обёртками как мусор;
+# * очень длинный путь упирается в MAX_PATH.
+#
+# Отсюда и появлялось «пакет скачан, но распаковать его автоматически не
+# удалось»: команда возвращала успех, а файлы уходили не туда (или никуда).
+# Поэтому распаковка всегда идёт в путь без пробелов и не-ASCII: сначала
+# пробуем короткое имя 8.3 (``GetShortPathNameW``), затем временную папку,
+# затем ``%PUBLIC%`` — и лишь потом переносим результат туда, куда просили.
+
+
+def short_path(path: str) -> str:
+    """Короткое имя 8.3 для пути (на не-Windows — путь без изменений)."""
+    if not IS_WINDOWS or not path:
+        return path
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        get_short = ctypes.windll.kernel32.GetShortPathNameW  # type: ignore[attr-defined]
+        get_short.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        get_short.restype = wintypes.DWORD
+        size = get_short(path, None, 0)
+        if not size:
+            return path
+        buffer = ctypes.create_unicode_buffer(size)
+        if not get_short(path, buffer, size):
+            return path
+        return buffer.value or path
+    except Exception:  # noqa: BLE001 — короткое имя не критично
+        return path
+
+
+def is_cmdline_safe(path: str) -> bool:
+    """Путь переживёт передачу внутри аргумента вида ``/T:<путь>``?"""
+    if not path:
+        return False
+    return path.isascii() and " " not in path and len(path) < 160
+
+
+def _public_temp_root() -> str:
+    """``%PUBLIC%\\Portablizer`` — ASCII-путь без пробелов и без прав админа."""
+    public = os.environ.get("PUBLIC") or ""
+    if not public:
+        drive = os.environ.get("SystemDrive") or "C:"
+        public = os.path.join(drive + os.sep, "Users", "Public")
+    return os.path.join(public, "Portablizer")
+
+
+def cmdline_safe_dir(destination: str) -> str:
+    """Папка для распаковки, которую не испортят пробелы и кириллица.
+
+    Возвращает либо сам ``destination`` (если он и так безопасен), либо
+    временную папку, куда пакет можно распаковать, а потом перенести файлы.
+    Пустая строка — безопасного места не нашлось, работаем как есть.
+    """
+    try:
+        os.makedirs(destination, exist_ok=True)
+    except OSError:
+        return ""
+    if is_cmdline_safe(destination):
+        return destination
+    shortened = short_path(destination)
+    if is_cmdline_safe(shortened):
+        return shortened
+    import tempfile
+
+    for base in (None, _public_temp_root()):
+        try:
+            if base:
+                os.makedirs(base, exist_ok=True)
+            staging = tempfile.mkdtemp(prefix="pblz", dir=base)
+        except OSError:
+            continue
+        candidate = short_path(staging)
+        if is_cmdline_safe(candidate):
+            return candidate
+        if is_cmdline_safe(staging):
+            return staging
+        shutil.rmtree(staging, ignore_errors=True)
+    return ""
+
+
+def _same_dir(first: str, second: str) -> bool:
+    """Одна и та же папка? Короткое имя 8.3 и длинное — это одна папка."""
+    if not first or not second:
+        return False
+    try:
+        if os.path.isdir(first) and os.path.isdir(second):
+            return os.path.samefile(first, second)
+    except OSError:
+        pass
+    try:
+        return os.path.normcase(os.path.abspath(first)) == \
+            os.path.normcase(os.path.abspath(second))
+    except OSError:
+        return first == second
+
+
+def merge_tree(source: str, destination: str) -> None:
+    """Переносит распакованное из временной папки в целевую."""
+    if not os.path.isdir(source) or _same_dir(source, destination):
+        return
+    os.makedirs(destination, exist_ok=True)
+    for current, _dirs, files in os.walk(source):
+        relative = os.path.relpath(current, source)
+        target = destination if relative == "." else os.path.join(destination,
+                                                                  relative)
+        os.makedirs(target, exist_ok=True)
+        for name in files:
+            try:
+                shutil.move(os.path.join(current, name),
+                            os.path.join(target, name))
+            except (OSError, shutil.Error):
+                continue
+
+
+def find_7zip() -> str:
+    """7-Zip, если он установлен: он вскрывает и IExpress, и Burn."""
+    if not IS_WINDOWS:
+        return ""
+    candidates = [shutil.which("7z") or "", shutil.which("7za") or ""]
+    for variable in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        base = os.environ.get(variable)
+        if base:
+            candidates.append(os.path.join(base, "7-Zip", "7z.exe"))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+#: Ключи **распаковки** (не установки!) по движку самораспаковывающегося пакета.
+#: ``{dest}`` подставляется уже безопасным путём.
+EXTRACT_SWITCHES: Dict[str, Tuple[Tuple[str, ...], ...]] = {
+    # wextract/IExpress: VC++ 2005/2008/2010, directx_*_redist.exe, dxwebsetup.
+    "iexpress": (("/Q", "/C", "/T:{dest}"),
+                 ("/C", "/T:{dest}"),
+                 ("/q", "/x:{dest}"),
+                 ("/x:{dest}",)),
+    "vcredist_legacy": (("/Q", "/C", "/T:{dest}"),
+                        ("/C", "/T:{dest}"),
+                        ("/q", "/x:{dest}"),
+                        ("/x:{dest}",),
+                        ("/extract:{dest}", "/quiet")),
+    "directx_bundle": (("/Q", "/C", "/T:{dest}"),
+                       ("/C", "/T:{dest}")),
+    # WiX Burn: VC++ 2012 и новее. /layout раскладывает msi и cab-контейнеры.
+    "burn": (("/quiet", "/norestart", "/layout", "{dest}"),
+             ("/layout", "{dest}", "/quiet", "/norestart"),
+             ("/quiet", "/layout", "{dest}"),
+             ("/q", "/x:{dest}")),
+    "nsis": (("/S", "/D={dest}"),),
+    "installshield": (("/s", "/extract_all:{dest}"),
+                      ("/b{dest}", "/s", "/v/qn")),
+    # Движок неизвестен — перебираем всё ходовое, каждый запуск под таймаутом.
+    "": (("/Q", "/C", "/T:{dest}"),
+         ("/q", "/x:{dest}"),
+         ("/x:{dest}",),
+         ("/quiet", "/layout", "{dest}"),
+         ("/extract:{dest}", "/quiet"),
+         ("-y", "-o{dest}")),
+}
+
+
+def extraction_commands(archive: str, destination: str,
+                        kind: str = "") -> List[List[str]]:
+    """Лестница команд распаковки пакета — от самой точной к самой общей.
+
+    Последние ступени универсальны: и IExpress-обёртки, и кабинеты внутри
+    них — обычные CAB-контейнеры, которые умеют вскрывать штатные ``expand``
+    и ``extrac32``, а 7-Zip (если он есть на ПК) вскрывает вдобавок Burn.
+    """
+    archive = os.path.abspath(archive)
+    lower = os.path.basename(archive).lower()
+    kind = kind or installer_kind(archive)
+    if lower.endswith(".cab") or kind == "cab":
+        return [["expand", "-R", "-F:*", archive, destination]]
+    if lower.endswith((".msi", ".msp")) or kind == "msi":
+        return [["msiexec", "/a", archive, "/qn", f"TARGETDIR={destination}"]]
+
+    commands: List[List[str]] = []
+    seen: set = set()
+
+    def add(command: Sequence[str]) -> None:
+        key = tuple(command)
+        if key not in seen:
+            seen.add(key)
+            commands.append(list(command))
+
+    for key in (kind, ""):
+        for switches in EXTRACT_SWITCHES.get(key, ()):
+            add([archive] + [item.format(dest=destination)
+                             for item in switches])
+    # Самораспаковывающийся exe — это CAB с PE-заголовком: штатные
+    # распаковщики Windows берут его и без «правильного» ключа.
+    add(["expand", "-R", "-F:*", archive, destination])
+    add(["extrac32", "/Y", "/E", "/L", destination, archive])
+    sevenzip = find_7zip()
+    if sevenzip:
+        add([sevenzip, "x", "-y", f"-o{destination}", archive])
+    return commands
+
+
+# =============================================================================
 #  4b. Тихая установка распространяемых пакетов
 # =============================================================================
 #
@@ -1191,6 +1412,9 @@ SILENT_SWITCHES: Dict[str, Tuple[Tuple[str, ...], ...]] = {
                         ("/qb",),
                         ("/Q",),
                         ("/quiet", "/norestart")),
+    # DXSETUP понимает ровно один ключ; на любом другом он показывает окно
+    # «Установка DirectX — Неверная операция командной строки» и ждёт мышку,
+    # поэтому перебирать варианты для него запрещено (см. silent_commands).
     "dxsetup": (("/silent",),),
     "iexpress": (("/Q",), ("/q",), ("/quiet",)),
     "inno": (("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"),
@@ -1276,9 +1500,16 @@ def silent_commands(path: str, kind: str = "",
         return [["wusa", path, "/quiet", "/norestart"]]
     if kind == "cab":
         return []
+    if kind == "directx_bundle":
+        # ``directx_Jun2010_redist.exe`` — не установщик, а самораспаковыва-
+        # ющийся архив: внутри лежат кабинеты и DXSETUP.exe. Любой ключ
+        # тихого режима он передаёт внутрь, и DXSETUP отвечает окном
+        # «Неверная операция командной строки». Ставится он двумя шагами —
+        # см. install_directx_bundle().
+        return []
     commands = [[path, *switches]
                 for switches in SILENT_SWITCHES.get(kind, SILENT_SWITCHES[""])]
-    if kind and kind != "dxsetup":
+    if kind and kind not in ("dxsetup", "directx_bundle"):
         # Подстраховка: если «правильные» ключи не сработали, пробуем общие.
         for switches in SILENT_SWITCHES[""]:
             candidate = [path, *switches]
@@ -1334,6 +1565,51 @@ class SilentInstall:
         return f"{self.title or self.name}: {words.get(self.status, self.status)}"
 
 
+def install_directx_bundle(path: str, run: Callable[[Sequence[str]], int],
+                           log=None) -> Tuple[Optional[int], str]:
+    """Ставит DirectX из ``directx_*_redist.exe`` — распаковка, потом DXSETUP.
+
+    Сам бандл ничего не устанавливает: это архив IExpress. Ключи тихого
+    режима он пробрасывает вложенному ``DXSETUP.exe``, а тот на всё, кроме
+    ``/silent``, отвечает модальным окном «Установка DirectX — Неверная
+    операция командной строки». Поэтому бандл сначала распаковывается во
+    временную папку, а затем запускается ``DXSETUP.exe /silent``.
+    """
+    import tempfile
+
+    if not IS_WINDOWS or not os.path.isfile(path):
+        return None, ""
+    try:
+        base = tempfile.mkdtemp(prefix="pblzdx")
+    except OSError:
+        return None, ""
+    work = cmdline_safe_dir(base) or base
+    try:
+        for command in extraction_commands(path, work, "directx_bundle"):
+            code = run(command)
+            if log is not None:
+                log.debug(f"Распаковка DirectX (код {code}): "
+                          + subprocess.list2cmdline(command))
+            if _has_files(work):
+                break
+        setup = _find_file(work, "dxsetup.exe", allow_mangled=False)
+        if not setup:
+            if log is not None:
+                log.debug("DXSETUP.exe в пакете DirectX не найден — "
+                          "установка пропущена.")
+            return None, ""
+        command = [setup, "/silent"]
+        code = run(command)
+        if log is not None:
+            log.debug(f"Тихая установка DirectX (код {code}): "
+                      + subprocess.list2cmdline(command))
+        return code, subprocess.list2cmdline(command)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+        if not _same_dir(work, base):
+            shutil.rmtree(work, ignore_errors=True)
+
+
 def run_silent_install(path: str, *,
                        runner: Optional[Callable[[Sequence[str]], int]] = None,
                        title: str = "", package_key: str = "", arch: str = "",
@@ -1353,6 +1629,12 @@ def run_silent_install(path: str, *,
         package_key=package_key or (rule.package_key if rule else ""))
     if not os.path.isfile(path):
         outcome.status = "skipped"
+        return outcome
+    if kind == "directx_bundle":
+        code, command = install_directx_bundle(path, run, log)
+        outcome.code = code
+        outcome.command = command
+        outcome.status = classify_exit_code(code) if command else "skipped"
         return outcome
     commands = silent_commands(path, kind)
     if not commands:
@@ -1409,17 +1691,31 @@ def render_silent_install_script(entries: Sequence[Dict[str, str]]) -> str:
         args = str(entry.get("args", ""))
         target = f'"%REDIST_ROOT%\\{relative}"'
         if kind == "msi":
-            command = f"msiexec /i {target} /qn /norestart"
+            body = [f"msiexec /i {target} /qn /norestart"]
         elif kind == "msu":
-            command = f"wusa {target} /quiet /norestart"
+            body = [f"wusa {target} /quiet /norestart"]
+        elif kind == "directx_bundle":
+            # Бандл DirectX ничего не ставит сам: распаковываем его и
+            # запускаем DXSETUP.exe /silent - единственный ключ, который
+            # он понимает (на прочих показывает окно с ошибкой).
+            temp = f"%SystemRoot%\\Temp\\pblz_dx{index}"
+            body = [
+                f'set "DXTMP={temp}"',
+                'if exist "%DXTMP%" rd /s /q "%DXTMP%"',
+                'md "%DXTMP%" 2>nul',
+                f'start "" /wait {target} /Q /C /T:"%DXTMP%"',
+                'if exist "%DXTMP%\\DXSETUP.exe" start "" /wait '
+                '"%DXTMP%\\DXSETUP.exe" /silent',
+                'rd /s /q "%DXTMP%" 2>nul',
+            ]
         else:
-            command = f'start "" /wait {target} {args}'.rstrip()
+            body = [f'start "" /wait {target} {args}'.rstrip()]
         lines += [
             "",
             f"rem --- {relative}",
             f"if not exist {target} goto redist_skip_{index}",
             f"echo Installing {title} ...",
-            command,
+            *body,
             f"call :redist_check %ERRORLEVEL%",
             f"goto redist_next_{index}",
             f":redist_skip_{index}",
@@ -1664,22 +1960,36 @@ class RuntimeProvisioner:
     # -- распаковка пакетов ---------------------------------------------------
     def _extract_installer(self, archive: str, destination: str,
                            wanted: str = "") -> bool:
-        """Распаковывает пакет Microsoft, не устанавливая его в систему."""
+        """Распаковывает пакет Microsoft, не устанавливая его в систему.
+
+        Ключ распаковки подбирается по движку пакета (wextract, WiX Burn,
+        MSI…), а сам путь распаковки готовится так, чтобы его пережил разбор
+        внутри самого пакета: без пробелов и кириллицы (см. раздел 4a). Если
+        ни один ключ не сработал, пакет вскрывается как CAB-контейнер —
+        штатными ``expand``/``extrac32`` или 7-Zip, если он есть на ПК.
+        """
         if not IS_WINDOWS or not os.path.isfile(archive):
             return False
         os.makedirs(destination, exist_ok=True)
-        attempts: List[List[str]] = [
-            # IExpress: DirectX redist и старые самораспаковывающиеся пакеты.
-            [archive, "/Q", "/C", f"/T:{destination}"],
-            # vcredist 2005/2008/2010.
-            [archive, "/q", f"/x:{destination}"],
-            # WiX Burn: vcredist 2012 и новее.
-            [archive, "/quiet", "/layout", destination],
-        ]
-        for attempt in attempts:
-            self._run(attempt)
-            if _has_files(destination):
-                break
+        staging = cmdline_safe_dir(destination) or destination
+        source = archive
+        if not is_cmdline_safe(source):
+            shortened = short_path(source)
+            if os.path.isfile(shortened):
+                source = shortened
+        try:
+            for attempt in extraction_commands(source, staging):
+                code = self._run(attempt)
+                self.log.debug(
+                    f"Распаковка пакета (код {code}): "
+                    + subprocess.list2cmdline(attempt))
+                if _has_files(staging):
+                    break
+            if not _same_dir(staging, destination):
+                merge_tree(staging, destination)
+        finally:
+            if not _same_dir(staging, destination):
+                shutil.rmtree(staging, ignore_errors=True)
         if not _has_files(destination):
             return False
         self._expand_payloads(destination, wanted)
@@ -1841,10 +2151,16 @@ class RuntimeProvisioner:
                                        requirement.arch or "any")
             if not self._extract_installer(archive, destination,
                                            requirement.dll):
+                hint = ("Попробую поставить его молча и забрать файлы из "
+                        "системы." if self.allow_install and not
+                        requirement.proactive else
+                        "Включите «Тихая установка пакетов», чтобы "
+                        "Portablizer взял файлы после установки пакета.")
                 self.log.warn(
                     f"{package.title}: пакет скачан, но распаковать его "
-                    "автоматически не удалось. Он сохранён в папке "
-                    f"{REDIST_DIR_NAME} портатива.")
+                    f"автоматически не удалось. {hint} Сам пакет сохранён в "
+                    f"папке {REDIST_DIR_NAME} портатива "
+                    f"(там же {SILENT_SCRIPT_NAME}).")
                 self._failed_packages.add(key)
                 self._extracted[key] = ""
                 return "", ""
@@ -2133,7 +2449,10 @@ class RuntimeProvisioner:
                 (report.stock_missing if requirement.proactive
                  else report.missing).append(requirement)
                 continue
-            if source == "WinSxS":
+            if requirement.package is not None and requirement.package.sxs:
+                # VC++ 2005/2008 без private-манифеста рядом с exe просто
+                # игнорируются — и неважно, откуда взялся файл: из WinSxS,
+                # из System32 или из распакованного vcredist.
                 self._write_sxs_manifest(requirement, path, app_dir)
             requirement.status = "provided"
             requirement.source = source
@@ -2285,13 +2604,43 @@ def _has_files(directory: str) -> bool:
     return False
 
 
-def _find_file(directory: str, name: str) -> str:
+def _looks_like_pe(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
+def _find_file(directory: str, name: str, allow_mangled: bool = True) -> str:
+    """Ищет файл в дереве — в том числе под «складским» именем из MSI.
+
+    Внутри ``vc_red.cab`` (VC++ 2005/2008/2010) библиотеки лежат не под
+    своими именами, а под именами таблицы File установщика:
+    ``FL_mfc80_dll_01_8.0.50727.762_x-ww_1b4fc1e7``. Развёрнутый кабинет
+    поэтому выглядит «пустым» для поиска по ``mfc80.dll`` — отсюда и
+    появлялось «не удалось найти файлы для: mfc80.dll» при полностью
+    скачанном и распакованном пакете.
+    """
     target = name.lower()
+    stem, extension = os.path.splitext(target)
+    extension = extension.lstrip(".")
+    pattern = None
+    if allow_mangled and stem and extension:
+        pattern = re.compile(
+            rf"(?:^|[^a-z0-9]){re.escape(stem)}[_.]{re.escape(extension)}"
+            rf"(?:[^a-z0-9]|$)")
+    fallback = ""
     for root, _dirs, files in os.walk(directory):
         for candidate in files:
-            if candidate.lower() == target:
-                return os.path.join(root, candidate)
-    return ""
+            lowered = candidate.lower()
+            path = os.path.join(root, candidate)
+            if lowered == target:
+                return path
+            if pattern is not None and not fallback \
+                    and pattern.search(lowered) and _looks_like_pe(path):
+                fallback = path
+    return fallback
 
 
 def _folder_version(name: str) -> Tuple[int, ...]:

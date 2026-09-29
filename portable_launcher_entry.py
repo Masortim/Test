@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence
@@ -146,6 +147,43 @@ def missing_runtime_components(root: Path, cfg: Dict[str, Any], target: Path,
 RUNTIME_OK_CODES = frozenset({0, 1638, 5100, 3010, 1641, 0x80070666})
 
 
+def _directx_scratch_dir() -> Path:
+    """A writable folder for unpacking the DirectX bundle into."""
+    candidates = [Path(os.environ.get("SystemRoot") or r"C:\Windows") / "Temp",
+                  Path(tempfile.gettempdir())]
+    for base in candidates:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            probe = base / "pblz_dx.tmp"
+            probe.write_bytes(b"")
+            probe.unlink()
+            return base / "pblz_dx"
+        except OSError:
+            continue
+    return candidates[-1] / "pblz_dx"
+
+
+def _directx_commands(path: Path) -> list[list[str]]:
+    """Unpack directx_*_redist.exe, then run DXSETUP.exe /silent.
+
+    The bundle is an IExpress archive, not an installer: any silent switch
+    reaches DXSETUP, and DXSETUP knows exactly one ("/silent") - anything
+    else pops up "Invalid command line operation" and waits for a click.
+    Both steps go into one hidden cmd line so the exit code of DXSETUP is
+    the exit code of the whole package.
+    """
+    scratch = _directx_scratch_dir()
+    line = (
+        f'rd /s /q "{scratch}" 2>nul & md "{scratch}" 2>nul & '
+        f'"{path}" /Q /C /T:"{scratch}" & '
+        f'if not exist "{scratch}\\DXSETUP.exe" (rd /s /q "{scratch}" 2>nul '
+        f'& exit /b 1) & '
+        f'"{scratch}\\DXSETUP.exe" /silent & set DXRC=!ERRORLEVEL! & '
+        f'rd /s /q "{scratch}" 2>nul & exit /b !DXRC!'
+    )
+    return [["cmd.exe", "/v:on", "/c", line]]
+
+
 def _runtime_install_commands(root: Path,
                               entry: Dict[str, Any]) -> list[list[str]]:
     """Command line that installs one package without showing anything."""
@@ -160,6 +198,11 @@ def _runtime_install_commands(root: Path,
         return [["msiexec", "/i", str(path), "/qn", "/norestart"]]
     if kind == "msu" or path.suffix.lower() == ".msu":
         return [["wusa", str(path), "/quiet", "/norestart"]]
+    if kind == "directx_bundle" or path.name.lower().startswith("directx_"):
+        # directx_*_redist.exe only unpacks itself; every silent switch is
+        # handed over to DXSETUP, which answers with a modal "Invalid
+        # command line operation" box.  Unpack first, then DXSETUP /silent.
+        return _directx_commands(path)
     args = str(entry.get("args", "")).split()
     commands = [[str(path), *args]] if args else []
     for fallback in (["/quiet", "/norestart"], ["/q", "/norestart"],

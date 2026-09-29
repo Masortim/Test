@@ -1277,6 +1277,248 @@ class SilentInstallTests(unittest.TestCase):
             self.assertIn("msvcp110.dll", entries[0]["dlls"])
 
 
+class PackageExtractionTests(unittest.TestCase):
+    """Распаковка пакетов: «скачан, но распаковать не удалось» — это баг.
+
+    Жалобы пользователя: VC++ 2008/2010/2012 скачивались, но не
+    распаковывались, DirectX отвечал окном «Неверная операция командной
+    строки», а ``mfc80.dll`` не находился ни в одном источнике.
+    """
+
+    def setUp(self):
+        self.log = Logger()
+
+    def _portable(self, temp):
+        portable = Path(temp, "Game_Portable")
+        app = portable / "App"
+        app.mkdir(parents=True)
+        return portable, app
+
+    # -- ключи распаковки ----------------------------------------------------
+    def test_every_engine_gets_its_own_extraction_switches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def make(name, data=b"MZ"):
+                path = Path(temp, name)
+                path.write_bytes(data)
+                return str(path)
+
+            dest = str(Path(temp, "out"))
+            legacy = redist.extraction_commands(make("vcredist_x86.exe"), dest)
+            self.assertEqual(legacy[0][1:], ["/Q", "/C", f"/T:{dest}"])
+            self.assertIn([legacy[0][0], "/q", f"/x:{dest}"], legacy)
+
+            burn = redist.extraction_commands(make("vc_redist.x64.exe"), dest)
+            # WiX Burn не знает ни /T:, ни /x: — только /layout.
+            self.assertIn("/layout", burn[0])
+            self.assertIn(dest, burn[0])
+
+            msi = redist.extraction_commands(make("xnafx40_redist.msi"), dest)
+            self.assertEqual(msi[0][0], "msiexec")
+            self.assertIn("/a", msi[0])
+
+            cab = redist.extraction_commands(make("Jun2010_d3dx9_43_x86.cab"),
+                                             dest)
+            self.assertEqual(cab[0][0], "expand")
+
+    def test_extraction_falls_back_to_cab_tools(self):
+        """Не помог ни один ключ — пакет вскрывается как CAB-контейнер."""
+        with tempfile.TemporaryDirectory() as temp:
+            archive = str(Path(temp, "vcredist_x86.exe"))
+            Path(archive).write_bytes(b"MZ")
+            tools = [command[0] for command
+                     in redist.extraction_commands(archive, str(Path(temp, "o")))]
+            self.assertIn("expand", tools)
+            self.assertIn("extrac32", tools)
+
+    def test_extraction_path_never_contains_spaces_or_cyrillic(self):
+        """``/T:C:\\Мои игры\\…`` пакет разбирает неверно — путь готовим сами."""
+        self.assertTrue(redist.is_cmdline_safe(r"C:\Temp\pblz"))
+        self.assertFalse(redist.is_cmdline_safe(r"C:\Мои игры\pblz"))
+        self.assertFalse(redist.is_cmdline_safe(r"C:\Program Files\pblz"))
+
+        with tempfile.TemporaryDirectory() as temp:
+            awkward = Path(temp, "Мои игры", "Портатив", "_redist cache")
+            safe = redist.cmdline_safe_dir(str(awkward))
+            self.assertTrue(safe, "безопасная папка не найдена")
+            self.assertTrue(redist.is_cmdline_safe(safe), safe)
+            self.assertTrue(awkward.is_dir())
+            # Результат распаковки обязан переехать в запрошенную папку.
+            Path(safe, "vc_red.cab").write_bytes(b"MSCF")
+            redist.merge_tree(safe, str(awkward))
+            self.assertTrue((awkward / "vc_red.cab").is_file())
+
+            plain = Path(temp, "plain")
+            self.assertTrue(redist.is_cmdline_safe(
+                redist.cmdline_safe_dir(str(plain))))
+
+    def test_downloaded_package_is_unpacked_into_a_safe_path(self):
+        """Кириллица в пути портатива больше не срывает распаковку."""
+        calls = []
+
+        def downloader(url, destination):
+            Path(destination).write_bytes(b"MZ fake vcredist")
+            return True
+
+        def runner(args):
+            calls.append(list(args))
+            target = ""
+            for item in list(args)[1:]:
+                if item.startswith(("/T:", "/x:")):
+                    target = item.split(":", 1)[1]
+            if not target:
+                return 1
+            os.makedirs(target, exist_ok=True)
+            write_runtime_dll(Path(target, "msvcp110.dll"))
+            return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Мои игры", "Игра Portable")
+            app = portable / "App"
+            app.mkdir(parents=True)
+            write_pe(app / "game.exe", imports=("msvcp110.dll",))
+
+            scan = redist.scan_app_runtime(str(app))
+            with mock.patch.object(redist, "IS_WINDOWS", True):
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="", allow_download=True,
+                    downloader=downloader, runner=runner,
+                ).provision(scan, str(app), str(portable), "Игра")
+
+            self.assertEqual(report.missing, [])
+            self.assertTrue((app / "msvcp110.dll").is_file())
+            for command in calls:
+                for item in command:
+                    if item.startswith(("/T:", "/x:")):
+                        self.assertTrue(
+                            redist.is_cmdline_safe(item.split(":", 1)[1]),
+                            item)
+
+    # -- mfc80.dll -----------------------------------------------------------
+    def test_visual_cpp_2005_has_an_official_download(self):
+        package = {p.key: p for p in redist.REDIST_PACKAGES}["vc2005"]
+        self.assertTrue(package.downloads.get("x86", "").startswith("https://"))
+        self.assertTrue(package.downloads.get("x64", "").startswith("https://"))
+        self.assertTrue(package.matches("mfc80.dll"))
+
+    def test_library_hidden_under_an_msi_name_is_found(self):
+        """В ``vc_red.cab`` файлы лежат под именами таблицы File установщика."""
+        with tempfile.TemporaryDirectory() as temp:
+            write_runtime_dll(Path(
+                temp, "FL_mfc80_dll_01_8.0.50727.762_x-ww_1b4fc1e7"))
+            write_runtime_dll(Path(
+                temp, "FL_mfc80u_dll_01_8.0.50727.762_x-ww_1b4fc1e7"))
+
+            found = redist._find_file(temp, "mfc80.dll")
+            self.assertTrue(found)
+            self.assertIn("fl_mfc80_dll", os.path.basename(found).lower())
+            # Соседний mfc80u.dll — другой файл, подменять его нельзя.
+            other = redist._find_file(temp, "mfc80u.dll")
+            self.assertIn("fl_mfc80u_dll", os.path.basename(other).lower())
+            self.assertEqual(redist._find_file(temp, "msvcr80.dll"), "")
+
+    def test_mfc80_is_delivered_with_a_private_manifest(self):
+        """VC++ 2005 рядом с exe работает только вместе с манифестом сборки."""
+        def downloader(url, destination):
+            Path(destination).write_bytes(b"MZ fake vcredist")
+            return True
+
+        def runner(args):
+            target = ""
+            for item in list(args)[1:]:
+                if item.startswith(("/T:", "/x:")):
+                    target = item.split(":", 1)[1]
+            if not target:
+                return 1
+            os.makedirs(target, exist_ok=True)
+            write_runtime_dll(Path(target, "FL_mfc80_dll_01_8.0.50727.762"))
+            return 0
+
+        manifest = (
+            '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" '
+            'manifestVersion="1.0"><dependency><dependentAssembly>'
+            '<assemblyIdentity type="win32" name="Microsoft.VC80.MFC" '
+            'version="8.0.50727.762" processorArchitecture="x86" '
+            'publicKeyToken="1fc8b3b9a1e18e3b"/>'
+            '</dependentAssembly></dependency></assembly>'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("mfc80.dll",),
+                     manifest=manifest)
+
+            scan = redist.scan_app_runtime(str(app))
+            with mock.patch.object(redist, "IS_WINDOWS", True):
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="", allow_download=True,
+                    downloader=downloader, runner=runner,
+                ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertEqual([r.dll for r in report.provided], ["mfc80.dll"])
+            self.assertTrue((app / "mfc80.dll").is_file())
+            written = app / "Microsoft.VC80.MFC.manifest"
+            self.assertTrue(written.is_file())
+            self.assertIn("8.0.50727.762", written.read_text(encoding="utf-8"))
+
+    # -- DirectX -------------------------------------------------------------
+    def test_directx_bundle_is_never_given_a_switch_it_cannot_parse(self):
+        """«Установка DirectX — Неверная операция командной строки» — больше нет."""
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp, "directx_Jun2010_redist.exe")
+            bundle.write_bytes(b"MZ")
+            self.assertEqual(redist.installer_kind(str(bundle)),
+                             "directx_bundle")
+            # Бандл — архив, а не установщик: прямых команд у него нет.
+            self.assertEqual(redist.silent_commands(str(bundle)), [])
+            for command in redist.silent_commands(
+                    str(Path(temp, "DXSETUP.exe").resolve())):
+                self.assertEqual(command[1:], ["/silent"])
+
+    def test_directx_bundle_is_unpacked_and_dxsetup_runs_silently(self):
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            args = list(args)
+            if args[0].lower().endswith("directx_jun2010_redist.exe"):
+                target = ""
+                for item in args[1:]:
+                    if item.startswith(("/T:", "/x:")):
+                        target = item.split(":", 1)[1]
+                if not target:
+                    return 1
+                os.makedirs(target, exist_ok=True)
+                Path(target, "DXSETUP.exe").write_bytes(b"MZ")
+                Path(target, "Jun2010_d3dx9_43_x86.cab").write_bytes(b"MSCF")
+                return 0
+            return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp, "directx_Jun2010_redist.exe")
+            bundle.write_bytes(b"MZ")
+            with mock.patch.object(redist, "IS_WINDOWS", True):
+                outcome = redist.run_silent_install(str(bundle), runner=runner)
+
+            self.assertEqual(outcome.status, "installed")
+            self.assertTrue(outcome.command.lower().endswith("/silent"))
+            self.assertIn("dxsetup.exe", outcome.command.lower())
+            # Ни одна команда бандлу не передала ключ, которого он не знает.
+            for command in calls:
+                if command[0].lower().endswith("directx_jun2010_redist.exe"):
+                    self.assertNotIn("/quiet", command)
+                    self.assertNotIn("/silent", command)
+
+    def test_target_pc_script_installs_directx_in_two_steps(self):
+        text = redist.render_silent_install_script([
+            {"file": "Redist/directx_Jun2010_redist.exe",
+             "title": "DirectX End-User Runtime",
+             "kind": "directx_bundle", "args": ""},
+        ])
+        self.assertIn("/T:", text)
+        self.assertIn("DXSETUP.exe", text)
+        self.assertIn("/silent", text)
+        self.assertTrue(text.isascii())
+
+
 class LauncherSilentInstallTests(unittest.TestCase):
     """LaunchPortable.exe: сначала поставить молча, и только потом жаловаться."""
 
