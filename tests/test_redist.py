@@ -27,6 +27,17 @@ from portablizer.core.launcher import (
 from portablizer.core.logutil import Logger
 from portablizer.core.portablizer import PortableOptions, Portablizer
 
+def tool_name(command) -> str:
+    """Имя штатной утилиты Windows из команды, без пути и расширения.
+
+    На Windows Portablizer зовёт ``expand``/``msiexec`` по абсолютному пути
+    (``C:\\Windows\\System32\\expand.exe``): в PATH урезанного профиля их
+    может не быть. Тестам важно имя, а не путь.
+    """
+    first = str(command[0] if isinstance(command, (list, tuple)) else command)
+    return os.path.splitext(os.path.basename(first))[0].lower()
+
+
 #: Ровно тот список, с которого начался разговор.
 USER_REPORTED = (
     "XINPUT1_3.dll", "d3dx9_38.dll", "MSVCP110.dll", "MSVCR110.dll",
@@ -477,7 +488,7 @@ class RuntimeProvisionTests(unittest.TestCase):
                             "APR2007_xinput_x86.cab"):
                     Path(target, cab).write_bytes(b"MSCF fake cabinet")
                 return 0
-            if args[0] == "expand":
+            if tool_name(args) == "expand":
                 cab = Path(args[-2])
                 name = cab.name.lower().replace("jun2010_", "")
                 write_runtime_dll(Path(args[-1],
@@ -502,7 +513,7 @@ class RuntimeProvisionTests(unittest.TestCase):
             self.assertEqual([r.dll for r in report.provided],
                              ["d3dx9_39.dll"])
             self.assertTrue((app / "d3dx9_39.dll").is_file())
-            expanded = [c[-2] for c in calls if c[0] == "expand"]
+            expanded = [c[-2] for c in calls if tool_name(c) == "expand"]
             self.assertEqual(len(expanded), 1, expanded)
             self.assertIn("d3dx9_39", expanded[0])
 
@@ -752,7 +763,7 @@ class FullKitProvisionTests(unittest.TestCase):
                             "Jun2010_d3dx9_39_x86.cab"):
                     Path(target, cab).write_bytes(b"MSCF fake cabinet")
                 return 0
-            if args[0] == "expand":
+            if tool_name(args) == "expand":
                 cab = Path(args[-2])
                 name = cab.name.lower().replace("jun2010_", "") \
                                          .replace("_x86.cab", ".dll")
@@ -779,7 +790,7 @@ class FullKitProvisionTests(unittest.TestCase):
                              {"d3dx9_38.dll", "d3dx9_39.dll"})
             self.assertTrue((app / "d3dx9_38.dll").is_file())
             self.assertTrue((app / "d3dx9_39.dll").is_file())
-            expanded = [c[-2] for c in calls if c[0] == "expand"]
+            expanded = [c[-2] for c in calls if tool_name(c) == "expand"]
             self.assertEqual(len(expanded), 2, expanded)
 
 
@@ -1115,7 +1126,7 @@ class SilentInstallTests(unittest.TestCase):
             self.assertEqual(redist.silent_commands(dx)[0][1:], ["/silent"])
             msi = make("xnafx40_redist.msi")
             command = redist.silent_commands(msi)[0]
-            self.assertEqual(command[0], "msiexec")
+            self.assertEqual(tool_name(command), "msiexec")
             self.assertIn("/qn", command)
             # Неизвестный движок опознаётся по сигнатуре внутри файла.
             inno = make("oddredist.exe", b"MZ ... Inno Setup Setup Data")
@@ -1319,19 +1330,19 @@ class PackageExtractionTests(unittest.TestCase):
             self.assertIn(dest, burn[0])
 
             msi = redist.extraction_commands(make("xnafx40_redist.msi"), dest)
-            self.assertEqual(msi[0][0], "msiexec")
+            self.assertEqual(tool_name(msi[0]), "msiexec")
             self.assertIn("/a", msi[0])
 
             cab = redist.extraction_commands(make("Jun2010_d3dx9_43_x86.cab"),
                                              dest)
-            self.assertEqual(cab[0][0], "expand")
+            self.assertEqual(tool_name(cab[0]), "expand")
 
     def test_extraction_falls_back_to_cab_tools(self):
         """Не помог ни один ключ — пакет вскрывается как CAB-контейнер."""
         with tempfile.TemporaryDirectory() as temp:
             archive = str(Path(temp, "vcredist_x86.exe"))
             Path(archive).write_bytes(b"MZ")
-            tools = [command[0] for command
+            tools = [tool_name(command) for command
                      in redist.extraction_commands(archive, str(Path(temp, "o")))]
             self.assertIn("expand", tools)
             self.assertIn("extrac32", tools)
@@ -1605,9 +1616,17 @@ class PackageExtractionTests(unittest.TestCase):
                     f"{package.key}/{arch}: запасной ссылки нет")
 
     def test_system_tools_are_looked_up_by_absolute_path_on_windows(self):
-        # На не-Windows имя остаётся именем: тесты и Linux-сборка не должны
-        # зависеть от наличия System32.
-        self.assertEqual(redist.system_tool("expand"), "expand")
+        tool = redist.system_tool("expand")
+        self.assertEqual(os.path.splitext(os.path.basename(tool))[0].lower(),
+                         "expand")
+        if sys.platform.startswith("win"):
+            # В PATH службы сборки System32 может не быть вовсе.
+            self.assertTrue(os.path.isabs(tool), tool)
+            self.assertTrue(os.path.isfile(tool), tool)
+        else:
+            # На других ОС имя остаётся именем: сборка и тесты не должны
+            # зависеть от наличия System32.
+            self.assertEqual(tool, "expand")
 
     # -- DirectX -------------------------------------------------------------
     def test_directx_bundle_is_never_given_a_switch_it_cannot_parse(self):
