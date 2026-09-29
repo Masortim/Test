@@ -230,7 +230,22 @@ class MainWindow(QMainWindow):
             "Redistributable, DirectX End-User Runtime) и достанет нужные "
             "файлы из него. Требуется интернет; по умолчанию выключено, "
             "чтобы сборка не ходила в сеть без спроса.")
+        self.cb_full_runtimes = QCheckBox(
+            "Полный комплект библиотек (все версии VC++ и DirectX)")
+        self.cb_full_runtimes.setChecked(True)
+        self.cb_full_runtimes.setToolTip(
+            "Заранее приносит в портатив не только то, что программа "
+            "импортирует сама, а весь каталог распространяемых библиотек: "
+            "все версии Visual C++ 2005–2022 (MSVCP100.dll, MSVCR100.dll, "
+            "MSVCP110.dll, MSVCR110.dll, msvcp140.dll…), весь DirectX "
+            "End-User Runtime (XINPUT1_3.dll, d3dx9_24…43.dll, XAudio, "
+            "XACT…), OpenAL, PhysX, VB6-runtime. Это закрывает и библиотеки, "
+            "которые грузятся динамически или подключаются плагинами и "
+            "модами: окно «отсутствует XINPUT1_3.dll» не возникает в "
+            "принципе. Портатив становится заметно больше; снимите галочку, "
+            "чтобы приносить только то, что требует таблица импорта.")
         self.cb_runtimes.toggled.connect(self.cb_fetch_runtimes.setEnabled)
+        self.cb_runtimes.toggled.connect(self.cb_full_runtimes.setEnabled)
         self.cb_assisted = QCheckBox("Разрешить окно мастера установки")
         self.cb_assisted.setToolTip(
             "Нужно старым установщикам InstallShield InstallScript 5/6 "
@@ -248,6 +263,7 @@ class MainWindow(QMainWindow):
         checks.addWidget(self.cb_assisted, 2, 1)
         checks.addWidget(self.cb_runtimes, 3, 0)
         checks.addWidget(self.cb_fetch_runtimes, 3, 1)
+        checks.addWidget(self.cb_full_runtimes, 4, 0, 1, 2)
         checks.setColumnStretch(2, 1)
         lay.addLayout(checks)
 
@@ -436,6 +452,8 @@ class MainWindow(QMainWindow):
             include_shell_integration=self.cb_integration.isChecked(),
             allow_assisted_install=self.cb_assisted.isChecked(),
             bundle_runtimes=self.cb_runtimes.isChecked(),
+            full_runtimes=(self.cb_runtimes.isChecked()
+                           and self.cb_full_runtimes.isChecked()),
             download_runtimes=(self.cb_runtimes.isChecked()
                                and self.cb_fetch_runtimes.isChecked()),
             extra_install_args=args,
@@ -550,6 +568,16 @@ class MainWindow(QMainWindow):
                     f"({len(result.runtime_provided)} шт.): "
                     + ", ".join(sorted(set(result.runtime_provided))[:8])
                     + ("…" if len(set(result.runtime_provided)) > 8 else ""),
+                ]
+            if result.runtime_stock:
+                stock = sorted(set(result.runtime_stock))
+                details += [
+                    "",
+                    f"Полный комплект «про запас»: принесено ещё {len(stock)} "
+                    "библиотек (все версии VC++ и DirectX) — на случай "
+                    "плагинов, модов и динамических загрузок: "
+                    + ", ".join(stock[:6])
+                    + ("…" if len(stock) > 6 else ""),
                 ]
             if result.runtime_missing:
                 details += [

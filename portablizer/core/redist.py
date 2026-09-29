@@ -30,7 +30,17 @@ Runtime и т. п.), которые обычная установка кладё
    ``DirectX``…), затем системные папки этого ПК (с проверкой разрядности),
    затем WinSxS (для VC++ 2005/2008 — с генерацией private-манифеста),
    затем — по желанию — официальная загрузка с сайта Microsoft.
-4. **Честно сообщает об остатке**: то, что принести не удалось, попадает в
+4. **Разворачивает полный комплект «про запас»** (по умолчанию): не только
+   то, что нашлось в таблицах импорта, а **весь каталог известных библиотек**
+   — все версии Visual C++ 2005…2022, весь набор DirectX июня 2010, OpenAL,
+   PhysX, VB6-runtime. Таблица импорта не видит библиотек, которые грузятся
+   динамически по имени, собранному строкой (игры делают так с
+   ``d3dx9_%d.dll``), подключаются плагинами и модами или появляются после
+   докачки компонента установщиком, — полный комплект закрывает и их: окно
+   «отсутствует XINPUT1_3.dll» не возникает в принципе. Ненайденное «про
+   запас» ошибкой **не** считается и предстартовую проверку лончера не
+   тревожит.
+5. **Честно сообщает об остатке**: то, что принести не удалось, попадает в
    ``redistributables.txt`` и в предстартовую проверку лончера — вместо
    системного окна «отсутствует MSVCR110.dll» пользователь видит название
    пакета и ссылку на него.
@@ -89,6 +99,11 @@ class RedistPackage:
     sxs: str = ""
     #: Можно ли положить файлы рядом с программой (app-local deployment).
     app_local: bool = True
+    #: Разрядности, для которых пакет вообще существует. Нужно только полному
+    #: комплекту «про запас»: у VC++ 2012 нет сборки под arm64, а у runtime
+    #: Visual Basic 6 — под x64. Обнаруженные таблицей импорта требования
+    #: обрабатываются и вне этого списка.
+    archs: Tuple[str, ...] = ("x86", "x64")
     note: str = ""
 
     def matches(self, dll: str) -> bool:
@@ -116,7 +131,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
     RedistPackage(
         key="vc2005",
         title="Microsoft Visual C++ 2005 SP1 Redistributable (VC++ 8.0)",
-        pattern=r"(?:msvc[rpm]80|mfcm?80u?|mfc80[a-z]{3}|atl80|vcomp)\.dll",
+        pattern=r"(?:msvc[rpm]80|mfcm?80u?|mfc80[a-z]{3}|atl80|vcomp80)\.dll",
         downloads={},
         page="https://www.microsoft.com/download/details.aspx?id=26347",
         sxs="Microsoft.VC80",
@@ -188,6 +203,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
             "arm64": "https://aka.ms/vc14/vc_redist.arm64.exe",
         },
         page="https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist",
+        archs=("x86", "x64", "arm64"),
         note="Универсальная среда выполнения C (UCRT) входит в Windows 10 и "
              "новее; на Windows 7/8.1 её приносит этот же пакет. " + _VC_LICENSE_NOTE,
     ),
@@ -197,6 +213,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         pattern=r"(?:msvc[rp]7[01]|msvcp60|msvcirt|msvcp50)\.dll",
         downloads={},
         page="",
+        archs=("x86",),
         note="Отдельного установщика от Microsoft не существует: эти файлы "
              "распространяются только рядом с программой. Portablizer берёт "
              "их с этого ПК и кладёт в портатив.",
@@ -207,7 +224,8 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         ascii_title="DirectX End-User Runtime (June 2010)",
         pattern=r"(?:d3dx9_(?:2[4-9]|3\d|4[0-3])|d3dx10_(?:3[3-9]|4[0-3])"
                 r"|d3dx11_4[23]|d3dcsx_4[0-3]|d3dcompiler_(?:3[3-9]|4[0-3])"
-                r"|xinput1_[123]|xaudio2_[0-7]|xactengine[23]_\d"
+                r"|xinput1_[123]|xaudio2_[0-7]"
+                r"|xactengine2_(?:\d|10)|xactengine3_[0-7]"
                 r"|x3daudio1_[0-7]|xapofx1_[0-5]|dxerr|d3dref9"
                 r"|dsetup|dsetup32|dpnaddr|dpnhpast)\.dll",
         downloads={
@@ -255,6 +273,8 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         title="Visual Basic 6 Runtime (msvbvm60.dll)",
         pattern=r"(?:msvbvm[56]0|vb6[a-z]*|comcat|mswinsck)\.dll",
         downloads={},
+        # 64-битного runtime у VB5/VB6 не существует.
+        archs=("x86",),
         page="https://learn.microsoft.com/previous-versions/visualstudio/"
              "visual-basic-6/vb6-support",
         note="Runtime Visual Basic 6 входит в состав Windows, но на "
@@ -266,6 +286,7 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         ascii_title="Games for Windows - LIVE (xlive.dll)",
         pattern=r"(?:xlive|gfwlivesetup)\.dll",
         downloads={},
+        archs=("x86",),
         page="",
         note="Сервис закрыт, официального пакета больше нет. Игры обычно "
              "поставляют xlive.dll рядом с exe.",
@@ -277,6 +298,98 @@ _SXS_SUFFIXES: Tuple[Tuple[str, str], ...] = (
     ("mfcm", "MFC"), ("mfc", "MFC"), ("atl", "ATL"), ("vcomp", "OPENMP"),
     ("msvcm", "CRT"), ("msvcp", "CRT"), ("msvcr", "CRT"),
 )
+
+
+def _dll_range(prefix: str, start: int, end: int) -> Tuple[str, ...]:
+    """``d3dx9_24.dll`` … ``d3dx9_43.dll`` одним кортежем."""
+    return tuple(f"{prefix}_{index}.dll" for index in range(start, end + 1))
+
+
+#: **Полный комплект** библиотек каждого пакета — режим «про запас».
+#:
+#: Ключ ``"*"`` — файлы, существующие для всех разрядностей пакета; отдельный
+#: ключ разрядности добавляет файлы, которые бывают **только** у неё:
+#: ``vcruntime140_1.dll`` не выпускалась для x86, у PhysX 3 имена с суффиксом
+#: ``_x86``/``_x64``, а локализованные MFC (``mfc90esv.dll`` и родня) в
+#: комплект не входят — их приносит только точный путь по таблице импорта.
+#: В комплект не включены и установочные файлы самого пакета (``dsetup``:
+#: их загружает инсталлятор DirectX, а не программа). Каждое имя обязано
+#: опознаваться регулярным выражением своего же пакета — это проверяется
+#: тестами.
+FULL_KIT: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "vc2005": {"*": (
+        "msvcr80.dll", "msvcp80.dll", "msvcm80.dll",
+        "mfc80.dll", "mfc80u.dll", "mfcm80.dll", "mfcm80u.dll",
+        "atl80.dll", "vcomp80.dll",
+    )},
+    "vc2008": {"*": (
+        "msvcr90.dll", "msvcp90.dll", "msvcm90.dll",
+        "mfc90.dll", "mfc90u.dll", "mfcm90.dll", "mfcm90u.dll",
+        "atl90.dll", "vcomp90.dll",
+    )},
+    "vc2010": {"*": (
+        "msvcr100.dll", "msvcp100.dll", "msvcm100.dll",
+        "mfc100.dll", "mfc100u.dll", "mfcm100.dll", "mfcm100u.dll",
+        "atl100.dll", "vcomp100.dll",
+    )},
+    "vc2012": {"*": (
+        "msvcr110.dll", "msvcp110.dll", "msvcm110.dll",
+        "vcomp110.dll", "vccorlib110.dll", "concrt110.dll",
+        "atl110.dll", "mfc110.dll", "mfc110u.dll",
+        "mfcm110.dll", "mfcm110u.dll",
+    )},
+    "vc2013": {"*": (
+        "msvcr120.dll", "msvcp120.dll", "msvcm120.dll",
+        "vcomp120.dll", "vccorlib120.dll", "concrt120.dll",
+        "atl120.dll", "mfc120.dll", "mfc120u.dll",
+        "mfcm120.dll", "mfcm120u.dll",
+    )},
+    "vc14": {
+        "*": (
+            "vcruntime140.dll", "msvcp140.dll", "msvcp140_1.dll",
+            "msvcp140_2.dll", "msvcp140_atomic_wait.dll",
+            "msvcp140_codecvt_ids.dll", "concrt140.dll", "vccorlib140.dll",
+            "vcamp140.dll", "vcomp140.dll",
+            "mfc140.dll", "mfc140u.dll", "mfcm140.dll", "mfcm140u.dll",
+            "ucrtbase.dll",
+        ),
+        # Эти файлы появились в 64-битной части redist 2015–2022.
+        "x64": ("vcruntime140_1.dll", "vcruntime140_2.dll",
+                "vcruntime140_threads.dll"),
+        "arm64": ("vcruntime140_1.dll", "vcruntime140_2.dll",
+                  "vcruntime140_threads.dll"),
+    },
+    "vc_legacy": {"*": (
+        "msvcp60.dll", "msvcr70.dll", "msvcp70.dll",
+        "msvcr71.dll", "msvcp71.dll", "msvcirt.dll",
+    )},
+    "directx_jun2010": {"*": (
+        *_dll_range("d3dx9", 24, 43),
+        *_dll_range("d3dx10", 33, 43),
+        "d3dx11_42.dll", "d3dx11_43.dll",
+        *_dll_range("d3dcsx", 40, 43),
+        *_dll_range("d3dcompiler", 33, 43),
+        "xinput1_1.dll", "xinput1_2.dll", "xinput1_3.dll",
+        *_dll_range("xaudio2", 0, 7),
+        *_dll_range("xactengine2", 0, 10),
+        *_dll_range("xactengine3", 0, 7),
+        *_dll_range("x3daudio1", 0, 7),
+        *_dll_range("xapofx1", 0, 5),
+    )},
+    "d3dcompiler_modern": {"*": ("d3dcompiler_46.dll", "d3dcompiler_47.dll")},
+    "openal": {"*": ("openal32.dll", "wrap_oal.dll", "soft_oal.dll")},
+    "physx": {
+        # PhysX 2.x и Ageia были только 32-битными.
+        "x86": ("physxloader.dll", "physxcore.dll", "physxcooking.dll",
+                "physxdevice.dll", "nxcooking.dll", "nxcharacter.dll",
+                "physx3common_x86.dll", "physx3cooking_x86.dll",
+                "physx3core_x86.dll"),
+        "x64": ("physx3common_x64.dll", "physx3cooking_x64.dll",
+                "physx3core_x64.dll"),
+    },
+    "vb6": {"*": ("msvbvm50.dll", "msvbvm60.dll")},
+    "gfwl": {"*": ("xlive.dll",)},
+}
 
 #: Библиотеки, которые всегда даёт сама Windows.
 SYSTEM_DLLS = frozenset("""
@@ -644,6 +757,10 @@ class RuntimeRequirement:
     status: str = "missing"
     source: str = ""
     targets: List[str] = field(default_factory=list)
+    #: True — библиотека принесена «про запас» полным комплектом, а не потому,
+    #: что её требует таблица импорта. Такое требование не может быть
+    #: «обязательным»: его неудача — не ошибка, а пустое место в запасе.
+    proactive: bool = False
 
     @property
     def title(self) -> str:
@@ -666,6 +783,8 @@ class RuntimeScan:
     app_dir: str = ""
     requirements: List[RuntimeRequirement] = field(default_factory=list)
     arch: str = ""
+    #: Все разрядности, встретившиеся среди exe/dll (для полного комплекта).
+    archs: List[str] = field(default_factory=list)
     dotnet: bool = False
     scanned: int = 0
     parsed: int = 0
@@ -754,6 +873,11 @@ def scan_app_runtime(app_dir: str, max_files: int = MAX_SCANNED_FILES
 
     if machines:
         scan.arch = max(machines.items(), key=lambda item: item[1])[0]
+        # Порядок: от главной разрядности к второстепенной — так полный
+        # комплект разворачивается в том же порядке, в каком программа
+        # грузит свои бинарники.
+        scan.archs = [arch for arch, _count in
+                      sorted(machines.items(), key=lambda item: -item[1])]
 
     for requirement in collected.values():
         local = _pick_local_copy(present.get(requirement.dll, []),
@@ -772,6 +896,38 @@ def scan_app_runtime(app_dir: str, max_files: int = MAX_SCANNED_FILES
         collected.values(),
         key=lambda r: (r.status != "missing", r.dll, r.arch))
     return scan
+
+
+def full_kit_requirements(archs: Sequence[str],
+                          anchors: Sequence[str] = (),
+                          ) -> List[RuntimeRequirement]:
+    """**Полный комплект** всех известных библиотек — «про запас».
+
+    Таблица импорта отвечает на вопрос «что программа требует точно», но не
+    видит библиотек, которые грузятся динамически по имени, собранному
+    строкой (игры собирают ``d3dx9_%d.dll``), подключаются плагинами и
+    модами или оказываются нужны после того, как установщик докачал
+    компонент. Полный комплект приносит всё, что вообще умеет приносить
+    Portablizer, — в этом случае окно «отсутствует XINPUT1_3.dll» не
+    возникает в принципе.
+
+    ``anchors`` — app-относительные пути главных exe: рядом с ними комплект
+    и раскладывается. Требования помечаются ``proactive=True``, поэтому
+    неудача их доставки ошибкой не считается.
+    """
+    out: List[RuntimeRequirement] = []
+    for package in REDIST_PACKAGES:
+        members = FULL_KIT.get(package.key)
+        if not members:
+            continue
+        for arch in archs:
+            if arch not in package.archs:
+                continue
+            for dll in members.get("*", ()) + members.get(arch, ()):
+                out.append(RuntimeRequirement(
+                    dll=dll, arch=arch, package=package, proactive=True,
+                    importers=[str(a).replace("\\", "/") for a in anchors]))
+    return out
 
 
 # =============================================================================
@@ -793,13 +949,21 @@ class ProvisionReport:
     #: Скачанные установщики пакетов, оставленные в Redist/.
     packages: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    #: Полный комплект включён: часть требований взята из каталога всех
+    #: известных пакетов, а не из таблиц импорта программы.
+    full_kit: bool = False
+    #: Принесено «про запас» полным комплектом (не обязательно программе).
+    stock: List[RuntimeRequirement] = field(default_factory=list)
+    #: Полный комплект: найти не удалось (программе, скорее всего, не нужно).
+    stock_missing: List[RuntimeRequirement] = field(default_factory=list)
     #: Сколько библиотек программа принесла с собой (её собственные файлы).
     own_files: int = 0
 
     @property
     def touched(self) -> bool:
         return bool(self.provided or self.missing or self.bundled
-                    or self.unknown or self.packages)
+                    or self.unknown or self.packages or self.stock
+                    or self.stock_missing)
 
 
 def system_dirs_for(arch: str) -> List[str]:
@@ -1186,6 +1350,12 @@ class RuntimeProvisioner:
             self._extracted[key] = destination
             self._add_to_index(destination)
         candidate = _find_file(destination, requirement.dll)
+        if not candidate:
+            # Пакет уже распакован ради другой библиотеки, а кабинеты под
+            # эту ещё не развёрнуты (например, второй d3dx9_* из того же
+            # directx_Jun2010_redist.exe) — доворачиваем только их.
+            self._expand_payloads(destination, requirement.dll)
+            candidate = _find_file(destination, requirement.dll)
         if candidate and self._arch_matches(candidate, requirement.arch):
             return candidate, "пакет из комплекта установщика"
         return "", ""
@@ -1233,6 +1403,11 @@ class RuntimeProvisioner:
         if not destination:
             return "", ""
         candidate = _find_file(destination, requirement.dll)
+        if not candidate:
+            # Скачанный пакет распакован ради другой библиотеки: кабинеты
+            # под эту (и .msi с ней) ещё не развёрнуты.
+            self._expand_payloads(destination, requirement.dll)
+            candidate = _find_file(destination, requirement.dll)
         if candidate and self._arch_matches(candidate, requirement.arch):
             return candidate, "официальный пакет Microsoft"
         return "", ""
@@ -1323,13 +1498,53 @@ class RuntimeProvisioner:
                 self.log.warn(f"Не удалось создать {assembly}.manifest: {exc}")
 
     # -- основной проход ------------------------------------------------------
+    def _stock_requirements(self, scan: RuntimeScan,
+                            anchors: Sequence[str],
+                            ) -> List[RuntimeRequirement]:
+        """Библиотеки полного комплекта, которых нет среди обнаруженных.
+
+        Обнаруженное таблицей импорта всегда точнее: у него известны
+        импортёры и разрядность, поэтому дубликаты из комплекта убираются.
+        """
+        archs = list(scan.archs) or ([scan.arch] if scan.arch else ["x86"])
+        known = {(item.dll, item.arch) for item in scan.requirements}
+        any_arch = {item.dll for item in scan.requirements if not item.arch}
+        out: List[RuntimeRequirement] = []
+        for requirement in full_kit_requirements(archs, anchors):
+            key = (requirement.dll, requirement.arch)
+            if key in known or requirement.dll in any_arch:
+                continue
+            known.add(key)
+            out.append(requirement)
+        return out
+
     def provision(self, scan: RuntimeScan, app_dir: str, portable_dir: str,
-                  app_name: str = "") -> ProvisionReport:
+                  app_name: str = "", *, full_kit: bool = False,
+                  anchors: Sequence[str] = (),
+                  ) -> ProvisionReport:
+        """Доставляет библиотеки в портатив.
+
+        ``full_kit=True`` добавляет к обнаруженным требованиям полный комплект
+        всех известных библиотек «про запас»: они ложатся рядом с главными exe
+        (``anchors`` — их app-относительные пути), а неудача их доставки
+        ошибкой не считается — программа их, скорее всего, вовсе не просит.
+        """
         report = ProvisionReport(app_name=app_name, arch=scan.arch,
-                                 dotnet=scan.dotnet)
+                                 dotnet=scan.dotnet, full_kit=full_kit)
         work_dir = os.path.join(portable_dir, "_redist_cache")
 
-        for requirement in scan.requirements:
+        requirements = list(scan.requirements)
+        if full_kit:
+            requirements += self._stock_requirements(scan, anchors)
+
+        for requirement in requirements:
+            if requirement.proactive:
+                # Рядом с целевыми exe библиотека уже лежит (принёс
+                # установщик или предыдущая сборка) — запас не нужен.
+                if any(os.path.isfile(os.path.join(
+                        directory, requirement.dll))
+                        for directory in self._target_dirs(requirement, app_dir)):
+                    continue
             if requirement.status == "bundled":
                 # Собственные dll программы в отчёте не нужны: они лежат
                 # рядом с exe и переезжают вместе с папкой.
@@ -1358,20 +1573,23 @@ class RuntimeProvisioner:
                                                    work_dir)
             if not path:
                 requirement.status = "missing"
-                report.missing.append(requirement)
+                (report.stock_missing if requirement.proactive
+                 else report.missing).append(requirement)
                 continue
 
             copied = self._deploy(requirement, path, app_dir)
             if not copied:
                 requirement.status = "missing"
-                report.missing.append(requirement)
+                (report.stock_missing if requirement.proactive
+                 else report.missing).append(requirement)
                 continue
             if source == "WinSxS":
                 self._write_sxs_manifest(requirement, path, app_dir)
             requirement.status = "provided"
             requirement.source = source
             requirement.targets = copied
-            report.provided.append(requirement)
+            (report.stock if requirement.proactive
+             else report.provided).append(requirement)
 
         self._provide_ucrt_base(report, app_dir, portable_dir, work_dir)
 
@@ -1418,17 +1636,17 @@ class RuntimeProvisioner:
         без обновления UCRT — нет, и программа падает уже после того, как
         заглушки успешно загрузились.
         """
-        stubs = [item for item in report.provided
+        stubs = [item for item in report.provided + report.stock
                  if item.dll.startswith("api-ms-win-crt-")]
         if not stubs:
             return
         if any(item.dll == "ucrtbase.dll"
-               for item in report.provided + report.bundled):
+               for item in report.provided + report.bundled + report.stock):
             return
         sample = stubs[0]
         companion = RuntimeRequirement(
             dll="ucrtbase.dll", arch=sample.arch, package=find_package("ucrtbase.dll"),
-            importers=list(sample.importers))
+            importers=list(sample.importers), proactive=sample.proactive)
         path, source = self._from_sources(companion)
         if not path:
             path, source = self._from_system(companion)
@@ -1441,7 +1659,8 @@ class RuntimeProvisioner:
             companion.status = "provided"
             companion.source = source
             companion.targets = copied
-            report.provided.append(companion)
+            (report.stock if companion.proactive
+             else report.provided).append(companion)
 
 
 def _has_files(directory: str) -> bool:
@@ -1509,7 +1728,8 @@ def launcher_requirements(report: ProvisionReport, limit: int = 24
 
 
 def _format_group(title: str, items: Sequence[RuntimeRequirement],
-                  show_source: bool = False) -> List[str]:
+                  show_source: bool = False,
+                  show_importers: bool = True) -> List[str]:
     if not items:
         return []
     lines = [title, "-" * len(title)]
@@ -1522,7 +1742,7 @@ def _format_group(title: str, items: Sequence[RuntimeRequirement],
             arch = f" [{item.arch}]" if item.arch else ""
             suffix = f" — {item.source}" if show_source and item.source else ""
             lines.append(f"    • {item.dll}{arch}{suffix}")
-            if item.importers:
+            if item.importers and show_importers:
                 importers = ", ".join(item.importers[:3])
                 lines.append(f"        нужна файлам: {importers}")
         url = group[0].url
@@ -1550,16 +1770,47 @@ def render_report(report: ProvisionReport) -> str:
         lines.append(f"Разрядность программы: {report.arch}")
         lines.append("")
 
+    if report.full_kit and (report.stock or report.stock_missing):
+        lines += [
+            "Включён полный комплект: рядом с программой оказались все "
+            "известные",
+            "версии распространяемых библиотек, а не только найденные в "
+            "таблицах",
+            "импорта. Это страхует плагины, моды и библиотеки, которые "
+            "грузятся",
+            "динамически (LoadLibrary по имени, собранному строкой), — окно",
+            "«отсутствует dll» в этом случае не возникает в принципе.",
+            "",
+        ]
+
     lines += _format_group(
         "Принесено в портатив (на целевом ПК ставить ничего не нужно)",
         report.provided, show_source=True)
+    lines += _format_group(
+        "Принесено про запас — полный комплект всех redistributables",
+        report.stock, show_source=True, show_importers=False)
     lines += _format_group(
         "Входит в состав программы (принёс сам установщик)", report.bundled)
     lines += _format_group(
         "ТРЕБУЕТСЯ НА ЦЕЛЕВОМ ПК — файлы найти не удалось", report.missing)
     lines += _format_group(
+        "Полный комплект: найти не удалось (программе, скорее всего, "
+        "не нужно)",
+        report.stock_missing, show_importers=False)
+    lines += _format_group(
         "Не опознано (проверьте вручную, если программа не запускается)",
         report.unknown)
+
+    if report.stock_missing:
+        lines += [
+            "  Это НЕ обязательные файлы: полный комплект пытается принести "
+            "всё",
+            "  подряд, а нашлись только те, что есть на компьютере сборки. "
+            "Если",
+            "  программа всё-таки попросит один из них, включите «Скачивать",
+            "  недостающие пакеты» и пересоберите портатив.",
+            "",
+        ]
 
     if report.packages:
         lines.append(f"Установщики пакетов в папке {REDIST_DIR_NAME}")

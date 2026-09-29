@@ -557,6 +557,226 @@ class RuntimeProvisionTests(unittest.TestCase):
             self.assertTrue(any(".NET" in note for note in report.notes))
 
 
+class FullKitCatalogTests(unittest.TestCase):
+    """Каталог полного комплекта: все варианты должны быть предусмотрены."""
+
+    def test_every_library_from_the_user_report_is_in_the_kit(self):
+        members = {r.dll for r in redist.full_kit_requirements(("x86", "x64"))}
+        for name in USER_REPORTED:
+            with self.subTest(dll=name):
+                self.assertIn(redist.normalize_dll(name), members)
+
+    def test_kit_names_are_recognised_by_their_own_packages(self):
+        # Имя из комплекта обязано опознаваться каталогом: иначе классификация
+        # и отчёт разойдутся с тем, что реально приносит провижинер.
+        for requirement in redist.full_kit_requirements(("x86", "x64", "arm64")):
+            with self.subTest(dll=requirement.dll, arch=requirement.arch):
+                self.assertIs(requirement.package,
+                              redist.find_package(requirement.dll))
+                self.assertTrue(requirement.package.matches(requirement.dll))
+
+    def test_kit_follows_package_architectures(self):
+        arm64 = {(r.dll, r.arch) for r in redist.full_kit_requirements(("arm64",))}
+        self.assertIn(("vcruntime140.dll", "arm64"), arm64)
+        self.assertIn(("vcruntime140_1.dll", "arm64"), arm64)
+        # Под arm64 этих пакетов не существует — синтезировать их бесполезно.
+        self.assertNotIn(("msvcr110.dll", "arm64"), arm64)
+        self.assertNotIn(("xinput1_3.dll", "arm64"), arm64)
+
+        x86 = {(r.dll, r.arch) for r in redist.full_kit_requirements(("x86",))}
+        self.assertIn(("msvcr110.dll", "x86"), x86)
+        self.assertIn(("xinput1_3.dll", "x86"), x86)
+        self.assertIn(("msvbvm60.dll", "x86"), x86)
+        self.assertIn(("physx3core_x86.dll", "x86"), x86)
+        # vcruntime140_1.dll для x86 не выпускалась, как и 64-битный VB6.
+        self.assertNotIn(("vcruntime140_1.dll", "x86"), x86)
+        x64 = {(r.dll, r.arch) for r in redist.full_kit_requirements(("x64",))}
+        self.assertIn(("physx3core_x64.dll", "x64"), x64)
+        self.assertNotIn(("msvbvm60.dll", "x64"), x64)
+        self.assertNotIn(("physx3core_x86.dll", "x64"), x64)
+
+    def test_kit_spans_the_whole_directx_family(self):
+        x86 = {r.dll for r in redist.full_kit_requirements(("x86",))
+               if r.package.key == "directx_jun2010"}
+        for index in range(24, 44):
+            self.assertIn(f"d3dx9_{index}.dll", x86)
+        for name in ("d3dx10_33.dll", "d3dx10_43.dll", "d3dx11_43.dll",
+                     "d3dcompiler_33.dll", "d3dcompiler_43.dll",
+                     "xinput1_1.dll", "xinput1_2.dll", "xinput1_3.dll",
+                     "xaudio2_0.dll", "xaudio2_7.dll",
+                     "xactengine2_10.dll", "xactengine3_7.dll",
+                     "x3daudio1_7.dll", "xapofx1_5.dll", "d3dcsx_43.dll"):
+            self.assertIn(name, x86)
+
+    def test_kit_requirements_are_proactive_and_anchor_aware(self):
+        requirements = redist.full_kit_requirements(("x86",), ("bin/game.exe",))
+        self.assertTrue(requirements)
+        self.assertTrue(all(r.proactive for r in requirements))
+        self.assertTrue(all(r.importers == ["bin/game.exe"] for r in requirements))
+        # С полным набором архитектур комплект только растёт.
+        both = redist.full_kit_requirements(("x86", "x64"))
+        self.assertGreater(len(both), len(requirements))
+
+
+class FullKitProvisionTests(unittest.TestCase):
+    """Полный комплект «про запас»: все версии — заранее, ошибки — никогда."""
+
+    def setUp(self):
+        self.log = Logger()
+
+    def _portable(self, temp):
+        portable = Path(temp, "Game_Portable")
+        app = portable / "App"
+        app.mkdir(parents=True)
+        return portable, app
+
+    def test_kit_lands_next_to_the_main_exe_and_covers_dynamic_loads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            # Программа импортирует только kernel32 — но игра может собрать
+            # имя «d3dx9_%d.dll» строкой и грузить его LoadLibrary'ем:
+            # таблица импорта этого не видит в принципе.
+            write_pe(app / "bin" / "Game.exe", imports=("KERNEL32.dll",))
+            system = Path(temp, "FakeSystem")
+            system.mkdir()
+            found = ("msvcp110.dll", "msvcr110.dll", "msvcr100.dll",
+                     "xinput1_3.dll", "d3dx9_38.dll", "d3dx9_40.dll",
+                     "openal32.dll", "msvbvm60.dll", "vcruntime140.dll")
+            for name in found:
+                write_runtime_dll(system / name)
+
+            scan = redist.scan_app_runtime(str(app))
+            report = redist.RuntimeProvisioner(
+                self.log, system_dirs=[str(system)], sxs_dir="",
+            ).provision(scan, str(app), str(portable), "Game",
+                        full_kit=True, anchors=["bin/Game.exe"])
+
+            # Программа ничего не требовала — обязательных списков нет.
+            self.assertEqual(report.missing, [])
+            self.assertEqual(report.provided, [])
+            stock = {r.dll for r in report.stock}
+            for name in found:
+                self.assertIn(name, stock)
+                self.assertTrue((app / "bin" / name).is_file(), name)
+            # Ненайденное «про запас» — не ошибка и не повод для лончера.
+            self.assertTrue(report.stock_missing)
+            self.assertIn("d3dx11_43.dll",
+                          {r.dll for r in report.stock_missing})
+            self.assertEqual(redist.launcher_requirements(report), [])
+            text = redist.render_report(report)
+            self.assertIn("про запас", text)
+            self.assertIn("d3dx9_40.dll", text)
+
+    def test_shortage_of_the_kit_is_advisory_and_never_blocks_the_launcher(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("KERNEL32.dll",))
+            scan = redist.scan_app_runtime(str(app))
+            report = redist.RuntimeProvisioner(
+                self.log, system_dirs=[], sxs_dir="",
+            ).provision(scan, str(app), str(portable), "Game", full_kit=True)
+
+            self.assertEqual(report.missing, [])
+            self.assertEqual(report.provided, [])
+            self.assertEqual(report.stock, [])
+            self.assertTrue(report.stock_missing)
+            for name in USER_REPORTED:
+                self.assertIn(redist.normalize_dll(name),
+                              {r.dll for r in report.stock_missing})
+            self.assertEqual(redist.launcher_requirements(report), [])
+
+    def test_detected_requirement_wins_over_the_kit_copy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("MSVCP110.dll",))
+            system = Path(temp, "FakeSystem")
+            system.mkdir()
+            write_runtime_dll(system / "msvcp110.dll")
+
+            scan = redist.scan_app_runtime(str(app))
+            report = redist.RuntimeProvisioner(
+                self.log, system_dirs=[str(system)], sxs_dir="",
+            ).provision(scan, str(app), str(portable), "Game", full_kit=True)
+
+            # Обнаруженная таблицей импорта библиотека — обязательная, у неё
+            # известны импортёры; дубликата «про запас» быть не должно.
+            self.assertEqual([r.dll for r in report.provided], ["msvcp110.dll"])
+            self.assertFalse(report.provided[0].proactive)
+            self.assertEqual(report.provided[0].importers, ["game.exe"])
+            self.assertNotIn("msvcp110.dll", {r.dll for r in report.stock})
+
+    def test_kit_is_not_duplicated_when_already_next_to_the_exe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("KERNEL32.dll",))
+            # Установщик сам положил пару библиотек рядом с exe.
+            for name in ("msvcr100.dll", "xinput1_3.dll"):
+                write_runtime_dll(app / name)
+            system = Path(temp, "FakeSystem")
+            system.mkdir()
+            write_runtime_dll(system / "msvcr100.dll")
+
+            scan = redist.scan_app_runtime(str(app))
+            report = redist.RuntimeProvisioner(
+                self.log, system_dirs=[str(system)], sxs_dir="",
+            ).provision(scan, str(app), str(portable), "Game", full_kit=True)
+
+            self.assertNotIn("msvcr100.dll", {r.dll for r in report.stock})
+            self.assertNotIn("xinput1_3.dll", {r.dll for r in report.stock})
+            self.assertNotIn("msvcr100.dll",
+                             {r.dll for r in report.stock_missing})
+
+    def test_second_dll_from_the_same_extracted_package_is_delivered(self):
+        """Из одного пакета достаются обе библиотеки.
+
+        Регрессия: пакет ``directx_Jun2010_redist.exe`` распаковывался ради
+        первой ``d3dx9_38.dll``, а кабинет второй (``d3dx9_39``) оставался
+        свёрнутым — и библиотека попадала в «отсутствующие», хотя пакет
+        лежал рядом. То же касается полного комплекта: из одного пакета
+        теперь достаются десятки файлов.
+        """
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            if args[0].lower().endswith("directx_jun2010_redist.exe"):
+                target = args[-1].split(":", 1)[1]
+                os.makedirs(target, exist_ok=True)
+                for cab in ("Jun2010_d3dx9_38_x86.cab",
+                            "Jun2010_d3dx9_39_x86.cab"):
+                    Path(target, cab).write_bytes(b"MSCF fake cabinet")
+                return 0
+            if args[0] == "expand":
+                cab = Path(args[-2])
+                name = cab.name.lower().replace("jun2010_", "") \
+                                         .replace("_x86.cab", ".dll")
+                write_runtime_dll(Path(args[-1], name))
+                return 0
+            return 1
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe",
+                     imports=("d3dx9_38.dll", "d3dx9_39.dll"))
+            shipped = Path(temp, "_CommonRedist", "DirectX")
+            shipped.mkdir(parents=True)
+            (shipped / "directx_Jun2010_redist.exe").write_bytes(b"MZ self-x")
+
+            scan = redist.scan_app_runtime(str(app))
+            with mock.patch.object(redist, "IS_WINDOWS", True):
+                report = redist.RuntimeProvisioner(
+                    self.log, source_dirs=[str(shipped)], system_dirs=[],
+                    sxs_dir="", runner=runner,
+                ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertEqual({r.dll for r in report.provided},
+                             {"d3dx9_38.dll", "d3dx9_39.dll"})
+            self.assertTrue((app / "d3dx9_38.dll").is_file())
+            self.assertTrue((app / "d3dx9_39.dll").is_file())
+            expanded = [c[-2] for c in calls if c[0] == "expand"]
+            self.assertEqual(len(expanded), 2, expanded)
+
+
 class RuntimeLauncherTests(unittest.TestCase):
     """Предстартовая проверка в Launch.bat и в LaunchPortable.exe."""
 
@@ -753,6 +973,55 @@ class PortablizerRuntimeIntegrationTests(unittest.TestCase):
                 (portable / "launcher_config.json").read_text(encoding="utf-8"))
             self.assertEqual(config["runtime_requirements"], [])
 
+    def test_full_kit_is_on_by_default_and_brings_the_whole_family(self):
+        with tempfile.TemporaryDirectory() as temp:
+            # Рядом с установщиком лежит DirectX-пакет репака. Сама программа
+            # просит только XINPUT1_3.dll, но полный комплект приносит всё,
+            # что нашлось, — в том числе «ненужные» d3dx9_*.
+            shipped = Path(temp, "_CommonRedist", "DirectX")
+            shipped.mkdir(parents=True)
+            for name in ("xinput1_3.dll", "d3dx9_39.dll", "d3dx9_38.dll"):
+                write_runtime_dll(shipped / name)
+
+            result, portable = self._build(temp)
+
+            self.assertTrue(result.success)
+            # Обязательное: программа сама просит (delay-load XInput).
+            self.assertIn("xinput1_3.dll", result.runtime_provided)
+            self.assertTrue((portable / "App" / "xinput1_3.dll").is_file())
+            # «Про запас»: в таблицах импорта этих библиотек не было.
+            self.assertIn("d3dx9_39.dll", result.runtime_stock)
+            self.assertIn("d3dx9_38.dll", result.runtime_stock)
+            self.assertTrue((portable / "App" / "d3dx9_39.dll").is_file())
+            self.assertTrue((portable / "App" / "d3dx9_38.dll").is_file())
+            # Недостающее осталось только обязательным: msvcp110 программа
+            # импортирует, msvcr100 — тоже, их и ждёт целевой ПК.
+            self.assertEqual(sorted(set(result.runtime_missing)),
+                             ["msvcp110.dll", "msvcr100.dll"])
+            config = json.loads(
+                (portable / "launcher_config.json").read_text(encoding="utf-8"))
+            # Предстартовая проверка лончера — только про обязательное.
+            self.assertEqual(
+                sorted(item["dll"] for item in config["runtime_requirements"]),
+                ["msvcp110.dll", "msvcr100.dll"])
+            report = (portable / redist.REPORT_NAME).read_text(
+                encoding="utf-8-sig")
+            self.assertIn("про запас", report)
+            self.assertIn("d3dx9_38.dll", report)
+
+    def test_full_kit_can_be_switched_off_for_a_lean_portable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            shipped = Path(temp, "_CommonRedist", "DirectX")
+            shipped.mkdir(parents=True)
+            write_runtime_dll(shipped / "d3dx9_39.dll")
+
+            result, portable = self._build(temp, full_runtimes=False)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.runtime_stock, [])
+            # Точный режим: программу d3dx9_39 не интересует — файла нет.
+            self.assertFalse((portable / "App" / "d3dx9_39.dll").exists())
+
     def test_stale_report_is_removed_on_rebuild(self):
         with tempfile.TemporaryDirectory() as temp:
             _result, portable = self._build(temp)
@@ -794,27 +1063,36 @@ class GuiWiringTests(unittest.TestCase):
         # Скачивание — только по явному согласию пользователя.
         self.assertNotIn("self.cb_fetch_runtimes.setChecked(True)",
                          self.source)
+        # Полный комплект — включён сразу: ошибки «отсутствует XINPUT1_3.dll»
+        # должны быть закрыты заранее, а не после жалобы.
+        self.assertIn("self.cb_full_runtimes = QCheckBox(", self.source)
+        self.assertIn("self.cb_full_runtimes.setChecked(True)", self.source)
 
     def test_options_are_passed_to_the_builder(self):
         self.assertIn("bundle_runtimes=self.cb_runtimes.isChecked()",
                       self.source)
         self.assertIn("download_runtimes=", self.source)
         self.assertIn("self.cb_fetch_runtimes.isChecked()", self.source)
+        self.assertIn("full_runtimes=", self.source)
+        self.assertIn("self.cb_full_runtimes.isChecked()", self.source)
         for name in ("PortableOptions", "bundle_runtimes",
-                     "download_runtimes"):
+                     "download_runtimes", "full_runtimes"):
             self.assertIn(name, self.source)
 
     def test_options_exist_in_the_builder_dataclass(self):
         names = PortableOptions.__dataclass_fields__
         self.assertIn("bundle_runtimes", names)
         self.assertIn("download_runtimes", names)
+        self.assertIn("full_runtimes", names)
         defaults = PortableOptions(installer_path="x", output_dir="y")
         self.assertTrue(defaults.bundle_runtimes)
+        self.assertTrue(defaults.full_runtimes)
         self.assertFalse(defaults.download_runtimes)
 
     def test_result_of_the_build_is_shown_to_the_user(self):
         for name in ("result.runtime_provided", "result.runtime_missing",
-                     "result.runtime_packages", "result.runtime_report_rel"):
+                     "result.runtime_packages", "result.runtime_report_rel",
+                     "result.runtime_stock"):
             self.assertIn(name, self.source)
 
 
