@@ -244,6 +244,21 @@ class MainWindow(QMainWindow):
             "модами: окно «отсутствует XINPUT1_3.dll» не возникает в "
             "принципе. Портатив становится заметно больше; снимите галочку, "
             "чтобы приносить только то, что требует таблица импорта.")
+        self.cb_silent_redist = QCheckBox(
+            "Ставить redistributables молча (без окон с «OK»)")
+        self.cb_silent_redist.setChecked(True)
+        self.cb_silent_redist.setToolTip(
+            "Установщики игр и программ сами запускают свои предусловия — "
+            "vcredist, DXSETUP, OpenAL, PhysX, .NET — и каждое показывает "
+            "окно, которое приходится закрывать кнопкой «OK» (так ведёт "
+            "себя, например, первый «Ведьмак»). Portablizer ставит эти "
+            "пакеты заранее и в тихом режиме: мастер основной установки "
+            "проходит их молча. Тем же способом добираются библиотеки, "
+            "которых нет ни в комплекте, ни на этом ПК, а недостающие "
+            "установщики кладутся в папку Redist портатива — на целевом ПК "
+            "лончер поставит их так же молча, за один запрос UAC. "
+            "Запускаются только опознанные распространяемые пакеты.")
+        self.cb_runtimes.toggled.connect(self.cb_silent_redist.setEnabled)
         self.cb_runtimes.toggled.connect(self.cb_fetch_runtimes.setEnabled)
         self.cb_runtimes.toggled.connect(self.cb_full_runtimes.setEnabled)
         self.cb_assisted = QCheckBox("Разрешить окно мастера установки")
@@ -264,6 +279,7 @@ class MainWindow(QMainWindow):
         checks.addWidget(self.cb_runtimes, 3, 0)
         checks.addWidget(self.cb_fetch_runtimes, 3, 1)
         checks.addWidget(self.cb_full_runtimes, 4, 0, 1, 2)
+        checks.addWidget(self.cb_silent_redist, 5, 0, 1, 2)
         checks.setColumnStretch(2, 1)
         lay.addLayout(checks)
 
@@ -456,6 +472,8 @@ class MainWindow(QMainWindow):
                            and self.cb_full_runtimes.isChecked()),
             download_runtimes=(self.cb_runtimes.isChecked()
                                and self.cb_fetch_runtimes.isChecked()),
+            silent_runtime_install=(self.cb_runtimes.isChecked()
+                                    and self.cb_silent_redist.isChecked()),
             extra_install_args=args,
             extra_env=self._parse_env(),
         )

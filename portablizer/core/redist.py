@@ -948,6 +948,11 @@ class ProvisionReport:
     unknown: List[RuntimeRequirement] = field(default_factory=list)
     #: Скачанные установщики пакетов, оставленные в Redist/.
     packages: List[str] = field(default_factory=list)
+    #: Пакеты, установленные в систему этого ПК в тихом режиме по ходу сборки.
+    installed: List["SilentInstall"] = field(default_factory=list)
+    #: Установщики, положенные в ``Redist`` портатива: если библиотеки всё же
+    #: не хватит на целевом ПК, лончер поставит их оттуда — тоже молча.
+    installers: List[Dict[str, str]] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     #: Полный комплект включён: часть требований взята из каталога всех
     #: известных пакетов, а не из таблиц импорта программы.
@@ -1089,6 +1094,443 @@ def _run_quiet(args: Sequence[str], timeout: int = 600) -> int:
         return 1
 
 
+# =============================================================================
+#  4b. Тихая установка распространяемых пакетов
+# =============================================================================
+#
+# Установщики игр и программ почти всегда тянут за собой предусловия:
+# ``vcredist_x86.exe``, ``DXSETUP.exe``, ``oalinst.exe``, PhysX, .NET. Когда
+# очередь установки доходит до них, каждый показывает своё окно и ждёт «OK» —
+# именно это и происходит с первым «Ведьмаком». Портативная сборка обязана
+# идти без участия человека, поэтому Portablizer запускает такие пакеты сам
+# и только в тихом режиме.
+#
+# Два правила, из которых сделан этот раздел:
+#
+# 1. **Запускаем только то, что опознали.** Список ``REDIST_INSTALLERS`` —
+#    белый список имён файлов. Произвольный exe из папки установщика никто
+#    молча не запустит: это чужой код с правами администратора.
+# 2. **Ключи тихого режима подбираются лестницей.** Единственно верного
+#    ключа не существует: WiX Burn понимает ``/install /quiet /norestart``,
+#    IExpress-обёртки VC++ 2005–2010 — ``/q``, DXSETUP — ``/silent``,
+#    Inno Setup — ``/VERYSILENT``, NSIS — ``/S``. Движок определяется по
+#    имени и по сигнатурам внутри файла, а если он неизвестен — варианты
+#    перебираются от самого частого к самому редкому, и каждый запуск
+#    ограничен таймаутом: зависшее окно не остановит сборку.
+
+#: Сколько ждать один пакет: DirectX на HDD ставится неторопливо.
+SILENT_INSTALL_TIMEOUT = 900
+
+#: Успех: 0 — поставлено, 1638/5100/0x80070666 — уже стоит (в т. ч. более
+#: новая версия), 3010/1641 — поставлено, но просит перезагрузку.
+SILENT_OK_CODES = frozenset({0})
+SILENT_ALREADY_CODES = frozenset({1638, 5100, 0x80070666, 0x8007064F})
+SILENT_REBOOT_CODES = frozenset({3010, 1641, 0x80240020})
+
+
+@dataclass(frozen=True)
+class RedistInstallerRule:
+    """Опознанный установщик пакета и его ключи тихого режима."""
+
+    pattern: str
+    kind: str
+    title: str
+    package_key: str = ""
+
+    def matches(self, filename: str) -> bool:
+        return re.fullmatch(self.pattern, filename.lower()) is not None
+
+
+#: Белый список установщиков предусловий. Порядок важен: более конкретные
+#: правила стоят раньше общих.
+REDIST_INSTALLERS: Tuple[RedistInstallerRule, ...] = (
+    RedistInstallerRule(r"vc_redist\.(?:x86|x64|arm64)\.exe", "burn",
+                        "Visual C++ 2015-2022 Redistributable", "vc14"),
+    RedistInstallerRule(r"vcredist_(?:x86|x64|ia64)\.exe", "vcredist_legacy",
+                        "Visual C++ Redistributable"),
+    RedistInstallerRule(r"vcredist(?:2005|2008|2010|2012|2013|2015|2017|2019|2022)"
+                        r"[_ ]?(?:x86|x64)?\.exe", "vcredist_legacy",
+                        "Visual C++ Redistributable"),
+    RedistInstallerRule(r"vcredist\.msi|vc_red\.msi", "msi",
+                        "Visual C++ Redistributable"),
+    RedistInstallerRule(r"dxsetup\.exe", "dxsetup",
+                        "DirectX End-User Runtime", "directx_jun2010"),
+    RedistInstallerRule(r"directx_(?:jun|feb|apr|aug|mar|oct|nov|dec)?\d*"
+                        r"_?redist\.exe", "directx_bundle",
+                        "DirectX End-User Runtime (redist)", "directx_jun2010"),
+    RedistInstallerRule(r"dxwebsetup\.exe", "iexpress",
+                        "DirectX Web Setup", "directx_jun2010"),
+    RedistInstallerRule(r"oalinst\.exe|openal.*\.exe", "nsis",
+                        "OpenAL runtime", "openal"),
+    RedistInstallerRule(r"(?:nvidia_)?physx.*\.msi", "msi",
+                        "NVIDIA PhysX System Software", "physx"),
+    RedistInstallerRule(r"(?:nvidia_)?physx.*\.exe", "installshield",
+                        "NVIDIA PhysX System Software", "physx"),
+    RedistInstallerRule(r"(?:dotnetfx.*|ndp\d.*|netfx.*|dotnet-runtime-.*)\.exe",
+                        "dotnet", ".NET Framework / .NET Runtime"),
+    RedistInstallerRule(r"xnafx\d*_redist\.msi|xna.*redist.*\.msi", "msi",
+                        "Microsoft XNA Framework Redistributable"),
+    RedistInstallerRule(r"xliveredist\.msi|gfwlivesetup\.exe", "msi_or_exe",
+                        "Games for Windows - LIVE", "gfwl"),
+    RedistInstallerRule(r"wmfdist\d*\.exe|windowsmedia.*\.exe", "iexpress",
+                        "Windows Media Format Runtime"),
+    RedistInstallerRule(r"msxml\d*\.msi", "msi", "MSXML Parser"),
+    RedistInstallerRule(r"windows\d[^\\/]*\.msu|kb\d{6,}[^\\/]*\.msu", "msu",
+                        "Обновление Windows (MSU)"),
+)
+
+#: Лестница ключей тихого режима по движку установщика.
+SILENT_SWITCHES: Dict[str, Tuple[Tuple[str, ...], ...]] = {
+    # WiX Burn: vc_redist.x64.exe и большинство современных бандлов.
+    "burn": (("/install", "/quiet", "/norestart"),
+             ("/quiet", "/norestart"),
+             ("/q", "/norestart")),
+    # IExpress-обёртки VC++ 2005/2008/2010: у каждого поколения свой ключ.
+    "vcredist_legacy": (("/q", "/norestart"),
+                        ("/q",),
+                        ("/qb",),
+                        ("/Q",),
+                        ("/quiet", "/norestart")),
+    "dxsetup": (("/silent",),),
+    "iexpress": (("/Q",), ("/q",), ("/quiet",)),
+    "inno": (("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"),
+             ("/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART")),
+    "nsis": (("/S",), ("/s",)),
+    "installshield": (("/s", "/v/qn"), ("-s",), ("/s", "/sms")),
+    "dotnet": (("/q", "/norestart"), ("/quiet", "/norestart"),
+               ("/passive", "/norestart")),
+    # Движок неизвестен: перебираем все ходовые варианты. Каждый запуск
+    # ограничен таймаутом, поэтому «не тот» ключ стоит только времени.
+    "": (("/quiet", "/norestart"), ("/q", "/norestart"), ("/S",),
+         ("/silent",), ("/s", "/v/qn"),
+         ("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART")),
+}
+
+#: Сигнатуры движков внутри exe — когда имя файла ничего не подсказало.
+_ENGINE_SIGNATURES: Tuple[Tuple[bytes, str], ...] = (
+    (b".wixburn", "burn"),
+    (b"Inno Setup", "inno"),
+    (b"Nullsoft Install System", "nsis"),
+    (b"InstallShield", "installshield"),
+    (b"wextract", "iexpress"),
+)
+
+
+def installer_rule(path: str) -> Optional[RedistInstallerRule]:
+    """Правило белого списка для файла (или ``None``, если он не наш)."""
+    name = os.path.basename(str(path)).lower()
+    for rule in REDIST_INSTALLERS:
+        if rule.matches(name):
+            return rule
+    return None
+
+
+def is_redist_installer(path: str) -> bool:
+    """Это установщик известного распространяемого пакета?"""
+    return installer_rule(path) is not None
+
+
+def sniff_engine(path: str, limit: int = 2 * 1024 * 1024) -> str:
+    """Движок установщика по сигнатурам внутри файла (пустая строка — не понял)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(limit)
+    except OSError:
+        return ""
+    for signature, engine in _ENGINE_SIGNATURES:
+        if signature in head:
+            return engine
+    return ""
+
+
+def installer_kind(path: str) -> str:
+    """Тип пакета: ``msi``/``msu``/``burn``/``dxsetup``/… — что запускать и с чем."""
+    lower = os.path.basename(str(path)).lower()
+    if lower.endswith((".msi", ".msp")):
+        return "msi"
+    if lower.endswith(".msu"):
+        return "msu"
+    rule = installer_rule(path)
+    kind = rule.kind if rule else ""
+    if kind == "msi_or_exe":
+        kind = "msi" if lower.endswith(".msi") else ""
+    if kind in ("", "iexpress") and lower.endswith(".exe"):
+        # Имя ничего не сказало (или сказало слишком общо) — спросим файл.
+        engine = sniff_engine(path)
+        if engine:
+            return engine
+    return kind
+
+
+def silent_commands(path: str, kind: str = "",
+                    log_file: str = "") -> List[List[str]]:
+    """Лестница команд тихой установки — от самой точной к самой общей."""
+    path = os.path.abspath(path)
+    kind = kind or installer_kind(path)
+    if kind == "msi":
+        command = ["msiexec", "/i", path, "/qn", "/norestart"]
+        if log_file:
+            command += ["/L*v", log_file]
+        return [command]
+    if kind == "msu":
+        return [["wusa", path, "/quiet", "/norestart"]]
+    if kind == "cab":
+        return []
+    commands = [[path, *switches]
+                for switches in SILENT_SWITCHES.get(kind, SILENT_SWITCHES[""])]
+    if kind and kind != "dxsetup":
+        # Подстраховка: если «правильные» ключи не сработали, пробуем общие.
+        for switches in SILENT_SWITCHES[""]:
+            candidate = [path, *switches]
+            if candidate not in commands:
+                commands.append(candidate)
+    return commands
+
+
+def classify_exit_code(code: Optional[int]) -> str:
+    """Что означает код возврата установщика пакета."""
+    if code is None:
+        return "failed"
+    value = int(code) & 0xFFFFFFFF
+    if value in SILENT_OK_CODES:
+        return "installed"
+    if value in SILENT_ALREADY_CODES:
+        return "already"
+    if value in SILENT_REBOOT_CODES:
+        return "reboot"
+    return "failed"
+
+
+@dataclass
+class SilentInstall:
+    """Результат тихой установки одного пакета."""
+
+    path: str
+    title: str = ""
+    package_key: str = ""
+    arch: str = ""
+    kind: str = ""
+    #: ``installed`` / ``already`` / ``reboot`` / ``failed`` / ``skipped``.
+    status: str = "pending"
+    code: Optional[int] = None
+    command: str = ""
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(self.path)
+
+    @property
+    def ok(self) -> bool:
+        return self.status in ("installed", "already", "reboot")
+
+    def describe(self) -> str:
+        words = {
+            "installed": "установлен",
+            "already": "уже был установлен",
+            "reboot": "установлен (Windows просит перезагрузку)",
+            "failed": "установить не удалось",
+            "skipped": "пропущен",
+        }
+        return f"{self.title or self.name}: {words.get(self.status, self.status)}"
+
+
+def run_silent_install(path: str, *,
+                       runner: Optional[Callable[[Sequence[str]], int]] = None,
+                       title: str = "", package_key: str = "", arch: str = "",
+                       log=None) -> SilentInstall:
+    """Ставит один распространяемый пакет **молча**, перебирая ключи.
+
+    Ни одно окно при этом не появляется: запуск идёт с ``CREATE_NO_WINDOW``,
+    а ключи подобраны так, чтобы установщик не задавал вопросов. Если пакет
+    всё же решил показать мастер, его прервёт таймаут — сборка продолжится.
+    """
+    run = runner or (lambda args: _run_quiet(args, SILENT_INSTALL_TIMEOUT))
+    rule = installer_rule(path)
+    kind = installer_kind(path)
+    outcome = SilentInstall(
+        path=os.path.abspath(path), kind=kind, arch=arch,
+        title=title or (rule.title if rule else os.path.basename(path)),
+        package_key=package_key or (rule.package_key if rule else ""))
+    if not os.path.isfile(path):
+        outcome.status = "skipped"
+        return outcome
+    commands = silent_commands(path, kind)
+    if not commands:
+        outcome.status = "skipped"
+        return outcome
+    for command in commands:
+        if log is not None:
+            log.debug("Тихая установка: " + subprocess.list2cmdline(command))
+        code = run(command)
+        outcome.code = code
+        outcome.command = subprocess.list2cmdline(command)
+        outcome.status = classify_exit_code(code)
+        if outcome.ok:
+            break
+    return outcome
+
+
+#: Скрипт тихой установки, который кладётся в Redist портатива.
+SILENT_SCRIPT_NAME = "Install-Redist.cmd"
+
+
+def render_silent_install_script(entries: Sequence[Dict[str, str]]) -> str:
+    """``Install-Redist.cmd``: ставит всё из ``Redist`` молча, за один UAC.
+
+    Скрипт сам просит повышение прав (один раз), после чего каждый пакет
+    ставится с ключами тихого режима: никаких мастеров и кнопок «OK». Его
+    запускает лончер, но пользователь может выполнить файл и вручную.
+    """
+    lines = [
+        "@echo off",
+        "rem Silent installation of the Microsoft/vendor runtime packages",
+        "rem this portable app may need. Generated by Portablizer.",
+        "setlocal",
+        'set "REDIST_ROOT=%~dp0.."',
+        "",
+        "rem One UAC prompt for the whole batch - installing runtimes needs",
+        "rem administrator rights, everything after that is silent.",
+        ">nul 2>&1 net session || (",
+        '  powershell -NoProfile -ExecutionPolicy Bypass -Command '
+        '"Start-Process -Verb RunAs -Wait -WindowStyle Hidden '
+        '-FilePath \'%~f0\' -ArgumentList \'--elevated\'" >nul 2>&1',
+        "  exit /b 0",
+        ")",
+        "",
+        'set "REDIST_RC=0"',
+    ]
+    for index, entry in enumerate(entries, start=1):
+        relative = str(entry.get("file", "")).replace("/", "\\")
+        if not relative:
+            continue
+        title = "".join(ch for ch in str(entry.get("title", relative))
+                        if 32 <= ord(ch) < 127 and ch not in '%&|<>^()"')
+        kind = str(entry.get("kind", ""))
+        args = str(entry.get("args", ""))
+        target = f'"%REDIST_ROOT%\\{relative}"'
+        if kind == "msi":
+            command = f"msiexec /i {target} /qn /norestart"
+        elif kind == "msu":
+            command = f"wusa {target} /quiet /norestart"
+        else:
+            command = f'start "" /wait {target} {args}'.rstrip()
+        lines += [
+            "",
+            f"rem --- {relative}",
+            f"if not exist {target} goto redist_skip_{index}",
+            f"echo Installing {title} ...",
+            command,
+            f"call :redist_check %ERRORLEVEL%",
+            f"goto redist_next_{index}",
+            f":redist_skip_{index}",
+            f"echo   skipped: {relative} is not in this folder",
+            f":redist_next_{index}",
+        ]
+    lines += [
+        "",
+        'if not "%REDIST_RC%" == "0" echo Some packages could not be '
+        "installed silently (last code %REDIST_RC%).",
+        "endlocal & exit /b %REDIST_RC%",
+        "",
+        "rem 0 = installed, 1638/5100 = already present, 3010/1641 = reboot",
+        "rem later. Everything else is a real failure worth reporting.",
+        ":redist_check",
+        'if "%~1" == "0" goto :eof',
+        'if "%~1" == "1638" goto :eof',
+        'if "%~1" == "5100" goto :eof',
+        'if "%~1" == "3010" goto :eof',
+        'if "%~1" == "1641" goto :eof',
+        'set "REDIST_RC=%~1"',
+        "echo   [WARNING] exit code %~1",
+        "goto :eof",
+        "",
+    ]
+    return "\r\n".join(lines)
+
+
+def write_silent_install_script(portable_dir: str,
+                                entries: Sequence[Dict[str, str]]) -> str:
+    """Сохраняет ``Redist/Install-Redist.cmd`` и возвращает путь к нему."""
+    if not entries:
+        return ""
+    redist_dir = os.path.join(portable_dir, REDIST_DIR_NAME)
+    path = os.path.join(redist_dir, SILENT_SCRIPT_NAME)
+    try:
+        os.makedirs(redist_dir, exist_ok=True)
+        with open(path, "w", encoding="ascii", errors="replace",
+                  newline="") as fh:
+            fh.write(render_silent_install_script(entries))
+    except OSError:
+        return ""
+    return path
+
+
+def find_prerequisite_installers(directories: Sequence[str],
+                                 max_files: int = 60000) -> List[str]:
+    """Установщики предусловий, приложенные к дистрибутиву.
+
+    Возвращаются только файлы из белого списка (``vcredist_x86.exe``,
+    ``DXSETUP.exe``, ``oalinst.exe``…), причём каждое имя — один раз:
+    ``_CommonRedist`` часто содержит один и тот же пакет в нескольких
+    подпапках.
+    """
+    found: List[str] = []
+    seen: set = set()
+    scanned = 0
+    for root in directories:
+        if not root or not os.path.isdir(root):
+            continue
+        for current, _dirs, files in os.walk(root):
+            for name in files:
+                scanned += 1
+                if scanned > max_files:
+                    return found
+                if not is_redist_installer(name):
+                    continue
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(os.path.join(current, name))
+    # DirectX и VC++ — раньше всего: от них зависят остальные пакеты.
+    def order(path: str) -> Tuple[int, str]:
+        lower = os.path.basename(path).lower()
+        if lower.startswith(("vcredist", "vc_redist")):
+            return (0, lower)
+        if lower.startswith(("dxsetup", "directx")):
+            return (1, lower)
+        return (2, lower)
+
+    return sorted(found, key=order)
+
+
+def install_prerequisites(directories: Sequence[str], log, *,
+                          runner: Optional[Callable[[Sequence[str]], int]] = None,
+                          limit: int = 24) -> List[SilentInstall]:
+    """Ставит **молча** все предусловия, приложенные к установщику.
+
+    Вызывается ДО запуска основного установщика: когда пакеты уже на месте,
+    его собственный шаг «установка компонентов» либо пропускается целиком,
+    либо проходит без единого окна с кнопкой «OK».
+    """
+    installers = find_prerequisite_installers(directories)[:limit]
+    results: List[SilentInstall] = []
+    if not installers:
+        return results
+    log.info(f"Предусловия установщика: найдено пакетов — {len(installers)}. "
+             "Ставлю их в тихом режиме, окна с «OK» не появятся.")
+    for path in installers:
+        outcome = run_silent_install(path, runner=runner, log=log)
+        results.append(outcome)
+        if outcome.status == "failed":
+            log.warn(f"  • {outcome.describe()} (код {outcome.code})")
+        elif outcome.status == "skipped":
+            log.debug(f"  • {outcome.describe()}")
+        else:
+            log.ok(f"  • {outcome.describe()}")
+    return results
+
+
 class RuntimeProvisioner:
     """Приносит недостающие системные библиотеки в портативную папку.
 
@@ -1105,19 +1547,31 @@ class RuntimeProvisioner:
                  system_dirs: Optional[Sequence[str]] = None,
                  sxs_dir: Optional[str] = None,
                  allow_download: bool = False,
+                 allow_install: bool = False,
                  downloader: Optional[Callable[[str, str], bool]] = None,
-                 runner: Optional[Callable[[Sequence[str]], int]] = None
+                 runner: Optional[Callable[[Sequence[str]], int]] = None,
+                 installer_runner: Optional[Callable[[Sequence[str]], int]] = None
                  ) -> None:
         self.log = log
         self.source_dirs = [d for d in source_dirs if d and os.path.isdir(d)]
         self._system_dirs = list(system_dirs) if system_dirs is not None else None
         self._sxs_dir = sxs_dir if sxs_dir is not None else winsxs_dir()
         self.allow_download = allow_download
+        #: Разрешено ли ставить пакет в систему этого ПК — молча, как
+        #: последнюю ступень лестницы: поставленный пакет кладёт файлы в
+        #: System32/WinSxS, откуда их уже можно взять в портатив.
+        self.allow_install = allow_install
         self._download = downloader or _download_file
         self._run = runner or _run_quiet
+        self._install_run = installer_runner
         self._index: Optional[Dict[str, List[str]]] = None
         self._extracted: Dict[str, str] = {}
         self._failed_packages: set = set()
+        #: Что было установлено в систему по ходу сборки.
+        self.installs: List[SilentInstall] = []
+        #: Кэш «пакет+разрядность → путь к установщику» (в т. ч. неудачи).
+        self._archives: Dict[str, str] = {}
+        self._install_tried: set = set()
 
     # -- индекс источников ----------------------------------------------------
     def _source_index(self) -> Dict[str, List[str]]:
@@ -1373,20 +1827,16 @@ class RuntimeProvisioner:
             return "", ""
         destination = self._extracted.get(key)
         if destination is None:
-            redist_dir = os.path.join(portable_dir, REDIST_DIR_NAME)
-            os.makedirs(redist_dir, exist_ok=True)
-            filename = url.rsplit("/", 1)[-1] or f"{package.key}.exe"
-            if not filename.lower().endswith((".exe", ".msi", ".cab", ".zip")):
-                filename = f"{package.key}_{requirement.arch or 'any'}.exe"
-            archive = os.path.join(redist_dir, filename)
-            if not os.path.isfile(archive):
-                self.log.info(f"Скачиваю {package.title} ({url})…")
-                if not self._download(url, archive):
-                    self.log.warn(
-                        f"Не удалось скачать {package.title}. Файл можно "
-                        f"взять вручную: {package.page or url}")
-                    self._failed_packages.add(key)
-                    return "", ""
+            # Один и тот же файл нужен и распаковке, и тихой установке, и
+            # папке Redist портатива: качаем его ровно один раз за сборку.
+            archive = self._download_archive(package, requirement.arch,
+                                             portable_dir)
+            if not archive:
+                self.log.warn(
+                    f"Не удалось скачать {package.title}. Файл можно "
+                    f"взять вручную: {package.page or url}")
+                self._failed_packages.add(key)
+                return "", ""
             destination = os.path.join(work_dir, "download", package.key,
                                        requirement.arch or "any")
             if not self._extract_installer(archive, destination,
@@ -1410,6 +1860,100 @@ class RuntimeProvisioner:
             candidate = _find_file(destination, requirement.dll)
         if candidate and self._arch_matches(candidate, requirement.arch):
             return candidate, "официальный пакет Microsoft"
+        return "", ""
+
+    # -- тихая установка пакета в систему ------------------------------------
+    def _download_archive(self, package: RedistPackage, arch: str,
+                          portable_dir: str) -> str:
+        """Официальный пакет с сайта Microsoft — ровно одна загрузка за сборку.
+
+        Файл остаётся в ``Redist`` портатива: он нужен и распаковке, и
+        тихой установке, и целевому ПК (там интернета может не быть).
+        """
+        if not self.allow_download:
+            return ""
+        url = package.downloads.get(arch) or package.downloads.get("any")
+        if not url:
+            return ""
+        key = f"archive:{package.key}:{arch}"
+        cached = self._archives.get(key)
+        if cached is not None:
+            return cached
+        redist_dir = os.path.join(portable_dir, REDIST_DIR_NAME)
+        filename = url.rsplit("/", 1)[-1] or f"{package.key}.exe"
+        if not filename.lower().endswith((".exe", ".msi", ".cab", ".zip")):
+            filename = f"{package.key}_{arch or 'any'}.exe"
+        archive = os.path.join(redist_dir, filename)
+        try:
+            os.makedirs(redist_dir, exist_ok=True)
+        except OSError:
+            return ""
+        if os.path.isfile(archive):
+            self._archives[key] = archive
+            return archive
+        self.log.info(f"Скачиваю {package.title} ({url})…")
+        if not self._download(url, archive):
+            # Второй раз за сборку в сеть за тем же файлом не ходим.
+            self._archives[key] = ""
+            return ""
+        self._archives[key] = archive
+        return archive
+
+    def _archive_for_package(self, package: RedistPackage, arch: str,
+                             portable_dir: str) -> str:
+        """Установщик пакета: из комплекта дистрибутива или скачанный."""
+        for archive in self._package_archives(package, arch):
+            if archive.lower().endswith((".exe", ".msi")) \
+                    and is_redist_installer(archive):
+                return archive
+        return self._download_archive(package, arch, portable_dir)
+
+    def _from_silent_install(self, requirement: RuntimeRequirement,
+                             portable_dir: str) -> Tuple[str, str]:
+        """Последняя ступень: ставим пакет в систему **молча** и берём файлы.
+
+        До этой ступени доходят только библиотеки, которых нет ни в
+        комплекте установщика, ни на этом ПК, ни в WinSxS, и вытащить их из
+        пакета распаковкой не удалось. Установка идёт без единого окна: ни
+        мастера, ни «OK». После неё файл лежит в System32/SysWOW64, откуда
+        обычная ступень ``_from_system`` и заберёт его в портатив.
+        """
+        package = requirement.package
+        if package is None or not self.allow_install or not IS_WINDOWS:
+            return "", ""
+        key = f"install:{package.key}:{requirement.arch}"
+        if key in self._failed_packages:
+            return "", ""
+        if key not in self._install_tried:
+            self._install_tried.add(key)
+            archive = self._archive_for_package(package, requirement.arch,
+                                                portable_dir)
+            if not archive:
+                self._failed_packages.add(key)
+                return "", ""
+            self.log.info(
+                f"{package.title}: файлов нет нигде — ставлю пакет в тихом "
+                "режиме (окон не будет).")
+            outcome = run_silent_install(
+                archive, runner=self._install_run, title=package.title,
+                package_key=package.key, arch=requirement.arch, log=self.log)
+            self.installs.append(outcome)
+            if outcome.ok:
+                self.log.ok(f"  • {outcome.describe()}")
+            else:
+                self.log.warn(
+                    f"  • {outcome.describe()} (код {outcome.code}). "
+                    f"Файл оставлен: {os.path.basename(archive)}")
+                self._failed_packages.add(key)
+                return "", ""
+        elif key in self._failed_packages:
+            return "", ""
+        path, _source = self._from_system(requirement)
+        if path:
+            return path, "пакет установлен в тихом режиме"
+        path, _source = self._from_sxs(requirement)
+        if path:
+            return path, "пакет установлен в тихом режиме (WinSxS)"
         return "", ""
 
     # -- размещение в портативе ----------------------------------------------
@@ -1571,6 +2115,12 @@ class RuntimeProvisioner:
             if not path:
                 path, source = self._from_download(requirement, portable_dir,
                                                    work_dir)
+            if not path and not requirement.proactive:
+                # Запас «про запас» ради установки пакета в систему не
+                # ставим: молча менять чужой ПК можно только ради того, без
+                # чего программа действительно не запустится.
+                path, source = self._from_silent_install(requirement,
+                                                         portable_dir)
             if not path:
                 requirement.status = "missing"
                 (report.stock_missing if requirement.proactive
@@ -1592,12 +2142,15 @@ class RuntimeProvisioner:
              else report.provided).append(requirement)
 
         self._provide_ucrt_base(report, app_dir, portable_dir, work_dir)
+        report.installed = list(self.installs)
+        self._stage_installers(report, portable_dir)
 
         redist_dir = os.path.join(portable_dir, REDIST_DIR_NAME)
         if os.path.isdir(redist_dir):
             report.packages = sorted(
                 name for name in os.listdir(redist_dir)
                 if os.path.isfile(os.path.join(redist_dir, name))
+                and name != SILENT_SCRIPT_NAME
             )
         if os.path.isdir(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -1610,6 +2163,68 @@ class RuntimeProvisioner:
                 "https://dotnet.microsoft.com/download/dotnet-framework")
         return report
 
+
+    def _stage_installers(self, report: ProvisionReport,
+                          portable_dir: str) -> None:
+        """Кладёт в ``Redist`` портатива установщики недостающих пакетов.
+
+        Это страховка на «все случаи жизни»: файлы библиотек принести не
+        удалось, значит на целевом ПК их может не быть. Установщик рядом с
+        портативом позволяет лончеру поставить пакет **молча**, одним
+        запросом UAC, вместо череды окон с «OK» — или обойтись вовсе без
+        интернета, если пакет уже скачан.
+        """
+        if not report.missing:
+            return
+        redist_dir = os.path.join(portable_dir, REDIST_DIR_NAME)
+        staged: Dict[str, Dict[str, str]] = {}
+        for requirement in report.missing:
+            package = requirement.package
+            if package is None:
+                continue
+            key = f"{package.key}:{requirement.arch}"
+            if key in staged:
+                staged[key]["dlls"] = ",".join(sorted(set(
+                    staged[key]["dlls"].split(",") + [requirement.dll])))
+                continue
+            archive = self._archive_for_package(package, requirement.arch,
+                                                portable_dir)
+            if not archive:
+                continue
+            try:
+                os.makedirs(redist_dir, exist_ok=True)
+                if os.path.dirname(os.path.abspath(archive)) != \
+                        os.path.abspath(redist_dir):
+                    destination = os.path.join(
+                        redist_dir, os.path.basename(archive))
+                    if not os.path.isfile(destination):
+                        shutil.copy2(archive, destination)
+                    archive = destination
+            except OSError as exc:
+                self.log.warn(
+                    f"Не удалось положить {os.path.basename(archive)} в "
+                    f"{REDIST_DIR_NAME}: {exc}")
+                continue
+            kind = installer_kind(archive)
+            first = (silent_commands(archive, kind) or [[archive]])[0]
+            entry = {
+                "file": f"{REDIST_DIR_NAME}/{os.path.basename(archive)}",
+                "title": package.plain_title(),
+                "arch": requirement.arch,
+                "dlls": requirement.dll,
+                "kind": kind,
+                # Ключи тихого режима для exe; у msi/msu команду собирает
+                # тот, кто запускает (msiexec/wusa).
+                "args": " ".join(first[1:]) if kind not in ("msi", "msu") else "",
+            }
+            staged[key] = entry
+        report.installers = list(staged.values())
+        if report.installers:
+            write_silent_install_script(portable_dir, report.installers)
+            self.log.ok(
+                f"В папку {REDIST_DIR_NAME} положены установщики "
+                f"({len(report.installers)} шт.) и {SILENT_SCRIPT_NAME}: "
+                "на целевом ПК недостающее ставится молча, без окон.")
 
     def _place_next_to_importers(self, requirement: RuntimeRequirement,
                                  app_dir: str) -> None:
@@ -1727,6 +2342,24 @@ def launcher_requirements(report: ProvisionReport, limit: int = 24
     return out
 
 
+def launcher_installers(report: ProvisionReport, limit: int = 12
+                        ) -> List[Dict[str, str]]:
+    """Установщики из ``Redist``, которые лончер вправе запустить молча."""
+    out: List[Dict[str, str]] = []
+    for entry in report.installers[:limit]:
+        if not entry.get("file"):
+            continue
+        out.append({
+            "file": str(entry.get("file", "")),
+            "title": str(entry.get("title", "")),
+            "kind": str(entry.get("kind", "")),
+            "args": str(entry.get("args", "")),
+            "dlls": str(entry.get("dlls", "")),
+            "arch": str(entry.get("arch", "")),
+        })
+    return out
+
+
 def _format_group(title: str, items: Sequence[RuntimeRequirement],
                   show_source: bool = False,
                   show_importers: bool = True) -> List[str]:
@@ -1812,13 +2445,28 @@ def render_report(report: ProvisionReport) -> str:
             "",
         ]
 
+    if report.installed:
+        lines.append("Установлено в систему при сборке (в тихом режиме)")
+        lines.append("-" * 48)
+        lines.append("  Этих файлов не было ни в комплекте установщика, ни на "
+                     "компьютере сборки,")
+        lines.append("  поэтому пакет был поставлен молча — без мастеров и "
+                     "окон с «OK» — и файлы")
+        lines.append("  забраны из системы уже после установки.")
+        for item in report.installed:
+            lines.append(f"  • {item.describe()}")
+        lines.append("")
+
     if report.packages:
         lines.append(f"Установщики пакетов в папке {REDIST_DIR_NAME}")
         lines.append("-" * 40)
-        lines.append("  Распаковать их автоматически не удалось, но они уже "
-                     "скачаны: запустите")
-        lines.append("  нужный файл на том ПК, где программа не стартует, — "
-                     "интернет не понадобится.")
+        lines.append("  Библиотеки из них принести не удалось, но сами пакеты "
+                     "уже лежат рядом:")
+        lines.append(f"  запустите {REDIST_DIR_NAME}\\{SILENT_SCRIPT_NAME} — "
+                     "он поставит всё молча, за один")
+        lines.append("  запрос прав администратора, и интернет не "
+                     "понадобится. Лончер делает это")
+        lines.append("  сам, когда видит, что библиотеки на этом ПК нет.")
         for name in report.packages:
             lines.append(f"  • {REDIST_DIR_NAME}\\{name}")
         lines.append("")

@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
 
 from .. import __version__
+from .redist import REDIST_DIR_NAME, SILENT_SCRIPT_NAME as REDIST_SCRIPT_NAME
 
 #: Маркер портативной папки внутри захваченного .reg (см. core/registry.py).
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
@@ -112,6 +113,12 @@ class LauncherConfig:
     # чего не хватает, вместо системного окна «отсутствует MSVCR110.dll».
     # Каждая запись: {"dll", "title", "url", "arch"}.
     runtime_requirements: List[Dict[str, str]] = field(default_factory=list)
+    # Установщики этих пакетов, положенные в папку Redist портатива. Если
+    # библиотеки на целевом ПК действительно нет, лончер ставит пакет
+    # МОЛЧА (один запрос UAC, никаких окон с «OK»), а не забрасывает
+    # пользователя сообщениями. Каждая запись: {"file", "title", "kind",
+    # "args", "dlls", "arch"}.
+    runtime_installers: List[Dict[str, str]] = field(default_factory=list)
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -234,14 +241,26 @@ def _runtime_check_block(cfg: LauncherConfig) -> str:
     if not calls:
         return ("rem (this program needs no extra Microsoft runtime "
                 "components)\ngoto :eof")
+    script = f"%PORTABLE_ROOT%\\{REDIST_DIR_NAME}\\{REDIST_SCRIPT_NAME}"
     lines = ['set "PORTABLE_RUNTIME_MISSING="']
     lines += calls
     lines += [
-        "if defined PORTABLE_RUNTIME_MISSING (",
-        "  echo   Details and download links: redistributables.txt",
-        "  echo   The program may still start: some components load on demand.",
+        "if not defined PORTABLE_RUNTIME_MISSING goto :eof",
+        # Пакеты лежат рядом - ставим их молча: один запрос прав вместо
+        # череды окон установщика с кнопкой OK.
+        f'if not exist "{script}" goto portable_runtime_manual',
+        "echo   Installing the missing packages silently from the "
+        f"{REDIST_DIR_NAME} folder...",
+        f'call "{script}"',
+        "if not errorlevel 1 (",
+        "  echo   Done: the packages were installed without any dialogs.",
         "  echo.",
+        "  goto :eof",
         ")",
+        ":portable_runtime_manual",
+        "echo   Details and download links: redistributables.txt",
+        "echo   The program may still start: some components load on demand.",
+        "echo.",
         "goto :eof",
     ]
     return "\n".join(lines)
@@ -1296,6 +1315,11 @@ def render_config_json(cfg: LauncherConfig) -> str:
         # Чего не хватает на чужом ПК: лончер проверяет этот список перед
         # стартом и называет пакет вместо системной ошибки про DLL.
         "runtime_requirements": cfg.runtime_requirements,
+        # Чем это лечится прямо на месте: тихая установка из папки Redist.
+        "runtime_installers": cfg.runtime_installers,
+        "runtime_install_script": (
+            f"{REDIST_DIR_NAME}/{REDIST_SCRIPT_NAME}"
+            if cfg.runtime_installers else ""),
         "registry": {
             "enabled": cfg.apply_registry,
             "file": cfg.reg_file_name,

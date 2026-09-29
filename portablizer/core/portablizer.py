@@ -300,6 +300,14 @@ class PortableOptions:
     # Докачивать недостающие пакеты с сайта Microsoft. По умолчанию выключено:
     # сборка не должна молча ходить в сеть.
     download_runtimes: bool = False
+    # Ставить распространяемые пакеты (vcredist, DXSETUP, OpenAL, PhysX…) в
+    # ТИХОМ режиме. Установщики игр запускают их сами и показывают окно за
+    # окном с кнопкой «OK» — так ведёт себя, например, первый «Ведьмак».
+    # Portablizer ставит предусловия заранее и молча: мастер основной
+    # установки их пропускает, а недостающие библиотеки после этого можно
+    # забрать из системы в портатив. Ставится только то, что опознано как
+    # известный распространяемый пакет.
+    silent_runtime_install: bool = True
 
 
 @dataclass
@@ -366,6 +374,9 @@ class PortableResult:
     runtime_packages: List[str] = field(default_factory=list)
     #: Отчёт по распространяемым компонентам внутри портатива.
     runtime_report_rel: str = ""
+    #: Пакеты, установленные в тихом режиме на этом ПК по ходу сборки
+    #: (предусловия дистрибутива и недостающие runtime).
+    runtime_installed: List[str] = field(default_factory=list)
 
 
 class Portablizer:
@@ -558,6 +569,13 @@ class Portablizer:
             # shell-папки и не подчиняются переменным окружения, поэтому их
             # приходится отслеживать отдельно.
             shortcuts_before = self._snapshot_shortcuts()
+
+            # 3b. Предусловия дистрибутива (vcredist, DirectX, OpenAL,
+            # PhysX…). Их надо поставить ДО основного установщика: иначе он
+            # сделает это сам — с окном и кнопкой «OK» на каждый пакет.
+            self._check_cancel()
+            self.progress(26, "Распространяемые компоненты (тихая установка)")
+            self._install_prerequisites(opts, result)
 
             # 4. Тихая установка: идём по лестнице попыток, пока в App не
             # появятся файлы программы. Снимок реестра «после» делается ниже —
@@ -2047,6 +2065,59 @@ class Portablizer:
         # Ограничим, чтобы PATH не разросся: корень App + до 10 подпапок.
         return dep_dirs[:12]
 
+    # -- предусловия дистрибутива --------------------------------------------
+    def _install_prerequisites(self, opts: PortableOptions,
+                               result: PortableResult) -> None:
+        """Ставит предусловия дистрибутива молча — ДО основного установщика.
+
+        Так выглядит проблема без этого шага: установщик первого «Ведьмака»
+        доходит до шага «установка компонентов», по очереди запускает
+        ``vcredist``, ``DXSETUP`` и компанию — и каждый показывает своё окно,
+        которое надо закрыть кнопкой «OK». Портативная сборка обязана идти
+        без человека, поэтому пакеты ставятся заранее и в тихом режиме:
+        мастер видит их уже установленными и молча проходит этот шаг.
+
+        Запускается только то, что опознано белым списком
+        (``vcredist_x86.exe``, ``DXSETUP.exe``, ``oalinst.exe``, PhysX,
+        .NET…): произвольный exe из папки дистрибутива никто молча не
+        выполняет.
+        """
+        if not opts.bundle_runtimes or not opts.silent_runtime_install:
+            return
+        if not IS_WINDOWS:
+            self.log.debug(
+                "Тихая установка распространяемых пакетов доступна только "
+                "на Windows — пропускаю.")
+            return
+        sources = redist_mod.installer_source_dirs(opts.installer_path)
+        if not sources:
+            return
+        if not is_elevated():
+            self.log.warn(
+                "Portablizer запущен без прав администратора: тихая "
+                "установка распространяемых пакетов может не пройти, и "
+                "установщик программы снова покажет окна с «OK».")
+        try:
+            outcomes = redist_mod.install_prerequisites(sources, self.log)
+        except Exception as exc:  # noqa: BLE001 — предусловия не критичны
+            self.log.warn(f"Не удалось поставить предусловия: {exc}")
+            return
+        for item in outcomes:
+            if item.ok:
+                result.runtime_installed.append(item.title or item.name)
+        if outcomes:
+            failed = [item for item in outcomes if item.status == "failed"]
+            if failed:
+                self.log.warn(
+                    "Часть предусловий поставить молча не удалось: "
+                    + ", ".join(item.name for item in failed[:6])
+                    + ". Если установщик покажет их окна, закройте их "
+                      "кнопкой «OK» — на портатив это не влияет.")
+            else:
+                self.log.ok(
+                    "Все предусловия дистрибутива установлены в тихом "
+                    "режиме — окон с «OK» по ходу установки не будет.")
+
     # -- распространяемые компоненты -----------------------------------------
     def _provision_runtimes(
         self, app_dir: str, portable_dir: str, opts: PortableOptions,
@@ -2109,7 +2180,8 @@ class Portablizer:
                 + ", ".join(os.path.basename(s) for s in sources[:6]))
         provisioner = redist_mod.RuntimeProvisioner(
             self.log, source_dirs=sources,
-            allow_download=opts.download_runtimes)
+            allow_download=opts.download_runtimes,
+            allow_install=opts.silent_runtime_install)
         try:
             report = provisioner.provision(
                 scan, app_dir, portable_dir, name,
@@ -2146,6 +2218,15 @@ class Portablizer:
                 packages.append(entry)
         result.runtime_missing = [r.dll for r in report.missing]
         result.runtime_packages = packages
+        for item in report.installed:
+            if item.ok and (item.title or item.name) not in result.runtime_installed:
+                result.runtime_installed.append(item.title or item.name)
+        if report.installers:
+            self.log.ok(
+                "Недостающие пакеты положены в папку "
+                f"{redist_mod.REDIST_DIR_NAME} вместе со скриптом "
+                f"{redist_mod.SILENT_SCRIPT_NAME}: на целевом ПК лончер "
+                "поставит их молча, без окон с «OK».")
 
         if report.missing:
             self.log.warn(
@@ -2248,6 +2329,10 @@ class Portablizer:
             config_target_rel=config_target,
             runtime_requirements=(
                 redist_mod.launcher_requirements(runtime_report)
+                if runtime_report is not None else []
+            ),
+            runtime_installers=(
+                redist_mod.launcher_installers(runtime_report)
                 if runtime_report is not None else []
             ),
         )
@@ -2368,6 +2453,16 @@ class Portablizer:
                     "  (обычно это Microsoft Visual C++ Redistributable или "
                     "DirectX End-User Runtime).\n"
                 )
+                if runtime_report.installers:
+                    runtime_section += (
+                        "  Проще всего запустить "
+                        f"{redist_mod.REDIST_DIR_NAME}\\"
+                        f"{redist_mod.SILENT_SCRIPT_NAME}: он поставит всё "
+                        "молча,\n"
+                        "  за один запрос прав администратора. Лончер "
+                        "делает это сам, когда\n"
+                        "  видит, что библиотеки на этом компьютере нет.\n"
+                    )
         self._write_text(
             os.path.join(portable_dir, "README_PORTABLE.txt"),
             _README.format(

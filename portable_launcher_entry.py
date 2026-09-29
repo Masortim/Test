@@ -141,6 +141,169 @@ def missing_runtime_components(root: Path, cfg: Dict[str, Any], target: Path,
     return missing
 
 
+#: Exit codes meaning "the package is in place": installed, already there
+#: (1638/5100/0x80070666) or installed but asking for a reboot (3010/1641).
+RUNTIME_OK_CODES = frozenset({0, 1638, 5100, 3010, 1641, 0x80070666})
+
+
+def _runtime_install_commands(root: Path,
+                              entry: Dict[str, Any]) -> list[list[str]]:
+    """Command line that installs one package without showing anything."""
+    relative = str(entry.get("file", "")).replace("/", os.sep)
+    if not relative:
+        return []
+    path = root / relative
+    if not path.is_file():
+        return []
+    kind = str(entry.get("kind", "")).lower()
+    if kind == "msi" or path.suffix.lower() in (".msi", ".msp"):
+        return [["msiexec", "/i", str(path), "/qn", "/norestart"]]
+    if kind == "msu" or path.suffix.lower() == ".msu":
+        return [["wusa", str(path), "/quiet", "/norestart"]]
+    args = str(entry.get("args", "")).split()
+    commands = [[str(path), *args]] if args else []
+    for fallback in (["/quiet", "/norestart"], ["/q", "/norestart"],
+                     ["/S"], ["/silent"]):
+        candidate = [str(path), *fallback]
+        if candidate not in commands:
+            commands.append(candidate)
+    return commands
+
+
+def _run_hidden(command: Sequence[str], timeout: int = 900) -> Optional[int]:
+    """Run an installer with no console and no window at all."""
+    try:
+        completed = subprocess.run(
+            [str(part) for part in command], timeout=timeout,
+            creationflags=NO_WINDOW, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return int(completed.returncode)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _run_hidden_elevated(program: str,
+                         arguments: Sequence[str]) -> Optional[int]:
+    """Run a program through UAC with no window, and wait for it.
+
+    One prompt for the whole batch of runtime packages: after the user has
+    confirmed it, nothing else appears on screen.
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        SEE_MASK_NOCLOSEPROCESS = 0x00000040
+        SEE_MASK_NO_CONSOLE = 0x00008000
+        SW_HIDE = 0
+
+        class SHELLEXECUTEINFOW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong),
+                ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+                ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+                ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+                ("hProcess", wintypes.HANDLE),
+            ]
+
+        info = SHELLEXECUTEINFOW()
+        info.cbSize = ctypes.sizeof(info)
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE
+        info.lpVerb = "runas"
+        info.lpFile = str(program)
+        info.lpParameters = subprocess.list2cmdline(
+            [str(part) for part in arguments])
+        info.nShow = SW_HIDE
+        shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
+        if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
+            return None
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
+        code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+        kernel32.CloseHandle(info.hProcess)
+        return int(code.value)
+    except Exception:  # noqa: BLE001 - UAC refusal must not break the launch
+        return None
+
+
+def install_missing_runtime(root: Path, cfg: Dict[str, Any],
+                            missing: Sequence[Dict[str, Any]]
+                            ) -> list[Dict[str, str]]:
+    """Install the packages this PC lacks - silently, without any dialog.
+
+    Portablizer ships the installers it could not unpack in the ``Redist``
+    folder.  Instead of throwing one message box after another at the user
+    ("MSVCR110.dll is missing - press OK"), the launcher runs them with the
+    silent switches recorded at build time.  Everything that really got
+    installed disappears from the warning; only genuine failures are
+    reported, once.
+    """
+    entries = cfg.get("runtime_installers") or []
+    if not IS_WINDOWS or not isinstance(entries, list) or not entries:
+        return list(missing)
+
+    # Installing a runtime needs administrator rights.  The generated
+    # Redist\Install-Redist.cmd puts every package behind a SINGLE UAC
+    # prompt and stays hidden, which is far better than one dialog per
+    # package - or per missing DLL.
+    script = str(cfg.get("runtime_install_script") or "")
+    if script:
+        path = root / script.replace("/", os.sep)
+        if path.is_file():
+            command = ["cmd.exe", "/c", str(path)]
+            code = (_run_hidden(command) if _is_elevated()
+                    else _run_hidden_elevated("cmd.exe",
+                                              ["/c", str(path)]))
+            _run_log(root, f"silent runtime install script -> {code}")
+            still = [item for item in missing
+                     if not _library_present(root, str(item.get("dll", "")))]
+            if not still:
+                return still
+
+    wanted = {str(item.get("dll", "")).lower() for item in missing}
+    installed: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        covered = {name.strip().lower()
+                   for name in str(entry.get("dlls", "")).split(",")
+                   if name.strip()}
+        if covered and not (covered & wanted):
+            continue
+        for command in _runtime_install_commands(root, entry):
+            code = _run_hidden(command)
+            _run_log(root, f"silent runtime install: "
+                           f"{subprocess.list2cmdline(command)} -> {code}")
+            if code is not None and (code & 0xFFFFFFFF) in RUNTIME_OK_CODES:
+                installed.append(str(entry.get("title") or entry.get("file")))
+                break
+    if installed:
+        _run_log(root, "installed silently: " + ", ".join(installed))
+    return [item for item in missing
+            if not _library_present(root, str(item.get("dll", "")))]
+
+
+def _library_present(root: Path, name: str) -> bool:
+    """True when Windows can resolve the library right now."""
+    if not name:
+        return True
+    windir = os.environ.get("SystemRoot") or r"C:\Windows"
+    for directory in (root / "App", Path(windir) / "System32",
+                      Path(windir) / "SysWOW64"):
+        try:
+            if (directory / name).is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _runtime_warning_is_new(root: Path, cfg: Dict[str, Any],
                             missing: Sequence[Dict[str, Any]]) -> bool:
     """True when this exact warning has not been acknowledged yet.
@@ -181,6 +344,9 @@ def _warn_about_runtime(root: Path, missing: Sequence[Dict[str, Any]]) -> None:
             lines.append(f"      {url}")
     lines += [
         "",
+        "Поставить их молча, без единого окна, можно файлом "
+        "Redist\\Install-Redist.cmd",
+        "рядом с портативной папкой (если он там есть).",
         "Подробности и ссылки — в файле redistributables.txt рядом с "
         "портативной папкой.",
         "Программа всё равно будет запущена: часть компонентов нужна не "
@@ -940,7 +1106,14 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     # Предстартовая проверка распространяемых компонентов: лучше назвать
     # пакет, чем оставить пользователя наедине с окном Windows
     # «отсутствует MSVCR110.dll».
+    # Предстартовая проверка распространяемых компонентов. Если нужного
+    # пакета на этом ПК нет, сначала пробуем поставить его МОЛЧА из папки
+    # Redist — пользователь не должен закрывать окна с «OK» ни во время
+    # сборки, ни при запуске. Сообщение остаётся только на тот случай,
+    # когда тихая установка невозможна (нет установщика, отказ UAC).
     missing_runtime = missing_runtime_components(root, cfg, target, env)
+    if missing_runtime:
+        missing_runtime = install_missing_runtime(root, cfg, missing_runtime)
     if missing_runtime and _runtime_warning_is_new(root, cfg, missing_runtime):
         _warn_about_runtime(root, missing_runtime)
 
