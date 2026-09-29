@@ -42,7 +42,50 @@ def _store_blocks(payload: bytes) -> bytes:
     return bytes(out)
 
 
-def make_cabinet(files: Dict[str, bytes], compress: bool = True) -> bytes:
+def _lzx_blocks(payload: bytes, window_bits: int = 21) -> bytes:
+    """Данные папки кабинета, нарезанные на блоки CFDATA (LZX uncompressed blocks)."""
+    out = bytearray()
+    pos = 0
+    first_block = True
+    while pos < len(payload) or (pos == 0 and len(payload) == 0):
+        chunk = payload[pos:pos + _BLOCK]
+        pos += len(chunk)
+        bs = bytearray()
+        if first_block:
+            # 1 bit (intel hdr=0) + 3 bits (type=3) + 24 bits (len)
+            top_12 = (len(chunk) >> 12) & 0xFFF
+            low_12 = len(chunk) & 0xFFF
+            word1 = (0 << 15) | (3 << 12) | top_12
+            word2 = (low_12 << 4)
+            bs.append(word1 & 0xFF)
+            bs.append((word1 >> 8) & 0xFF)
+            bs.append(word2 & 0xFF)
+            bs.append((word2 >> 8) & 0xFF)
+            first_block = False
+        else:
+            # 3 bits (type=3) + 24 bits (len)
+            top_13 = (len(chunk) >> 11) & 0x1FFF
+            low_11 = len(chunk) & 0x7FF
+            word1 = (3 << 13) | top_13
+            word2 = (low_11 << 5)
+            bs.append(word1 & 0xFF)
+            bs.append((word1 >> 8) & 0xFF)
+            bs.append(word2 & 0xFF)
+            bs.append((word2 >> 8) & 0xFF)
+        bs.extend(struct.pack("<III", 1, 1, 1))
+        bs.extend(chunk)
+        if len(chunk) & 1:
+            bs.append(0)
+
+        out.extend(struct.pack("<IHH", 0, len(bs), len(chunk)))
+        out.extend(bs)
+        if pos >= len(payload):
+            break
+    return bytes(out)
+
+
+def make_cabinet(files: Dict[str, bytes], compress: bool = True,
+                 compression_type: int = 1, window_bits: int = 21) -> bytes:
     """Готовый кабинет с одной папкой и перечисленными файлами."""
     payload = bytearray()
     entries = []
@@ -50,8 +93,16 @@ def make_cabinet(files: Dict[str, bytes], compress: bool = True) -> bytes:
         entries.append((name, len(payload), len(data)))
         payload += data
 
-    blocks = _mszip_blocks(bytes(payload)) if compress \
-        else _store_blocks(bytes(payload))
+    if compression_type == 3:  # LZX
+        blocks = _lzx_blocks(bytes(payload), window_bits=window_bits)
+        folder_comp = 3 | (window_bits << 8)
+    elif compress:
+        blocks = _mszip_blocks(bytes(payload))
+        folder_comp = 1
+    else:
+        blocks = _store_blocks(bytes(payload))
+        folder_comp = 0
+
     block_count = 0
     position = 0
     while position < len(blocks):
@@ -74,9 +125,13 @@ def make_cabinet(files: Dict[str, bytes], compress: bool = True) -> bytes:
     header = struct.pack(
         "<4sIIIIIBBHHHHH", b"MSCF", 0, total, 0, coff_files, 0, 3, 1,
         1, len(entries), 0, 0, 0)
-    folder = struct.pack("<IHH", data_offset, block_count,
-                         1 if compress else 0)
+    folder = struct.pack("<IHH", data_offset, block_count, folder_comp)
     return bytes(header + folder + bytes(file_table) + blocks)
+
+
+def make_lzx_cabinet(files: Dict[str, bytes], window_bits: int = 21) -> bytes:
+    """Кабинет со сжатием LZX."""
+    return make_cabinet(files, compression_type=3, window_bits=window_bits)
 
 
 def make_self_extracting_exe(files: Dict[str, bytes],

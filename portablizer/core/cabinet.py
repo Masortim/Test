@@ -28,15 +28,12 @@
 Отсюда и брались сообщения «пакет скачан, но распаковать его автоматически
 не удалось». Здесь кабинет читается напрямую: ищем сигнатуру ``MSCF``,
 разбираем заголовки CFHEADER/CFFOLDER/CFFILE/CFDATA и распаковываем данные
-штатным ``zlib`` (MSZIP — это тот же deflate с историей между блоками).
+штатным ``zlib`` (MSZIP — это deflate с историей между блоками) или собственным
+декодером LZX (используется во многих vc_red.cab и кабинетах DirectX).
 Никаких запусков, никаких путей в командной строке, работает и на Windows,
 и в тестах на любой ОС.
 
-Чего модуль не умеет: LZX и Quantum (в пакетах Microsoft они встречаются
-редко — в основном в старых кабинетах DirectX). Такие папки кабинета просто
-пропускаются, и вызывающий код возвращается к ``expand``.
-
-Формат CAB описан в MS-CAB; здесь реализована минимально необходимая часть.
+Формат CAB описан в MS-CAB; здесь реализована необходимая часть включая MSZIP и LZX.
 """
 from __future__ import annotations
 
@@ -46,7 +43,7 @@ import os
 import re
 import struct
 import zlib
-from typing import Iterator, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 #: Сигнатура кабинета.
 SIGNATURE = b"MSCF"
@@ -73,6 +70,388 @@ MAX_DEPTH = 4
 class CabinetError(Exception):
     """Кабинет повреждён или это вовсе не кабинет."""
 
+
+# =============================================================================
+#  LZX Decompressor for MS-CAB
+# =============================================================================
+
+_LZX_MIN_MATCH = 2
+_LZX_MAX_MATCH = 257
+_LZX_NUM_CHARS = 256
+_LZX_BLOCKTYPE_VERBATIM = 1
+_LZX_BLOCKTYPE_ALIGNED = 2
+_LZX_BLOCKTYPE_UNCOMPRESSED = 3
+_LZX_PRETREE_NUM_ELEMENTS = 20
+_LZX_ALIGNED_NUM_ELEMENTS = 8
+_LZX_NUM_SECONDARY_LENGTHS = 249
+_LZX_NUM_PRIMARY_LENGTHS = 7
+_LZX_FRAME_SIZE = 32768
+
+_POSITION_SLOTS = (30, 32, 34, 36, 38, 42, 50)
+_EXTRA_BITS: List[int] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+    9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16
+] + [17] * 300
+
+_POSITION_BASE: List[int] = [0] * 300
+for _i in range(1, 300):
+    _eb = _EXTRA_BITS[_i - 1]
+    _POSITION_BASE[_i] = _POSITION_BASE[_i - 1] + (1 << _eb)
+
+
+class _LzxBitReader:
+    __slots__ = ("data", "pos", "bit_buf", "bits_left")
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.pos = 0
+        self.bit_buf = 0
+        self.bits_left = 0
+
+    def ensure_bits(self, n: int) -> None:
+        while self.bits_left < n:
+            if self.pos + 1 < len(self.data):
+                b0 = self.data[self.pos]
+                b1 = self.data[self.pos + 1]
+                self.pos += 2
+                word = b0 | (b1 << 8)
+                self.bit_buf = (self.bit_buf << 16) | word
+                self.bits_left += 16
+            elif self.pos < len(self.data):
+                b0 = self.data[self.pos]
+                self.pos += 1
+                self.bit_buf = (self.bit_buf << 16) | b0
+                self.bits_left += 16
+            else:
+                self.bit_buf = (self.bit_buf << 16)
+                self.bits_left += 16
+
+    def peek_bits(self, n: int) -> int:
+        self.ensure_bits(n)
+        return (self.bit_buf >> (self.bits_left - n)) & ((1 << n) - 1)
+
+    def remove_bits(self, n: int) -> None:
+        self.bits_left -= n
+        self.bit_buf &= (1 << self.bits_left) - 1
+
+    def read_bits(self, n: int) -> int:
+        if n <= 0:
+            return 0
+        self.ensure_bits(n)
+        val = (self.bit_buf >> (self.bits_left - n)) & ((1 << n) - 1)
+        self.bits_left -= n
+        self.bit_buf &= (1 << self.bits_left) - 1
+        return val
+
+    def align_word(self) -> None:
+        rem = self.bits_left % 16
+        if rem != 0:
+            self.remove_bits(rem)
+
+    def read_bytes(self, count: int) -> bytes:
+        if self.bits_left > 0:
+            self.bit_buf = 0
+            self.bits_left = 0
+        res = self.data[self.pos:self.pos + count]
+        self.pos += len(res)
+        return res
+
+
+class _FastHuffman:
+    __slots__ = ("table_bits", "empty", "table")
+
+    def __init__(self, lengths: Sequence[int], table_bits: int = 10) -> None:
+        self.table_bits = table_bits
+        max_len = max(lengths) if lengths else 0
+        self.empty = (max_len == 0)
+        self.table: List[Optional[Union[Tuple[int, int], dict]]] = [None] * (1 << table_bits)
+        if self.empty:
+            return
+
+        bl_count = [0] * (max_len + 1)
+        for length in lengths:
+            if length > 0:
+                bl_count[length] += 1
+
+        next_code = [0] * (max_len + 1)
+        code = 0
+        for bits in range(1, max_len + 1):
+            code = (code + bl_count[bits - 1]) << 1
+            next_code[bits] = code
+
+        for sym, length in enumerate(lengths):
+            if length == 0:
+                continue
+            c = next_code[length]
+            next_code[length] += 1
+            if length <= table_bits:
+                shift = table_bits - length
+                start = c << shift
+                for i in range(1 << shift):
+                    self.table[start + i] = (sym, length)
+            else:
+                prefix = c >> (length - table_bits)
+                if self.table[prefix] is None:
+                    self.table[prefix] = {}
+                node = self.table[prefix]
+                rem_bits = length - table_bits
+                for b_idx in range(rem_bits - 1, -1, -1):
+                    bit = (c >> b_idx) & 1
+                    if b_idx == 0:
+                        node[bit] = (sym, length)
+                    else:
+                        if bit not in node:
+                            node[bit] = {}
+                        node = node[bit]
+
+    def read_sym(self, reader: _LzxBitReader) -> int:
+        if self.empty:
+            raise CabinetError("пустое дерево Хаффмана в блоке LZX")
+        peek = reader.peek_bits(self.table_bits)
+        entry = self.table[peek]
+        if entry is None:
+            raise CabinetError("некорректный код Хаффмана в блоке LZX")
+        if isinstance(entry, tuple):
+            sym, length = entry
+            reader.remove_bits(length)
+            return sym
+        reader.remove_bits(self.table_bits)
+        node = entry
+        while isinstance(node, dict):
+            b = reader.read_bits(1)
+            if b not in node:
+                raise CabinetError("некорректный длинный код Хаффмана в блоке LZX")
+            node = node[b]
+        sym, _length = node
+        return sym
+
+
+def _lzx_read_lens(reader: _LzxBitReader, lens: List[int],
+                   first: int, last: int) -> None:
+    pretree_lens = [reader.read_bits(4) for _ in range(20)]
+    pretree = _FastHuffman(pretree_lens, table_bits=6)
+    x = first
+    while x < last:
+        z = pretree.read_sym(reader)
+        if z == 17:
+            y = reader.read_bits(4) + 4
+            while y > 0 and x < last:
+                lens[x] = 0
+                x += 1
+                y -= 1
+        elif z == 18:
+            y = reader.read_bits(5) + 20
+            while y > 0 and x < last:
+                lens[x] = 0
+                x += 1
+                y -= 1
+        elif z == 19:
+            y = reader.read_bits(1) + 4
+            z = pretree.read_sym(reader)
+            val = (lens[x] - z) % 17
+            while y > 0 and x < last:
+                lens[x] = val
+                x += 1
+                y -= 1
+        else:
+            val = (lens[x] - z) % 17
+            lens[x] = val
+            x += 1
+
+
+def decompress_lzx(data: bytes, uncompressed_size: int,
+                   window_bits: int = 21) -> bytes:
+    """Распаковывает поток данных формата LZX для Microsoft Cabinet."""
+    if uncompressed_size <= 0:
+        return b""
+    if window_bits < 15 or window_bits > 21:
+        window_bits = 21
+    window_size = 1 << window_bits
+    window = bytearray(window_size)
+    window_posn = 0
+    frame_posn = 0
+    frame = 0
+
+    num_pos_slots = _POSITION_SLOTS[window_bits - 15]
+    num_offsets = num_pos_slots * 8
+    main_tree_symbols = _LZX_NUM_CHARS + num_offsets
+
+    main_lens = [0] * main_tree_symbols
+    length_lens = [0] * _LZX_NUM_SECONDARY_LENGTHS
+    aligned_lens = [0] * _LZX_ALIGNED_NUM_ELEMENTS
+
+    main_tree: Optional[_FastHuffman] = None
+    length_tree: Optional[_FastHuffman] = None
+    aligned_tree: Optional[_FastHuffman] = None
+
+    r0, r1, r2 = 1, 1, 1
+
+    reader = _LzxBitReader(data)
+    header_read = False
+    intel_filesize = 0
+    intel_started = False
+
+    block_remaining = 0
+    block_type = 0
+    block_length = 0
+
+    out = bytearray()
+    offset = 0
+
+    while offset < uncompressed_size:
+        if not header_read:
+            hdr = reader.read_bits(1)
+            if hdr != 0:
+                hi = reader.read_bits(16)
+                lo = reader.read_bits(16)
+                intel_filesize = (hi << 16) | lo
+            header_read = True
+
+        frame_size = _LZX_FRAME_SIZE
+        if uncompressed_size - offset < frame_size:
+            frame_size = uncompressed_size - offset
+
+        bytes_todo = frame_size
+        while bytes_todo > 0:
+            if block_remaining == 0:
+                if block_type == _LZX_BLOCKTYPE_UNCOMPRESSED and (block_length & 1):
+                    reader.read_bytes(1)
+
+                block_type = reader.read_bits(3)
+                hi = reader.read_bits(16)
+                lo = reader.read_bits(8)
+                block_remaining = block_length = (hi << 8) | lo
+
+                if block_type == _LZX_BLOCKTYPE_ALIGNED:
+                    aligned_lens = [reader.read_bits(3) for _ in range(8)]
+                    aligned_tree = _FastHuffman(aligned_lens, table_bits=6)
+                    _lzx_read_lens(reader, main_lens, 0, 256)
+                    _lzx_read_lens(reader, main_lens, 256, main_tree_symbols)
+                    main_tree = _FastHuffman(main_lens, table_bits=10)
+                    if main_lens[0xE8] != 0:
+                        intel_started = True
+                    _lzx_read_lens(reader, length_lens, 0, _LZX_NUM_SECONDARY_LENGTHS)
+                    length_tree = _FastHuffman(length_lens, table_bits=8)
+                elif block_type == _LZX_BLOCKTYPE_VERBATIM:
+                    _lzx_read_lens(reader, main_lens, 0, 256)
+                    _lzx_read_lens(reader, main_lens, 256, main_tree_symbols)
+                    main_tree = _FastHuffman(main_lens, table_bits=10)
+                    if main_lens[0xE8] != 0:
+                        intel_started = True
+                    _lzx_read_lens(reader, length_lens, 0, _LZX_NUM_SECONDARY_LENGTHS)
+                    length_tree = _FastHuffman(length_lens, table_bits=8)
+                elif block_type == _LZX_BLOCKTYPE_UNCOMPRESSED:
+                    intel_started = True
+                    reader.align_word()
+                    buf = reader.read_bytes(12)
+                    if len(buf) < 12:
+                        raise CabinetError("обрыв несжатого блока LZX")
+                    r0, r1, r2 = struct.unpack("<III", buf)
+                else:
+                    raise CabinetError(f"незнакомый тип блока LZX: {block_type}")
+
+            this_run = min(block_remaining, bytes_todo)
+            bytes_todo -= this_run
+            block_remaining -= this_run
+
+            if block_type in (_LZX_BLOCKTYPE_VERBATIM, _LZX_BLOCKTYPE_ALIGNED):
+                if main_tree is None:
+                    raise CabinetError("дерево Хаффмана не инициализировано")
+                while this_run > 0:
+                    main_elem = main_tree.read_sym(reader)
+                    if main_elem < _LZX_NUM_CHARS:
+                        window[window_posn] = main_elem
+                        window_posn += 1
+                        this_run -= 1
+                    else:
+                        main_elem -= _LZX_NUM_CHARS
+                        match_length = main_elem & _LZX_NUM_PRIMARY_LENGTHS
+                        if match_length == _LZX_NUM_PRIMARY_LENGTHS:
+                            if length_tree is None:
+                                raise CabinetError("дерево длин не инициализировано")
+                            match_length += length_tree.read_sym(reader)
+                        match_length += _LZX_MIN_MATCH
+
+                        match_offset = main_elem >> 3
+                        if match_offset == 0:
+                            match_offset = r0
+                        elif match_offset == 1:
+                            match_offset = r1
+                            r1 = r0
+                            r0 = match_offset
+                        elif match_offset == 2:
+                            match_offset = r2
+                            r2 = r0
+                            r0 = match_offset
+                        else:
+                            extra = 17 if match_offset >= 36 else _EXTRA_BITS[match_offset]
+                            match_offset = _POSITION_BASE[match_offset] - 2
+                            if extra >= 3 and block_type == _LZX_BLOCKTYPE_ALIGNED:
+                                if extra > 3:
+                                    v_bits = reader.read_bits(extra - 3)
+                                    match_offset += (v_bits << 3)
+                                if aligned_tree is None:
+                                    raise CabinetError("дерево выравнивания не инициализировано")
+                                a_bits = aligned_tree.read_sym(reader)
+                                match_offset += a_bits
+                            elif extra > 0:
+                                v_bits = reader.read_bits(extra)
+                                match_offset += v_bits
+
+                            r2 = r1
+                            r1 = r0
+                            r0 = match_offset
+
+                        for _ in range(match_length):
+                            src = (window_posn - match_offset) % window_size
+                            window[window_posn] = window[src]
+                            window_posn += 1
+
+                        this_run -= match_length
+
+                if this_run < 0:
+                    block_remaining -= (-this_run)
+
+            elif block_type == _LZX_BLOCKTYPE_UNCOMPRESSED:
+                chunk = reader.read_bytes(this_run)
+                if len(chunk) < this_run:
+                    raise CabinetError("обрыв несжатых данных LZX")
+                window[window_posn:window_posn + len(chunk)] = chunk
+                window_posn += len(chunk)
+                this_run = 0
+
+        reader.align_word()
+
+        frame_bytes = window[frame_posn:frame_posn + frame_size]
+        if intel_started and intel_filesize > 0 and frame < 32768 and frame_size > 10:
+            frame_arr = bytearray(frame_bytes)
+            curpos = offset
+            p = 0
+            limit = frame_size - 10
+            while p < limit:
+                if frame_arr[p] == 0xE8:
+                    abs_off = struct.unpack_from("<i", frame_arr, p + 1)[0]
+                    if -curpos <= abs_off < intel_filesize:
+                        rel_off = abs_off - curpos if abs_off >= 0 else abs_off + intel_filesize
+                        struct.pack_into("<i", frame_arr, p + 1, rel_off)
+                    p += 4
+                    curpos += 4
+                p += 1
+                curpos += 1
+            frame_bytes = bytes(frame_arr)
+
+        out.extend(frame_bytes)
+        offset += frame_size
+        frame_posn = (frame_posn + frame_size) % window_size
+        window_posn = window_posn % window_size
+        frame += 1
+
+    return bytes(out[:uncompressed_size])
+
+
+# =============================================================================
+#  Cabinet Container Structures
+# =============================================================================
 
 class _Folder:
     __slots__ = ("offset", "blocks", "compression", "cache")
@@ -193,11 +572,34 @@ class Cabinet:
         if folder.cache is not None:
             return folder.cache
         compression = folder.compression & 0x000F
-        if compression not in (COMPRESSION_NONE, COMPRESSION_MSZIP):
+        if compression not in (COMPRESSION_NONE, COMPRESSION_MSZIP, COMPRESSION_LZX):
             raise CabinetError(
                 "папка кабинета сжата способом, который умеет только Windows "
                 f"(код {compression})")
         position = folder.offset
+
+        if compression == COMPRESSION_LZX:
+            wnd_bits = (folder.compression >> 8) & 0x1F
+            if not 15 <= wnd_bits <= 21:
+                wnd_bits = 21
+            compressed_data = bytearray()
+            total_uncompressed = 0
+            for _ in range(folder.blocks):
+                head = self._read(position, 8)
+                _checksum, compressed, uncompressed = struct.unpack("<IHH", head)
+                position += 8 + getattr(self, "_data_reserve", 0)
+                block = self._read(position, compressed)
+                position += compressed
+                compressed_data.extend(block)
+                total_uncompressed += uncompressed
+                if total_uncompressed > MAX_TOTAL_SIZE:
+                    raise CabinetError("папка кабинета неправдоподобно велика")
+            try:
+                folder.cache = decompress_lzx(bytes(compressed_data), total_uncompressed, wnd_bits)
+            except Exception as exc:
+                raise CabinetError(f"ошибка распаковки LZX: {exc}") from exc
+            return folder.cache
+
         out = io.BytesIO()
         history = b""
         total = 0
@@ -212,8 +614,6 @@ class Cabinet:
             else:
                 if block[:2] != b"CK":
                     raise CabinetError("повреждённый блок MSZIP")
-                # MSZIP — это raw deflate, где словарём служат последние
-                # 32 КБ предыдущего блока той же папки.
                 decompressor = zlib.decompressobj(-15, zdict=history) \
                     if history else zlib.decompressobj(-15)
                 plain = decompressor.decompress(block[2:], uncompressed)
@@ -306,7 +706,6 @@ def iter_cabinets(data, limit: int = MAX_CABINETS) -> Iterator[int]:
             continue
         found += 1
         yield index
-        # Следующий кабинет ищем уже после этого.
         position = index + max(cb_cabinet, 4)
 
 

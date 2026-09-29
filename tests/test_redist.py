@@ -1561,6 +1561,74 @@ class PackageExtractionTests(unittest.TestCase):
             self.assertEqual((app / "mfc80.dll").read_bytes(), dll)
             self.assertTrue((app / "Microsoft.VC80.MFC.manifest").is_file())
 
+    def test_lzx_nested_cabinet_in_vc2008_vc2010_is_unpacked(self):
+        """VC++ 2008/2010: exe → vc_red.cab (LZX) → msvcr90.dll / msvcr100.dll."""
+        from cabbuild import make_lzx_cabinet
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            manifest = (
+                '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" '
+                'manifestVersion="1.0"><dependency><dependentAssembly>'
+                '<assemblyIdentity type="win32" name="Microsoft.VC90.CRT" '
+                'version="9.0.30729.6161" processorArchitecture="x86" '
+                'publicKeyToken="1fc8b3b9a1e18e3b"/>'
+                '</dependentAssembly></dependency></assembly>'
+            )
+            write_pe(app / "game.exe", imports=("msvcr90.dll",),
+                     manifest=manifest)
+            source = Path(temp, "src")
+            source.mkdir()
+            write_runtime_dll(source / "msvcr90.dll")
+            dll = (source / "msvcr90.dll").read_bytes()
+
+            inner = make_lzx_cabinet({
+                "FL_msvcr90_dll_01_9.0.30729.6161_x-ww_1b4fc1e7": dll,
+            })
+            shipped = Path(temp, "_CommonRedist", "vcredist", "2008")
+            shipped.mkdir(parents=True)
+            (shipped / "vcredist_x86.exe").write_bytes(
+                self._package_bytes({"vc_red.cab": inner,
+                                     "vc_red.msi": b"\xd0\xcf\x11\xe0" * 4096}))
+
+            scan = redist.scan_app_runtime(str(app))
+            report = redist.RuntimeProvisioner(
+                self.log, source_dirs=[str(shipped)], system_dirs=[],
+                sxs_dir="",
+            ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertEqual([r.dll for r in report.provided], ["msvcr90.dll"])
+            self.assertEqual((app / "msvcr90.dll").read_bytes(), dll)
+            self.assertTrue((app / "Microsoft.VC90.CRT.manifest").is_file())
+
+    def test_lzx_nested_cabinet_in_vc2012_burn_bundle_is_unpacked(self):
+        """VC++ 2012: WiX Burn bundle → cab1.cab (LZX) → msvcp110.dll."""
+        from cabbuild import make_burn_bundle, make_lzx_cabinet
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("msvcp110.dll",))
+            source = Path(temp, "src")
+            source.mkdir()
+            write_runtime_dll(source / "msvcp110.dll")
+            dll = (source / "msvcp110.dll").read_bytes()
+
+            inner_cab = make_lzx_cabinet({"msvcp110.dll": dll})
+            shipped = Path(temp, "_CommonRedist", "vcredist", "2012")
+            shipped.mkdir(parents=True)
+            (shipped / "vcredist_x86.exe").write_bytes(
+                make_burn_bundle([
+                    {"manifest.xml": b"<BurnManifest/>"},
+                    {"cab1.cab": inner_cab},
+                ]))
+
+            scan = redist.scan_app_runtime(str(app))
+            report = redist.RuntimeProvisioner(
+                self.log, source_dirs=[str(shipped)], system_dirs=[],
+                sxs_dir="",
+            ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertEqual([r.dll for r in report.provided], ["msvcp110.dll"])
+            self.assertEqual((app / "msvcp110.dll").read_bytes(), dll)
+
     # -- проверка скачанного -------------------------------------------------
     def test_a_web_page_is_never_mistaken_for_a_package(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1712,6 +1780,33 @@ class PackageExtractionTests(unittest.TestCase):
         self.assertIn("DXSETUP.exe", text)
         self.assertIn("/silent", text)
         self.assertTrue(text.isascii())
+
+    def test_launcher_runtime_commands_for_dxsetup_is_only_silent(self):
+        """DXSETUP.exe в лончере получает ровно /silent, без пагубных /quiet и /S."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            dx = root / "Redist" / "DXSETUP.exe"
+            dx.parent.mkdir(parents=True)
+            dx.write_bytes(b"MZ")
+            commands = exe_launcher._runtime_install_commands(
+                root, {"file": "Redist/DXSETUP.exe", "kind": "dxsetup"})
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(commands[0][1:], ["/silent"])
+
+    def test_launcher_runtime_commands_for_directx_bundle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = root / "Redist" / "directx_Jun2010_redist.exe"
+            bundle.parent.mkdir(parents=True)
+            bundle.write_bytes(b"MZ")
+            commands = exe_launcher._runtime_install_commands(
+                root, {"file": "Redist/directx_Jun2010_redist.exe",
+                       "kind": "directx_bundle"})
+            self.assertEqual(len(commands), 1)
+            line = commands[0][-1]
+            self.assertIn("DXSETUP.exe", line)
+            self.assertIn("/silent", line)
+            self.assertNotIn("/quiet", line)
 
 
 class LauncherSilentInstallTests(unittest.TestCase):

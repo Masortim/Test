@@ -175,7 +175,7 @@ def _directx_commands(path: Path) -> list[list[str]]:
     scratch = _directx_scratch_dir()
     line = (
         f'rd /s /q "{scratch}" 2>nul & md "{scratch}" 2>nul & '
-        f'"{path}" /Q /C /T:"{scratch}" & '
+        f'"{path}" /Q /C /T:{scratch} & '
         f'if not exist "{scratch}\\DXSETUP.exe" (rd /s /q "{scratch}" 2>nul '
         f'& exit /b 1) & '
         f'"{scratch}\\DXSETUP.exe" /silent & set DXRC=!ERRORLEVEL! & '
@@ -194,11 +194,18 @@ def _runtime_install_commands(root: Path,
     if not path.is_file():
         return []
     kind = str(entry.get("kind", "")).lower()
+    lower_name = path.name.lower()
     if kind == "msi" or path.suffix.lower() in (".msi", ".msp"):
         return [["msiexec", "/i", str(path), "/qn", "/norestart"]]
     if kind == "msu" or path.suffix.lower() == ".msu":
         return [["wusa", str(path), "/quiet", "/norestart"]]
-    if kind == "directx_bundle" or path.name.lower().startswith("directx_"):
+    if kind == "dxsetup" or lower_name == "dxsetup.exe":
+        # DXSETUP understands only /silent; any other switch pops up
+        # "Invalid command line operation".
+        return [[str(path), "/silent"]]
+    if (kind == "directx_bundle" or lower_name.startswith("directx_")
+            or lower_name.startswith("directx") or lower_name.startswith("dx_")
+            or lower_name.startswith("dxredist")):
         # directx_*_redist.exe only unpacks itself; every silent switch is
         # handed over to DXSETUP, which answers with a modal "Invalid
         # command line operation" box.  Unpack first, then DXSETUP /silent.
