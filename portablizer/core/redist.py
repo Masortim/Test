@@ -1948,30 +1948,101 @@ def find_prerequisite_installers(directories: Sequence[str],
     return sorted(found, key=order)
 
 
+def extract_embedded_prerequisites(installer_path: str, log=None,
+                                   timeout: int = 240) -> Tuple[str, List[str]]:
+    """Достаёт «_CommonRedist»-подобные папки ИЗ САМОГО установщика.
+
+    ``installer_source_dirs`` находит предусловия, только если они лежат
+    РЯДОМ с установщиком отдельными файлами (типично для repack-сборок).
+    Однофайловые инсталляторы (один ``Setup.exe`` без соседних файлов)
+    несут vcredist/DXSETUP/OpenAL ВНУТРИ своего payload — и достаются
+    оттуда только тогда, когда установщик сам их распаковывает и
+    запускает. Именно тогда и всплывает окно DXSETUP «Неверная операция
+    командной строки»: свой ключ тихого режима установщик передаёт
+    вложенному DXSETUP, а тот его не понимает.
+
+    Чтобы окно не появилось вовсе, нужные пакеты достаются из архива
+    ЗАРАНЕЕ — без запуска самого установщика (никаких побочных эффектов,
+    никакого мастера на экране) — и ставятся тихо шагом раньше. Работает
+    только там, где есть 7-Zip: он умеет выборочно распаковывать путь
+    внутри NSIS/InstallShield/Burn-архива, не трогая остальные гигабайты
+    payload'а. Нет 7-Zip — метод просто не применяется, поведение прежнее.
+    """
+    if not IS_WINDOWS or not os.path.isfile(installer_path):
+        return "", []
+    sevenzip = find_7zip()
+    if not sevenzip:
+        return "", []
+    import tempfile
+
+    try:
+        base = tempfile.mkdtemp(prefix="pblzprereq")
+    except OSError:
+        return "", []
+    dest = cmdline_safe_dir(base) or base
+    patterns = [f"*{name}*" for name in REDIST_SOURCE_NAMES]
+    command = [sevenzip, "x", "-y", "-r", f"-o{dest}", installer_path, *patterns]
+    try:
+        code = _run_quiet(command, timeout)
+        if log is not None:
+            log.debug(f"Поиск предусловий внутри установщика (код {code}): "
+                      + subprocess.list2cmdline(command))
+        found = find_prerequisite_installers([dest]) if _has_files(dest) else []
+        if not found:
+            shutil.rmtree(base, ignore_errors=True)
+            if not _same_dir(dest, base):
+                shutil.rmtree(dest, ignore_errors=True)
+            return "", []
+        if log is not None:
+            log.debug(f"Внутри установщика найдено предусловий: {len(found)}.")
+        return base, found
+    except Exception as exc:  # noqa: BLE001 — необязательный шаг, не критично
+        if log is not None:
+            log.debug(f"Поиск предусловий внутри установщика не удался: {exc}")
+        shutil.rmtree(base, ignore_errors=True)
+        return "", []
+
+
 def install_prerequisites(directories: Sequence[str], log, *,
                           runner: Optional[Callable[[Sequence[str]], int]] = None,
-                          limit: int = 24) -> List[SilentInstall]:
+                          limit: int = 24,
+                          installer_path: str = "") -> List[SilentInstall]:
     """Ставит **молча** все предусловия, приложенные к установщику.
 
     Вызывается ДО запуска основного установщика: когда пакеты уже на месте,
     его собственный шаг «установка компонентов» либо пропускается целиком,
     либо проходит без единого окна с кнопкой «OK».
+
+    Если рядом с установщиком подходящих файлов не нашлось, а сам
+    ``installer_path`` передан, предусловия дополнительно ищутся ВНУТРИ
+    установщика (см. :func:`extract_embedded_prerequisites`) — это и
+    закрывает случай однофайловых дистрибутивов, чей встроенный DXSETUP
+    иначе показал бы «Неверная операция командной строки» уже во время
+    настоящей установки.
     """
-    installers = find_prerequisite_installers(directories)[:limit]
+    installers = find_prerequisite_installers(directories)
+    scratch = ""
+    if not installers and installer_path:
+        scratch, installers = extract_embedded_prerequisites(installer_path, log)
+    installers = installers[:limit]
     results: List[SilentInstall] = []
     if not installers:
         return results
     log.info(f"Предусловия установщика: найдено пакетов — {len(installers)}. "
              "Ставлю их в тихом режиме, окна с «OK» не появятся.")
-    for path in installers:
-        outcome = run_silent_install(path, runner=runner, log=log)
-        results.append(outcome)
-        if outcome.status == "failed":
-            log.warn(f"  • {outcome.describe()} (код {outcome.code})")
-        elif outcome.status == "skipped":
-            log.debug(f"  • {outcome.describe()}")
-        else:
-            log.ok(f"  • {outcome.describe()}")
+    try:
+        for path in installers:
+            outcome = run_silent_install(path, runner=runner, log=log)
+            results.append(outcome)
+            if outcome.status == "failed":
+                log.warn(f"  • {outcome.describe()} (код {outcome.code})")
+            elif outcome.status == "skipped":
+                log.debug(f"  • {outcome.describe()}")
+            else:
+                log.ok(f"  • {outcome.describe()}")
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
     return results
 
 

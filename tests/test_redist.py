@@ -8,6 +8,7 @@ MSVCR110.dll / d3dx9_39.dll / MSVCP100.dll / MSVCR100.dll». Такие ошиб
 """
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -1781,6 +1782,93 @@ class PackageExtractionTests(unittest.TestCase):
         self.assertIn("/silent", text)
         self.assertTrue(text.isascii())
 
+    def test_embedded_prerequisites_are_pulled_out_before_the_installer_runs(self):
+        """Однофайловый Setup.exe: DXSETUP внутри него достаётся заранее \u2014
+        7-Zip выборочно распаковывает только redist-папку, установщик при
+        этом не запускается вовсе."""
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "GameSetup.exe")
+            installer.write_bytes(b"MZ" + b"\x00" * 1024)
+            calls = []
+
+            def fake_run_quiet(args, timeout=600):
+                calls.append(list(args))
+                dest = ""
+                for part in args:
+                    if part.startswith("-o"):
+                        dest = part[2:]
+                self.assertTrue(dest)
+                redist_dir = Path(dest, "_CommonRedist", "DirectX")
+                redist_dir.mkdir(parents=True, exist_ok=True)
+                (redist_dir / "DXSETUP.exe").write_bytes(b"MZ")
+                other = Path(dest, "_CommonRedist", "vcredist", "2010")
+                other.mkdir(parents=True, exist_ok=True)
+                (other / "vcredist_x86.exe").write_bytes(b"MZ")
+                return 0
+
+            with mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "find_7zip",
+                                      lambda: r"C:\7-Zip\7z.exe"), \
+                    mock.patch.object(redist, "_run_quiet", fake_run_quiet):
+                scratch, found = redist.extract_embedded_prerequisites(
+                    str(installer), self.log)
+
+            try:
+                self.assertTrue(scratch)
+                names = sorted(os.path.basename(p).lower() for p in found)
+                self.assertEqual(names, ["dxsetup.exe", "vcredist_x86.exe"])
+                # Установщик игры не запускался \u2014 запускался только 7-Zip.
+                self.assertEqual(len(calls), 1)
+                self.assertTrue(calls[0][0].lower().endswith("7z.exe"))
+                self.assertIn(str(installer), calls[0])
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_embedded_prerequisites_lookup_is_skipped_without_7zip(self):
+        """Нет 7-Zip \u2014 метод не пытается запускать установщик игры сам."""
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "GameSetup.exe")
+            installer.write_bytes(b"MZ")
+            with mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "find_7zip", lambda: ""):
+                scratch, found = redist.extract_embedded_prerequisites(
+                    str(installer), self.log)
+            self.assertEqual(scratch, "")
+            self.assertEqual(found, [])
+
+    def test_full_prerequisite_pipeline_installs_the_embedded_dxsetup_silently(self):
+        """Сквозной сценарий: install_prerequisites() без соседних файлов
+        достаёт DXSETUP из самого установщика и ставит его ровно с /silent
+        \u2014 без единого окна «Неверная операция командной строки»."""
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "GameSetup.exe")
+            installer.write_bytes(b"MZ" + b"\x00" * 1024)
+            started = []
+
+            def runner(args):
+                started.append(list(args))
+                return 0
+
+            def fake_run_quiet(args, timeout=600):
+                dest = next(p[2:] for p in args if p.startswith("-o"))
+                redist_dir = Path(dest, "_CommonRedist", "DirectX")
+                redist_dir.mkdir(parents=True, exist_ok=True)
+                (redist_dir / "DXSETUP.exe").write_bytes(b"MZ")
+                return 0
+
+            with mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "find_7zip",
+                                      lambda: r"C:\7-Zip\7z.exe"), \
+                    mock.patch.object(redist, "_run_quiet", fake_run_quiet):
+                outcomes = redist.install_prerequisites(
+                    [], self.log, runner=runner, installer_path=str(installer))
+
+            self.assertEqual(len(outcomes), 1)
+            self.assertTrue(outcomes[0].ok)
+            self.assertEqual(len(started), 1)
+            self.assertTrue(started[0][0].lower().endswith("dxsetup.exe"))
+            self.assertEqual(started[0][1:], ["/silent"])
+
     def test_launcher_runtime_commands_for_dxsetup_is_only_silent(self):
         """DXSETUP.exe в лончере получает ровно /silent, без пагубных /quiet и /S."""
         with tempfile.TemporaryDirectory() as temp:
@@ -1964,6 +2052,37 @@ class PrerequisiteStageTests(unittest.TestCase):
             self.assertTrue(result.success, result.messages)
             self.assertEqual(order, ["prerequisites", "installer"])
             self.assertIn("Visual C++ 2010", result.runtime_installed)
+
+    def test_prerequisites_are_looked_for_inside_a_single_exe_installer(self):
+        """Нет ``_CommonRedist`` рядом \u2014 значит, встроенный DXSETUP ищем
+        внутри самого установщика, а не оставляем его на потом (где он и
+        показал бы «Неверная операция командной строки»)."""
+        seen_kwargs = {}
+
+        def fake_prerequisites(dirs, log, **kwargs):
+            seen_kwargs.update(kwargs)
+            return []
+
+        class Engine(Portablizer):
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                write_pe(Path(app_dir, "Game.exe"), imports=("kernel32.dll",))
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "GameSetup.exe")
+            installer.write_bytes(b"MZ Inno Setup")
+            # Никакого _CommonRedist по соседству \u2014 однофайловый дистрибутив.
+            with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                    mock.patch("portablizer.core.portablizer.is_elevated",
+                               lambda: True), \
+                    mock.patch.object(redist, "install_prerequisites",
+                                      fake_prerequisites):
+                Engine(Logger()).run(PortableOptions(
+                    installer_path=str(installer), output_dir=temp,
+                    app_name="Game", capture_registry=False,
+                    cleanup_host=False, redirect_userdirs=False))
+
+        self.assertEqual(seen_kwargs.get("installer_path"), str(installer))
 
     def test_the_stage_is_skipped_when_the_user_says_so(self):
         class Engine(Portablizer):

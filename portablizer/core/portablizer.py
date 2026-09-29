@@ -2090,7 +2090,7 @@ class Portablizer:
                 "на Windows — пропускаю.")
             return
         sources = redist_mod.installer_source_dirs(opts.installer_path)
-        if not sources:
+        if not sources and not os.path.isfile(opts.installer_path or ""):
             return
         if not is_elevated():
             self.log.warn(
@@ -2098,7 +2098,8 @@ class Portablizer:
                 "установка распространяемых пакетов может не пройти, и "
                 "установщик программы снова покажет окна с «OK».")
         try:
-            outcomes = redist_mod.install_prerequisites(sources, self.log)
+            outcomes = redist_mod.install_prerequisites(
+                sources, self.log, installer_path=opts.installer_path)
         except Exception as exc:  # noqa: BLE001 — предусловия не критичны
             self.log.warn(f"Не удалось поставить предусловия: {exc}")
             return
