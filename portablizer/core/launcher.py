@@ -55,6 +55,9 @@ ROOT_TOKEN = "@@PORTABLE_ROOT@@"
 #: Максимум ключей реестра, обслуживаемых лончером (защита от «простыни»).
 MAX_REGISTRY_KEYS = 256
 
+#: Максимум строк в предстартовой проверке системных библиотек.
+MAX_RUNTIME_CHECKS = 12
+
 
 @dataclass
 class TargetInfo:
@@ -104,6 +107,11 @@ class LauncherConfig:
     # Все эти файлы являются копиями одного PortableLauncher.exe, поэтому
     # выбор цели хранится в переносимом JSON, а не в абсолютном пути.
     launcher_aliases: Dict[str, str] = field(default_factory=dict)
+    # Распространяемые компоненты (VC++, DirectX…), которые не удалось
+    # принести в портатив. Лончер проверяет их перед стартом и объясняет,
+    # чего не хватает, вместо системного окна «отсутствует MSVCR110.dll».
+    # Каждая запись: {"dll", "title", "url", "arch"}.
+    runtime_requirements: List[Dict[str, str]] = field(default_factory=list)
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -191,6 +199,51 @@ def _path_lines(cfg: LauncherConfig) -> str:
         lines.append(f'set "PATH=%PORTABLE_ROOT%\\{_bat_set_value(rel)};%PATH%"')
     if not lines:
         lines.append("rem (no local dependency folders were detected)")
+    return "\n".join(lines)
+
+
+def _ascii_token(value: str) -> str:
+    """Готовит имя файла/ссылку к подстановке в .bat литералом.
+
+    Символы, которые cmd.exe считает операторами, просто удаляются: имя DLL
+    и адрес пакета их не содержат, а случайный мусор не должен ломать разбор.
+    """
+    cleaned = "".join(ch for ch in str(value) if ch in _ASCII_OK)
+    for ch in '"%&|<>^()\r\n\t':
+        cleaned = cleaned.replace(ch, "")
+    return cleaned.strip()
+
+
+def _runtime_check_block(cfg: LauncherConfig) -> str:
+    """Предстартовая проверка распространяемых компонентов.
+
+    Список формируется при сборке: в него попадает только то, что Portablizer
+    НЕ смог принести в портатив. Если на целевом ПК такой библиотеки тоже нет,
+    пользователь увидит название пакета и ссылку, а не системное окно
+    «Запуск программы невозможен: отсутствует MSVCR110.dll».
+    """
+    calls: List[str] = []
+    for item in cfg.runtime_requirements[:MAX_RUNTIME_CHECKS]:
+        dll = _ascii_token(item.get("dll", ""))
+        if not dll:
+            continue
+        title = ascii_display(item.get("title", ""),
+                              fallback="Microsoft runtime package")
+        url = _ascii_token(item.get("url", ""))
+        calls.append(f'call :portable_need_dll "{dll}" "{title}" "{url}"')
+    if not calls:
+        return ("rem (this program needs no extra Microsoft runtime "
+                "components)\ngoto :eof")
+    lines = ['set "PORTABLE_RUNTIME_MISSING="']
+    lines += calls
+    lines += [
+        "if defined PORTABLE_RUNTIME_MISSING (",
+        "  echo   Details and download links: redistributables.txt",
+        "  echo   The program may still start: some components load on demand.",
+        "  echo.",
+        ")",
+        "goto :eof",
+    ]
     return "\n".join(lines)
 
 
@@ -645,6 +698,12 @@ if not exist "%PORTABLE_TARGET%" (
   exit /b 1
 )
 
+rem --- Microsoft runtime components (VC++, DirectX, ...) ---------------------
+rem Windows only reports "the program can't start because MSVCR110.dll is
+rem missing" after the fact. The check below names the package instead.
+for %%I in ("%PORTABLE_TARGET%") do set "PORTABLE_TARGET_DIR=%%~dpI"
+call :portable_check_runtime
+
 rem Launchers/configurators of older games often require their captured HKLM
 rem InstallFolder. VirtualStore is ignored by manifest-aware programs, so only
 rem those auxiliary targets are relaunched with UAC when a machine file exists.
@@ -656,7 +715,6 @@ if defined PORTABLE_RELAUNCHED (
 call :portable_documents_load
 call :portable_registry_load
 
-for %%I in ("%PORTABLE_TARGET%") do set "PORTABLE_TARGET_DIR=%%~dpI"
 pushd "%PORTABLE_TARGET_DIR%" 2>nul
 echo Starting {title} from the portable folder...
 "%PORTABLE_TARGET%" {target_args}%PORTABLE_ARGS%
@@ -713,6 +771,26 @@ echo ===========================================================================
 {list_items}
 echo ===========================================================================
 endlocal & exit /b 0
+
+:portable_check_runtime
+{runtime_check}
+
+:portable_need_dll
+rem %1 = library, %2 = package that provides it, %3 = where to get it.
+rem A library next to the program or in the Windows folders is fine; only a
+rem really missing one is reported.
+if exist "%PORTABLE_TARGET_DIR%%~1" goto :eof
+if exist "%PORTABLE_ROOT%\App\%~1" goto :eof
+if exist "%SystemRoot%\System32\%~1" goto :eof
+if exist "%SystemRoot%\SysWOW64\%~1" goto :eof
+if not defined PORTABLE_RUNTIME_MISSING (
+  echo.
+  echo [WARNING] This PC is missing Microsoft runtime components:
+)
+set "PORTABLE_RUNTIME_MISSING=1"
+echo   - %~1 : %~2
+if not "%~3" == "" echo     %~3
+goto :eof
 
 :portable_elevate_for_machine
 {machine_elevation}
@@ -890,6 +968,7 @@ def render_bat(cfg: LauncherConfig) -> str:
         machine_elevation=_machine_elevation_block(cfg),
         documents_load=_documents_load_block(cfg),
         documents_restore=_documents_restore_block(cfg),
+        runtime_check=_runtime_check_block(cfg),
     )
     return ensure_ascii_bat(text)
 
@@ -1214,6 +1293,9 @@ def render_config_json(cfg: LauncherConfig) -> str:
         "extra_env": cfg.extra_env,
         "path_prepend": cfg.path_prepend,
         "redirect_known_folders": cfg.redirect_known_folders,
+        # Чего не хватает на чужом ПК: лончер проверяет этот список перед
+        # стартом и называет пакет вместо системной ошибки про DLL.
+        "runtime_requirements": cfg.runtime_requirements,
         "registry": {
             "enabled": cfg.apply_registry,
             "file": cfg.reg_file_name,

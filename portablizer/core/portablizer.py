@@ -46,6 +46,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tupl
 
 from .. import __version__
 from . import launcher as launcher_mod
+from . import redist as redist_mod
 from . import registry as reg_mod
 from .detect import DetectionResult, InstallerType, detect_installer
 from .logutil import Logger
@@ -287,6 +288,12 @@ class PortableOptions:
     # setup.iss, а записать его может лишь человек, прошедший мастер.
     allow_assisted_install: bool = False
     assisted_timeout: int = 3600       # сек: человек за клавиатурой не спешит
+    # Приносить в портатив распространяемые компоненты (Visual C++, DirectX и
+    # т. п.), чтобы на чужом ПК не возникало «отсутствует MSVCP110.dll».
+    bundle_runtimes: bool = True
+    # Докачивать недостающие пакеты с сайта Microsoft. По умолчанию выключено:
+    # сборка не должна молча ходить в сеть.
+    download_runtimes: bool = False
 
 
 @dataclass
@@ -341,6 +348,14 @@ class PortableResult:
     portable_launcher_exe_rel: str = ""
     launcher_exe_rel: str = ""
     config_exe_rel: str = ""
+    #: Системные библиотеки (VC++/DirectX…), принесённые в портатив.
+    runtime_provided: List[str] = field(default_factory=list)
+    #: То, чего принести не удалось: нужен пакет на целевом ПК.
+    runtime_missing: List[str] = field(default_factory=list)
+    #: Пакеты, которые придётся установить (человеческие названия + ссылки).
+    runtime_packages: List[str] = field(default_factory=list)
+    #: Отчёт по распространяемым компонентам внутри портатива.
+    runtime_report_rel: str = ""
 
 
 class Portablizer:
@@ -397,7 +412,7 @@ class Portablizer:
             "install.log",
             "install-retry.log", "install-layout.log", "installer-engine.log",
             "installer-output.log", "portablizer.log", "_bundle_layout",
-            "setup-installshield.log",
+            "setup-installshield.log", redist_mod.REPORT_NAME, "_redist_cache",
         ):
             path = os.path.join(portable_dir, filename)
             try:
@@ -622,8 +637,15 @@ class Portablizer:
                     result.config_exe_rel = os.path.relpath(
                         os.path.join(portable_dir, t.rel_path), portable_dir)
 
-            # 7. Зависимости и переменные среды
-            self.progress(85, "Учёт зависимостей и переменных среды")
+            # 7. Распространяемые компоненты: VC++, DirectX и прочее, чего на
+            # чужом ПК может не оказаться.
+            self._check_cancel()
+            self.progress(82, "Распространяемые компоненты (VC++, DirectX)")
+            runtime_report = self._provision_runtimes(
+                app_dir, portable_dir, opts, name, result)
+
+            # 7b. Зависимости и переменные среды
+            self.progress(87, "Учёт зависимостей и переменных среды")
             path_prepend = self._collect_dep_dirs(app_dir, portable_dir)
 
             # 8. Генерация лончера и вспомогательных скриптов
@@ -631,7 +653,8 @@ class Portablizer:
             self.progress(92, "Генерация портативного лончера и меню")
             companion_files = self._write_launcher(
                 portable_dir, name, result.main_exe_rel,
-                opts, path_prepend, capture, targets)
+                opts, path_prepend, capture, targets,
+                runtime_report=runtime_report)
             result.companion_launchers = companion_files
             exe_launcher = os.path.join(
                 portable_dir, "App", APP_EXE_LAUNCHER_NAME)
@@ -2013,6 +2036,98 @@ class Portablizer:
         # Ограничим, чтобы PATH не разросся: корень App + до 10 подпапок.
         return dep_dirs[:12]
 
+    # -- распространяемые компоненты -----------------------------------------
+    def _provision_runtimes(
+        self, app_dir: str, portable_dir: str, opts: PortableOptions,
+        name: str, result: PortableResult,
+    ) -> Optional["redist_mod.ProvisionReport"]:
+        """Приносит в портатив VC++/DirectX и прочие системные библиотеки.
+
+        Обычная установка кладёт их в систему, поэтому на компьютере-сборщике
+        всё работает, а на чужом ПК Windows показывает «отсутствует
+        MSVCP110.dll». Здесь список нужных библиотек берётся из таблиц импорта
+        самих exe/dll программы, а файлы — из комплекта установщика, системных
+        папок этого ПК, WinSxS или (по желанию) с сайта Microsoft.
+        """
+        if not opts.bundle_runtimes:
+            self.log.info(
+                "Проверка распространяемых компонентов отключена в параметрах.")
+            return None
+        try:
+            scan = redist_mod.scan_app_runtime(app_dir)
+        except Exception as exc:  # noqa: BLE001 — диагностика не должна ронять сборку
+            self.log.warn(f"Не удалось разобрать зависимости программы: {exc}")
+            return None
+        if not scan.parsed:
+            self.log.debug(
+                "Ни одного PE-файла в App разобрать не удалось — проверка "
+                "распространяемых компонентов пропущена.")
+            return None
+
+        self.log.info(
+            f"Разобрано исполняемых файлов: {scan.parsed}; внешних библиотек: "
+            f"{len(scan.requirements)}; из них требует внимания: "
+            f"{len(scan.needed)}.")
+
+        sources = redist_mod.installer_source_dirs(opts.installer_path, app_dir)
+        if sources:
+            self.log.debug(
+                "Папки с готовыми redist-файлами рядом с установщиком: "
+                + ", ".join(os.path.basename(s) for s in sources[:6]))
+        provisioner = redist_mod.RuntimeProvisioner(
+            self.log, source_dirs=sources,
+            allow_download=opts.download_runtimes)
+        try:
+            report = provisioner.provision(scan, app_dir, portable_dir, name)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warn(
+                f"Не удалось перенести распространяемые компоненты: {exc}")
+            return None
+
+        for requirement in report.provided:
+            self.log.ok(
+                f"В портатив добавлена {requirement.dll} "
+                f"[{requirement.arch or '?'}] — {requirement.title} "
+                f"({requirement.source})")
+        result.runtime_provided = [r.dll for r in report.provided]
+
+        packages: List[str] = []
+        for requirement in report.missing:
+            entry = f"{requirement.title} — {requirement.url}" \
+                if requirement.url else requirement.title
+            if entry not in packages:
+                packages.append(entry)
+        result.runtime_missing = [r.dll for r in report.missing]
+        result.runtime_packages = packages
+
+        if report.missing:
+            self.log.warn(
+                "Не удалось найти файлы для: "
+                + ", ".join(sorted({r.dll for r in report.missing}))
+                + ". На целевом ПК может понадобиться установка пакета — "
+                  "см. " + redist_mod.REPORT_NAME + " в папке портатива.")
+            for entry in packages[:6]:
+                self.log.warn(f"  • {entry}")
+            if not opts.download_runtimes:
+                self.log.info(
+                    "Совет: включите «Скачивать недостающие пакеты», и "
+                    "Portablizer возьмёт файлы прямо с сайта Microsoft.")
+        elif report.provided:
+            self.log.ok(
+                "Все системные компоненты, нужные программе, теперь лежат "
+                "внутри портатива — установка на чужом ПК не потребуется.")
+
+        if report.touched:
+            try:
+                self._write_text(
+                    os.path.join(portable_dir, redist_mod.REPORT_NAME),
+                    redist_mod.render_report(report), encoding="utf-8-sig")
+                result.runtime_report_rel = redist_mod.REPORT_NAME
+            except OSError as exc:
+                self.log.warn(
+                    f"Не удалось сохранить {redist_mod.REPORT_NAME}: {exc}")
+        return report
+
     # -- лончер ---------------------------------------------------------------
     def _copy_exe_launcher(
         self, portable_dir: str,
@@ -2059,7 +2174,8 @@ class Portablizer:
     def _write_launcher(self, portable_dir: str, name: str, main_exe_rel: str,
                         opts: PortableOptions, path_prepend: List[str],
                         capture: Optional[RegistryCapture] = None,
-                        targets: Optional[List[launcher_mod.TargetInfo]] = None
+                        targets: Optional[List[launcher_mod.TargetInfo]] = None,
+                        runtime_report: "Optional[redist_mod.ProvisionReport]" = None
                         ) -> List[str]:
         has_registry = bool(
             capture and (capture.reg_file or capture.machine_reg_file
@@ -2083,6 +2199,10 @@ class Portablizer:
             targets=all_targets,
             launcher_target_rel=launcher_target,
             config_target_rel=config_target,
+            runtime_requirements=(
+                redist_mod.launcher_requirements(runtime_report)
+                if runtime_report is not None else []
+            ),
         )
         # Launch.bat — CRLF, чистый ASCII и без BOM. cmd.exe читает .bat по
         # байтовым смещениям: BOM, LF-концы строк или многобайтовый символ
@@ -2173,6 +2293,34 @@ class Portablizer:
             "  portable.reg          — настройки программы (переносятся с папкой)\n"
             if capture and capture.reg_file else ""
         )
+        # Раздел о системных библиотеках нужен, только если они вообще
+        # обсуждались: пустой заголовок в README только путает.
+        runtime_note = ""
+        runtime_section = ""
+        if runtime_report is not None and runtime_report.touched:
+            runtime_note = (
+                f"  {redist_mod.REPORT_NAME:<21} — какие системные библиотеки "
+                "нужны программе\n"
+            )
+            if runtime_report.provided:
+                runtime_section = (
+                    "\nСистемные библиотеки (Visual C++, DirectX и т.п.):\n"
+                    "  • нужные файлы уже лежат внутри папки App — "
+                    "устанавливать пакеты\n"
+                    "    на чужом компьютере не нужно;\n"
+                    f"  • полный список — в {redist_mod.REPORT_NAME}.\n"
+                )
+            if runtime_report.missing:
+                missing_names = ", ".join(sorted({
+                    item.dll for item in runtime_report.missing})[:8])
+                runtime_section += (
+                    "\nВНИМАНИЕ: часть системных библиотек найти не удалось: "
+                    f"{missing_names}.\n"
+                    "  Если программа не запустится, установите пакеты по "
+                    f"ссылкам из {redist_mod.REPORT_NAME}\n"
+                    "  (обычно это Microsoft Visual C++ Redistributable или "
+                    "DirectX End-User Runtime).\n"
+                )
         self._write_text(
             os.path.join(portable_dir, "README_PORTABLE.txt"),
             _README.format(
@@ -2181,6 +2329,8 @@ class Portablizer:
                 companion_section=companion_section,
                 companion_files_list=companion_files_list,
                 registry_note=registry_note,
+                runtime_note=runtime_note,
+                runtime_section=runtime_section,
                 exe_launcher_step=(
                     "  2. Запустите App\\LaunchPortable.exe — это готовый EXE, "
                     "который сохраняет изоляцию.\n"
@@ -2234,7 +2384,7 @@ _README = """{app_name} — портативная версия
   Launch.bat            — портативный лончер (перенаправляет каталоги и env)
   LaunchHidden.vbs      — запуск без окна консоли
 {companion_files_list}  launcher_config.json  — параметры лончера
-{registry_note}  install.log           — подробный журнал установщика (если он поддерживается)
+{registry_note}{runtime_note}  install.log           — подробный журнал установщика (если он поддерживается)
   portablizer.log       — журнал создания и диагностики портатива
 
 Ключи запуска (Launch.bat):
@@ -2251,6 +2401,7 @@ _README = """{app_name} — портативная версия
   --help            справка
   -- <аргументы>    передать аргументы самой программе
 
+{runtime_section}
 Как это работает:
   • стандартные каталоги профиля (AppData, Temp, Документы и др.) на время
     работы перенаправляются в PortableData — программа не пишет в C:\\Users;
