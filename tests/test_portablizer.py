@@ -26,6 +26,10 @@ from portablizer.core.launcher import (
     render_vbs,
 )
 from portablizer.core.logutil import Logger
+from portablizer.core.redistributables import (
+    RuntimeReport, package_for_dll, render_runtime_manifest,
+    render_runtime_readme, render_runtime_script,
+)
 from portablizer.core.portablizer import (
     PortableOptions, PortableResult, Portablizer, _burn_layout_payloads,
     _exit_code_hint, _format_exit_code, read_installshield_result,
@@ -2465,6 +2469,45 @@ class RegistryVirtualizationTests(unittest.TestCase):
         self.assertEqual(len(roots), 2)
         self.assertIn(r"HKCU\Software\CD Projekt RED\The Witcher 2", roots)
         self.assertIn(r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\CD Projekt RED\The Witcher 2", roots)
+
+
+class RedistributableCatalogTests(unittest.TestCase):
+    """The legacy names that motivated the runtime preflight stay covered."""
+
+    def test_legacy_dll_names_map_to_official_runtime_families(self):
+        expected = {
+            "XINPUT1_3.dll": "directx-legacy-jun2010",
+            "d3dx9_38.dll": "directx-legacy-jun2010",
+            "d3dx9_39.dll": "directx-legacy-jun2010",
+            "MSVCP100.dll": "vc2010",
+            "MSVCR100.dll": "vc2010",
+            "MSVCP110.dll": "vc2012",
+            "MSVCR110.dll": "vc2012",
+            "vcruntime140_1.dll": "vc2015-2022",
+        }
+        for dll, package_id in expected.items():
+            package = package_for_dll(dll)
+            self.assertIsNotNone(package, dll)
+            self.assertEqual(package.package_id, package_id)
+
+    def test_runtime_artifacts_are_actionable_and_ascii_helper_is_safe(self):
+        report = RuntimeReport(
+            architectures=["x86"],
+            required=["msvcp110.dll", "xinput1_3.dll"],
+            missing=["msvcp110.dll", "xinput1_3.dll"],
+            packages={
+                "vc2012": {
+                    "display_name": "VC++ 2012",
+                    "official_page": "https://www.microsoft.com/",
+                },
+            },
+        )
+        manifest = json.loads(render_runtime_manifest(report))
+        self.assertEqual(manifest["missing"], report.missing)
+        self.assertIn("msvcp110.dll", render_runtime_readme(report))
+        helper = render_runtime_script(report)
+        self.assertTrue(helper.isascii())
+        self.assertIn("No installer was supplied", helper)
 
 
 if __name__ == "__main__":

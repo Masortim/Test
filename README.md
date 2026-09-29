@@ -104,6 +104,40 @@ MyApp_Portable/
 └─ README_PORTABLE.txt
 ```
 
+## Redistributables: VC++ и DirectX без «отсутствует DLL»
+
+После установки Portablizer анализирует **таблицу импортов PE** каждого EXE и
+DLL в `App/`, а не только имена файлов. Поэтому заранее выявляются, в том
+числе:
+
+* `XINPUT1_3.dll`, `d3dx9_24.dll` … `d3dx9_43.dll`, `d3dx10_*`, `d3dx11_*`,
+  `d3dcompiler_*`, `XAudio2`, `XACTEngine`, `XAPOFX` — **DirectX End-User
+  Runtime (June 2010)**;
+* `MSVCP80/MSVCR80`, `90`, `100`, `110`, `120`, `MSVCP140`, `VCRUNTIME140`,
+  `api-ms-win-crt-*` и `ucrtbase.dll` — **Visual C++ 2005, 2008, 2010,
+  2012, 2013 и 2015–2022** для x86/x64/ARM64.
+
+Совместимая DLL, уже поставленная вместе с программой или найденная в
+локальной папке `redist` исходного установщика, копируется в
+`App\\Runtime\\...` и добавляется в `PATH`. DLL другой архитектуры не
+подмешивается. Заглушки и DLL из случайных сайтов никогда не создаются.
+
+В каждом результате появляются:
+
+* `runtime-manifest.json` — реальные импорты, архитектуры, найденные и
+  отсутствующие DLL, официальный пакет для каждой группы и ссылки Microsoft;
+* `README_Redistributables.txt` — понятная диагностика;
+* `Install_Redistributables.cmd` — офлайн-помощник, который запускает только
+  найденные в портативе официальные установщики. Обычный двойной клик по
+  портативу ничего в Windows не устанавливает; для помощника используется
+  явный ключ `App\\LaunchPortable.exe --install-redistributables`.
+
+Если исходный установщик уже содержит `vc_redist*.exe`, `vcredist*.exe` или
+`directx_Jun2010_redist.exe`, Portablizer переносит их в `Redistributables/`.
+Если пакета нет, отчёт сразу указывает точную страницу Microsoft — ошибка не
+откладывается до запуска программы на другом компьютере. На чистом ПК можно
+сначала выполнить `Install_Redistributables.cmd`, затем запускать приложение.
+
 ## Автономность и переносимость с флешки на флешку
 
 Портатив рассчитан на сценарий «скопировал папку на флешку — работает на любом
@@ -351,6 +385,8 @@ Launch.bat --no-registry        :: вообще не трогать реестр
 Launch.bat --keep-registry      :: оставить настройки в реестре после выхода
 Launch.bat --reset              :: забыть сохранённые настройки
 Launch.bat --help               :: справка
+App\\LaunchPortable.exe --runtime-info :: показать проверку native DLL
+App\\LaunchPortable.exe --install-redistributables :: запустить комплект runtime
 Launch.bat -- --arg1 --arg2     :: передать аргументы самой программе
 ```
 

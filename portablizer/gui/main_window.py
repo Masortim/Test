@@ -525,6 +525,21 @@ class MainWindow(QMainWindow):
                 "Скопируйте папку целиком на флешку — установка на другом "
                 "компьютере не потребуется.",
             ]
+            if result.runtime_copied:
+                details += [
+                    "",
+                    "Скопированы app-local runtime DLL: "
+                    + ", ".join(sorted(result.runtime_copied)),
+                ]
+            if result.runtime_missing:
+                details += [
+                    "",
+                    "⚠ Не все Redistributables найдены: "
+                    + ", ".join(result.runtime_missing),
+                    "См. runtime-manifest.json и README_Redistributables.txt; "
+                    "официальные пакеты можно запустить через "
+                    "Install_Redistributables.cmd.",
+                ]
             if result.removed_from_installed_list:
                 details += [
                     "",

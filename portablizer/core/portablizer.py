@@ -49,6 +49,15 @@ from . import launcher as launcher_mod
 from . import registry as reg_mod
 from .detect import DetectionResult, InstallerType, detect_installer
 from .logutil import Logger
+from .redistributables import (
+    RuntimeReport,
+    copy_available_runtime_dlls,
+    find_bundled_installers,
+    inspect_application,
+    render_runtime_manifest,
+    render_runtime_readme,
+    render_runtime_script,
+)
 from .silentargs import SilentPlan, build_attempts, build_silent_plan
 
 ProgressCB = Callable[[int, str], None]
@@ -341,6 +350,10 @@ class PortableResult:
     portable_launcher_exe_rel: str = ""
     launcher_exe_rel: str = ""
     config_exe_rel: str = ""
+    #: Отчёт по реальным PE-импортам VC++/DirectX и подготовленным runtime.
+    runtime_manifest_path: str = ""
+    runtime_missing: List[str] = field(default_factory=list)
+    runtime_copied: Dict[str, str] = field(default_factory=dict)
 
 
 class Portablizer:
@@ -397,7 +410,9 @@ class Portablizer:
             "install.log",
             "install-retry.log", "install-layout.log", "installer-engine.log",
             "installer-output.log", "portablizer.log", "_bundle_layout",
-            "setup-installshield.log",
+            "setup-installshield.log", "runtime-manifest.json",
+            "README_Redistributables.txt", "Install_Redistributables.cmd",
+            "Redistributables",
         ):
             path = os.path.join(portable_dir, filename)
             try:
@@ -622,8 +637,19 @@ class Portablizer:
                     result.config_exe_rel = os.path.relpath(
                         os.path.join(portable_dir, t.rel_path), portable_dir)
 
-            # 7. Зависимости и переменные среды
-            self.progress(85, "Учёт зависимостей и переменных среды")
+            # 7. Зависимости и переменные среды.  Проверяем именно PE import
+            # table, чтобы заранее поймать XINPUT1_3/d3dx9_38/MSVCP110 и
+            # остальные legacy runtime DLL, а не ждать сообщения Windows после
+            # переноса папки на другой ПК.
+            self.progress(85, "Проверка Redistributables и зависимостей")
+            runtime_report = self._prepare_runtime_support(
+                app_dir, portable_dir, opts.installer_path
+            )
+            result.runtime_manifest_path = os.path.relpath(
+                os.path.join(portable_dir, "runtime-manifest.json"), portable_dir
+            )
+            result.runtime_missing = list(runtime_report.missing)
+            result.runtime_copied = dict(runtime_report.copied)
             path_prepend = self._collect_dep_dirs(app_dir, portable_dir)
 
             # 8. Генерация лончера и вспомогательных скриптов
@@ -1993,6 +2019,85 @@ class Portablizer:
         return main_exe
 
     # -- зависимости ----------------------------------------------------------
+    def _prepare_runtime_support(
+        self, app_dir: str, portable_dir: str, installer_path: str,
+    ) -> RuntimeReport:
+        """Build an import-based runtime inventory for the generated App.
+
+        This is intentionally done after installation and before the launcher is
+        written.  The final App then contains every matching DLL which was
+        already shipped by the setup or is available in the setup's local
+        redist directory, while unresolved names get an official package and
+        architecture in an actionable manifest instead of a late Windows
+        ``DLL not found`` dialog.
+        """
+        report = inspect_application(app_dir)
+        source_dir = os.path.dirname(os.path.abspath(installer_path))
+        copied = copy_available_runtime_dlls(
+            report, app_dir, extra_roots=(source_dir,)
+        )
+        if copied:
+            # Re-scan: the JSON must describe the final state, not the state
+            # before the copied DLLs were placed in App/Runtime.
+            report = inspect_application(app_dir)
+            report.copied.update(copied)
+
+        # Keep redistributable installers already supplied with the application.
+        # Also accept official vcredist/DirectX files next to setup.exe; do not
+        # copy arbitrary EXE files from that directory.
+        bundled = find_bundled_installers(app_dir)
+        redist_dir = os.path.join(portable_dir, "Redistributables")
+        for relative in find_bundled_installers(source_dir):
+            source = os.path.join(source_dir, relative)
+            destination = os.path.join(redist_dir, os.path.basename(source))
+            try:
+                os.makedirs(redist_dir, exist_ok=True)
+                shutil.copy2(source, destination)
+                bundled.append(os.path.join(
+                    "Redistributables", os.path.basename(source)
+                ).replace("\\", "/"))
+            except OSError as exc:
+                self.log.warn(
+                    f"Не удалось добавить redistributable {source}: {exc}"
+                )
+        report.bundled_installers = sorted(set(bundled), key=str.casefold)
+
+        manifest_path = os.path.join(portable_dir, "runtime-manifest.json")
+        self._write_text(manifest_path, render_runtime_manifest(report),
+                         encoding="utf-8", newline="\n")
+        self._write_text(
+            os.path.join(portable_dir, "README_Redistributables.txt"),
+            render_runtime_readme(report), encoding="utf-8", newline="\r\n",
+        )
+        # The helper is ASCII-only and can be launched from Explorer without
+        # involving Python.  It executes only installers that are actually
+        # present in this particular portable folder.
+        self._write_text(
+            os.path.join(portable_dir, "Install_Redistributables.cmd"),
+            render_runtime_script(report), encoding="ascii", newline="",
+        )
+
+        if report.missing:
+            self.log.warn(
+                "Не все native runtime DLL найдены app-local: "
+                + ", ".join(report.missing)
+            )
+            self.log.info(
+                "Подготовлен runtime-manifest.json: официальные пакеты "
+                "VC++/DirectX и архитектуры перечислены в отчёте."
+            )
+        else:
+            self.log.ok(
+                "Проверены PE-зависимости: все обнаруженные VC++/DirectX DLL "
+                "доступны локально или в системе."
+            )
+        if copied:
+            self.log.ok(
+                f"Скопировано app-local runtime DLL: {len(copied)} шт. "
+                "в App/Runtime."
+            )
+        return report
+
     def _collect_dep_dirs(self, app_dir: str, portable_dir: str) -> List[str]:
         """Определяет папки с dll/runtime для добавления в PATH лончера.
 
@@ -2080,6 +2185,8 @@ class Portablizer:
             extra_env=opts.extra_env,
             path_prepend=path_prepend,
             redirect_known_folders=True,
+            runtime_manifest_name="runtime-manifest.json",
+            runtime_install_script_name="Install_Redistributables.cmd",
             targets=all_targets,
             launcher_target_rel=launcher_target,
             config_target_rel=config_target,
@@ -2234,6 +2341,10 @@ _README = """{app_name} — портативная версия
   Launch.bat            — портативный лончер (перенаправляет каталоги и env)
   LaunchHidden.vbs      — запуск без окна консоли
 {companion_files_list}  launcher_config.json  — параметры лончера
+  runtime-manifest.json — PE-импорты и требуемые VC++/DirectX Redistributables
+  README_Redistributables.txt — диагностика DLL и официальные ссылки Microsoft
+  Install_Redistributables.cmd — запуск найденных offline-пакетов (только явно)
+  Redistributables\\     — комплектные официальные установщики, если были в setup
 {registry_note}  install.log           — подробный журнал установщика (если он поддерживается)
   portablizer.log       — журнал создания и диагностики портатива
 
@@ -2250,6 +2361,8 @@ _README = """{app_name} — портативная версия
   --reset           забыть сохранённые настройки и стартовать «с нуля»
   --help            справка
   -- <аргументы>    передать аргументы самой программе
+  App\\LaunchPortable.exe --runtime-info — проверить native runtime DLL
+  App\\LaunchPortable.exe --install-redistributables — запустить комплект runtime
 
 Как это работает:
   • стандартные каталоги профиля (AppData, Temp, Документы и др.) на время

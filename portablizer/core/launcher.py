@@ -104,6 +104,9 @@ class LauncherConfig:
     # Все эти файлы являются копиями одного PortableLauncher.exe, поэтому
     # выбор цели хранится в переносимом JSON, а не в абсолютном пути.
     launcher_aliases: Dict[str, str] = field(default_factory=dict)
+    # Import-based native runtime inventory generated alongside the launcher.
+    runtime_manifest_name: str = "runtime-manifest.json"
+    runtime_install_script_name: str = "Install_Redistributables.cmd"
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -1214,6 +1217,10 @@ def render_config_json(cfg: LauncherConfig) -> str:
         "extra_env": cfg.extra_env,
         "path_prepend": cfg.path_prepend,
         "redirect_known_folders": cfg.redirect_known_folders,
+        "runtime": {
+            "manifest": cfg.runtime_manifest_name,
+            "install_script": cfg.runtime_install_script_name,
+        },
         "registry": {
             "enabled": cfg.apply_registry,
             "file": cfg.reg_file_name,
