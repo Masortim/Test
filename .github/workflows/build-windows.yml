@@ -19,9 +19,18 @@ on:
 permissions:
   contents: write
 
+# Новый пуш в ветку отменяет предыдущую сборку: зависший прогон не должен
+# занимать раннер часами и мешать следующему.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
+    # Обычная сборка укладывается в 3-5 минут. Больше получаса — значит
+    # что-то зависло (например, лончер ждёт процесс, который не завершается).
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -89,7 +98,15 @@ jobs:
           # for a windowed (GUI-subsystem) EXE and leave $LASTEXITCODE unset.
           $process = Start-Process -FilePath (Join-Path $root "App/LaunchPortable.exe") `
             -ArgumentList '/d /c "set PORTABLE_APP>launcher-smoke.txt"' `
-            -Wait -PassThru
+            -PassThru
+          # Лончер обязан завершиться сам: если он ждёт процесс, которого
+          # нет (например, собственный загрузчик PyInstaller), прогон должен
+          # упасть с понятной ошибкой, а не висеть часами.
+          if (-not $process.WaitForExit(180000)) {
+            $process.Kill()
+            Write-Host "::error title=LaunchPortable.exe smoke failure::the launcher did not exit within 180 s"
+            throw "LaunchPortable.exe did not exit within 180 s"
+          }
           if ($process.ExitCode -ne 0) {
             $errorLog = Join-Path $root "PortableData/launcher-exe-error.log"
             $details = if (Test-Path $errorLog) { Get-Content $errorLog -Raw } else { "no launcher error log" }

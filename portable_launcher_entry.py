@@ -707,6 +707,41 @@ def _hklm_key_missing(keys: Iterable[str]) -> bool:
     return False if checked else False
 
 
+def _own_executable_images() -> tuple:
+    """Case-folded paths of this launcher EXE (empty when run from source).
+
+    Both the plain and the resolved form are kept: the portable folder may
+    be reached through a mapped or substituted drive, and Windows reports
+    process images in only one of the two spellings.
+    """
+    if not getattr(sys, "frozen", False):
+        return ()
+    images = [str(sys.executable).casefold()]
+    try:
+        resolved = str(Path(sys.executable).resolve()).casefold()
+    except OSError:
+        resolved = ""
+    if resolved and resolved not in images:
+        images.append(resolved)
+    return tuple(images)
+
+
+def _counts_as_portable_process(image: str, prefix: str, own_image) -> bool:
+    """True when this running image is the portable program, not us.
+
+    A one-file EXE always runs as two processes: the PyInstaller bootloader
+    and the Python child it spawns.  The bootloader lives in App as well, so
+    counting it would mean waiting for ourselves - the session would never
+    end, the registry would never be restored and the window would hang
+    around until the 24 hour limit.  Our own image is therefore skipped.
+    """
+    image = image.casefold()
+    if not image.startswith(prefix):
+        return False
+    own = (own_image,) if isinstance(own_image, str) else tuple(own_image)
+    return image not in [item for item in own if item]
+
+
 def _portable_processes(root: Path) -> int:
     """Count running processes whose executable lives inside the portable folder."""
     if not IS_WINDOWS:
@@ -738,6 +773,7 @@ def _portable_processes(root: Path) -> int:
             return 0
         prefix = str(root).rstrip("\\").casefold() + "\\"
         own = os.getpid()
+        own_image = _own_executable_images()
         found = 0
         try:
             entry = PROCESSENTRY32W()
@@ -754,7 +790,8 @@ def _portable_processes(root: Path) -> int:
                             buffer = ctypes.create_unicode_buffer(size.value)
                             if kernel32.QueryFullProcessImageNameW(
                                     handle, 0, buffer, ctypes.byref(size)):
-                                if buffer.value.casefold().startswith(prefix):
+                                if _counts_as_portable_process(
+                                        buffer.value, prefix, own_image):
                                     found += 1
                         finally:
                             kernel32.CloseHandle(handle)

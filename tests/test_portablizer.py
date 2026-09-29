@@ -2429,6 +2429,51 @@ class GameLauncherHandoffTests(unittest.TestCase):
             self.assertFalse(exe_launcher._machine_file_needs_admin(user_only))
             self.assertTrue(exe_launcher._machine_file_needs_admin(machine))
 
+    def test_launcher_does_not_wait_for_its_own_bootloader(self):
+        """Ожидание не должно ловить сам LaunchPortable.exe.
+
+        Однофайловый EXE всегда живёт двумя процессами: загрузчик
+        PyInstaller и порождённый им Python. Загрузчик лежит в той же папке
+        App, поэтому наивный подсчёт «процессов из портатива» находит самого
+        себя и ждёт вечно: реестр не восстанавливается, окно не закрывается,
+        а сборочный прогон CI висит часами.
+        """
+        prefix = (r"c:\games\portable" + "\\").casefold()
+        own = r"c:\games\portable\app\launchportable.exe"
+
+        self.assertFalse(exe_launcher._counts_as_portable_process(
+            r"C:\Games\Portable\App\LaunchPortable.exe", prefix, own))
+        # Настоящая игра, запущенная официальным лаунчером, — ждём её.
+        self.assertTrue(exe_launcher._counts_as_portable_process(
+            r"C:\Games\Portable\App\System\witcher.exe", prefix, own))
+        # Посторонние программы компьютера нас не касаются.
+        self.assertFalse(exe_launcher._counts_as_portable_process(
+            r"C:\Windows\System32\notepad.exe", prefix, own))
+        # Тот же EXE может быть виден и по подставленному диску.
+        both = (own, r"x:\portable\app\launchportable.exe")
+        self.assertFalse(exe_launcher._counts_as_portable_process(
+            r"C:\Games\Portable\App\LaunchPortable.exe", prefix, both))
+        self.assertTrue(exe_launcher._counts_as_portable_process(
+            r"C:\Games\Portable\App\game.exe", prefix, both))
+        # Запуск из исходников: своего EXE нет, ждём всё, что нашли.
+        self.assertTrue(exe_launcher._counts_as_portable_process(
+            r"C:\Games\Portable\App\game.exe", prefix, ()))
+
+    def test_waiting_stops_as_soon_as_the_program_is_gone(self):
+        counts = [1, 1, 0]
+
+        def fake_count(_root):
+            return counts.pop(0) if counts else 0
+
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher, "_portable_processes",
+                                  side_effect=fake_count), \
+                mock.patch("time.sleep"):
+            waited = exe_launcher._wait_for_portable_processes(
+                Path(r"C:\Games\Portable"))
+        self.assertEqual(waited, 1)
+        self.assertEqual(counts, [])
+
 
 class RegistryVirtualizationTests(unittest.TestCase):
     """Тесты UAC-виртуализации и слияния machine-настроек в HKCU."""
