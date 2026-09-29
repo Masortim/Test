@@ -1412,7 +1412,11 @@ def extraction_commands(archive: str, destination: str,
     lower = os.path.basename(archive).lower()
     kind = kind or installer_kind(archive)
     if lower.endswith(".cab") or kind == "cab":
-        return [[system_tool("expand"), "-R", "-F:*", archive, destination]]
+        return [
+            [system_tool("expand"), "-F:*", archive, destination],
+            [system_tool("expand"), "-r", archive, destination],
+            [system_tool("extrac32"), "/Y", "/E", "/L", destination, archive],
+        ]
     if lower.endswith((".msi", ".msp")) or kind == "msi":
         return [[system_tool("msiexec"), "/a", archive, "/qn",
                  f"TARGETDIR={destination}"]]
@@ -1432,7 +1436,8 @@ def extraction_commands(archive: str, destination: str,
                              for item in switches])
     # Самораспаковывающийся exe — это CAB с PE-заголовком: штатные
     # распаковщики Windows берут его и без «правильного» ключа.
-    add([system_tool("expand"), "-R", "-F:*", archive, destination])
+    add([system_tool("expand"), "-F:*", archive, destination])
+    add([system_tool("expand"), "-r", archive, destination])
     add([system_tool("extrac32"), "/Y", "/E", "/L", destination, archive])
     sevenzip = find_7zip()
     if sevenzip:
@@ -1492,17 +1497,19 @@ class RedistInstallerRule:
 REDIST_INSTALLERS: Tuple[RedistInstallerRule, ...] = (
     RedistInstallerRule(r"vc_redist\.(?:x86|x64|arm64)\.exe", "burn",
                         "Visual C++ 2015-2022 Redistributable", "vc14"),
+    RedistInstallerRule(r"vcredist(?:2012|2013|2015|2017|2019|2022)"
+                        r"[_ ]?(?:x86|x64)?\.exe", "burn",
+                        "Visual C++ Redistributable"),
     RedistInstallerRule(r"vcredist_(?:x86|x64|ia64)\.exe", "vcredist_legacy",
                         "Visual C++ Redistributable"),
-    RedistInstallerRule(r"vcredist(?:2005|2008|2010|2012|2013|2015|2017|2019|2022)"
+    RedistInstallerRule(r"vcredist(?:2005|2008|2010)"
                         r"[_ ]?(?:x86|x64)?\.exe", "vcredist_legacy",
                         "Visual C++ Redistributable"),
     RedistInstallerRule(r"vcredist\.msi|vc_red\.msi", "msi",
                         "Visual C++ Redistributable"),
     RedistInstallerRule(r"dxsetup\.exe", "dxsetup",
                         "DirectX End-User Runtime", "directx_jun2010"),
-    RedistInstallerRule(r"directx_(?:jun|feb|apr|aug|mar|oct|nov|dec)?\d*"
-                        r"_?redist\.exe", "directx_bundle",
+    RedistInstallerRule(r"(?:directx.*|dx.*redist.*)\.exe", "directx_bundle",
                         "DirectX End-User Runtime (redist)", "directx_jun2010"),
     RedistInstallerRule(r"dxwebsetup\.exe", "iexpress",
                         "DirectX Web Setup", "directx_jun2010"),
@@ -1530,6 +1537,7 @@ SILENT_SWITCHES: Dict[str, Tuple[Tuple[str, ...], ...]] = {
     # WiX Burn: vc_redist.x64.exe и большинство современных бандлов.
     "burn": (("/install", "/quiet", "/norestart"),
              ("/quiet", "/norestart"),
+             ("/layout", "{dest}", "/quiet", "/norestart"),
              ("/q", "/norestart")),
     # IExpress-обёртки VC++ 2005/2008/2010: у каждого поколения свой ключ.
     "vcredist_legacy": (("/q", "/norestart"),
@@ -1582,12 +1590,17 @@ def is_redist_installer(path: str) -> bool:
 def sniff_engine(path: str, limit: int = 2 * 1024 * 1024) -> str:
     """Движок установщика по сигнатурам внутри файла (пустая строка — не понял)."""
     try:
+        size = os.path.getsize(path)
         with open(path, "rb") as fh:
             head = fh.read(limit)
+            tail = b""
+            if size > limit:
+                fh.seek(max(0, size - 131072))
+                tail = fh.read(131072)
     except OSError:
         return ""
     for signature, engine in _ENGINE_SIGNATURES:
-        if signature in head:
+        if signature in head or (tail and signature in tail):
             return engine
     return ""
 
@@ -1599,15 +1612,14 @@ def installer_kind(path: str) -> str:
         return "msi"
     if lower.endswith(".msu"):
         return "msu"
+    if lower.endswith(".exe"):
+        engine = sniff_engine(path)
+        if engine:
+            return engine
     rule = installer_rule(path)
     kind = rule.kind if rule else ""
     if kind == "msi_or_exe":
         kind = "msi" if lower.endswith(".msi") else ""
-    if kind in ("", "iexpress") and lower.endswith(".exe"):
-        # Имя ничего не сказало (или сказало слишком общо) — спросим файл.
-        engine = sniff_engine(path)
-        if engine:
-            return engine
     return kind
 
 
@@ -1837,11 +1849,13 @@ def render_silent_install_script(entries: Sequence[Dict[str, str]]) -> str:
                 f'set "DXTMP={temp}"',
                 'if exist "%DXTMP%" rd /s /q "%DXTMP%"',
                 'md "%DXTMP%" 2>nul',
-                f'start "" /wait {target} /Q /C /T:"%DXTMP%"',
+                f'start "" /wait {target} /Q /C /T:%DXTMP%',
                 'if exist "%DXTMP%\\DXSETUP.exe" start "" /wait '
                 '"%DXTMP%\\DXSETUP.exe" /silent',
                 'rd /s /q "%DXTMP%" 2>nul',
             ]
+        elif kind == "dxsetup" or relative.lower().endswith("dxsetup.exe"):
+            body = [f'start "" /wait {target} /silent']
         else:
             body = [f'start "" /wait {target} {args}'.rstrip()]
         lines += [
@@ -2122,15 +2136,15 @@ class RuntimeProvisioner:
             self.log.debug(
                 f"{os.path.basename(archive)}: собственным распаковщиком "
                 f"извлечено файлов — {len(written)}.")
+        self._expand_payloads(destination, wanted)
         enough = (bool(_find_file(destination, wanted)) if wanted
                   else _has_files(destination))
         if enough:
-            self._expand_payloads(destination, wanted)
             return True
 
         # Ступени 2-3 требуют Windows: там живут wextract, expand и msiexec.
         if not IS_WINDOWS:
-            return bool(_has_files(destination))
+            return bool(_find_file(destination, wanted)) if wanted else bool(_has_files(destination))
         staging = cmdline_safe_dir(destination) or destination
         source = archive
         if not is_cmdline_safe(source):
@@ -2143,17 +2157,16 @@ class RuntimeProvisioner:
                 self.log.debug(
                     f"Распаковка пакета (код {code}): "
                     + subprocess.list2cmdline(attempt))
-                if _has_files(staging):
+                self._expand_payloads(staging, wanted)
+                if (bool(_find_file(staging, wanted)) if wanted else _has_files(staging)):
                     break
             if not _same_dir(staging, destination):
                 merge_tree(staging, destination)
         finally:
             if not _same_dir(staging, destination):
                 shutil.rmtree(staging, ignore_errors=True)
-        if not _has_files(destination):
-            return False
         self._expand_payloads(destination, wanted)
-        return True
+        return bool(_find_file(destination, wanted)) if wanted else bool(_has_files(destination))
 
     def _expand_payloads(self, directory: str, wanted: str = "") -> None:
         """Раскрывает вложенные ``.cab`` и ``.msi`` внутри распакованного пакета.
@@ -2163,6 +2176,8 @@ class RuntimeProvisioner:
         в имя кабинета (``Jun2010_d3dx9_39_x86.cab``), поэтому сначала
         пробуем только подходящие, и лишь если не вышло — все подряд.
         """
+        if wanted and _find_file(directory, wanted):
+            return
         stem = os.path.splitext(wanted)[0].lower() if wanted else ""
         cabinets: List[str] = []
         installers: List[str] = []
@@ -2214,9 +2229,21 @@ class RuntimeProvisioner:
             return True
         if not IS_WINDOWS:
             return False
-        # Остаются кабинеты LZX/Quantum — их умеет только Windows.
-        self._run([system_tool("expand"), "-R", "-F:*", archive, destination])
-        return True
+        if self._run([system_tool("expand"), "-F:*", archive, destination]) == 0 \
+                or _has_files(destination):
+            return True
+        if self._run([system_tool("expand"), "-r", archive, destination]) == 0 \
+                or _has_files(destination):
+            return True
+        if self._run([system_tool("extrac32"), "/Y", "/E", "/L", destination, archive]) == 0 \
+                or _has_files(destination):
+            return True
+        sevenzip = find_7zip()
+        if sevenzip:
+            self._run([sevenzip, "x", "-y", f"-o{destination}", archive])
+            if _has_files(destination):
+                return True
+        return _has_files(destination)
 
     def _package_archives(self, package: RedistPackage, arch: str) -> List[str]:
         """Пакеты этой версии, уже лежащие рядом с установщиком.
@@ -2846,7 +2873,7 @@ def _find_file(directory: str, name: str, allow_mangled: bool = True) -> str:
     if allow_mangled and stem and extension:
         pattern = re.compile(
             rf"(?:^|[^a-z0-9]){re.escape(stem)}[_.]{re.escape(extension)}"
-            rf"(?:[^a-z0-9]|$)")
+            rf"(?:[^a-z0-9]|$)", re.IGNORECASE)
     fallback = ""
     for root, _dirs, files in os.walk(directory):
         for candidate in files:
@@ -2854,9 +2881,11 @@ def _find_file(directory: str, name: str, allow_mangled: bool = True) -> str:
             path = os.path.join(root, candidate)
             if lowered == target:
                 return path
-            if pattern is not None and not fallback \
-                    and pattern.search(lowered) and _looks_like_pe(path):
-                fallback = path
+            if allow_mangled and not fallback and _looks_like_pe(path):
+                if pattern is not None and pattern.search(lowered):
+                    fallback = path
+                elif f"{stem}_{extension}" in lowered or f"{stem}.{extension}" in lowered:
+                    fallback = path
     return fallback
 
 

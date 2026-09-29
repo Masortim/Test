@@ -15,7 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cabbuild import make_burn_bundle, make_cabinet, make_self_extracting_exe
+from cabbuild import (make_burn_bundle, make_cabinet, make_lzx_cabinet,
+                      make_self_extracting_exe)
 from portablizer.core import cabinet
 
 
@@ -36,6 +37,22 @@ class CabinetReaderTests(unittest.TestCase):
             for name, data in payload.items():
                 self.assertEqual((out / name).read_bytes(), data)
             self.assertTrue(cabinet.looks_like_cabinet(str(path)))
+
+    def test_lzx_cabinet_round_trip(self):
+        """Кабинет со сжатием LZX (используется во многих пакетах VC++ и DirectX)."""
+        payload = {"msvcr90.dll": b"MZ" + os.urandom(80000),
+                   "readme.txt": "test lzx content".encode("utf-8")}
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "vc_red_lzx.cab")
+            path.write_bytes(make_lzx_cabinet(payload))
+            out = Path(temp, "out")
+
+            written = cabinet.extract_file(str(path), str(out))
+
+            self.assertEqual({os.path.basename(p) for p in written},
+                             set(payload))
+            for name, data in payload.items():
+                self.assertEqual((out / name).read_bytes(), data)
 
     def test_uncompressed_cabinet_is_read_too(self):
         with tempfile.TemporaryDirectory() as temp:
