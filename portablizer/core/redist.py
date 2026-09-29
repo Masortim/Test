@@ -193,8 +193,10 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
     ),
     RedistPackage(
         key="vc_legacy",
-        title="Visual C++ 6.0/2002/2003 Runtime (msvcr70/71, msvcp60/70/71)",
-        pattern=r"(?:msvc[rp]7[01]|msvcp60|msvcirt|msvcp50)\.dll",
+        title="Visual C++ 6.0/2002/2003 Runtime (msvcr70/71, msvcp60/70/71, "
+              "mfc42/70/71)",
+        pattern=r"(?:msvc[rp]7[01]|msvcp60|msvcirt|msvcp50"
+                r"|mfc(?:40|42|70|71)u?)\.dll",
         downloads={},
         page="",
         note="Отдельного установщика от Microsoft не существует: эти файлы "
@@ -208,8 +210,9 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         pattern=r"(?:d3dx9_(?:2[4-9]|3\d|4[0-3])|d3dx10_(?:3[3-9]|4[0-3])"
                 r"|d3dx11_4[23]|d3dcsx_4[0-3]|d3dcompiler_(?:3[3-9]|4[0-3])"
                 r"|xinput1_[123]|xaudio2_[0-7]|xactengine[23]_\d"
-                r"|x3daudio1_[0-7]|xapofx1_[0-5]|dxerr|d3dref9"
-                r"|dsetup|dsetup32|dpnaddr|dpnhpast)\.dll",
+                r"|x3daudio1_[0-7]|xapofx1_[0-5]|dxerr|d3dref9|d3drm"
+                r"|dsetup|dsetup32|dpnaddr|dpnhpast|dplayx|dpnet|dpnsvr"
+                r"|dpnhupnp|dpnlobby|dpvoice|dpvvox|dpwsockx)\.dll",
         downloads={
             "any": "https://download.microsoft.com/download/8/4/A/"
                    "84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe",
@@ -217,7 +220,8 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         page="https://www.microsoft.com/download/details.aspx?id=8109",
         note="Сама DirectX в Windows уже есть; пакет добавляет старые "
              "side-by-side компоненты (D3DX9/10/11, XInput 1.3, XAudio 2.7, "
-             "XACT), которые Windows не содержит.",
+             "XACT, DirectPlay, Direct3D Retained Mode), которые Windows не "
+             "содержит.",
     ),
     RedistPackage(
         key="d3dcompiler_modern",

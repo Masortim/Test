@@ -277,9 +277,11 @@ Portablizer закрывает это **заранее**, на четырёх у
 | `msvcp110.dll`, `d3dx9_39.dll`, `ucrtbase.dll` | распространяемый пакет | приносит в портатив |
 
 Каталог пакетов покрывает Visual C++ 6.0/2002/2003/2005/2008/2010/2012/2013 и
-2015–2022 (включая UCRT и заглушки `api-ms-win-crt-*`), DirectX End-User
-Runtime июня 2010 (`d3dx9_24…43`, `d3dx10_*`, `d3dx11_*`, `d3dcompiler_33…43`,
-`xinput1_1…1_3`, `xaudio2_0…2_7`, `x3daudio1_*`, `xapofx1_*`, XACT), MFC/ATL,
+2015–2022 (включая UCRT и заглушки `api-ms-win-crt-*`, а также старые MFC без
+номера версии — `mfc42/42u`, `mfc70/71u`), DirectX End-User Runtime июня 2010
+(`d3dx9_24…43`, `d3dx10_*`, `d3dx11_*`, `d3dcompiler_33…43`, `xinput1_1…1_3`,
+`xaudio2_0…2_7`, `x3daudio1_*`, `xapofx1_*`, XACT, DirectPlay — `dplayx`,
+`dpnet`, `dpnsvr` и соседи, Direct3D Retained Mode — `d3drm`), MFC/ATL,
 OpenMP, OpenAL, PhysX, VB6-runtime и Games for Windows – LIVE.
 
 **3. Лестница источников** — от самого точного к самому общему:

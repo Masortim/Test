@@ -126,6 +126,12 @@ class RedistCatalogTests(unittest.TestCase):
             "d3dcompiler_43.dll": "directx_jun2010",
             "openal32.dll": "openal",
             "physxloader.dll": "physx",
+            "mfc42.dll": "vc_legacy", "mfc42u.dll": "vc_legacy",
+            "mfc70.dll": "vc_legacy", "mfc71u.dll": "vc_legacy",
+            "d3drm.dll": "directx_jun2010",
+            "dplayx.dll": "directx_jun2010",
+            "dpnet.dll": "directx_jun2010",
+            "dpvoice.dll": "directx_jun2010",
         }
         for dll, key in cases.items():
             with self.subTest(dll=dll):
