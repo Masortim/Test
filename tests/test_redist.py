@@ -2601,6 +2601,321 @@ class DownloadProgressTests(unittest.TestCase):
         self.assertTrue(calls)
 
 
+class StuckAt85PercentRegressionTests(unittest.TestCase):
+    """Жалоба: «после скачивания DirectX сборка виснет на 85% и не сдвигается».
+
+    Скачивание уже показывает проценты (см. ``DownloadProgressTests``), а вот
+    следующий шаг — распаковка ~100 МБ пакета собственным (чисто питоновским)
+    декодером кабинетов и последующий тихий запуск ``DXSETUP.exe`` — раньше
+    был ОДНИМ блокирующим вызовом без единой точки прогресса или потолка по
+    времени. Здесь проверяется, что оба вызова теперь ограничены по времени
+    и «докладывают», что ещё работают, а не просто пропадают на минуты.
+    """
+
+    def setUp(self):
+        self.log = Logger()
+
+    def test_bounded_call_never_waits_longer_than_its_timeout(self):
+        """Даже «зависший» чисто питоновский вызов не блокирует сборку вечно."""
+        import threading as _threading
+
+        started = _threading.Event()
+
+        def slow():
+            started.set()
+            _threading.Event().wait(30)  # никогда не установится за тест
+            return ["never"]
+
+        ticks = []
+        started_at = __import__("time").monotonic()
+        result = redist._bounded_call(
+            slow, timeout=0.3, heartbeat=0.1, default=[],
+            on_tick=lambda elapsed: ticks.append(elapsed))
+        elapsed_total = __import__("time").monotonic() - started_at
+
+        self.assertTrue(started.wait(1))
+        self.assertEqual(result, [])
+        # Не «зависли» дольше отведённого потолка (с небольшим запасом).
+        self.assertLess(elapsed_total, 2.0)
+        # И при этом хотя бы раз «доложили», что работа идёт.
+        self.assertTrue(ticks, "heartbeat не сработал")
+
+    def test_bounded_call_returns_the_real_result_when_fast_enough(self):
+        result = redist._bounded_call(lambda: [1, 2, 3], timeout=5,
+                                      heartbeat=0.05, default=[])
+        self.assertEqual(result, [1, 2, 3])
+
+    def test_directx_bundle_extraction_does_not_stall_the_build(self):
+        """Собственный декодер «висит» на бандле — сборка не должна ждать его.
+
+        Ступень 1 (:mod:`.cabinet`) подменена вечно работающей функцией;
+        ``install_directx_bundle`` обязан вовремя перейти к ступени 2
+        (штатный wextract, здесь — фиктивный ``run``) вместо того, чтобы
+        стоять на месте до просветления.
+        """
+        import threading as _threading
+
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            if args[0].lower().endswith("directx_jun2010_redist.exe"):
+                target = args[-1].split(":", 1)[1]
+                os.makedirs(target, exist_ok=True)
+                Path(target, "DXSETUP.exe").write_bytes(b"MZ")
+                return 0
+            # Финальный запуск DXSETUP.exe /silent — просто «успех».
+            return 0
+
+        def never_returns(*_args, **_kwargs):
+            _threading.Event().wait(30)
+            return []
+
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp, "directx_Jun2010_redist.exe")
+            bundle.write_bytes(b"MZ" + b"\x00" * 4096)
+
+            with mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "CABINET_DECODE_TIMEOUT", 0.2), \
+                    mock.patch.object(redist, "CABINET_HEARTBEAT_SECONDS", 0.05), \
+                    mock.patch.object(redist.cabinet, "extract_file",
+                                      never_returns):
+                started_at = __import__("time").monotonic()
+                code, command = redist.install_directx_bundle(
+                    str(bundle), runner, self.log)
+                elapsed = __import__("time").monotonic() - started_at
+
+        self.assertLess(elapsed, 3.0,
+                        "install_directx_bundle не должен ждать дольше потолка")
+        self.assertEqual(code, 0)
+        self.assertIn("DXSETUP.exe", command)
+        self.assertTrue(calls)
+
+    def test_silent_install_reports_progress_while_it_waits(self):
+        """Тихая установка сообщает в журнал, что ещё жива, а не молчит."""
+
+        class FakeProcess:
+            def __init__(self):
+                self.pid = 4242
+                self._polls = 0
+
+            def wait(self, timeout=None):
+                self._polls += 1
+                if self._polls < 3:
+                    raise __import__("subprocess").TimeoutExpired(
+                        ["fake"], timeout)
+                return 0
+
+            def kill(self):
+                pass
+
+        with mock.patch.object(redist, "IS_WINDOWS", True), \
+                mock.patch.object(redist, "_WAIT_POLL_SECONDS", 0.01), \
+                mock.patch("subprocess.Popen", return_value=FakeProcess()):
+            ticks = []
+            code = redist._run_quiet(
+                ["fake.exe", "/silent"], timeout=5,
+                on_tick=lambda elapsed, total: ticks.append((elapsed, total)))
+
+        self.assertEqual(code, 0)
+        self.assertTrue(ticks, "on_tick обязан сработать, пока процесс идёт")
+        self.assertEqual(ticks[0][1], 5)
+
+    def test_default_runner_of_run_silent_install_pings_the_log(self):
+        class FakeProcess:
+            def __init__(self):
+                self.pid = 1
+                self._polls = 0
+
+            def wait(self, timeout=None):
+                self._polls += 1
+                if self._polls < 3:
+                    raise __import__("subprocess").TimeoutExpired(
+                        ["fake"], timeout)
+                return 0
+
+            def kill(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "vc_redist.x64.exe")
+            path.write_bytes(b"MZ")
+            with mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "_WAIT_POLL_SECONDS", 0.01), \
+                    mock.patch("subprocess.Popen", return_value=FakeProcess()):
+                outcome = redist.run_silent_install(str(path), log=self.log)
+
+        self.assertEqual(outcome.status, "installed")
+
+    def test_a_requirement_stuck_on_an_unknown_step_does_not_stall_the_build(self):
+        """Последний рубеж: даже застрявшая ступень лестницы не бесконечна.
+
+        ``_from_sources`` подменена вечно работающей функцией — ни одна из
+        уже описанных защит (декодер кабинетов, внешний процесс) тут не
+        участвует. ``provision()`` всё равно обязан не ждать дольше
+        ``REQUIREMENT_TIMEOUT`` и пойти дальше.
+        """
+        import threading as _threading
+
+        def never_returns(_requirement):
+            _threading.Event().wait(30)
+            return "", ""
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("msvcp110.dll",))
+            scan = redist.scan_app_runtime(str(app))
+
+            with mock.patch.object(redist, "REQUIREMENT_TIMEOUT", 0.2), \
+                    mock.patch.object(redist, "CABINET_HEARTBEAT_SECONDS", 0.05), \
+                    mock.patch.object(redist.RuntimeProvisioner, "_from_sources",
+                                      lambda self, requirement: never_returns(requirement)):
+                started_at = __import__("time").monotonic()
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="",
+                ).provision(scan, str(app), str(portable), "Game")
+                elapsed = __import__("time").monotonic() - started_at
+
+        self.assertLess(elapsed, 3.0,
+                        "застрявшая ступень не должна стоить сборке минут")
+        self.assertEqual([r.dll for r in report.missing], ["msvcp110.dll"])
+
+    def _portable(self, temp):
+        portable = Path(temp, "Game_Portable")
+        app = portable / "App"
+        app.mkdir(parents=True)
+        return portable, app
+
+    def test_full_build_finishes_even_if_every_extraction_layer_hangs(self):
+        """Сквозной сценарий из жалобы, целиком: DirectX докачался (100%),
+        а дальше ВСЁ, что можно, «зависает» — собственный декодер кабинетов
+        никогда не возвращается, а любой внешний процесс (expand/wextract/
+        DXSETUP) никогда не отвечает на ``wait()``. Раньше это бы значило
+        «сборка висит на 85% навсегда». Теперь ``Portablizer.run()`` обязан
+        всё равно дойти до конца за разумное время, а недостающую
+        библиотеку — просто честно назвать в отчёте.
+        """
+        import threading as _threading
+
+        class FakePortablizer(Portablizer):
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                write_pe(Path(app_dir, "Game.exe"),
+                         imports=("KERNEL32.dll", "XINPUT1_3.dll"))
+                return 0
+
+        class FakeStuckProcess:
+            """Симулирует внешний инструмент, который никогда не отвечает."""
+
+            def __init__(self, *_args, **_kwargs):
+                self.pid = 4242
+
+            def wait(self, timeout=None):
+                raise __import__("subprocess").TimeoutExpired(
+                    ["stuck-tool"], timeout)
+
+            def kill(self):
+                pass
+
+        attempts = []
+
+        def never_returns_cabinet(*_args, **_kwargs):
+            # Собственный декодер, который никогда не завершается сам.
+            attempts.append(1)
+            _threading.Event().wait(30)
+            return []
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "GameSetup.exe")
+            installer.write_bytes(b"MZ Inno Setup")
+            shipped = Path(temp, "_CommonRedist", "DirectX")
+            shipped.mkdir(parents=True)
+            (shipped / "directx_Jun2010_redist.exe").write_bytes(
+                b"MZ" + b"\x00" * 4096)
+
+            engine = FakePortablizer(Logger())
+
+            with mock.patch("portablizer.core.portablizer.IS_WINDOWS", False), \
+                    mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "system_dirs_for", lambda arch: []), \
+                    mock.patch.object(redist, "winsxs_dir", lambda: ""), \
+                    mock.patch.object(redist, "REQUIREMENT_TIMEOUT", 0.3), \
+                    mock.patch.object(redist, "CABINET_HEARTBEAT_SECONDS", 0.05), \
+                    mock.patch.object(redist, "_WAIT_POLL_SECONDS", 0.05), \
+                    mock.patch.object(redist.cabinet, "extract_file",
+                                      never_returns_cabinet), \
+                    mock.patch("subprocess.Popen", FakeStuckProcess):
+                started_at = __import__("time").monotonic()
+                result = engine.run(PortableOptions(
+                    installer_path=str(installer), output_dir=temp,
+                    app_name="Game", capture_registry=False,
+                    download_runtimes=False, silent_runtime_install=True))
+                elapsed = __import__("time").monotonic() - started_at
+
+        # Главное: сборка ДОШЛА ДО КОНЦА, а не «висит на 85%» — и уложилась
+        # в разумное время, а не в 15-20 минут по сумме всех таймаутов.
+        self.assertTrue(result.success, result.messages)
+        self.assertLess(elapsed, 2.0,
+                        "полный проход не должен стоить сборке минут, даже "
+                        "если распаковка и тихая установка зависли — а "
+                        "десятки DLL из FULL_KIT одного и того же пакета "
+                        "(DirectX June 2010 — их там под сотню) не должны "
+                        "КАЖДАЯ по отдельности платить свой REQUIREMENT_TIMEOUT")
+        self.assertIn("xinput1_3.dll", result.runtime_missing)
+        # Проверка независимая от времени выполнения: DirectX June 2010 в
+        # полном комплекте отвечает почти за сотню отдельных DLL (d3dx9,
+        # d3dx10, d3dx11, xinput, xaudio2, xactengine, x3daudio, xapofx…).
+        # Без дедупликации по пакету «зависший» декодер запускался бы по
+        # разу на каждую из них.
+        self.assertLessEqual(
+            len(attempts), 2,
+            "застрявшая распаковка одного пакета не должна запускаться "
+            f"заново для каждой DLL из полного комплекта (вызовов: {len(attempts)})")
+
+    def test_a_stuck_download_is_not_repeated_for_every_dll_in_the_full_kit(self):
+        """То же самое, но для закачки: ``_download_archive`` раньше тоже
+        помечал попытку успешной/неудачной только ПОСЛЕ завершения. Если
+        сеть зависает, а не отвечает ошибкой сразу, то же самое «одна
+        зависшая операция превращается в N попыток» било бы уже не по
+        распаковке, а по загрузке ~100 МБ файла с сайта Microsoft — то есть
+        было бы значительно хуже.
+        """
+        import threading as _threading
+
+        attempts = []
+
+        def stuck_downloader(url, destination):
+            attempts.append(url)
+            _threading.Event().wait(30)
+            return False
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("KERNEL32.dll",))
+            scan = redist.scan_app_runtime(str(app))
+            with mock.patch.object(redist, "REQUIREMENT_TIMEOUT", 0.2), \
+                    mock.patch.object(redist, "CABINET_HEARTBEAT_SECONDS", 0.05):
+                started_at = __import__("time").monotonic()
+                redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="",
+                    allow_download=True, downloader=stuck_downloader,
+                ).provision(scan, str(app), str(portable), "Game", full_kit=True)
+                elapsed = __import__("time").monotonic() - started_at
+
+        self.assertLess(elapsed, 5.0,
+                        "полный комплект не должен стоить сборке минут из-за "
+                        "одной зависшей загрузки")
+        # Разных пакетов (VC++ 2005/2008/…/DirectX/OpenAL…) действительно
+        # несколько, и у каждого — своя закачка. А вот ОДИН и тот же URL
+        # (например, DirectX June 2010 отвечает за десятки DLL) не должен
+        # запрашиваться больше одного раза.
+        from collections import Counter
+        counts = Counter(attempts)
+        repeated = {url: n for url, n in counts.items() if n > 1}
+        self.assertFalse(
+            repeated,
+            f"один и тот же пакет запрашивался заново для каждой DLL: {repeated}")
+
+
 class ProgressWiringTests(unittest.TestCase):
     """Проценты доходят до окна: ядро → воркер → вторая полоса прогресса."""
 
