@@ -28,7 +28,7 @@ from ..core import elevate
 from ..core.detect import detect_installer
 from ..core.portablizer import PortableOptions, PortableResult
 from . import style
-from .worker import PortableWorker
+from .worker import MaintenanceWorker, PortableWorker
 
 
 def _resource(rel: str) -> str:
@@ -64,6 +64,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.worker: Optional[PortableWorker] = None
+        self.maintenance_worker: Optional[MaintenanceWorker] = None
         self.last_result: Optional[PortableResult] = None
         #: Запоминаем папку вывода между запусками: каждый раз искать её
         #: заново — лишнее вмешательство пользователя в то, что программа
@@ -103,6 +104,7 @@ class MainWindow(QMainWindow):
         cl.addWidget(self._build_source_card())
         cl.addWidget(self._build_options_card())
         cl.addWidget(self._build_process_card())
+        cl.addWidget(self._build_maintenance_card())
         cl.addStretch(1)
         outer.addWidget(scroll, 1)
 
@@ -343,6 +345,88 @@ class MainWindow(QMainWindow):
         self.log_view.setMinimumHeight(210)
         lay.addWidget(self.log_view)
         return frame
+
+    # -- карточка «Обслуживание готового портатива» ---------------------------
+    def _build_maintenance_card(self) -> QFrame:
+        frame, lay = _card("Готовый портатив: освободить папку или обновить", "4")
+
+        hint = QLabel(
+            "Если папку портатива не удаётся удалить («файл открыт в другой "
+            "программе»), укажите её здесь и нажмите «Освободить папку»: "
+            "Portablizer остановит службы и процессы, запущенные из неё, и "
+            "назовёт виновника, если файл держит посторонняя программа.\n"
+            "«Обновить лончер» перевыпускает Launch.bat, LaunchPortable.exe и "
+            "StopPortable.cmd текущей версией — нужно для портативов, "
+            "собранных прежними версиями Portablizer: они не умеют закрывать "
+            "за собой фоновые процессы. Настройки портатива сохраняются.")
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        row = QHBoxLayout()
+        self.maintenance_edit = QLineEdit()
+        self.maintenance_edit.setPlaceholderText(
+            "Папка портатива (та, где лежит Launch.bat)…")
+        browse = QPushButton("Обзор…")
+        browse.clicked.connect(self._browse_maintenance)
+        row.addWidget(self.maintenance_edit, 1)
+        row.addWidget(browse)
+        lay.addLayout(row)
+
+        buttons = QHBoxLayout()
+        self.release_btn = QPushButton("Освободить папку")
+        self.release_btn.clicked.connect(lambda: self._maintenance("release"))
+        self.refresh_btn = QPushButton("Обновить лончер")
+        self.refresh_btn.setObjectName("Ghost")
+        self.refresh_btn.clicked.connect(lambda: self._maintenance("refresh"))
+        buttons.addWidget(self.release_btn)
+        buttons.addWidget(self.refresh_btn)
+        buttons.addStretch(1)
+        self.maintenance_status = QLabel("")
+        self.maintenance_status.setObjectName("Hint")
+        buttons.addWidget(self.maintenance_status, 1)
+        lay.addLayout(buttons)
+        return frame
+
+    def _browse_maintenance(self) -> None:
+        start = self.maintenance_edit.text().strip() or (
+            self.last_result.portable_dir if self.last_result else "")
+        path = QFileDialog.getExistingDirectory(
+            self, "Папка готового портатива", start)
+        if path:
+            self.maintenance_edit.setText(path)
+
+    def _maintenance(self, action: str) -> None:
+        folder = self.maintenance_edit.text().strip()
+        if not folder and self.last_result:
+            folder = self.last_result.portable_dir
+            self.maintenance_edit.setText(folder)
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, "Portablizer",
+                                "Укажите существующую папку портатива.")
+            return
+        if self.maintenance_worker and self.maintenance_worker.isRunning():
+            return
+        self.release_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        self.maintenance_status.setText(
+            "Освобождаю папку…" if action == "release" else "Обновляю…")
+        self.maintenance_worker = MaintenanceWorker(folder, action)
+        self.maintenance_worker.log_line.connect(self._on_log)
+        self.maintenance_worker.finished_report.connect(
+            self._on_maintenance_done)
+        self.maintenance_worker.start()
+
+    def _on_maintenance_done(self, report) -> None:
+        self.release_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+        text = "\n".join(report.messages) or "Готово."
+        if report.success:
+            self.maintenance_status.setText("✔ Готово")
+            QMessageBox.information(self, "Portablizer", text)
+        else:
+            self.maintenance_status.setText("✖ Не удалось")
+            QMessageBox.warning(self, "Portablizer", text)
 
     # -- нижняя панель --------------------------------------------------------
     def _build_footer(self) -> QWidget:
@@ -600,6 +684,10 @@ class MainWindow(QMainWindow):
         self.open_btn.setEnabled(
             bool(result.portable_dir and os.path.isdir(result.portable_dir))
         )
+        # Папка результата сразу подставляется в обслуживание: если позже её
+        # не удастся удалить, нажать «Освободить папку» можно не выбирая её.
+        if result.portable_dir and not self.maintenance_edit.text().strip():
+            self.maintenance_edit.setText(result.portable_dir)
         self._on_detail(0, "")
         if result.success:
             self.progress.setFormat("Готово — 100%")
@@ -772,6 +860,8 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self.start_btn.setEnabled(not running)
+        self.release_btn.setEnabled(not running)
+        self.refresh_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         for w in (self.installer_edit, self.output_edit, self.name_edit,
                   self.args_edit, self.env_edit, self.cb_redirect,

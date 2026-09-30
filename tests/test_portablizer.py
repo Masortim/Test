@@ -17,6 +17,7 @@ import batsim
 import portable_launcher_entry as exe_launcher
 from portablizer.core import elevate as elevate_mod
 from portablizer.core import launcher as launcher_mod
+from portablizer.core import maintenance
 from portablizer.core import procutil
 from portablizer.core import registry
 from portablizer.core.detect import (
@@ -3405,6 +3406,179 @@ class HandsOffGuiTests(unittest.TestCase):
             self.assertEqual(
                 picker([FakeUrl(str(text)), FakeUrl(str(setup))]), str(setup))
             self.assertEqual(picker([FakeUrl(str(text))]), "")
+
+
+class ExistingPortableMaintenanceTests(unittest.TestCase):
+    """Портатив, собранный ПРЕЖНЕЙ версией, лечится без пересборки.
+
+    Исправления живут внутри каждой готовой папки: там своя копия
+    LaunchPortable.exe и свой Launch.bat. Обновление самого Portablizer
+    ничего не меняет в уже созданных портативах — их нужно либо пересобрать,
+    либо обновить на месте.
+    """
+
+    def _old_portable(self, temp, app_name="Old Game"):
+        root = Path(temp, "Old_Portable")
+        (root / "App").mkdir(parents=True)
+        (root / "App" / "game.exe").write_bytes(b"MZ")
+        cfg = launcher_mod.LauncherConfig(
+            app_name=app_name, target_exe_rel="App/game.exe",
+            extra_env={"GAME_HOME": "%PORTABLE_ROOT%/App"},
+            path_prepend=["App"],
+            targets=[launcher_mod.TargetInfo(name="game",
+                                             rel_path="App/game.exe")],
+            launcher_aliases={"Launch_Config.exe": "App/cfg.exe"},
+        )
+        data = json.loads(launcher_mod.render_config_json(cfg))
+        # Так выглядел конфиг до появления политики завершения сеанса.
+        data.pop("shutdown")
+        (root / "launcher_config.json").write_text(
+            json.dumps(data), encoding="utf-8")
+        (root / "Launch.bat").write_text("@echo off\nrem old", encoding="ascii")
+        return root
+
+    def test_refresh_reissues_launchers_and_adds_the_shutdown_policy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._old_portable(temp)
+            copied = []
+
+            report = maintenance.refresh(
+                str(root), Logger(),
+                copy_exe=lambda folder, rel: copied.append(rel) or rel)
+
+            self.assertTrue(report.success)
+            config = json.loads((root / "launcher_config.json").read_text(
+                encoding="utf-8-sig"))
+            # Главное: новый лончер знает, когда отпускать папку.
+            self.assertEqual(config["shutdown"]["idle_grace"], 20.0)
+            self.assertTrue(config["shutdown"]["kill_leftovers"])
+            # И появился аварийный «отпускатель».
+            self.assertTrue((root / launcher_mod.STOP_SCRIPT_NAME).is_file())
+            bat = (root / "Launch.bat").read_text(encoding="ascii")
+            self.assertIn("PORTABLE_IDLE_GRACE", bat)
+            self.assertIn("CloseMainWindow", bat)
+            # EXE-лончер и его именованные копии перевыпущены.
+            self.assertIn(os.path.join("App", "LaunchPortable.exe"), copied)
+            self.assertIn("Launch_Config.exe", copied)
+
+    def test_refresh_keeps_every_setting_of_the_portable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._old_portable(temp, app_name="Игра")
+            maintenance.refresh(str(root), Logger(),
+                                copy_exe=lambda folder, rel: rel)
+
+            config = json.loads((root / "launcher_config.json").read_text(
+                encoding="utf-8-sig"))
+            self.assertEqual(config["app_name"], "Игра")
+            self.assertEqual(config["target_exe_rel"], "App/game.exe")
+            self.assertEqual(config["extra_env"],
+                             {"GAME_HOME": "%PORTABLE_ROOT%/App"})
+            self.assertEqual(config["path_prepend"], ["App"])
+            self.assertEqual(config["launcher_aliases"],
+                             {"Launch_Config.exe": "App/cfg.exe"})
+            self.assertEqual(len(config["targets"]), 1)
+
+    def test_refresh_stops_the_old_launcher_before_overwriting_it(self):
+        """Работающий старый лончер нельзя перезаписать — сначала закрыть."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._old_portable(temp)
+            order = []
+            with mock.patch.object(
+                    procutil, "release_folder",
+                    side_effect=lambda folder, **_k:
+                    order.append("release") or ["LaunchPortable.exe"]):
+                report = maintenance.refresh(
+                    str(root), Logger(), copy_exe=lambda folder, rel: rel)
+
+            self.assertEqual(order, ["release"])
+            self.assertEqual(report.stopped, ["LaunchPortable.exe"])
+
+    def test_refresh_refuses_a_folder_that_is_not_a_portable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report = maintenance.refresh(temp, Logger())
+            self.assertFalse(report.success)
+            self.assertIn("launcher_config.json", " ".join(report.messages))
+
+    def test_release_reports_a_free_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._old_portable(temp)
+            with mock.patch.object(procutil, "release_folder",
+                                   return_value=["updater.exe"]):
+                report = maintenance.release(str(root), Logger())
+
+            self.assertTrue(report.success)
+            self.assertEqual(report.stopped, ["updater.exe"])
+            self.assertIn("можно удалить", " ".join(report.messages))
+
+    def test_release_names_the_program_holding_the_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._old_portable(temp)
+            holders = [procutil.Holder(11, r"C:\Windows\explorer.exe",
+                                       "module", r"C:\P\App\ext.dll")]
+            with mock.patch.object(procutil, "release_folder",
+                                   return_value=[]), \
+                    mock.patch.object(procutil, "folder_is_free",
+                                      return_value=False), \
+                    mock.patch.object(procutil, "holders",
+                                      return_value=holders):
+                report = maintenance.release(str(root), Logger())
+
+            self.assertFalse(report.success)
+            self.assertIn("explorer.exe (держит ext.dll)", report.holders)
+            self.assertIn("Закройте окна", " ".join(report.messages))
+
+    def test_release_works_on_any_folder_not_only_portables(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plain = Path(temp, "just a folder")
+            plain.mkdir()
+            with mock.patch.object(procutil, "release_folder",
+                                   return_value=[]):
+                report = maintenance.release(str(plain), Logger())
+            self.assertTrue(report.success)
+
+    def test_config_round_trip_survives_a_config_without_shutdown(self):
+        cfg = launcher_mod.LauncherConfig(
+            app_name="A", target_exe_rel="App/a.exe",
+            apply_registry=True, registry_keys=[r"HKCU\Software\A"])
+        data = json.loads(launcher_mod.render_config_json(cfg))
+        data.pop("shutdown")
+        restored = launcher_mod.config_from_dict(data)
+
+        self.assertEqual(restored.app_name, "A")
+        self.assertTrue(restored.apply_registry)
+        self.assertEqual(restored.registry_keys, [r"HKCU\Software\A"])
+        # Значения по умолчанию подставляются, а не теряются.
+        self.assertEqual(restored.shutdown_idle_grace, 20.0)
+        self.assertTrue(restored.shutdown_kill_leftovers)
+
+
+class MaintenanceGuiTests(unittest.TestCase):
+    """Обслуживание доступно из окна, а не только из кода."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "portablizer", "gui", "main_window.py"),
+                  encoding="utf-8") as handle:
+            cls.window = handle.read()
+        with open(os.path.join(root, "portablizer", "gui", "worker.py"),
+                  encoding="utf-8") as handle:
+            cls.worker = handle.read()
+
+    def test_window_has_release_and_refresh_buttons(self):
+        self.assertIn("self.release_btn = QPushButton(", self.window)
+        self.assertIn("self.refresh_btn = QPushButton(", self.window)
+        self.assertIn('self._maintenance("release")', self.window)
+        self.assertIn('self._maintenance("refresh")', self.window)
+
+    def test_maintenance_runs_in_a_background_thread(self):
+        self.assertIn("class MaintenanceWorker(QThread):", self.worker)
+        self.assertIn("maintenance.release", self.worker)
+        self.assertIn("maintenance.refresh", self.worker)
+
+    def test_built_folder_is_offered_for_maintenance(self):
+        self.assertIn("self.maintenance_edit.setText(result.portable_dir)",
+                      self.window)
 
 
 class ElevationTests(unittest.TestCase):

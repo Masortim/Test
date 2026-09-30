@@ -1128,6 +1128,93 @@ def render_vbs() -> str:
     return ensure_ascii_bat(_VBS_TEMPLATE)
 
 
+def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
+    """Восстанавливает ``LauncherConfig`` из готового ``launcher_config.json``.
+
+    Нужно для обслуживания уже собранного портатива: чтобы перевыпустить его
+    лончер новой версией, надо знать, чем он был собран. Разбор намеренно
+    терпимый — конфиг мог быть создан прежней версией Portablizer, в которой
+    части полей ещё не существовало (например, секции ``shutdown``).
+    """
+    def text(key: str, default: str = "") -> str:
+        value = data.get(key, default)
+        return value if isinstance(value, str) else default
+
+    def items(key: str) -> List[str]:
+        value = data.get(key)
+        return [str(v) for v in value] if isinstance(value, list) else []
+
+    def mapping(key: str) -> Dict[str, str]:
+        value = data.get(key)
+        if not isinstance(value, dict):
+            return {}
+        return {str(k): str(v) for k, v in value.items()}
+
+    registry = data.get("registry")
+    registry = registry if isinstance(registry, dict) else {}
+    shutdown = data.get("shutdown")
+    shutdown = shutdown if isinstance(shutdown, dict) else {}
+
+    def number(key: str, default: float) -> float:
+        try:
+            return float(shutdown.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    targets: List[TargetInfo] = []
+    raw_targets = data.get("targets")
+    if isinstance(raw_targets, list):
+        for item in raw_targets:
+            if not isinstance(item, dict):
+                continue
+            targets.append(TargetInfo(
+                name=str(item.get("name", "")),
+                rel_path=str(item.get("rel_path", "")),
+                role=str(item.get("role", "main")),
+                description=str(item.get("description", "")),
+                bat_name=str(item.get("bat_name", "")),
+                vbs_name=str(item.get("vbs_name", "")),
+            ))
+
+    def dict_list(key: str) -> List[Dict[str, str]]:
+        value = data.get(key)
+        if not isinstance(value, list):
+            return []
+        return [{str(k): str(v) for k, v in item.items()}
+                for item in value if isinstance(item, dict)]
+
+    return LauncherConfig(
+        app_name=text("app_name", "Portable"),
+        target_exe_rel=text("target_exe_rel"),
+        target_args=items("target_args"),
+        data_dir_name=text("data_dir_name", "PortableData"),
+        apply_registry=bool(registry.get("enabled", False)),
+        reg_file_name=str(registry.get("file", "portable.reg")),
+        machine_reg_file_name=str(
+            registry.get("machine_file", "portable_machine.reg")),
+        registry_keys=[str(k) for k in registry.get("keys", [])
+                       if isinstance(registry.get("keys", []), list)],
+        registry_created_keys=[
+            str(k) for k in registry.get("created_keys", [])
+            if isinstance(registry.get("created_keys", []), list)],
+        registry_has_root_token=bool(registry.get("root_token")),
+        extra_env=mapping("extra_env"),
+        path_prepend=items("path_prepend"),
+        redirect_known_folders=bool(data.get("redirect_known_folders", False)),
+        targets=targets,
+        launcher_target_rel=text("launcher_target_rel"),
+        config_target_rel=text("config_target_rel"),
+        launcher_aliases=mapping("launcher_aliases"),
+        runtime_requirements=dict_list("runtime_requirements"),
+        runtime_installers=dict_list("runtime_installers"),
+        shutdown_spawn_grace=number("spawn_grace", 6.0),
+        shutdown_idle_grace=number("idle_grace", 20.0),
+        shutdown_close_grace=number("close_grace", 5.0),
+        shutdown_max_wait=number("max_wait", 86400.0),
+        shutdown_kill_leftovers=bool(shutdown.get("kill_leftovers", True)),
+    )
+
+
 # --- StopPortable.cmd (освобождение папки) ------------------------------------
 
 #: Имя аварийного «отпускателя» папки в корне портатива.
