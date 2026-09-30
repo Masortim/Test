@@ -43,7 +43,7 @@ import os
 import re
 import struct
 import zlib
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 #: Сигнатура кабинета.
 SIGNATURE = b"MSCF"
@@ -69,6 +69,23 @@ MAX_DEPTH = 4
 
 class CabinetError(Exception):
     """Кабинет повреждён или это вовсе не кабинет."""
+
+
+class CabinetCancelled(Exception):
+    """Распаковка остановлена вызывающим кодом.
+
+    Исключение отделено от :class:`CabinetError`: повреждённый файл можно
+    пропустить и попробовать следующий контейнер, а после отмены нельзя
+    продолжать разбирать ещё сотню кабинетов DirectX.
+    """
+
+
+CancelCB = Optional[Callable[[], bool]]
+
+
+def _check_cancel(cancel: CancelCB) -> None:
+    if cancel is not None and cancel():
+        raise CabinetCancelled("распаковка отменена")
 
 
 # =============================================================================
@@ -260,7 +277,8 @@ def _lzx_read_lens(reader: _LzxBitReader, lens: List[int],
 
 
 def decompress_lzx(data: bytes, uncompressed_size: int,
-                   window_bits: int = 21) -> bytes:
+                   window_bits: int = 21,
+                   cancel: CancelCB = None) -> bytes:
     """Распаковывает поток данных формата LZX для Microsoft Cabinet."""
     if uncompressed_size <= 0:
         return b""
@@ -299,6 +317,7 @@ def decompress_lzx(data: bytes, uncompressed_size: int,
     offset = 0
 
     while offset < uncompressed_size:
+        _check_cancel(cancel)
         if not header_read:
             hdr = reader.read_bits(1)
             if hdr != 0:
@@ -357,7 +376,16 @@ def decompress_lzx(data: bytes, uncompressed_size: int,
             if block_type in (_LZX_BLOCKTYPE_VERBATIM, _LZX_BLOCKTYPE_ALIGNED):
                 if main_tree is None:
                     raise CabinetError("дерево Хаффмана не инициализировано")
+                symbols_read = 0
                 while this_run > 0:
+                    # LZX распаковывается побитно и на больших XACT/D3DX CAB
+                    # может надолго занять один поток. Проверка не на каждом
+                    # байте сохраняет скорость, но гарантирует, что таймаут
+                    # действительно ОСТАНОВИТ декодер, а не оставит его
+                    # грузить CPU фоном до конца всей сборки.
+                    symbols_read += 1
+                    if (symbols_read & 0x7FF) == 0:
+                        _check_cancel(cancel)
                     main_elem = main_tree.read_sym(reader)
                     if main_elem < _LZX_NUM_CHARS:
                         window[window_posn] = main_elem
@@ -608,7 +636,7 @@ class Cabinet:
         return position + 1
 
     # -- данные --------------------------------------------------------------
-    def folder_data(self, index: int) -> bytes:
+    def folder_data(self, index: int, cancel: CancelCB = None) -> bytes:
         """Распакованное содержимое одной папки кабинета."""
         folder = self.folders[index]
         if folder.cache is not None:
@@ -627,6 +655,7 @@ class Cabinet:
             compressed_data = bytearray()
             total_uncompressed = 0
             for _ in range(folder.blocks):
+                _check_cancel(cancel)
                 head = self._read(position, 8)
                 _checksum, compressed, uncompressed = struct.unpack("<IHH", head)
                 position += 8 + getattr(self, "_data_reserve", 0)
@@ -637,7 +666,11 @@ class Cabinet:
                 if total_uncompressed > MAX_TOTAL_SIZE:
                     raise CabinetError("папка кабинета неправдоподобно велика")
             try:
-                folder.cache = decompress_lzx(bytes(compressed_data), total_uncompressed, wnd_bits)
+                folder.cache = decompress_lzx(
+                    bytes(compressed_data), total_uncompressed, wnd_bits,
+                    cancel=cancel)
+            except CabinetCancelled:
+                raise
             except Exception as exc:
                 raise CabinetError(f"ошибка распаковки LZX: {exc}") from exc
             return folder.cache
@@ -646,6 +679,7 @@ class Cabinet:
         history = b""
         total = 0
         for _ in range(folder.blocks):
+            _check_cancel(cancel)
             head = self._read(position, 8)
             _checksum, compressed, uncompressed = struct.unpack("<IHH", head)
             position += 8 + getattr(self, "_data_reserve", 0)
@@ -668,8 +702,8 @@ class Cabinet:
         folder.cache = out.getvalue()
         return folder.cache
 
-    def read(self, entry: _File) -> bytes:
-        data = self.folder_data(entry.folder)
+    def read(self, entry: _File, cancel: CancelCB = None) -> bytes:
+        data = self.folder_data(entry.folder, cancel=cancel)
         return data[entry.offset:entry.offset + entry.size]
 
     def names(self) -> List[str]:
@@ -677,7 +711,8 @@ class Cabinet:
 
     def extract(self, destination: str,
                 wanted: Sequence[str] = (),
-                keep_containers: bool = False) -> List[str]:
+                keep_containers: bool = False,
+                cancel: CancelCB = None) -> List[str]:
         """Распаковывает кабинет; ``wanted`` — если нужны не все файлы.
 
         ``keep_containers=True`` дополнительно оставляет вложенные
@@ -690,6 +725,7 @@ class Cabinet:
                    for name in wanted if name}
         written: List[str] = []
         for entry in self.files:
+            _check_cancel(cancel)
             if lowered:
                 base = entry.name.replace("\\", "/").rsplit("/", 1)[-1].lower()
                 if base not in lowered and not (
@@ -700,7 +736,7 @@ class Cabinet:
                 continue
             target = os.path.join(destination, relative)
             try:
-                payload = self.read(entry)
+                payload = self.read(entry, cancel=cancel)
             except (CabinetError, zlib.error, struct.error):
                 continue
             try:
@@ -762,8 +798,46 @@ def iter_cabinets(data, limit: int = MAX_CABINETS) -> Iterator[int]:
         position = index + max(cb_cabinet, 4)
 
 
+def list_files(path: str, limit: int = 10000) -> List[str]:
+    """Имена файлов в CAB/SFX без распаковки самих данных.
+
+    Таблица CFFILE хранится в заголовочной части кабинета открытым текстом,
+    даже когда содержимое сжато LZX. Поэтому можно за миллисекунды выяснить,
+    что ``xactengine2_0.dll`` лежит именно в ``OCT2006_XACT_x86.cab``, вместо
+    последовательной распаковки всех 163 кабинетов DirectX. Это ключевое
+    отличие быстрого адресного поиска от прежнего полного перебора.
+    """
+    if not os.path.isfile(path) or limit <= 0:
+        return []
+    try:
+        handle, data = _open_mapped(path)
+    except (OSError, ValueError):
+        return []
+    names: List[str] = []
+    try:
+        for offset in iter_cabinets(data):
+            try:
+                parsed = Cabinet(data, offset)
+            except (CabinetError, struct.error, MemoryError):
+                continue
+            for name in parsed.names():
+                names.append(name)
+                if len(names) >= limit:
+                    return names
+        return names
+    finally:
+        try:
+            if hasattr(data, "close"):
+                data.close()
+        except (BufferError, ValueError):
+            pass
+        if handle is not None:
+            handle.close()
+
+
 def extract_file(path: str, destination: str, *, wanted: str = "",
-                 recurse: bool = True, depth: int = 0) -> List[str]:
+                 recurse: bool = True, depth: int = 0,
+                 cancel: CancelCB = None) -> List[str]:
     """Достаёт всё, что лежит в кабинетах внутри файла ``path``.
 
     Работает и с ``.cab``, и с самораспаковывающимся ``.exe``, и с ``.msi``
@@ -771,6 +845,7 @@ def extract_file(path: str, destination: str, *, wanted: str = "",
     (``vc_red.cab`` внутри ``vcredist_x86.exe``) раскрываются рекурсивно.
     Возвращает список созданных файлов.
     """
+    _check_cancel(cancel)
     if depth > MAX_DEPTH or not os.path.isfile(path):
         return []
     try:
@@ -783,10 +858,12 @@ def extract_file(path: str, destination: str, *, wanted: str = "",
     written: List[str] = []
     try:
         for offset in iter_cabinets(data):
+            _check_cancel(cancel)
             try:
                 cabinet = Cabinet(data, offset)
-                written += cabinet.extract(destination, wanted=(target,) if target else (),
-                                           keep_containers=bool(target))
+                written += cabinet.extract(
+                    destination, wanted=(target,) if target else (),
+                    keep_containers=bool(target), cancel=cancel)
             except (CabinetError, struct.error, zlib.error, MemoryError):
                 continue
     finally:
@@ -810,10 +887,36 @@ def extract_file(path: str, destination: str, *, wanted: str = "",
                   if os.path.isfile(item)
                   and _looks_like_container_name(os.path.basename(item))
                   and looks_like_container(item)]
-    if stem:
-        containers.sort(
-            key=lambda item: (0 if stem in os.path.basename(item).lower() else 1,
-                              os.path.basename(item).lower()))
+    if target:
+        # Имя CAB не всегда содержит имя библиотеки. Главный пример —
+        # xactengine2_0.dll внутри OCT2006_XACT_x86.cab: прежний алгоритм
+        # доходил до него только после полного перебора «163 из 163». Таблицу
+        # имён вложенного CAB можно прочитать без LZX-декомпрессии, поэтому
+        # контейнер с точным member ставим первым. Подсказка в имени CAB —
+        # лишь второй приоритет, полный перебор — последний запасной путь.
+        member_hits = set()
+        for item in containers:
+            _check_cancel(cancel)
+            try:
+                members = {
+                    name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+                    for name in list_files(item)
+                }
+            except (OSError, CabinetError):
+                members = set()
+            if target in members:
+                member_hits.add(os.path.normcase(os.path.abspath(item)))
+
+        def container_rank(item: str) -> Tuple[int, str]:
+            key = os.path.normcase(os.path.abspath(item))
+            name = os.path.basename(item).lower()
+            if key in member_hits:
+                return (0, name)
+            if stem and stem in name:
+                return (1, name)
+            return (2, name)
+
+        containers.sort(key=container_rank)
     nested: List[str] = []
     if not recurse:
         # Вызывающему нужны сами контейнеры, а не их содержимое: так
@@ -826,10 +929,12 @@ def extract_file(path: str, destination: str, *, wanted: str = "",
          if os.path.basename(item).lower() == target]
         or _find_in_tree(destination, target))
     for item in containers:
+        _check_cancel(cancel)
         if found:
             break
-        produced = extract_file(item, os.path.dirname(item),
-                                wanted=wanted, recurse=True, depth=depth + 1)
+        produced = extract_file(
+            item, os.path.dirname(item), wanted=wanted, recurse=True,
+            depth=depth + 1, cancel=cancel)
         nested += produced
         if target and any(os.path.basename(p).lower() == target
                           for p in produced):

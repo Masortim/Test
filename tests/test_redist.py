@@ -750,6 +750,48 @@ class FullKitProvisionTests(unittest.TestCase):
             self.assertNotIn("msvcr100.dll",
                              {r.dll for r in report.stock_missing})
 
+    def test_separate_directx_cabs_are_selected_by_their_member_tables(self):
+        """Диск с 163 CAB: для каждой XACT DLL открывается ровно её архив."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe",
+                     imports=("xactengine2_0.dll", "xactengine2_1.dll"))
+            shipped = Path(temp, "_CommonRedist", "DirectX")
+            shipped.mkdir(parents=True)
+            first = Path(write_runtime_dll(
+                Path(temp, "first.dll"))).read_bytes()
+            second = Path(write_runtime_dll(
+                Path(temp, "second.dll"))).read_bytes()
+            (shipped / "OCT2006_XACT_x86.cab").write_bytes(make_cabinet(
+                {"xactengine2_0.dll": first}))
+            (shipped / "FEB2007_XACT_x86.cab").write_bytes(make_cabinet(
+                {"xactengine2_1.dll": second}))
+            # Соседи, которые не должны распаковываться вообще.
+            for index in range(20):
+                (shipped / f"Jun2010_filler{index}_x86.cab").write_bytes(
+                    make_cabinet({f"filler{index}.dll": b"MZ filler"}))
+
+            scan = redist.scan_app_runtime(str(app))
+            provisioner = redist.RuntimeProvisioner(
+                self.log, source_dirs=[str(shipped)], system_dirs=[],
+                sxs_dir="")
+            original = provisioner._expand_one
+            touched = []
+
+            def counted(path, destination):
+                touched.append(os.path.basename(path))
+                return original(path, destination)
+
+            provisioner._expand_one = counted
+            report = provisioner.provision(
+                scan, str(app), str(portable), "Game")
+
+            self.assertEqual(report.missing, [])
+            self.assertEqual(set(touched),
+                             {"OCT2006_XACT_x86.cab", "FEB2007_XACT_x86.cab"})
+            self.assertTrue((app / "xactengine2_0.dll").is_file())
+            self.assertTrue((app / "xactengine2_1.dll").is_file())
+
     def test_second_dll_from_the_same_extracted_package_is_delivered(self):
         """Из одного пакета достаются обе библиотеки.
 
@@ -1603,7 +1645,16 @@ class PackageExtractionTests(unittest.TestCase):
             dest = str(Path(temp, "out"))
             legacy = redist.extraction_commands(make("vcredist_x86.exe"), dest)
             self.assertEqual(legacy[0][1:], ["/Q", "/C", f"/T:{dest}"])
-            self.assertIn([legacy[0][0], "/q", f"/x:{dest}"], legacy)
+            # У VC++ 2005 запасные /x, /quiet и /norestart не безобидны:
+            # обёртка показывает модальное «Command line option syntax
+            # error». После единственной точной команды разрешены только
+            # нативные распаковщики, но не повторный запуск самого EXE.
+            wrapper_commands = [command for command in legacy
+                                if command[0] == legacy[0][0]]
+            self.assertEqual(wrapper_commands, [legacy[0]])
+            self.assertFalse(any(
+                arg.lower().startswith(("/x", "/quiet", "/norestart"))
+                for command in legacy for arg in command[1:]))
 
             burn = redist.extraction_commands(make("vc_redist.x64.exe"), dest)
             # WiX Burn не знает ни /T:, ни /x: — только /layout.
@@ -2614,6 +2665,72 @@ class StuckAt85PercentRegressionTests(unittest.TestCase):
 
     def setUp(self):
         self.log = Logger()
+
+    def test_xact_cab_is_selected_by_member_without_scanning_163_cabs(self):
+        """Точный регресс жалобы: OCT2006_XACT был 163-м и «держал» 87%."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for index in range(162):
+                (root / f"Jun2010_filler_{index:03d}_x86.cab").write_bytes(
+                    make_cabinet({f"filler{index}.dll": b"MZ filler"}))
+            wanted_cab = root / "OCT2006_XACT_x86.cab"
+            wanted_cab.write_bytes(make_cabinet({
+                "xactengine2_0.dll": b"MZ xact 20",
+                "xactengine2_1.dll": b"MZ xact 21",
+            }))
+
+            provisioner = redist.RuntimeProvisioner(
+                self.log, system_dirs=[], sxs_dir="")
+            original = provisioner._expand_one
+            touched = []
+
+            def counted(path, destination):
+                touched.append(os.path.basename(path))
+                return original(path, destination)
+
+            provisioner._expand_one = counted
+            provisioner._expand_payloads(str(root), "xactengine2_0.dll")
+
+            self.assertTrue((root / "xactengine2_0.dll").is_file())
+            self.assertEqual(touched, ["OCT2006_XACT_x86.cab"])
+            # Второй файл приехал из того же CAB: повторной распаковки нет.
+            provisioner._expand_payloads(str(root), "xactengine2_1.dll")
+            self.assertEqual(touched, ["OCT2006_XACT_x86.cab"])
+
+    def test_known_wextract_packages_never_receive_guessed_switches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            destination = str(Path(temp, "out"))
+            for filename in ("vcredist_x86.exe",
+                             "directx_Jun2010_redist.exe"):
+                archive = Path(temp, filename)
+                archive.write_bytes(b"MZ")
+                commands = redist.extraction_commands(
+                    str(archive), destination)
+                wrapper = [cmd for cmd in commands
+                           if os.path.abspath(cmd[0]) == os.path.abspath(archive)]
+                self.assertEqual(len(wrapper), 1, (filename, wrapper))
+                self.assertEqual(wrapper[0][1:3], ["/Q", "/C"])
+                flattened = [arg.lower() for cmd in wrapper for arg in cmd[1:]]
+                self.assertNotIn("/quiet", flattened)
+                self.assertNotIn("/norestart", flattened)
+                self.assertFalse(any(arg.startswith("/x") for arg in flattened))
+
+    def test_bounded_call_cooperatively_stops_the_cabinet_worker(self):
+        stopped = __import__("threading").Event()
+
+        def decoder(*, cancel=None):
+            try:
+                while cancel is None or not cancel():
+                    __import__("time").sleep(0.01)
+            finally:
+                stopped.set()
+            return ["too late"]
+
+        result = redist._bounded_call(
+            decoder, timeout=0.08, heartbeat=0.02, default=[])
+        self.assertEqual(result, [])
+        self.assertTrue(stopped.wait(1),
+                        "декодер остался работать после таймаута")
 
     def test_bounded_call_never_waits_longer_than_its_timeout(self):
         """Даже «зависший» чисто питоновский вызов не блокирует сборку вечно."""

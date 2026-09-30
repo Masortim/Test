@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -116,6 +117,21 @@ class CabinetReaderTests(unittest.TestCase):
             cabinet.extract_file(str(path), str(out))
             self.assertFalse(Path(temp, "windows").exists())
             self.assertTrue((out / "windows" / "system32" / "evil.dll").is_file())
+
+    def test_member_names_are_read_without_decompressing_payload(self):
+        """Индекс CAB находит XACT-файл по таблице, не распаковывая LZX."""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "OCT2006_XACT_x86.cab")
+            path.write_bytes(make_cabinet({
+                "xactengine2_0.dll": b"MZ" + os.urandom(10000),
+                r"nested\\readme.txt": b"hello",
+            }))
+            with mock.patch.object(
+                    cabinet.Cabinet, "folder_data",
+                    side_effect=AssertionError("payload should not be decoded")):
+                names = cabinet.list_files(str(path))
+            self.assertIn("xactengine2_0.dll", names)
+            self.assertIn(r"nested\\readme.txt", names)
 
     def test_garbage_is_not_mistaken_for_a_cabinet(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -1298,15 +1298,14 @@ def _bounded_call(func: Callable[..., object], *args,
                   default: object = None, **kwargs) -> object:
     """Выполняет ``func`` в отдельном потоке и не ждёт его дольше ``timeout``.
 
-    Наш декодер кабинетов — чистый Python без единой точки, где его можно
-    прервать посередине, поэтому единственный надёжный способ не дать ему
-    подвесить сборку — вынести вызов в daemon-поток и ограничить ожидание
-    снаружи. Поток остаётся daemon'ом: если он всё же не уложится, он тихо
-    доработает в фоне (или будет снят вместе с процессом), а сборка в это
-    время уже перейдёт к следующей, более быстрой ступени лестницы
-    (``expand``/wextract). ``on_tick(elapsed)`` вызывается каждые
-    ``heartbeat`` секунд ожидания — сюда подключается индикатор прогресса,
-    чтобы «висит» и «просто небыстро» не выглядели одинаково.
+    Вызов вынесен в daemon-поток, чтобы даже неизвестная сторонняя функция
+    не могла навсегда удержать завершение процесса. Если функция принимает
+    именованный аргумент ``cancel`` (как собственный CAB-декодер), по тайм-ауту
+    ей передаётся кооперативный сигнал: реальная работа прекращается перед
+    переходом к следующей ступени, а не остаётся грузить CPU в фоне.
+    ``on_tick(elapsed)`` вызывается каждые ``heartbeat`` секунд ожидания —
+    сюда подключается индикатор прогресса, чтобы «висит» и «просто небыстро»
+    не выглядели одинаково.
 
     ``timeout``/``heartbeat`` при отсутствии берутся из модульных констант
     в момент ВЫЗОВА, а не при определении функции — иначе их нельзя было бы
@@ -1317,14 +1316,25 @@ def _bounded_call(func: Callable[..., object], *args,
     if heartbeat is None:
         heartbeat = CABINET_HEARTBEAT_SECONDS
     box: List[object] = [default]
+    done = threading.Event()
+    stop = threading.Event()
+
+    # Реальный таймаут обязан останавливать работу, а не только переставать
+    # её ждать. Раньше медленный LZX-декодер оставался daemon-потоком,
+    # продолжал грузить CPU и писать в ту же папку одновременно со штатным
+    # expand. После нескольких CAB таких «брошенных» потоков становилось
+    # много, и внешне сборка окончательно замирала на последнем «163 из 163».
+    # Новый cabinet.extract_file принимает кооперативную отмену; подмены из
+    # тестов/внешних сценариев без такого аргумента по-прежнему совместимы.
+    call_kwargs = dict(kwargs)
+    if "cancel" not in call_kwargs and _accepts_keyword(func, "cancel"):
+        call_kwargs["cancel"] = stop.is_set
 
     def worker() -> None:
         try:
-            box[0] = func(*args, **kwargs)
+            box[0] = func(*args, **call_kwargs)
         except Exception:  # noqa: BLE001 — чужой файл не должен ронять сборку
             pass
-
-    done = threading.Event()
 
     def run_and_signal() -> None:
         try:
@@ -1335,6 +1345,7 @@ def _bounded_call(func: Callable[..., object], *args,
     thread = threading.Thread(target=run_and_signal, daemon=True)
     thread.start()
     started = time.monotonic()
+    timed_out = False
     while not done.wait(timeout=heartbeat):
         elapsed = time.monotonic() - started
         if on_tick is not None:
@@ -1343,7 +1354,16 @@ def _bounded_call(func: Callable[..., object], *args,
             except Exception:  # noqa: BLE001
                 pass
         if elapsed >= timeout:
+            timed_out = True
+            stop.set()
             break
+    if timed_out:
+        # Кооперативный CAB-декодер замечает событие внутри ближайшего блока
+        # или LZX-кадра. Короткая пауза не увеличивает заметно общий потолок,
+        # зато исключает гонку «старый Python-декодер пишет, новый expand
+        # удаляет/перезаписывает те же файлы».
+        done.wait(timeout=min(1.0, max(0.05, heartbeat)))
+        return default
     return box[0]
 
 
@@ -1670,13 +1690,14 @@ EXTRACT_SWITCHES: Dict[str, Tuple[Tuple[str, ...], ...]] = {
                  ("/C", "/T:{dest}"),
                  ("/q", "/x:{dest}"),
                  ("/x:{dest}",)),
-    "vcredist_legacy": (("/Q", "/C", "/T:{dest}"),
-                        ("/C", "/T:{dest}"),
-                        ("/q", "/x:{dest}"),
-                        ("/x:{dest}",),
-                        ("/extract:{dest}", "/quiet")),
-    "directx_bundle": (("/Q", "/C", "/T:{dest}"),
-                       ("/C", "/T:{dest}")),
+    # У старых VC++ и DirectX намеренно РОВНО ОДНА документированная команда
+    # распаковки. Любая «запасная» смесь /x, /quiet или /norestart у этих же
+    # wextract-обёрток открывает модальное окно «Command line option syntax
+    # error» / «Invalid command line operation». Если точная команда не
+    # помогла, ниже используются expand/extrac32/7-Zip, но сам EXE с другими
+    # ключами больше не запускается.
+    "vcredist_legacy": (("/Q", "/C", "/T:{dest}"),),
+    "directx_bundle": (("/Q", "/C", "/T:{dest}"),),
     # WiX Burn: VC++ 2012 и новее. /layout раскладывает msi и cab-контейнеры.
     "burn": (("/quiet", "/norestart", "/layout", "{dest}"),
              ("/layout", "{dest}", "/quiet", "/norestart"),
@@ -1725,7 +1746,13 @@ def extraction_commands(archive: str, destination: str,
             seen.add(key)
             commands.append(list(command))
 
-    for key in (kind, ""):
+    # Для опознанного движка никогда не примешиваем универсальную лестницу.
+    # «Попробовать ещё один популярный ключ» здесь не безобидно: старый
+    # vcredist показывает видимое модальное окно на /quiet, а DirectX-бандл
+    # передаёт чужой ключ DXSETUP и останавливает автоматическую сборку.
+    # Общие варианты допустимы только для действительно неизвестного EXE.
+    keys = (kind,) if kind and kind in EXTRACT_SWITCHES else ("",)
+    for key in keys:
         for switches in EXTRACT_SWITCHES.get(key, ()):
             add([archive] + [item.format(dest=destination)
                              for item in switches])
@@ -2558,6 +2585,15 @@ class RuntimeProvisioner:
         #: отметки оборвавшаяся/зависшая загрузка ~100 МБ повторялась бы
         #: заново для каждой DLL того же пакета из полного комплекта.
         self._download_tried: set = set()
+        #: CAB/MSI, которые уже раскрывались (успешно или нет). Без этой
+        #: отметки полный комплект DirectX повторно прогонял одни и те же 163
+        #: кабинета для каждого xactengine/xaudio: строка доходила до
+        #: ``OCT2006_XACT_x86.cab (163 из 163)``, затем тот же круг начинался
+        #: заново, и сборка практически никогда не покидала 87%.
+        self._expanded_payloads: set = set()
+        #: Имена файлов из таблиц CFFILE. Это дешёвый индекс без распаковки
+        #: LZX, позволяющий сразу выбрать один нужный XACT/D3DX CAB.
+        self._cabinet_members: Dict[Tuple[str, int, int], set] = {}
         #: Доля этапа, достигнутая на данный момент (0..1).
         self._stage_fraction = 0.0
 
@@ -2814,80 +2850,159 @@ class RuntimeProvisioner:
         self._expand_payloads(destination, wanted)
         return bool(_find_file(destination, wanted)) if wanted else bool(_has_files(destination))
 
-    def _expand_payloads(self, directory: str, wanted: str = "") -> None:
-        """Раскрывает вложенные ``.cab`` и ``.msi`` внутри распакованного пакета.
+    @staticmethod
+    def _payload_key(path: str) -> Tuple[str, int, int]:
+        """Идентификатор версии контейнера для кэша распаковки."""
+        normalized = os.path.normcase(os.path.abspath(path))
+        try:
+            stat = os.stat(path)
+            return normalized, int(stat.st_size), int(stat.st_mtime_ns)
+        except OSError:
+            return normalized, -1, -1
 
-        В DirectX-редисте около сотни кабинетов, и разворачивать их все ради
-        одной ``d3dx9_39.dll`` — минуты впустую. Имя нужной библиотеки входит
-        в имя кабинета (``Jun2010_d3dx9_39_x86.cab``), поэтому сначала
-        пробуем только подходящие, и лишь если не вышло — все подряд.
+    def _members_of_cabinet(self, path: str) -> set:
+        """Имена CFFILE без распаковки LZX (результат кэшируется)."""
+        key = self._payload_key(path)
+        cached = self._cabinet_members.get(key)
+        if cached is not None:
+            return cached
+        try:
+            names = {
+                name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+                for name in cabinet.list_files(path)
+            }
+        except (OSError, ValueError):
+            names = set()
+        self._cabinet_members[key] = names
+        return names
+
+    def _cabinet_contains(self, path: str, wanted: str) -> bool:
+        """Можно ли адресно взять ``wanted`` из этого CAB."""
+        target = os.path.basename(wanted).lower()
+        if not target:
+            return False
+        members = self._members_of_cabinet(path)
+        if target in members:
+            return True
+        # VC++ хранит DLL под складскими именами MSI:
+        # FL_mfc80_dll_01_8.0.... Выбор такого CAB всё равно безопаснее и
+        # быстрее полного перебора, а окончательную проверку делает _find_file.
+        stem, extension = os.path.splitext(target)
+        extension = extension.lstrip(".")
+        if not stem or not extension:
+            return False
+        return any(
+            f"{stem}_{extension}" in name or f"{stem}.{extension}" in name
+            for name in members
+        )
+
+    def _expand_payloads(self, directory: str, wanted: str = "") -> None:
+        """Адресно раскрывает вложенный CAB/MSI внутри пакета.
+
+        DirectX June 2010 содержит 163 кабинета. Раньше, если имя CAB не
+        подсказывало имя DLL (``xactengine2_0.dll`` живёт в
+        ``OCT2006_XACT_x86.cab``), каждый файл полного комплекта заново
+        проходил ВСЕ 163 архива. Теперь таблицы CFFILE индексируются без
+        декомпрессии, нужный кабинет выбирается сразу, а один контейнер в
+        пределах сборки никогда не раскрывается дважды.
         """
         if wanted and _find_file(directory, wanted):
             return
         stem = os.path.splitext(wanted)[0].lower() if wanted else ""
         cabinets: List[str] = []
         installers: List[str] = []
+        seen = set()
         for current, _dirs, files in os.walk(directory):
             for name in files:
                 lower = name.lower()
                 path = os.path.join(current, name)
+                key = os.path.normcase(os.path.abspath(path))
+                if key in seen:
+                    continue
                 if lower.endswith(".cab"):
                     cabinets.append(path)
+                    seen.add(key)
                 elif lower.endswith((".msi", ".msp")):
                     installers.append(path)
+                    seen.add(key)
                 elif "." not in lower and cabinet.looks_like_container(path):
                     # WiX Burn (VC++ 2012-2022) хранит payload'ы под
-                    # служебными именами без расширения (``a0``, ``u1``).
-                    # Раньше их пропускали по расширению — отсюда и бралось
-                    # «пакет скачан, но распаковать его автоматически не
-                    # удалось» для VC++ 2013.
+                    # служебными именами без расширения (a0, u1).
                     if cabinet.looks_like_cabinet(path):
                         cabinets.append(path)
                     else:
                         installers.append(path)
+                    seen.add(key)
 
-        targeted = [path for path in cabinets
-                    if stem and stem in os.path.basename(path).lower()]
+        # Не повторяем уже законченные и уже неудачные попытки. Если внешний
+        # распаковщик заменил файл новой версией, size/mtime в ключе изменятся
+        # и контейнер закономерно получит ещё одну попытку.
+        cabinets = [p for p in cabinets
+                    if self._payload_key(p) not in self._expanded_payloads]
+        installers = [p for p in installers
+                      if self._payload_key(p) not in self._expanded_payloads]
+
+        member_hits: List[str] = []
+        name_hits: List[str] = []
+        if wanted:
+            for path in cabinets:
+                if self._cabinet_contains(path, wanted):
+                    member_hits.append(path)
+                elif stem and stem in os.path.basename(path).lower():
+                    name_hits.append(path)
+        targeted: List[str] = []
+        for path in member_hits + name_hits:
+            if path not in targeted:
+                targeted.append(path)
         rest = [path for path in cabinets if path not in targeted]
-        total = len(targeted) + len(rest) + len(installers)
-        done = 0
 
-        def tick(path: str) -> None:
-            nonlocal done
-            done += 1
-            if total > 1:
-                self._report(
-                    None,
-                    f"Распаковываю {os.path.basename(path)} "
-                    f"({done} из {total})",
-                    int(done * 100 / total))
+        def expand_cabinets(paths: Sequence[str]) -> bool:
+            total = len(paths)
+            for done, path in enumerate(paths, start=1):
+                key = self._payload_key(path)
+                # Ставим отметку ДО потенциально долгого вызова. Даже если
+                # внешний REQUIREMENT_TIMEOUT истечёт, следующая DLL того же
+                # пакета не запустит параллельно ещё один такой же декодер.
+                self._expanded_payloads.add(key)
+                self._expand_one(path, os.path.dirname(path))
+                if total:
+                    self._report(
+                        None,
+                        f"Распаковываю {os.path.basename(path)} "
+                        f"({done} из {total})",
+                        int(done * 100 / total))
+                if wanted and _find_file(directory, wanted):
+                    return True
+            return False
 
-        for path in targeted:
-            self._expand_one(path, os.path.dirname(path))
-            tick(path)
-        if stem and targeted and _find_file(directory, wanted):
+        # В нормальном DirectX-пакете member_hits содержит ровно один CAB:
+        # пользователь видит «1 из 1», а не финальное «163 из 163».
+        if targeted and expand_cabinets(targeted):
+            return
+        if expand_cabinets(rest):
             return
 
-        for path in rest:
-            self._expand_one(path, os.path.dirname(path))
-            tick(path)
-            if stem and _find_file(directory, wanted):
-                break
-        for path in installers:
-            tick(path)
+        pending_installers = [
+            path for path in installers
+            if self._payload_key(path) not in self._expanded_payloads
+        ]
+        total = len(pending_installers)
+        for done, path in enumerate(pending_installers, start=1):
+            self._expanded_payloads.add(self._payload_key(path))
             target = os.path.join(os.path.dirname(path), "_msi")
             os.makedirs(target, exist_ok=True)
             # Внутри MSI кабинет часто лежит отдельным потоком — свой
             # распаковщик достаёт его без msiexec и без прав администратора.
-            if self._expand_one(path, target):
-                if stem and _find_file(directory, wanted):
-                    break
-                continue
-            if IS_WINDOWS and path.lower().endswith((".msi", ".msp")):
+            expanded = self._expand_one(path, target)
+            if not expanded and IS_WINDOWS and path.lower().endswith((".msi", ".msp")):
                 self._run([system_tool("msiexec"), "/a", path, "/qn",
                            f"TARGETDIR={target}"])
-            if stem and _find_file(directory, wanted):
-                break
+            self._report(
+                None,
+                f"Распаковываю {os.path.basename(path)} ({done} из {total})",
+                int(done * 100 / max(1, total)))
+            if wanted and _find_file(directory, wanted):
+                return
 
     def _expand_one(self, archive: str, destination: str) -> bool:
         """Раскрывает один кабинет.
@@ -3027,16 +3142,32 @@ class RuntimeProvisioner:
                 return "", ""
             self._extraction_tried.add(key)
             extracted = False
-            for archive in self._package_archives(package, requirement.arch):
+            archives = self._package_archives(package, requirement.arch)
+            # Если DirectX уже разложен рядом с игрой отдельными CAB, имя
+            # ``OCT2006_XACT_x86.cab`` всё равно не подсказывает
+            # xactengine2_0.dll. Читаем таблицу CFFILE и ставим точный архив
+            # первым — тот же адресный поиск, что и для CAB внутри бандла.
+            if requirement.dll:
+                stem = os.path.splitext(requirement.dll)[0].lower()
+                archives.sort(key=lambda item: (
+                    0 if item.lower().endswith(".cab")
+                    and self._cabinet_contains(item, requirement.dll)
+                    else 1 if stem in os.path.basename(item).lower()
+                    else 2,
+                    os.path.basename(item).lower()))
+            for archive in archives:
                 lower = archive.lower()
                 if lower.endswith(".cab"):
                     os.makedirs(destination, exist_ok=True)
-                    self._expand_one(archive, destination)
+                    payload_key = self._payload_key(archive)
+                    if payload_key not in self._expanded_payloads:
+                        self._expanded_payloads.add(payload_key)
+                        self._expand_one(archive, destination)
                     extracted = extracted or _has_files(destination)
                 elif lower.endswith((".exe", ".msi")):
                     extracted = self._extract_installer(
                         archive, destination, requirement.dll) or extracted
-                if os.path.isfile(os.path.join(destination, requirement.dll)):
+                if _find_file(destination, requirement.dll):
                     break
             if not extracted:
                 self._failed_packages.add(key)
@@ -3050,6 +3181,27 @@ class RuntimeProvisioner:
             # directx_Jun2010_redist.exe) — доворачиваем только их.
             self._expand_payloads(destination, requirement.dll)
             candidate = _find_file(destination, requirement.dll)
+        if not candidate:
+            # Дисковые издания нередко поставляют не единый DirectX-бандл,
+            # а 163 отдельных CAB рядом с DXSETUP.exe. Эти CAB не копируются
+            # в ``destination`` сами собой, поэтому при следующей DLL снова
+            # обращаемся к ИСХОДНОМУ каталогу — но благодаря CFFILE-индексу
+            # раскрываем ровно подходящий архив, а не весь набор.
+            source_cabs = [
+                path for path in self._package_archives(
+                    package, requirement.arch)
+                if path.lower().endswith(".cab")
+                and self._cabinet_contains(path, requirement.dll)
+            ]
+            for archive in source_cabs:
+                payload_key = self._payload_key(archive)
+                if payload_key in self._expanded_payloads:
+                    continue
+                self._expanded_payloads.add(payload_key)
+                self._expand_one(archive, destination)
+                candidate = _find_file(destination, requirement.dll)
+                if candidate:
+                    break
         if candidate and self._arch_matches(candidate, requirement.arch):
             return candidate, "пакет из комплекта установщика"
         return "", ""
