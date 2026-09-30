@@ -23,10 +23,22 @@ from portablizer.core.portablizer import PortableOptions, Portablizer
 class RunnerProbeTests(unittest.TestCase):
 
     def test_runner_probe(self):
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
         out = []
         p = out.append
         p(f"platform={sys.platform} SystemRoot="
           f"{os.environ.get('SystemRoot')} WINDIR={os.environ.get('WINDIR')}")
+        # Проверка гипотезы падения №1: обычный dict(os.environ) на Windows
+        # держит ключи в ВЕРХНЕМ регистре — .get("SystemRoot") их не видит.
+        with mock.patch.dict(os.environ, {"SystemRoot": r"C:\probe\fake"}):
+            plain = dict(os.environ)
+            p(f"case probe: plain.get('SystemRoot')="
+              f"{plain.get('SystemRoot')!r} "
+              f"winds keys={[k for k in plain if k.lower() == 'systemroot']} "
+              f"plain.get('WINDIR')={plain.get('WINDIR')!r}")
         windir = os.environ.get("SystemRoot") or r"C:\Windows"
         p(f"system_dirs_for(x86)={redist.system_dirs_for('x86')}")
         p(f"winsxs_dir={redist.winsxs_dir()!r}")
