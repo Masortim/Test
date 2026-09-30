@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
+from ..core import elevate
 from ..core.detect import detect_installer
 from ..core.portablizer import PortableOptions, PortableResult
 from . import style
@@ -284,10 +285,12 @@ class MainWindow(QMainWindow):
         lay.addLayout(checks)
 
         hint = QLabel(
-            "Подсказка: реальная тихая установка и работа с реестром "
-            "выполняются только под Windows. Запускайте Portablizer от имени "
-            "администратора — это нужно и для снимка HKLM, и для полной "
-            "очистки следов установки с этого компьютера.")
+            "Сборка идёт автоматически: права администратора Portablizer "
+            "запрашивает сам при запуске (одно окно UAC), тихий сценарий "
+            "подбирается перебором, распространяемые пакеты ставятся молча, "
+            "а по окончании папка результата освобождается от посторонних "
+            "процессов — её сразу можно копировать и удалять. Реальная "
+            "установка и работа с реестром выполняются только под Windows.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -650,6 +653,11 @@ class MainWindow(QMainWindow):
                 "",
                 "Скопируйте папку целиком на флешку — установка на другом "
                 "компьютере не потребуется.",
+                "",
+                "После выхода из программы лончер сам закрывает всё, что было "
+                "запущено из портативной папки, поэтому её можно сразу "
+                "удалить или перенести. Если что-то всё же осталось в фоне — "
+                "запустите StopPortable.cmd из папки портатива.",
             ]
             if result.removed_from_installed_list:
                 details += [
@@ -714,6 +722,13 @@ class MainWindow(QMainWindow):
 
 
 def run() -> int:
+    # Права администратора нужны почти на каждом шаге (манифест
+    # requireAdministrator у установщика, снимок HKLM, тихая установка
+    # пакетов, уборка следов). Просим их сразу и один раз: щелчок «Да» в
+    # окне UAC вместо ручного перезапуска на середине сборки.
+    if elevate.ensure_elevated():
+        return 0
+
     app = QApplication(sys.argv)
     app.setApplicationName("Portablizer")
     ico = _resource(os.path.join("resources", "app.ico"))

@@ -46,6 +46,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tupl
 
 from .. import __version__
 from . import launcher as launcher_mod
+from . import procutil
 from . import redist as redist_mod
 from . import registry as reg_mod
 from .detect import DetectionResult, InstallerType, detect_installer
@@ -456,6 +457,58 @@ class Portablizer:
         cleaned = "".join(c for c in base if c.isalnum() or c in keep).strip()
         return cleaned or "PortableApp"
 
+    def _release_portable_dir(self, portable_dir: str,
+                              reason: str = "") -> List[str]:
+        """Останавливает всё, что запущено из папки результата.
+
+        Вызывается трижды за сборку: перед очисткой старого результата,
+        сразу после установки (установщики любят закончить галочкой
+        «Запустить программу сейчас») и перед выдачей готового портатива.
+        Смысл один: пользователь должен получить папку, которую можно
+        удалить, перенести и скопировать на флешку без «файл занят другим
+        процессом».
+        """
+        if not portable_dir or not os.path.isdir(portable_dir):
+            return []
+        try:
+            stopped = procutil.release_folder(portable_dir)
+        except Exception as exc:  # noqa: BLE001 - уборка не ломает сборку
+            self.log.debug(f"Не удалось опросить процессы папки: {exc}")
+            return []
+        if stopped:
+            tail = f" ({reason})" if reason else ""
+            self.log.info(
+                "Остановлены процессы, запущенные из папки портатива"
+                f"{tail}: " + ", ".join(sorted(set(stopped))))
+        return stopped
+
+    def _remove_path(self, path: str, attempts: int = 4) -> None:
+        """Удаляет файл или дерево, переживая кратковременную блокировку.
+
+        Антивирус, индексатор Windows и только что закрытая программа
+        отпускают файл не мгновенно. Раньше такая секундная блокировка
+        обрывала всю сборку сообщением «не удалось очистить старый файл»;
+        теперь попытка повторяется с нарастающей паузой, а перед последней
+        из папки выгоняются оставшиеся процессы.
+        """
+        last: Optional[OSError] = None
+        for attempt in range(attempts):
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                elif os.path.exists(path) or os.path.islink(path):
+                    os.remove(path)
+                return
+            except OSError as exc:
+                last = exc
+                if attempt == attempts - 2:
+                    self._release_portable_dir(
+                        os.path.dirname(path),
+                        reason=f"файл занят: {os.path.basename(path)}")
+                time.sleep(0.4 * (attempt + 1))
+        if last is not None:
+            raise last
+
     def _prepare_output(self, portable_dir: str, app_dir: str,
                         data_dir: str) -> None:
         """Готовит чистый App и удаляет лончер от незавершённого запуска.
@@ -466,10 +519,18 @@ class Portablizer:
         установщику — иначе старый exe маскирует неудачную установку.
         """
         os.makedirs(portable_dir, exist_ok=True)
+
+        # Пересборка поверх работающего портатива — самая частая причина
+        # «не удалось очистить старый файл результата»: прошлый запуск
+        # оставил в папке живой процесс (апдейтер, лончер, сама программа),
+        # и Windows не даёт удалить его файлы. Освобождаем папку сами,
+        # вместо того чтобы просить пользователя искать процесс в диспетчере.
+        self._release_portable_dir(portable_dir, reason="перед очисткой")
+
         if os.path.isdir(app_dir):
-            shutil.rmtree(app_dir)
+            self._remove_path(app_dir)
         elif os.path.exists(app_dir):
-            os.remove(app_dir)
+            self._remove_path(app_dir)
         os.makedirs(app_dir, exist_ok=True)
         os.makedirs(data_dir, exist_ok=True)
 
@@ -481,13 +542,11 @@ class Portablizer:
             "install-retry.log", "install-layout.log", "installer-engine.log",
             "installer-output.log", "portablizer.log", "_bundle_layout",
             "setup-installshield.log", redist_mod.REPORT_NAME, "_redist_cache",
+            launcher_mod.STOP_SCRIPT_NAME,
         ):
             path = os.path.join(portable_dir, filename)
             try:
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                elif os.path.exists(path):
-                    os.remove(path)
+                self._remove_path(path)
             except OSError as exc:
                 raise RuntimeError(
                     f"Не удалось очистить старый файл результата: {path}: {exc}"
@@ -507,7 +566,7 @@ class Portablizer:
             path = os.path.join(portable_dir, filename)
             try:
                 if os.path.isfile(path):
-                    os.remove(path)
+                    self._remove_path(path)
             except OSError as exc:
                 raise RuntimeError(
                     f"Не удалось очистить старый лончер: {path}: {exc}"
@@ -650,6 +709,12 @@ class Portablizer:
                 result.plan = used_plan
                 result.successful_attempt = used_plan.label
 
+            # Установщик мог закончить галочкой «Запустить программу сейчас»
+            # или оставить свой фоновый помощник. Закрываем их ДО снимка
+            # реестра: так программа успевает записать свои настройки (они
+            # уедут в портатив), а файлы App перестают быть занятыми.
+            self._release_portable_dir(portable_dir, reason="после установки")
+
             # 4b. Установщик не отдал файлы ни одной командой. Последний
             # honest-шанс: распаковать приклеенный к exe ZIP — так устроены
             # многие современные bootstrapper'ы, и это не требует ни прав
@@ -745,6 +810,20 @@ class Portablizer:
                 self._cleanup_host(capture, opts, result)
             if opts.cleanup_host:
                 self._cleanup_shortcuts(shortcuts_before, result)
+
+            # 10. Папка результата должна быть свободна: её сразу копируют
+            # на флешку, переносят и удаляют. Ничего запущенного из неё
+            # оставаться не должно.
+            self.progress(99, "Освобождение папки результата")
+            self._release_portable_dir(portable_dir, reason="перед выдачей")
+            left = procutil.processes_in(portable_dir)
+            if left:
+                names = ", ".join(sorted({
+                    procutil.image_name(image) for _, image in left}))
+                self.log.warn(
+                    "Из папки портатива всё ещё работают процессы: "
+                    f"{names}. Закройте их или запустите "
+                    f"{launcher_mod.STOP_SCRIPT_NAME} из папки портатива.")
 
             self.progress(100, "Готово")
             self.log.ok("Портативное приложение успешно создано!")
@@ -2405,7 +2484,17 @@ class Portablizer:
         self._write_text(os.path.join(portable_dir, "LaunchHidden.vbs"),
                          launcher_mod.render_vbs(), encoding="ascii")
 
-        created_launchers: List[str] = ["Launch.bat", "LaunchHidden.vbs"]
+        # Аварийный «отпускатель» папки. Штатно лончер закрывает за собой
+        # всё сам, но пользователь мог запустить программу из App напрямую,
+        # мимо лончера — тогда этот файл возвращает папку в состояние
+        # «можно удалить» без диспетчера задач.
+        self._write_text(
+            os.path.join(portable_dir, launcher_mod.STOP_SCRIPT_NAME),
+            launcher_mod.render_stop_cmd(cfg, APP_EXE_LAUNCHER_NAME),
+            encoding="ascii")
+
+        created_launchers: List[str] = ["Launch.bat", "LaunchHidden.vbs",
+                                        launcher_mod.STOP_SCRIPT_NAME]
 
         # Отдельные файлы нужны только для двух частых действий: официальный
         # launcher и окно настроек. Раньше BAT+VBS создавались для каждого
@@ -2584,6 +2673,7 @@ _README = """{app_name} — портативная версия
 {exe_launcher_file}  PortableData\\         — все пользовательские данные (AppData, Temp, настройки)
   Launch.bat            — портативный лончер (перенаправляет каталоги и env)
   LaunchHidden.vbs      — запуск без окна консоли
+  StopPortable.cmd      — освободить папку, если что-то из неё осталось в фоне
 {companion_files_list}  launcher_config.json  — параметры лончера
 {registry_note}{runtime_note}  install.log           — подробный журнал установщика (если он поддерживается)
   portablizer.log       — журнал создания и диагностики портатива
@@ -2617,6 +2707,18 @@ _README = """{app_name} — портативная версия
 
 Полной виртуализации Windows лончер не выполняет: отдельные программы могут
 обращаться к системным каталогам напрямую.
+
+Если папка не удаляется («файл открыт в другой программе»):
+  • обычно этого не бывает: после выхода лончер сам закрывает всё, что было
+    запущено из папки, — и программу, и её фоновых помощников (апдейтер,
+    отправку отчётов). Процессы объединяются в job-объект Windows, поэтому
+    пережить лончер они не могут;
+  • но если программу запускали напрямую из App, мимо лончера, помощник
+    мог остаться. Запустите StopPortable.cmd в этой папке: он вежливо
+    закроет такие процессы, а упрямых завершит принудительно, после чего
+    папку можно удалять, переносить и копировать;
+  • если StopPortable.cmd сообщает, что процесс не остановлен, запустите его
+    «от имени администратора» — процесс был запущен с повышенными правами.
 
 Если окно консоли закрывается сразу:
   • запустите Launch.bat из уже открытой консоли (cmd.exe) — вы увидите текст
