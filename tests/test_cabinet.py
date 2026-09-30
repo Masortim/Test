@@ -135,5 +135,81 @@ class CabinetReaderTests(unittest.TestCase):
             self.assertEqual(cabinet.extract_file(str(path), str(out)), [])
 
 
+class TargetedExtractionTests(unittest.TestCase):
+    """«Распаковка directx_Jun2010_redist.exe идёт слишком долго»."""
+
+    @staticmethod
+    def _directx_bundle(count: int = 40) -> tuple:
+        """Бандл DirectX: сотня кабинетов, нужная dll — в одном из них."""
+        dll = b"MZ" + os.urandom(20000)
+        members = {"DXSETUP.exe": b"MZ" + os.urandom(1000),
+                   "dsetup32.dll": b"MZ" + os.urandom(1000)}
+        for index in range(count):
+            members[f"Jun2010_filler{index}_x86.cab"] = make_cabinet(
+                {f"filler{index}.dll": b"MZ" + os.urandom(20000)})
+        members["Jun2010_d3dx9_43_x86.cab"] = make_cabinet(
+            {"d3dx9_43.dll": dll})
+        return members, dll
+
+    def test_only_the_cabinet_with_the_wanted_dll_is_unpacked(self):
+        members, dll = self._directx_bundle()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "directx_Jun2010_redist.exe")
+            path.write_bytes(make_self_extracting_exe(members))
+            out = Path(temp, "out")
+
+            cabinet.extract_file(str(path), str(out), wanted="d3dx9_43.dll")
+
+            self.assertEqual((out / "d3dx9_43.dll").read_bytes(), dll)
+            # Кабинеты-соседи остались кабинетами: сотня LZX-архивов ради
+            # одной библиотеки не разворачивается.
+            unpacked = [p for p in out.iterdir() if p.name.startswith("filler")]
+            self.assertEqual(unpacked, [])
+
+    def test_wanted_file_is_still_found_when_the_name_does_not_hint(self):
+        """Имя кабинета ничего не подсказало — перебор всё равно находит файл."""
+        dll = b"MZ" + os.urandom(20000)
+        members = {f"pack{i}.cab": make_cabinet({f"other{i}.dll": b"MZzz"})
+                   for i in range(5)}
+        members["pack9.cab"] = make_cabinet({"xinput1_3.dll": dll})
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "redist.exe")
+            path.write_bytes(make_self_extracting_exe(members))
+            out = Path(temp, "out")
+
+            cabinet.extract_file(str(path), str(out), wanted="xinput1_3.dll")
+
+            self.assertEqual((out / "xinput1_3.dll").read_bytes(), dll)
+
+    def test_recurse_false_keeps_cabinets_for_dxsetup(self):
+        """DXSETUP ставит DirectX сам — ему нужны кабинеты, а не их содержимое."""
+        members, _dll = self._directx_bundle(count=5)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "directx_Jun2010_redist.exe")
+            path.write_bytes(make_self_extracting_exe(members))
+            out = Path(temp, "out")
+
+            cabinet.extract_file(str(path), str(out), recurse=False)
+
+            self.assertTrue((out / "DXSETUP.exe").is_file())
+            self.assertTrue((out / "Jun2010_d3dx9_43_x86.cab").is_file())
+            self.assertFalse((out / "d3dx9_43.dll").exists())
+
+    def test_burn_payload_without_extension_is_still_opened(self):
+        """VC++ 2013: payload'ы Burn лежат под служебными именами без точки."""
+        dll = b"MZ" + os.urandom(30000)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "vcredist_x86.exe")
+            path.write_bytes(make_burn_bundle([
+                {"0": b"<BurnManifest/>"},
+                {"a0": make_cabinet({"msvcp120.dll": dll})},
+            ]))
+            out = Path(temp, "out")
+
+            cabinet.extract_file(str(path), str(out), wanted="msvcp120.dll")
+
+            self.assertEqual((out / "msvcp120.dll").read_bytes(), dll)
+
+
 if __name__ == "__main__":
     unittest.main()

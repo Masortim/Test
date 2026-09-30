@@ -1334,17 +1334,60 @@ def _download_file(url: str, destination: str, timeout: int = 120,
         return False
 
 
+#: Код «истекло время ожидания» (WAIT_TIMEOUT): пакет так и не завершился —
+#: почти наверняка он всё же показал окно и ждёт мышку.
+TIMEOUT_EXIT_CODE = 0x102
+
+
+def _kill_tree(process: "subprocess.Popen") -> None:
+    """Снимает зависший пакет вместе со всеми его детьми.
+
+    ``Popen.kill()`` снимает только саму обёртку, а модальное окно обычно
+    показывает её ребёнок (``msiexec``, ``DXSETUP``, распакованный
+    ``setup.exe``). Пережившее сборку окно ждало бы мышку вечно, поэтому
+    дерево процессов снимается целиком штатным ``taskkill``.
+    """
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.run(
+                [system_tool("taskkill"), "/T", "/F", "/PID", str(process.pid)],
+                timeout=30, creationflags=0x08000000,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _run_quiet(args: Sequence[str], timeout: int = 600) -> int:
-    """Запускает внешний инструмент (expand/msiexec) без окна консоли."""
+    """Запускает внешний инструмент (expand/msiexec) без окна консоли.
+
+    Возвращает код возврата; :data:`TIMEOUT_EXIT_CODE` означает, что пакет
+    не уложился в отведённое время и был снят вместе со своими детьми.
+    """
     if not IS_WINDOWS:
         return 1
     flags = 0x08000000  # CREATE_NO_WINDOW
     try:
-        completed = subprocess.run(
-            list(args), timeout=timeout, creationflags=flags,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        return completed.returncode
+        process = subprocess.Popen(
+            list(args), creationflags=flags,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
+        return 1
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(process)
+        return TIMEOUT_EXIT_CODE
+    except (OSError, subprocess.SubprocessError):
+        _kill_tree(process)
         return 1
 
 
@@ -1613,6 +1656,20 @@ def extraction_commands(archive: str, destination: str,
 #: Сколько ждать один пакет: DirectX на HDD ставится неторопливо.
 SILENT_INSTALL_TIMEOUT = 900
 
+#: Пакеты, которым столько времени и правда нужно: DirectX раскладывает
+#: сотню кабинетов, .NET и обновления Windows тоже не торопятся.
+_SLOW_KINDS = frozenset({"dxsetup", "directx_bundle", "dotnet", "msu"})
+
+#: Всем остальным хватает нескольких минут. Предел здесь — не про скорость,
+#: а про застрявшее окно: раньше «не тот» ключ держал сборку 15 минут.
+SILENT_INSTALL_TIMEOUT_FAST = 300
+
+
+def silent_timeout(kind: str) -> int:
+    """Сколько ждать тихую установку пакета этого типа (секунды)."""
+    return (SILENT_INSTALL_TIMEOUT if kind in _SLOW_KINDS
+            else SILENT_INSTALL_TIMEOUT_FAST)
+
 #: Успех: 0 — поставлено, 1638/5100/0x80070666 — уже стоит (в т. ч. более
 #: новая версия), 3010/1641 — поставлено, но просит перезагрузку.
 SILENT_OK_CODES = frozenset({0})
@@ -1747,21 +1804,40 @@ def sniff_engine(path: str, limit: int = 2 * 1024 * 1024) -> str:
 
 
 def installer_kind(path: str) -> str:
-    """Тип пакета: ``msi``/``msu``/``burn``/``dxsetup``/… — что запускать и с чем."""
+    """Тип пакета: ``msi``/``msu``/``burn``/``dxsetup``/… — что запускать и с чем.
+
+    Порядок опознания принципиален. Сигнатура внутри файла говорит лишь о
+    том, каким **упаковщиком** сделан exe, а белый список — о том, что это
+    за **пакет** и как с ним разговаривать. Это не одно и то же:
+
+    * ``vcredist_x86.exe`` VC++ 2005 упакован wextract, и по сигнатуре он
+      «iexpress». Лестница ключей iexpress перебирает ``/Q``, ``/q``,
+      ``/quiet`` — и на ``/quiet`` пакет показывает модальное окно
+      «Command line option syntax error. Type Command /? for Help», которое
+      ждёт мышку. Пакет VC++ 2005 понимает ровно один ключ — ``/q``;
+    * ``directx_Jun2010_redist.exe`` — тоже wextract, но это вообще не
+      установщик, а архив: любой ключ он пробрасывает вложенному DXSETUP,
+      и тот отвечает окном «Установка DirectX — Неверная операция
+      командной строки».
+
+    Поэтому правило белого списка сильнее сигнатуры. Исключение одно:
+    секция ``.wixburn`` — признак однозначный (ни у чего другого её нет),
+    и она важнее имени файла, потому что VC++ 2012/2013 зовутся
+    ``vcredist_x86.exe``, как и старые пакеты, но внутри у них WiX Burn.
+    """
     lower = os.path.basename(str(path)).lower()
     if lower.endswith((".msi", ".msp")):
         return "msi"
     if lower.endswith(".msu"):
         return "msu"
-    if lower.endswith(".exe"):
-        engine = sniff_engine(path)
-        if engine:
-            return engine
+    engine = sniff_engine(path) if lower.endswith(".exe") else ""
+    if engine == "burn":
+        return "burn"
     rule = installer_rule(path)
     kind = rule.kind if rule else ""
     if kind == "msi_or_exe":
         kind = "msi" if lower.endswith(".msi") else ""
-    return kind
+    return kind or engine
 
 
 def silent_commands(path: str, kind: str = "",
@@ -1870,7 +1946,10 @@ def install_directx_bundle(path: str, run: Callable[[Sequence[str]], int],
         # то есть обычный кабинет, приклеенный к PE. Запускать сам бандл
         # (и гадать с ключами) не нужно вовсе.
         try:
-            cabinet.extract_file(path, work)
+            # recurse=False: DXSETUP ждёт кабинеты кабинетами. Разворачивать
+            # сотню архивов June 2010 (это минуты) перед установкой не нужно
+            # и вредно — ставит их он сам.
+            cabinet.extract_file(path, work, recurse=False)
         except Exception as exc:  # noqa: BLE001
             if log is not None:
                 log.debug(f"Свой распаковщик DirectX: {exc}")
@@ -1900,6 +1979,65 @@ def install_directx_bundle(path: str, run: Callable[[Sequence[str]], int],
             shutil.rmtree(work, ignore_errors=True)
 
 
+def install_legacy_vcredist(path: str, run: Callable[[Sequence[str]], int],
+                            log=None) -> Tuple[Optional[int], str]:
+    """Ставит VC++ 2005/2008/2010 **без запуска самой обёртки**.
+
+    ``vcredist_x86.exe`` этих лет — обёртка IExpress (wextract) вокруг
+    обычного ``vc_red.msi`` с ``vc_red.cab``. Разбирать командную строку
+    она умеет плохо: лишний ключ (``/norestart``, ``/quiet``) даёт модальное
+    «Command line option syntax error. Type Command /? for Help», а ключ
+    ``/q:a /c:"…"`` у разных сборок работает по-разному.
+
+    Поэтому обёртку не запускаем вовсе: кабинет читается своим
+    распаковщиком, а ``vc_red.msi`` ставится штатным ``msiexec /qn`` — тем
+    самым, который вызвала бы и сама обёртка. Окон нет ни одного, а код
+    возврата msiexec говорит точно, что произошло. Если внутри msi не
+    нашлось (нестандартная сборка), возвращаемся к безопасному ``/q``.
+    """
+    import tempfile
+
+    if not IS_WINDOWS or not os.path.isfile(path):
+        return None, ""
+    fallback = [path, "/q"]
+    try:
+        base = tempfile.mkdtemp(prefix="pblzvc")
+    except OSError:
+        code = run(fallback)
+        return code, subprocess.list2cmdline(fallback)
+    work = cmdline_safe_dir(base) or base
+    try:
+        try:
+            cabinet.extract_file(path, work, wanted="vc_red.msi")
+        except Exception as exc:  # noqa: BLE001 — чужой файл не роняет сборку
+            if log is not None:
+                log.debug(f"Свой распаковщик VC++: {exc}")
+        package = (_find_file(work, "vc_red.msi", allow_mangled=False)
+                   or _find_file(work, "vcredist.msi", allow_mangled=False))
+        if package:
+            command = [system_tool("msiexec"), "/i", package, "/qn",
+                       "/norestart"]
+        else:
+            # Обёртку вскрыть не удалось — остаётся единственный ключ,
+            # который понимают все три поколения пакета.
+            command = fallback
+        code = run(command)
+        if log is not None:
+            log.debug(f"Тихая установка VC++ (код {code}): "
+                      + subprocess.list2cmdline(command))
+        if package and classify_exit_code(code) == "failed":
+            code = run(fallback)
+            if log is not None:
+                log.debug(f"Запасной путь VC++ (код {code}): "
+                          + subprocess.list2cmdline(fallback))
+            return code, subprocess.list2cmdline(fallback)
+        return code, subprocess.list2cmdline(command)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+        if not _same_dir(work, base):
+            shutil.rmtree(work, ignore_errors=True)
+
+
 def run_silent_install(path: str, *,
                        runner: Optional[Callable[[Sequence[str]], int]] = None,
                        title: str = "", package_key: str = "", arch: str = "",
@@ -1910,9 +2048,9 @@ def run_silent_install(path: str, *,
     а ключи подобраны так, чтобы установщик не задавал вопросов. Если пакет
     всё же решил показать мастер, его прервёт таймаут — сборка продолжится.
     """
-    run = runner or (lambda args: _run_quiet(args, SILENT_INSTALL_TIMEOUT))
     rule = installer_rule(path)
     kind = installer_kind(path)
+    run = runner or (lambda args: _run_quiet(args, silent_timeout(kind)))
     outcome = SilentInstall(
         path=os.path.abspath(path), kind=kind, arch=arch,
         title=title or (rule.title if rule else os.path.basename(path)),
@@ -1926,6 +2064,15 @@ def run_silent_install(path: str, *,
         outcome.command = command
         outcome.status = classify_exit_code(code) if command else "skipped"
         return outcome
+    if kind == "vcredist_legacy" and IS_WINDOWS:
+        # VC++ 2005-2010 ставим через вложенный vc_red.msi: сама обёртка
+        # на «лишний» ключ отвечает модальным окном (см. функцию).
+        code, command = install_legacy_vcredist(path, run, log)
+        if command:
+            outcome.code = code
+            outcome.command = command
+            outcome.status = classify_exit_code(code)
+            return outcome
     commands = silent_commands(path, kind)
     if not commands:
         outcome.status = "skipped"
@@ -1938,6 +2085,17 @@ def run_silent_install(path: str, *,
         outcome.command = subprocess.list2cmdline(command)
         outcome.status = classify_exit_code(code)
         if outcome.ok:
+            break
+        if code == TIMEOUT_EXIT_CODE:
+            # Пакет не завершился сам: почти наверняка он всё-таки показал
+            # окно, и оно было снято по таймауту. Перебирать оставшиеся
+            # ключи — значит показать это окно ещё несколько раз и отдать
+            # им ещё столько же минут. Останавливаемся: ниже по лестнице
+            # библиотеки возьмутся из системы или из папки Redist.
+            if log is not None:
+                log.debug(
+                    f"{outcome.name}: пакет не ответил за отведённое время "
+                    "и был снят — остальные ключи не пробую.")
             break
     return outcome
 
@@ -2472,10 +2630,21 @@ class RuntimeProvisioner:
         for current, _dirs, files in os.walk(directory):
             for name in files:
                 lower = name.lower()
+                path = os.path.join(current, name)
                 if lower.endswith(".cab"):
-                    cabinets.append(os.path.join(current, name))
-                elif lower.endswith(".msi"):
-                    installers.append(os.path.join(current, name))
+                    cabinets.append(path)
+                elif lower.endswith((".msi", ".msp")):
+                    installers.append(path)
+                elif "." not in lower and cabinet.looks_like_container(path):
+                    # WiX Burn (VC++ 2012-2022) хранит payload'ы под
+                    # служебными именами без расширения (``a0``, ``u1``).
+                    # Раньше их пропускали по расширению — отсюда и бралось
+                    # «пакет скачан, но распаковать его автоматически не
+                    # удалось» для VC++ 2013.
+                    if cabinet.looks_like_cabinet(path):
+                        cabinets.append(path)
+                    else:
+                        installers.append(path)
 
         targeted = [path for path in cabinets
                     if stem and stem in os.path.basename(path).lower()]
@@ -2514,15 +2683,41 @@ class RuntimeProvisioner:
                 if stem and _find_file(directory, wanted):
                     break
                 continue
-            if IS_WINDOWS:
+            if IS_WINDOWS and path.lower().endswith((".msi", ".msp")):
                 self._run([system_tool("msiexec"), "/a", path, "/qn",
                            f"TARGETDIR={target}"])
             if stem and _find_file(directory, wanted):
                 break
 
     def _expand_one(self, archive: str, destination: str) -> bool:
-        """Раскрывает один кабинет: сначала сами, потом штатным ``expand``."""
+        """Раскрывает один кабинет.
+
+        Порядок ступеней зависит от того, где мы работаем:
+
+        * на Windows обычный ``.cab`` сначала отдаём штатному ``expand`` —
+          это нативный распаковщик, и на LZX (а именно так сжаты кабинеты
+          DirectX и vc_red.cab) он в десятки раз быстрее нашего
+          декодера на Python. Именно из-за него «распаковка
+          directx_Jun2010_redist.exe шла слишком долго»;
+        * всё остальное (и случай, когда ``expand`` не справился) читает
+          собственный распаковщик: ему не мешают ни пробелы с кириллицей в
+          пути, ни отсутствие ``expand`` в PATH, ни политики запуска exe.
+
+        Успех определяется по появившимся файлам, а не по коду возврата:
+        распаковка идёт в папку, где файлы уже лежат, и сам по себе ноль
+        от ``expand`` ещё ничего не значит.
+        """
         os.makedirs(destination, exist_ok=True)
+        before = _dir_entries(destination)
+
+        def produced() -> bool:
+            return bool(_dir_entries(destination) - before)
+
+        native_first = IS_WINDOWS and archive.lower().endswith(".cab")
+        if native_first:
+            self._run([system_tool("expand"), "-F:*", archive, destination])
+            if produced():
+                return True
         try:
             written = cabinet.extract_file(archive, destination)
         except Exception as exc:  # noqa: BLE001
@@ -2532,21 +2727,23 @@ class RuntimeProvisioner:
             return True
         if not IS_WINDOWS:
             return False
-        if self._run([system_tool("expand"), "-F:*", archive, destination]) == 0 \
-                or _has_files(destination):
+        if not native_first:
+            self._run([system_tool("expand"), "-F:*", archive, destination])
+            if produced():
+                return True
+        self._run([system_tool("expand"), "-r", archive, destination])
+        if produced():
             return True
-        if self._run([system_tool("expand"), "-r", archive, destination]) == 0 \
-                or _has_files(destination):
-            return True
-        if self._run([system_tool("extrac32"), "/Y", "/E", "/L", destination, archive]) == 0 \
-                or _has_files(destination):
+        self._run([system_tool("extrac32"), "/Y", "/E", "/L", destination,
+                   archive])
+        if produced():
             return True
         sevenzip = find_7zip()
         if sevenzip:
             self._run([sevenzip, "x", "-y", f"-o{destination}", archive])
-            if _has_files(destination):
+            if produced():
                 return True
-        return _has_files(destination)
+        return False
 
     def _package_archives(self, package: RedistPackage, arch: str) -> List[str]:
         """Пакеты этой версии, уже лежащие рядом с установщиком.
@@ -2669,18 +2866,31 @@ class RuntimeProvisioner:
                                        requirement.arch or "any")
             if not self._extract_installer(archive, destination,
                                            requirement.dll):
-                hint = ("Попробую поставить его молча и забрать файлы из "
-                        "системы." if self.allow_install and not
-                        requirement.proactive else
-                        "Включите «Тихая установка пакетов», чтобы "
-                        "Portablizer взял файлы после установки пакета.")
-                self.log.warn(
-                    f"{package.title}: пакет скачан, но распаковать его "
-                    f"автоматически не удалось. {hint} Сам пакет сохранён в "
-                    f"папке {REDIST_DIR_NAME} портатива "
-                    f"(там же {SILENT_SCRIPT_NAME}).")
                 self._failed_packages.add(key)
                 self._extracted[key] = ""
+                if requirement.proactive:
+                    # Это библиотека «про запас» из полного комплекта:
+                    # программа её не просила, поэтому предупреждать не о
+                    # чем — строчка уходит в подробный журнал.
+                    self.log.debug(
+                        f"{package.title}: пакет скачан, но распаковать его "
+                        f"не удалось; {requirement.dll} нужна только «про "
+                        "запас» — пропускаю.")
+                elif self.allow_install and IS_WINDOWS:
+                    # Ничего включать не нужно: следующая ступень лестницы
+                    # поставит пакет молча и заберёт файлы из системы.
+                    self.log.info(
+                        f"{package.title}: распаковать пакет не удалось — "
+                        "ставлю его в тихом режиме и забираю файлы из "
+                        "системы (окон не будет).")
+                else:
+                    self.log.warn(
+                        f"{package.title}: пакет скачан, но распаковать его "
+                        "автоматически не удалось. Включите «Тихая установка "
+                        "пакетов», чтобы Portablizer взял файлы после "
+                        f"установки пакета. Сам пакет сохранён в папке "
+                        f"{REDIST_DIR_NAME} портатива "
+                        f"(там же {SILENT_SCRIPT_NAME}).")
                 return "", ""
             self._extracted[key] = destination
             self._add_to_index(destination)
@@ -3216,6 +3426,19 @@ class RuntimeProvisioner:
             companion.targets = copied
             (report.stock if companion.proactive
              else report.provided).append(companion)
+
+
+def _dir_entries(directory: str) -> set:
+    """Имена файлов в папке (без обхода вложенных) — для «что появилось».
+
+    Распаковка часто идёт в папку, где файлы уже есть, поэтому «получилось
+    ли» приходится определять по разнице, а не по наличию файлов вообще.
+    """
+    try:
+        with os.scandir(directory) as entries:
+            return {entry.name for entry in entries}
+    except OSError:
+        return set()
 
 
 def _has_files(directory: str) -> bool:

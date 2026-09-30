@@ -490,6 +490,48 @@ def _safe_name(name: str) -> str:
     return os.path.join(*parts) if parts else ""
 
 
+#: Расширения вложенных контейнеров, внутри которых может лежать нужный файл.
+CONTAINER_EXTENSIONS = (".cab", ".msi", ".msp", ".exe", ".zip")
+
+#: Сигнатуры контейнеров: кабинет и составной документ OLE (это .msi).
+_CONTAINER_MAGIC = (b"MSCF", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", b"MZ")
+
+
+def _looks_like_container_name(name: str) -> bool:
+    """Имя файла похоже на вложенный контейнер?
+
+    Бандлы WiX Burn (VC++ 2012-2022) хранят payload'ы под служебными
+    именами без расширения (``a0``, ``u1``): отбросить их как «не тот
+    файл» — это и есть та самая «пакет скачан, но распаковать не удалось».
+    """
+    lower = name.lower()
+    if lower.endswith(CONTAINER_EXTENSIONS):
+        return True
+    return "." not in lower
+
+
+def looks_like_container(path: str) -> bool:
+    """Внутри файла может лежать ещё один кабинет/MSI (по сигнатуре)?"""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+    except OSError:
+        return False
+    return any(head.startswith(magic) for magic in _CONTAINER_MAGIC)
+
+
+def _find_in_tree(directory: str, name: str) -> str:
+    """Путь к файлу ``name`` внутри дерева (пустая строка — не найден)."""
+    if not name:
+        return ""
+    target = os.path.basename(name).lower()
+    for current, _dirs, files in os.walk(directory):
+        for item in files:
+            if item.lower() == target:
+                return os.path.join(current, item)
+    return ""
+
+
 class Cabinet:
     """Разобранный кабинет: список файлов и доступ к их содержимому."""
 
@@ -634,14 +676,25 @@ class Cabinet:
         return [entry.name for entry in self.files]
 
     def extract(self, destination: str,
-                wanted: Sequence[str] = ()) -> List[str]:
-        """Распаковывает кабинет; ``wanted`` — если нужны не все файлы."""
+                wanted: Sequence[str] = (),
+                keep_containers: bool = False) -> List[str]:
+        """Распаковывает кабинет; ``wanted`` — если нужны не все файлы.
+
+        ``keep_containers=True`` дополнительно оставляет вложенные
+        контейнеры (``vc_red.cab``, ``vc_red.msi``, безымянные payload'ы
+        WiX Burn): нужного файла в них ещё не видно, но именно они его и
+        содержат, поэтому отбрасывать их вместе с «лишними» нельзя.
+        """
         os.makedirs(destination, exist_ok=True)
-        lowered = {name.lower() for name in wanted}
+        lowered = {os.path.basename(name).lower().replace("\\", "/").rsplit("/", 1)[-1]
+                   for name in wanted if name}
         written: List[str] = []
         for entry in self.files:
-            if lowered and entry.name.lower() not in lowered:
-                continue
+            if lowered:
+                base = entry.name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+                if base not in lowered and not (
+                        keep_containers and _looks_like_container_name(base)):
+                    continue
             relative = _safe_name(entry.name)
             if not relative:
                 continue
@@ -710,7 +763,7 @@ def iter_cabinets(data, limit: int = MAX_CABINETS) -> Iterator[int]:
 
 
 def extract_file(path: str, destination: str, *, wanted: str = "",
-                 depth: int = 0) -> List[str]:
+                 recurse: bool = True, depth: int = 0) -> List[str]:
     """Достаёт всё, что лежит в кабинетах внутри файла ``path``.
 
     Работает и с ``.cab``, и с самораспаковывающимся ``.exe``, и с ``.msi``
@@ -725,13 +778,15 @@ def extract_file(path: str, destination: str, *, wanted: str = "",
             return []
     except OSError:
         return []
+    target = os.path.basename(wanted).lower() if wanted else ""
     handle, data = _open_mapped(path)
     written: List[str] = []
     try:
         for offset in iter_cabinets(data):
             try:
                 cabinet = Cabinet(data, offset)
-                written += cabinet.extract(destination)
+                written += cabinet.extract(destination, wanted=(target,) if target else (),
+                                           keep_containers=bool(target))
             except (CabinetError, struct.error, zlib.error, MemoryError):
                 continue
     finally:
@@ -744,12 +799,41 @@ def extract_file(path: str, destination: str, *, wanted: str = "",
             handle.close()
 
     # Внутри кабинета лежат .msi и вложенные .cab — раскрываем и их.
+    #
+    # Порядок здесь решает минуты: в ``directx_Jun2010_redist.exe`` около
+    # сотни кабинетов, и раскрывать их все ради одной ``d3dx9_43.dll`` —
+    # это те самые «распаковка идёт слишком долго». Имя нужной библиотеки
+    # входит в имя кабинета (``Jun2010_d3dx9_43_x86.cab``), поэтому сначала
+    # берём подходящие, а как только файл найден — останавливаемся.
+    stem = os.path.splitext(target)[0] if target else ""
+    containers = [item for item in written
+                  if os.path.isfile(item)
+                  and _looks_like_container_name(os.path.basename(item))
+                  and looks_like_container(item)]
+    if stem:
+        containers.sort(
+            key=lambda item: (0 if stem in os.path.basename(item).lower() else 1,
+                              os.path.basename(item).lower()))
     nested: List[str] = []
-    for item in list(written):
-        lower = item.lower()
-        if lower.endswith((".cab", ".msi", ".msp")) and os.path.isfile(item):
-            nested += extract_file(item, os.path.dirname(item),
-                                   wanted=wanted, depth=depth + 1)
+    if not recurse:
+        # Вызывающему нужны сами контейнеры, а не их содержимое: так
+        # распаковывается бандл DirectX перед запуском DXSETUP — ему
+        # кабинеты нужны кабинетами, и разворачивать сотню LZX-архивов
+        # (минуты работы) незачем.
+        return written
+    found = bool(target) and bool(
+        [item for item in written
+         if os.path.basename(item).lower() == target]
+        or _find_in_tree(destination, target))
+    for item in containers:
+        if found:
+            break
+        produced = extract_file(item, os.path.dirname(item),
+                                wanted=wanted, recurse=True, depth=depth + 1)
+        nested += produced
+        if target and any(os.path.basename(p).lower() == target
+                          for p in produced):
+            found = True
     return written + nested
 
 
