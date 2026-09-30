@@ -1204,6 +1204,166 @@ def _terminate_pids(pids: "Iterable[int]") -> "list[int]":
     return killed
 
 
+#: Процессы Windows, которые нельзя закрывать: снятие любого из них портит
+#: сеанс пользователя. Если такой процесс держит файл из портатива (обычно
+#: подгруженная DLL - расширение оболочки, хук, антивирусный сканер), его
+#: можно только НАЗВАТЬ в журнале.
+PROTECTED_IMAGES = frozenset({
+    "explorer.exe", "csrss.exe", "winlogon.exe", "wininit.exe", "services.exe",
+    "lsass.exe", "smss.exe", "svchost.exe", "dwm.exe", "taskhostw.exe",
+    "searchindexer.exe", "searchprotocolhost.exe", "searchfilterhost.exe",
+    "sihost.exe", "fontdrvhost.exe", "runtimebroker.exe", "ctfmon.exe",
+    "msmpeng.exe", "mssense.exe", "securityhealthservice.exe",
+    "system", "registry", "memory compression", "idle",
+})
+
+
+def _modules_of(pid: int) -> "list[str]":
+    """Пути DLL, загруженных процессом ``pid``."""
+    if not IS_WINDOWS:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPMODULE = 0x00000008
+        TH32CS_SNAPMODULE32 = 0x00000010
+
+        class MODULEENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("th32ModuleID", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("GlblcntUsage", wintypes.DWORD),
+                ("ProccntUsage", wintypes.DWORD),
+                ("modBaseAddr", ctypes.POINTER(ctypes.c_byte)),
+                ("modBaseSize", wintypes.DWORD),
+                ("hModule", wintypes.HMODULE),
+                ("szModule", ctypes.c_wchar * 256),
+                ("szExePath", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        snap = kernel32.CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, int(pid))
+        if snap in (0, -1, None):
+            return []
+        modules: list[str] = []
+        try:
+            entry = MODULEENTRY32W()
+            entry.dwSize = ctypes.sizeof(MODULEENTRY32W)
+            more = kernel32.Module32FirstW(snap, ctypes.byref(entry))
+            while more and len(modules) < 4096:
+                modules.append(entry.szExePath)
+                more = kernel32.Module32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+        return modules
+    except Exception:
+        return []
+
+
+def _all_processes() -> "list[tuple[int, str]]":
+    """Все процессы системы: ``(pid, путь к exe)``."""
+    if not IS_WINDOWS:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap in (0, -1, None):
+            return []
+        own = os.getpid()
+        found: list[tuple[int, str]] = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            more = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while more:
+                pid = int(entry.th32ProcessID)
+                if pid not in (0, 4, own):
+                    handle = kernel32.OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                    image = entry.szExeFile
+                    if handle:
+                        try:
+                            size = wintypes.DWORD(32768)
+                            buffer = ctypes.create_unicode_buffer(size.value)
+                            if kernel32.QueryFullProcessImageNameW(
+                                    handle, 0, buffer, ctypes.byref(size)):
+                                image = buffer.value
+                        finally:
+                            kernel32.CloseHandle(handle)
+                    found.append((pid, image))
+                more = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+        return found
+    except Exception:
+        return []
+
+
+def module_holders(root: Path, budget: float = 4.0
+                   ) -> "list[tuple[int, str, str]]":
+    """Чужие процессы, подгрузившие DLL из портативной папки.
+
+    Случай, который не ловится сравнением путей самих процессов: программа
+    закрыта, её процессов нет, но DLL из папки держит кто-то снаружи -
+    проводник (расширение контекстного меню), антивирус, хук ввода. Папка
+    при этом не удаляется, а пользователю не за что зацепиться.
+
+    Возвращает ``(pid, образ процесса, удерживаемый файл)``.
+    """
+    if not IS_WINDOWS:
+        return []
+    import time
+
+    prefix = str(root).rstrip("\\").casefold() + "\\"
+    own_images = {image.casefold() for image in _own_executable_images()}
+    result: list[tuple[int, str, str]] = []
+    # Перебор модулей всех процессов системы стоит заметного времени, а
+    # выполняется на выходе, когда пользователь уже закрыл программу.
+    # Ограничиваем бюджет: лучше неполный отчёт, чем задержка закрытия.
+    deadline = time.monotonic() + budget
+    for pid, image in _all_processes():
+        if time.monotonic() > deadline:
+            break
+        if image.casefold() in own_images or image.casefold().startswith(prefix):
+            continue
+        for module in _modules_of(pid):
+            if module.casefold().startswith(prefix):
+                result.append((pid, image, module))
+                break
+    return result
+
+
+def describe_holders(holders: "Sequence[tuple[int, str, str]]") -> str:
+    """Человеческое описание того, кто держит папку."""
+    parts = []
+    for _pid, image, module in holders:
+        parts.append(f"{_image_name(image)} (держит {_image_name(module)})")
+    return ", ".join(sorted(set(parts)))
+
+
 def shutdown_settings(cfg: Dict[str, Any]) -> Dict[str, float]:
     """Timings of the shutdown sequence, with sane clamps.
 
@@ -1234,6 +1394,9 @@ def shutdown_settings(cfg: Dict[str, Any]) -> Dict[str, float]:
         # Absolute ceiling for a single portable session.
         "max_wait": number("max_wait", 86400.0, 10.0, 604800.0),
         "kill_leftovers": 1.0 if kill or kill is None else 0.0,
+        # Искать ли чужие процессы, подгрузившие DLL из папки. Стоит времени
+        # на выходе, зато называет виновника, когда папка всё же занята.
+        "deep_check": 0.0 if raw.get("deep_check") is False else 1.0,
     }
 
 
@@ -1335,6 +1498,31 @@ def release_portable_folder(root: Path,
         while time.monotonic() < deadline and _portable_process_list(root):
             time.sleep(0.25)
     return stopped
+
+
+def _report_folder_state(root: Path,
+                         settings: Optional[Dict[str, float]] = None) -> None:
+    """Записывает в журнал честный вердикт: свободна ли папка.
+
+    Пользователь хочет удалить папку. Если это почему-то всё ещё нельзя,
+    он должен прочитать в журнале ИМЯ виновника, а не гадать.
+    """
+    remaining = _portable_process_list(root)
+    if remaining:
+        _run_log(root, "WARNING: still running from the portable folder: "
+                 + ", ".join(sorted({_image_name(i) for _, i in remaining})))
+        return
+    deep = True
+    if settings is not None:
+        deep = bool(settings.get("deep_check", 1.0))
+    holders = module_holders(root) if deep else []
+    if holders:
+        _run_log(root, "WARNING: the folder is still held by other programs: "
+                 + describe_holders(holders)
+                 + ". Close them (a file manager preview or an antivirus "
+                   "scan is the usual reason) and the folder can be deleted.")
+        return
+    _run_log(root, "portable folder released: no processes left")
 
 
 class _JobObject:
@@ -1717,12 +1905,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         # us.  Only after this the folder can really be deleted.
         release_portable_folder(root, shutdown)
         job.close()
-        remaining = _portable_process_list(root)
-        if remaining:
-            _run_log(root, "WARNING: still running from the portable folder: "
-                     + ", ".join(sorted({_image_name(i) for _, i in remaining})))
-        else:
-            _run_log(root, "portable folder released: no processes left")
+        _report_folder_state(root, shutdown)
 
 
 def stop(root: Optional[Path] = None) -> int:
@@ -1751,6 +1934,23 @@ def stop(root: Optional[Path] = None) -> int:
             "Обычно это значит, что они запущены от имени администратора. "
             "Запустите этот же файл от имени администратора.")
         return 1
+
+    # Процессов из папки нет — но её может держать кто-то снаружи,
+    # подгрузивший оттуда DLL. Это самый непонятный для пользователя
+    # случай, поэтому виновник называется по имени.
+    holders = module_holders(root)
+    if holders:
+        description = describe_holders(holders)
+        _run_log(root, f"--stop: the folder is held from outside: {description}")
+        _show_warning(
+            "Из портативной папки ничего не запущено, но её файлы держат "
+            "другие программы:\n"
+            f"{description}\n\n"
+            "Обычно это проводник Windows (открыт предпросмотр или окно "
+            "папки) либо антивирус. Закройте окна этой папки и повторите — "
+            "после этого папка удалится.")
+        return 1
+
     _run_log(root, "--stop: portable folder released"
              + (": " + ", ".join(sorted(set(stopped))) if stopped else
                 " (nothing was running)"))

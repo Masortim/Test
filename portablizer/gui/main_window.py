@@ -15,7 +15,7 @@ import subprocess
 import sys
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
@@ -65,6 +65,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.worker: Optional[PortableWorker] = None
         self.last_result: Optional[PortableResult] = None
+        #: Запоминаем папку вывода между запусками: каждый раз искать её
+        #: заново — лишнее вмешательство пользователя в то, что программа
+        #: прекрасно помнит сама.
+        self.settings = QSettings("Portablizer", "Portablizer")
+        # Установщик можно просто перетащить в окно.
+        self.setAcceptDrops(True)
 
         self.setWindowTitle(
             f"Portablizer {__version__} — портативизатор установщиков"
@@ -101,6 +107,10 @@ class MainWindow(QMainWindow):
         outer.addWidget(scroll, 1)
 
         outer.addWidget(self._build_footer())
+
+        remembered = str(self.settings.value("output_dir", "") or "")
+        if remembered and os.path.isdir(remembered):
+            self.output_edit.setText(remembered)
 
     # -- шапка ----------------------------------------------------------------
     def _build_header(self) -> QWidget:
@@ -262,6 +272,11 @@ class MainWindow(QMainWindow):
         self.cb_runtimes.toggled.connect(self.cb_silent_redist.setEnabled)
         self.cb_runtimes.toggled.connect(self.cb_fetch_runtimes.setEnabled)
         self.cb_runtimes.toggled.connect(self.cb_full_runtimes.setEnabled)
+        self.cb_autoopen = QCheckBox("Открыть папку результата по окончании")
+        self.cb_autoopen.setChecked(True)
+        self.cb_autoopen.setToolTip(
+            "Когда портатив готов, папка сразу открывается в проводнике — "
+            "не нужно искать её вручную.")
         self.cb_assisted = QCheckBox("Разрешить окно мастера установки")
         self.cb_assisted.setToolTip(
             "Нужно старым установщикам InstallShield InstallScript 5/6 "
@@ -277,6 +292,7 @@ class MainWindow(QMainWindow):
         checks.addWidget(self.cb_integration, 1, 1)
         checks.addWidget(self.cb_exelauncher, 2, 0)
         checks.addWidget(self.cb_assisted, 2, 1)
+        checks.addWidget(self.cb_autoopen, 6, 0, 1, 2)
         checks.addWidget(self.cb_runtimes, 3, 0)
         checks.addWidget(self.cb_fetch_runtimes, 3, 1)
         checks.addWidget(self.cb_full_runtimes, 4, 0, 1, 2)
@@ -354,6 +370,28 @@ class MainWindow(QMainWindow):
         self.start_btn.clicked.connect(self._start)
         lay.addWidget(self.start_btn)
         return w
+
+    # -- перетаскивание установщика в окно ------------------------------------
+    @staticmethod
+    def _dropped_installer(urls) -> str:
+        """Первый подходящий установщик среди перетащенных файлов."""
+        for url in urls:
+            path = url.toLocalFile()
+            if path and os.path.isfile(path) and \
+                    os.path.splitext(path)[1].lower() in (".exe", ".msi"):
+                return path
+        return ""
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt API
+        mime = event.mimeData()
+        if mime.hasUrls() and self._dropped_installer(mime.urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt API
+        path = self._dropped_installer(event.mimeData().urls())
+        if path:
+            self.installer_edit.setText(path)
+            event.acceptProposedAction()
 
     # -- обработчики ----------------------------------------------------------
     def _browse_installer(self) -> None:
@@ -653,12 +691,30 @@ class MainWindow(QMainWindow):
                 "",
                 "Скопируйте папку целиком на флешку — установка на другом "
                 "компьютере не потребуется.",
-                "",
-                "После выхода из программы лончер сам закрывает всё, что было "
-                "запущено из портативной папки, поэтому её можно сразу "
-                "удалить или перенести. Если что-то всё же осталось в фоне — "
-                "запустите StopPortable.cmd из папки портатива.",
             ]
+            if result.removed_services:
+                details += [
+                    "",
+                    "С этого ПК снята служба, зарегистрированная "
+                    "установщиком: " + ", ".join(result.removed_services)
+                    + ". Иначе она держала бы папку портатива открытой.",
+                ]
+            if result.folder_is_free:
+                details += [
+                    "",
+                    "Проверено: папку можно удалить, перенести и скопировать "
+                    "— ничего из неё не занято. После выхода из программы "
+                    "лончер так же освобождает её сам.",
+                ]
+            else:
+                holders = ", ".join(result.folder_holders[:4]) or "неизвестно"
+                details += [
+                    "",
+                    f"⚠ Папку сейчас держат: {holders}. Обычно это открытое "
+                    "окно проводника или проверка антивирусом — через "
+                    "несколько секунд всё освободится. Если нет, запустите "
+                    "StopPortable.cmd из папки портатива.",
+                ]
             if result.removed_from_installed_list:
                 details += [
                     "",
@@ -673,6 +729,13 @@ class MainWindow(QMainWindow):
                     "портатива от имени администратора.",
                 ]
             QMessageBox.information(self, "Portablizer", "\n".join(details))
+            # Папку вывода запоминаем только после успеха: неудачный путь
+            # подсказывать в следующий раз незачем.
+            output = os.path.dirname(result.portable_dir.rstrip("\\/"))
+            if output:
+                self.settings.setValue("output_dir", output)
+            if self.cb_autoopen.isChecked():
+                self._open_result()
         else:
             self.progress.setFormat("Ошибка")
             msg = "\n\n".join(result.messages) or "См. журнал."
@@ -714,7 +777,8 @@ class MainWindow(QMainWindow):
                   self.args_edit, self.env_edit, self.cb_redirect,
                   self.cb_registry, self.cb_exelauncher, self.cb_cleanup,
                   self.cb_integration, self.cb_runtimes,
-                  self.cb_fetch_runtimes, self.cb_assisted):
+                  self.cb_fetch_runtimes, self.cb_assisted,
+                  self.cb_autoopen):
             w.setEnabled(not running)
         # Загрузка пакетов имеет смысл только вместе с самим переносом.
         self.cb_fetch_runtimes.setEnabled(

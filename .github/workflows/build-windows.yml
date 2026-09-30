@@ -178,6 +178,22 @@ jobs:
             throw "Processes from the portable folder outlived the launcher"
           }
 
+          # Лончер обязан не просто убрать за собой, но и записать вердикт:
+          # это единственная диагностика, которая остаётся у пользователя.
+          # Заодно проверяется, что новый глубокий поиск держателей (обход
+          # модулей всех процессов системы) отрабатывает на живой Windows.
+          $runLog = Join-Path $root "PortableData/launcher-run.log"
+          if (-not (Test-Path $runLog)) {
+            Write-Host "::error title=Leftover smoke failure::launcher-run.log was not written"
+            throw "launcher-run.log was not written"
+          }
+          $logText = Get-Content $runLog -Raw
+          Write-Host $logText
+          if ($logText -notmatch 'portable folder released') {
+            Write-Host "::error title=Leftover smoke failure::the launcher did not confirm the folder is free"
+            throw "No 'portable folder released' verdict in launcher-run.log"
+          }
+
           # Финальная проверка ровно в формулировке пользователя: папка
           # удаляется без «файл открыт в другой программе».
           Remove-Item -Recurse -Force $root -ErrorAction Stop

@@ -385,6 +385,12 @@ class PortableResult:
     #: Пакеты, установленные в тихом режиме на этом ПК по ходу сборки
     #: (предусловия дистрибутива и недостающие runtime).
     runtime_installed: List[str] = field(default_factory=list)
+    #: Проверено ли фактически, что папку результата можно удалить/перенести.
+    folder_is_free: bool = True
+    #: Кто держит папку, если это всё же не так (для показа пользователю).
+    folder_holders: List[str] = field(default_factory=list)
+    #: Службы Windows, снятые с регистрации (их бинарник лежал в портативе).
+    removed_services: List[str] = field(default_factory=list)
 
 
 class Portablizer:
@@ -481,6 +487,54 @@ class Portablizer:
                 "Остановлены процессы, запущенные из папки портатива"
                 f"{tail}: " + ", ".join(sorted(set(stopped))))
         return stopped
+
+    def _verify_folder_is_free(self, portable_dir: str,
+                               result: "PortableResult") -> bool:
+        """Проверяет делом: папку можно удалить, перенести, скопировать.
+
+        Перебор процессов отвечает на вопрос «кто запущен», а пользователь
+        спрашивает другое — «почему я не могу удалить папку». Windows не даёт
+        переименовать каталог, внутри которого открыт хотя бы один файл, то
+        есть ровно при том же условии, что и удаление. Поэтому пробное
+        переименование — это честная проверка результата сборки, не
+        зависящая от того, кто именно держит папку: процесс, служба или
+        подгруженная кем-то DLL.
+
+        Дорогой поиск виновника (обход модулей всех процессов системы)
+        выполняется только если проба не прошла.
+        """
+        if not IS_WINDOWS:
+            return True
+        if procutil.folder_is_free(portable_dir):
+            self.log.ok(
+                "Папка портатива свободна: её можно удалить, перенести или "
+                "скопировать на флешку прямо сейчас.")
+            return True
+
+        holders = procutil.holders(portable_dir)
+        names = sorted({
+            (f"{h.name} (держит {procutil.image_name(h.detail)})"
+             if h.kind == "module" else h.name)
+            for h in holders
+        })
+        result.folder_holders = names
+        if names:
+            self.log.warn(
+                "Папку портатива всё ещё держат: " + ", ".join(names) + ".")
+            if any(h.protected for h in holders):
+                self.log.warn(
+                    "Среди них есть системные процессы (обычно это открытое "
+                    "окно проводника или предпросмотр файла) — закройте окна "
+                    "этой папки, и она освободится.")
+        else:
+            self.log.warn(
+                "Папка портатива занята, но виновника определить не удалось: "
+                "чаще всего это открытое окно проводника или проверка "
+                "антивирусом. Через несколько секунд папка освободится сама.")
+        self.log.info(
+            f"Освободить папку вручную: {launcher_mod.STOP_SCRIPT_NAME} "
+            "в её корне.")
+        return False
 
     def _remove_path(self, path: str, attempts: int = 4) -> None:
         """Удаляет файл или дерево, переживая кратковременную блокировку.
@@ -806,6 +860,7 @@ class Portablizer:
             # 9. Уборка следов установки с ЭТОГО компьютера: программа не
             # должна остаться в списке «Установленные программы».
             self.progress(97, "Удаление следов установки с этого ПК")
+            self._remove_portable_services(portable_dir, opts, result)
             if capture is not None:
                 self._cleanup_host(capture, opts, result)
             if opts.cleanup_host:
@@ -816,14 +871,8 @@ class Portablizer:
             # оставаться не должно.
             self.progress(99, "Освобождение папки результата")
             self._release_portable_dir(portable_dir, reason="перед выдачей")
-            left = procutil.processes_in(portable_dir)
-            if left:
-                names = ", ".join(sorted({
-                    procutil.image_name(image) for _, image in left}))
-                self.log.warn(
-                    "Из папки портатива всё ещё работают процессы: "
-                    f"{names}. Закройте их или запустите "
-                    f"{launcher_mod.STOP_SCRIPT_NAME} из папки портатива.")
+            result.folder_is_free = self._verify_folder_is_free(
+                portable_dir, result)
 
             self.progress(100, "Готово")
             self.log.ok("Портативное приложение успешно создано!")
@@ -1287,6 +1336,52 @@ class Portablizer:
             "администратора). Запустите cleanup_host.cmd (он сам запросит права "
             f"администратора): {target}"
         )
+
+    def _remove_portable_services(self, portable_dir: str,
+                                  opts: PortableOptions,
+                                  result: PortableResult) -> None:
+        """Снимает службы Windows, чей бинарник оказался внутри портатива.
+
+        Установщики игр и «тяжёлых» программ регистрируют службы: защита от
+        копирования, обновлятор, вспомогательный драйвер. После сборки такая
+        служба указывает уже в папку портатива и делает сразу две гадости:
+
+        * держит файлы открытыми, поэтому папка не удаляется и не копируется
+          (убивать её процесс бесполезно — диспетчер служб поднимет его
+          снова);
+        * остаётся следом установки на этом компьютере, хотя программа
+          «не устанавливалась».
+
+        Поэтому служба останавливается и снимается с регистрации. Для этого
+        нужны права администратора — Portablizer запрашивает их при старте.
+        """
+        if not IS_WINDOWS or not portable_dir:
+            return
+        try:
+            services = procutil.services_in(portable_dir)
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug(f"Не удалось перечислить службы: {exc}")
+            return
+        if not services:
+            return
+        if not opts.cleanup_host:
+            result.cleanup_pending = True
+            self.log.warn(
+                "Очистка отключена: на этом ПК осталась зарегистрирована "
+                "служба из папки портатива (" + ", ".join(services) + "). "
+                "Пока она работает, папку нельзя ни удалить, ни перенести.")
+            return
+        if not is_elevated():
+            result.cleanup_pending = True
+            self.log.warn(
+                "Служба из папки портатива (" + ", ".join(services) + ") "
+                "требует прав администратора для снятия. Запустите "
+                "Portablizer от имени администратора и повторите сборку.")
+            return
+        for name in services:
+            procutil.stop_service(name, remove=True)
+            self.log.ok(f"Служба {name} остановлена и снята с регистрации.")
+        result.removed_services = list(services)
 
     # -- ярлыки ---------------------------------------------------------------
     @staticmethod
