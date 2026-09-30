@@ -783,8 +783,13 @@ class FullKitProvisionTests(unittest.TestCase):
                 return original(path, destination)
 
             provisioner._expand_one = counted
-            report = provisioner.provision(
-                scan, str(app), str(portable), "Game")
+            # Тестовые CAB намеренно минимальны и не содержат служебных
+            # checksum-полей, которые проверяет Windows expand.exe. Здесь
+            # проверяется наш CFFILE-индекс, поэтому используем встроенный
+            # кроссплатформенный распаковщик и на Windows CI тоже.
+            with mock.patch.object(redist, "IS_WINDOWS", False):
+                report = provisioner.provision(
+                    scan, str(app), str(portable), "Game")
 
             self.assertEqual(report.missing, [])
             self.assertEqual(set(touched),
