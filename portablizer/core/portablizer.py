@@ -505,11 +505,14 @@ class Portablizer:
         """
         if not IS_WINDOWS:
             return True
-        if procutil.folder_is_free(portable_dir):
+        probe_errors: List[str] = []
+        if procutil.folder_is_free(portable_dir, probe_errors):
             self.log.ok(
                 "Папка портатива свободна: её можно удалить, перенести или "
                 "скопировать на флешку прямо сейчас.")
             return True
+        for line in probe_errors:
+            self.log.debug(f"Проба переименования не прошла: {line}")
 
         holders = procutil.holders(portable_dir)
         names = sorted({

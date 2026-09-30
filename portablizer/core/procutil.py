@@ -420,7 +420,7 @@ def stop_service(name: str, remove: bool = False, timeout: float = 15.0
     return True
 
 
-def folder_is_free(root: str) -> bool:
+def folder_is_free(root: str, errors: Optional[List[str]] = None) -> bool:
     """Честная проверка «папку можно удалить»: пробное переименование.
 
     Windows не даёт переименовать каталог, внутри которого открыт хотя бы
@@ -429,7 +429,9 @@ def folder_is_free(root: str) -> bool:
     точнее любого перебора процессов и не зависит от того, кто именно её
     держит: процесс, служба или подгруженная DLL.
 
-    Вызывающий не должен находиться внутри проверяемой папки.
+    Вызывающий не должен находиться внутри проверяемой папки. В ``errors``,
+    если он передан, попадает текст ошибки — по нему видно, действительно ли
+    файл занят или, например, родительская папка доступна только на чтение.
     """
     if not root or not os.path.isdir(root):
         return True
@@ -440,7 +442,12 @@ def folder_is_free(root: str) -> bool:
         if os.path.exists(probe):
             return False
         os.rename(root, probe)
-    except OSError:
+    except OSError as exc:
+        # Текст ошибки важен вызывающему: «папка занята» (sharing violation)
+        # и «нет прав на запись в родительский каталог» выглядят одинаково,
+        # но означают разное, и пользователю нельзя говорить второе первым.
+        if errors is not None:
+            errors.append(f"{exc.__class__.__name__}: {exc}")
         return False
     # Имя обязано вернуться на место при любом исходе: пользователь не должен
     # обнаружить свою папку переименованной из-за диагностики.
