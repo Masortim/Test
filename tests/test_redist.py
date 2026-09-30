@@ -1108,7 +1108,16 @@ class PortablizerRuntimeIntegrationTests(unittest.TestCase):
         installer = Path(temp, "GameSetup.exe")
         installer.write_bytes(b"MZ Inno Setup")
         engine = self.FakePortablizer(Logger())
-        with mock.patch("portablizer.core.portablizer.IS_WINDOWS", False):
+        # Герметичность: тест описывает мир, в котором кроме приложенного к
+        # установщику комплекта (_CommonRedist) источников рантайма нет.
+        # Без этого шаги «системные папки» и «WinSxS» видели бы настоящие
+        # VC++ 2005/2008 сборки сборочной машины (на Windows-раннере они
+        # есть) — и результат зависел бы от того, что случайно установлено
+        # там, где запущены тесты.
+        with mock.patch("portablizer.core.portablizer.IS_WINDOWS", False), \
+                mock.patch.object(redist, "system_dirs_for",
+                                  lambda arch: []), \
+                mock.patch.object(redist, "winsxs_dir", lambda: ""):
             result = engine.run(PortableOptions(
                 installer_path=str(installer), output_dir=temp,
                 app_name="Game", capture_registry=False, **options))
