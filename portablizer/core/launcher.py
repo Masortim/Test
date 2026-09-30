@@ -119,6 +119,22 @@ class LauncherConfig:
     # пользователя сообщениями. Каждая запись: {"file", "title", "kind",
     # "args", "dlls", "arch"}.
     runtime_installers: List[Dict[str, str]] = field(default_factory=list)
+    # --- завершение сеанса ---------------------------------------------------
+    # Сколько секунд лончер ждёт запуска настоящей программы, если сначала
+    # стартовал официальный launcher/splash.
+    shutdown_spawn_grace: float = 6.0
+    # Сколько секунд процессу ИЗ ПОРТАТИВА без единого видимого окна
+    # позволено удерживать сеанс. Ровно из-за этого пункта раньше нельзя было
+    # удалить папку: программа закрыта, а её апдейтер/крэш-хендлер продолжал
+    # работать в фоне, и лончер (лежащий в App) ждал его сутки.
+    shutdown_idle_grace: float = 20.0
+    # Пауза между вежливым WM_CLOSE и принудительным завершением.
+    shutdown_close_grace: float = 5.0
+    # Потолок одного сеанса, секунды.
+    shutdown_max_wait: float = 86400.0
+    # Добивать то, что не закрылось само. Выключать стоит только при отладке:
+    # без этого папка снова может остаться заблокированной.
+    shutdown_kill_leftovers: bool = True
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -899,9 +915,19 @@ goto :eof
 {machine_elevation}
 
 :portable_wait_children
-rem Waits until no process started from this portable folder is left. The first
-rem seconds are a grace period: a launcher needs a moment to spawn the game.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$r=$env:PORTABLE_ROOT.TrimEnd('\')+'\'; $grace=8; $t=0; $seen=$false; while($t -lt 86400){{ $n=0; foreach($p in [Diagnostics.Process]::GetProcesses()){{ if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $n++ }} }} }}; if($n -gt 0){{ $seen=$true }} elseif($seen -or $t -ge $grace){{ break }}; Start-Sleep -Seconds 1; $t++ }}" >nul 2>&1
+rem Waits while the program is really being used, then frees the folder.
+rem
+rem Two rules, and the second one is what makes the folder deletable again:
+rem   * a process from this folder that owns a visible window means the user
+rem     is still working - wait as long as it takes;
+rem   * a process WITHOUT any window (updater, crash handler, silent helper)
+rem     only gets PORTABLE_IDLE_GRACE seconds. Afterwards it is asked to close
+rem     and then terminated. Otherwise it would keep running in the background
+rem     after the program was closed, and Windows would refuse to delete the
+rem     portable folder.
+if not defined PORTABLE_IDLE_GRACE set "PORTABLE_IDLE_GRACE={idle_grace}"
+if not defined PORTABLE_KILL_LEFTOVERS set "PORTABLE_KILL_LEFTOVERS={kill_leftovers}"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$r=$env:PORTABLE_ROOT.TrimEnd('\')+'\'; function Gp(){{ $a=@(); foreach($p in [Diagnostics.Process]::GetProcesses()){{ if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $a+=$p }} }} }}; return $a }}; $grace=8; $idle=[int]$env:PORTABLE_IDLE_GRACE; if($idle -le 0){{ $idle=20 }}; $t=0; $seen=$false; $q=0; while($t -lt 86400){{ $ps=@(Gp); if($ps.Count -gt 0){{ $seen=$true; $vis=0; foreach($p in $ps){{ if($p.MainWindowHandle.ToInt64() -ne 0){{ $vis++ }} }}; if($vis -gt 0){{ $q=0 }} else {{ $q++; if($q -ge $idle){{ break }} }} }} elseif($seen -or $t -ge $grace){{ break }}; Start-Sleep -Seconds 1; $t++ }}; if($env:PORTABLE_KILL_LEFTOVERS -eq '0'){{ exit 0 }}; $ps=@(Gp); if($ps.Count -gt 0){{ foreach($p in $ps){{ try{{ [void]$p.CloseMainWindow() }}catch{{}} }}; Start-Sleep -Seconds 3; foreach($p in @(Gp)){{ try{{ $p.Kill() }}catch{{}} }} }}" >nul 2>&1
 goto :eof
 
 :portable_documents_load
@@ -1074,6 +1100,8 @@ def render_bat(cfg: LauncherConfig) -> str:
         runtime_check=_runtime_check_block(cfg),
         redist_dir=REDIST_DIR_NAME,
         redist_script=REDIST_SCRIPT_NAME,
+        idle_grace=int(max(1, round(cfg.shutdown_idle_grace))),
+        kill_leftovers="1" if cfg.shutdown_kill_leftovers else "0",
     )
     return ensure_ascii_bat(text)
 
@@ -1098,6 +1126,144 @@ shell.Run line, 0, False
 
 def render_vbs() -> str:
     return ensure_ascii_bat(_VBS_TEMPLATE)
+
+
+def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
+    """Восстанавливает ``LauncherConfig`` из готового ``launcher_config.json``.
+
+    Нужно для обслуживания уже собранного портатива: чтобы перевыпустить его
+    лончер новой версией, надо знать, чем он был собран. Разбор намеренно
+    терпимый — конфиг мог быть создан прежней версией Portablizer, в которой
+    части полей ещё не существовало (например, секции ``shutdown``).
+    """
+    def text(key: str, default: str = "") -> str:
+        value = data.get(key, default)
+        return value if isinstance(value, str) else default
+
+    def items(key: str) -> List[str]:
+        value = data.get(key)
+        return [str(v) for v in value] if isinstance(value, list) else []
+
+    def mapping(key: str) -> Dict[str, str]:
+        value = data.get(key)
+        if not isinstance(value, dict):
+            return {}
+        return {str(k): str(v) for k, v in value.items()}
+
+    registry = data.get("registry")
+    registry = registry if isinstance(registry, dict) else {}
+    shutdown = data.get("shutdown")
+    shutdown = shutdown if isinstance(shutdown, dict) else {}
+
+    def number(key: str, default: float) -> float:
+        try:
+            return float(shutdown.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    targets: List[TargetInfo] = []
+    raw_targets = data.get("targets")
+    if isinstance(raw_targets, list):
+        for item in raw_targets:
+            if not isinstance(item, dict):
+                continue
+            targets.append(TargetInfo(
+                name=str(item.get("name", "")),
+                rel_path=str(item.get("rel_path", "")),
+                role=str(item.get("role", "main")),
+                description=str(item.get("description", "")),
+                bat_name=str(item.get("bat_name", "")),
+                vbs_name=str(item.get("vbs_name", "")),
+            ))
+
+    def dict_list(key: str) -> List[Dict[str, str]]:
+        value = data.get(key)
+        if not isinstance(value, list):
+            return []
+        return [{str(k): str(v) for k, v in item.items()}
+                for item in value if isinstance(item, dict)]
+
+    return LauncherConfig(
+        app_name=text("app_name", "Portable"),
+        target_exe_rel=text("target_exe_rel"),
+        target_args=items("target_args"),
+        data_dir_name=text("data_dir_name", "PortableData"),
+        apply_registry=bool(registry.get("enabled", False)),
+        reg_file_name=str(registry.get("file", "portable.reg")),
+        machine_reg_file_name=str(
+            registry.get("machine_file", "portable_machine.reg")),
+        registry_keys=[str(k) for k in registry.get("keys", [])
+                       if isinstance(registry.get("keys", []), list)],
+        registry_created_keys=[
+            str(k) for k in registry.get("created_keys", [])
+            if isinstance(registry.get("created_keys", []), list)],
+        registry_has_root_token=bool(registry.get("root_token")),
+        extra_env=mapping("extra_env"),
+        path_prepend=items("path_prepend"),
+        redirect_known_folders=bool(data.get("redirect_known_folders", False)),
+        targets=targets,
+        launcher_target_rel=text("launcher_target_rel"),
+        config_target_rel=text("config_target_rel"),
+        launcher_aliases=mapping("launcher_aliases"),
+        runtime_requirements=dict_list("runtime_requirements"),
+        runtime_installers=dict_list("runtime_installers"),
+        shutdown_spawn_grace=number("spawn_grace", 6.0),
+        shutdown_idle_grace=number("idle_grace", 20.0),
+        shutdown_close_grace=number("close_grace", 5.0),
+        shutdown_max_wait=number("max_wait", 86400.0),
+        shutdown_kill_leftovers=bool(shutdown.get("kill_leftovers", True)),
+    )
+
+
+# --- StopPortable.cmd (освобождение папки) ------------------------------------
+
+#: Имя аварийного «отпускателя» папки в корне портатива.
+STOP_SCRIPT_NAME = "StopPortable.cmd"
+
+_STOP_TEMPLATE = r"""@echo off
+rem ============================================================================
+rem  {title} - free this portable folder
+rem
+rem  Run this file when the program has been closed but Windows still refuses
+rem  to delete or move the folder ("the file is open in another program").
+rem  It closes every process whose executable lives inside this folder -
+rem  politely first, by force afterwards - and touches nothing else on the PC.
+rem
+rem  The normal launcher does this on its own; this script is the manual
+rem  rescue hatch (and works even without App\LaunchPortable.exe).
+rem ============================================================================
+setlocal
+set "PORTABLE_ROOT=%~dp0"
+if "%PORTABLE_ROOT:~-1%" == "\" set "PORTABLE_ROOT=%PORTABLE_ROOT:~0,-1%"
+
+if exist "%PORTABLE_ROOT%\App\{exe_launcher}" (
+  "%PORTABLE_ROOT%\App\{exe_launcher}" --stop
+  if not errorlevel 1 goto report
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$r=$env:PORTABLE_ROOT.TrimEnd('\')+'\'; function Gp(){{ $a=@(); foreach($p in [Diagnostics.Process]::GetProcesses()){{ if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $a+=$p }} }} }}; return $a }}; $ps=@(Gp); if($ps.Count -eq 0){{ Write-Host 'Nothing from this folder is running.'; exit 0 }}; foreach($p in $ps){{ Write-Host ('Closing ' + $p.ProcessName + ' (pid ' + $p.Id + ')'); try{{ [void]$p.CloseMainWindow() }}catch{{}} }}; Start-Sleep -Seconds 3; foreach($p in @(Gp)){{ try{{ $p.Kill() }}catch{{}} }}; Start-Sleep -Seconds 1; $left=@(Gp); if($left.Count -gt 0){{ foreach($p in $left){{ Write-Host ('Still running: ' + $p.ProcessName) }}; exit 1 }}"
+
+:report
+if errorlevel 1 (
+  echo.
+  echo Some processes could not be stopped. They are probably running as
+  echo administrator - start this file again with "Run as administrator".
+) else (
+  echo.
+  echo The folder is free: it can be deleted, moved or copied now.
+)
+if not "%~1" == "--nopause" pause
+endlocal & exit /b 0
+"""
+
+
+def render_stop_cmd(cfg: LauncherConfig,
+                    exe_launcher_name: str = "LaunchPortable.exe") -> str:
+    """Аварийный скрипт «освободить папку» в корне портатива."""
+    return ensure_ascii_bat(_STOP_TEMPLATE.format(
+        title=_bat_echo(ascii_display(cfg.app_name)),
+        exe_launcher=exe_launcher_name,
+    ))
 
 
 # --- Вспомогательные лаунчеры и меню ------------------------------------------
@@ -1406,6 +1572,15 @@ def render_config_json(cfg: LauncherConfig) -> str:
         "runtime_install_script": (
             f"{REDIST_DIR_NAME}/{REDIST_SCRIPT_NAME}"
             if cfg.runtime_installers else ""),
+        # Как завершать сеанс. Лончер обязан отпустить папку: ничего
+        # запущенного из портатива не должно пережить его самого.
+        "shutdown": {
+            "spawn_grace": cfg.shutdown_spawn_grace,
+            "idle_grace": cfg.shutdown_idle_grace,
+            "close_grace": cfg.shutdown_close_grace,
+            "max_wait": cfg.shutdown_max_wait,
+            "kill_leftovers": cfg.shutdown_kill_leftovers,
+        },
         "registry": {
             "enabled": cfg.apply_registry,
             "file": cfg.reg_file_name,

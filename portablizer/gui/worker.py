@@ -5,6 +5,7 @@ import threading
 
 from PySide6.QtCore import QThread, Signal
 
+from ..core import maintenance
 from ..core.logutil import Logger
 from ..core.portablizer import PortableOptions, PortableResult, Portablizer
 
@@ -34,3 +35,34 @@ class PortableWorker(QThread):
         )
         result: PortableResult = engine.run(self.opts)
         self.finished_result.emit(result)
+
+
+class MaintenanceWorker(QThread):
+    """Обслуживание готовой папки портатива в фоне.
+
+    Освобождение папки может занять секунды (вежливое закрытие окон,
+    остановка службы, поиск держателей), а интерфейс в это время обязан
+    оставаться живым.
+    """
+
+    log_line = Signal(str, str)              # level, message
+    finished_report = Signal(object)         # MaintenanceReport
+
+    def __init__(self, folder: str, action: str) -> None:
+        super().__init__()
+        self.folder = folder
+        self.action = action                 # "release" | "refresh"
+        self.logger = Logger()
+        self.logger.add_sink(lambda lvl, msg: self.log_line.emit(lvl, msg))
+
+    def run(self) -> None:  # noqa: D401 - QThread entrypoint
+        if self.action == "refresh":
+            engine = Portablizer(logger=self.logger)
+            report = maintenance.refresh(
+                self.folder, self.logger,
+                copy_exe=lambda folder, rel: engine._copy_exe_launcher(
+                    folder, rel),
+            )
+        else:
+            report = maintenance.release(self.folder, self.logger)
+        self.finished_report.emit(report)

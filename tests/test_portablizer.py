@@ -15,7 +15,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import batsim
 import portable_launcher_entry as exe_launcher
+from portablizer.core import elevate as elevate_mod
 from portablizer.core import launcher as launcher_mod
+from portablizer.core import maintenance
+from portablizer.core import procutil
 from portablizer.core import registry
 from portablizer.core.detect import (
     TRUSTED_CONFIDENCE, DetectionResult, InstallerType, InstallShieldGeneration,
@@ -71,6 +74,64 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertFalse((portable / "Launch.bat").exists())
             self.assertFalse((portable / "cleanup_host.reg").exists())
             self.assertTrue((data / "settings.json").exists())
+
+    def test_prepare_output_frees_the_folder_before_deleting_anything(self):
+        """Живой процесс из прошлого запуска не должен ронять пересборку.
+
+        Симптом до исправления: пользователь запускал портатив, закрывал
+        его, но фоновый помощник продолжал держать App — и следующая сборка
+        обрывалась сообщением «не удалось очистить старый файл результата».
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir()
+            released = []
+
+            with mock.patch.object(procutil, "release_folder",
+                                   side_effect=lambda root, **_k:
+                                   released.append(root) or ["helper.exe"]):
+                self.engine._prepare_output(str(portable), str(app), str(data))
+
+            self.assertIn(str(portable), released)
+            self.assertIn("helper.exe", self.engine.log.text)
+
+    def test_remove_path_retries_while_the_file_is_locked(self):
+        """Секундная блокировка (антивирус, индексатор) — не повод падать."""
+        with tempfile.TemporaryDirectory() as temp:
+            victim = Path(temp, "locked.log")
+            victim.write_text("x", encoding="ascii")
+            attempts = {"n": 0}
+            real_remove = os.remove
+
+            def flaky(path):
+                attempts["n"] += 1
+                if attempts["n"] < 3:
+                    raise OSError(32, "used by another process")
+                real_remove(path)
+
+            with mock.patch("os.remove", side_effect=flaky), \
+                    mock.patch.object(procutil, "release_folder",
+                                      return_value=[]), \
+                    mock.patch("time.sleep"):
+                self.engine._remove_path(str(victim))
+
+            self.assertEqual(attempts["n"], 3)
+            self.assertFalse(victim.exists())
+
+    def test_remove_path_gives_up_with_the_original_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            victim = Path(temp, "locked.log")
+            victim.write_text("x", encoding="ascii")
+            with mock.patch("os.remove",
+                            side_effect=OSError(32, "used by another process")), \
+                    mock.patch.object(procutil, "release_folder",
+                                      return_value=[]), \
+                    mock.patch("time.sleep"):
+                with self.assertRaises(OSError):
+                    self.engine._remove_path(str(victim))
 
     def test_prepare_output_removes_stale_per_target_launchers(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -327,21 +388,21 @@ class PortableExeLauncherTests(unittest.TestCase):
     def test_launches_real_program_with_portable_environment(self):
         with tempfile.TemporaryDirectory() as temp:
             root, app, target = self._portable(temp)
-            completed = mock.Mock(returncode=17)
+            child = mock.Mock(**{"wait.return_value": 17})
             with mock.patch.object(exe_launcher, "find_portable_root",
-                                   return_value=root), mock.patch(
-                "portable_launcher_entry.subprocess.run", return_value=completed
+                                   return_value=root), mock.patch.object(
+                exe_launcher, "_spawn_target", return_value=child
             ) as run_process:
                 rc = exe_launcher.run(["--user-argument"])
 
             self.assertEqual(rc, 17)
-            args, kwargs = run_process.call_args
+            args, _kwargs = run_process.call_args
             self.assertEqual(
-                args[0],
+                list(args[0]),
                 [str(target), "--from-config", "--user-argument"],
             )
-            self.assertEqual(kwargs["cwd"], str(app))
-            env = kwargs["env"]
+            self.assertEqual(args[1], str(app))
+            env = args[2]
             for key in ("APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP",
                         "PROGRAMDATA", "PUBLIC"):
                 self.assertTrue(env[key].startswith(str(root)), key)
@@ -353,6 +414,85 @@ class PortableExeLauncherTests(unittest.TestCase):
             self.assertEqual(env["PROGRAM_HOME"], f"{root}/App")
             self.assertTrue((root / "PortableData" / "User" /
                              "Documents" / "My Games").is_dir())
+
+    def test_session_end_releases_the_portable_folder(self):
+        """Главная жалоба: папку нельзя удалить после закрытия программы.
+
+        Сеанс обязан закончиться освобождением папки — иначе фоновые
+        помощники программы переживают лончер и держат её файлы.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root, _app, _target = self._portable(temp)
+            child = mock.Mock(**{"wait.return_value": 0})
+            with mock.patch.object(exe_launcher, "find_portable_root",
+                                   return_value=root), \
+                    mock.patch.object(exe_launcher, "_spawn_target",
+                                      return_value=child), \
+                    mock.patch.object(exe_launcher,
+                                      "_wait_for_portable_processes",
+                                      return_value=0), \
+                    mock.patch.object(exe_launcher, "release_portable_folder",
+                                      return_value=["updater.exe"]) as release, \
+                    mock.patch.object(exe_launcher, "_portable_process_list",
+                                      return_value=[]):
+                exe_launcher.run([])
+
+            # Основная уборка — внутри песочницы, плюс страховочный проход
+            # в самом конце.
+            self.assertEqual(release.call_count, 2)
+            log = (root / "PortableData" / "launcher-run.log").read_text(
+                encoding="utf-8")
+            self.assertIn("updater.exe", log)
+            self.assertIn("portable folder released", log)
+
+    def test_program_really_starts_when_there_is_no_job_object(self):
+        """Без job-объекта (не Windows, старая ОС) запуск обычный."""
+        process = exe_launcher._spawn_target(
+            [sys.executable, "-c", "import sys; sys.exit(7)"],
+            os.getcwd(), dict(os.environ), exe_launcher._JobObject())
+        self.assertEqual(process.wait(), 7)
+
+    def test_unresumable_child_is_restarted_instead_of_hanging_frozen(self):
+        """Если поток не удалось разморозить — стартуем обычным способом.
+
+        Иначе пользователь смотрел бы на пустой экран: процесс создан, но
+        навсегда приостановлен.
+        """
+        job = exe_launcher._JobObject()
+        job.handle = 1234  # как будто job создан
+        started = []
+
+        class FakeProcess:
+            _handle = 4321
+            pid = 999
+
+            def __init__(self, marker):
+                started.append(marker)
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        calls = {"n": 0}
+
+        def fake_popen(*_args, **kwargs):
+            calls["n"] += 1
+            return FakeProcess(kwargs.get("creationflags", 0))
+
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher.subprocess, "Popen",
+                                  side_effect=fake_popen), \
+                mock.patch.object(exe_launcher, "_resume_process_threads",
+                                  return_value=0), \
+                mock.patch.object(exe_launcher._JobObject, "assign",
+                                  return_value=True):
+            exe_launcher._spawn_target(["prog.exe"], ".", {}, job)
+
+        self.assertEqual(calls["n"], 2, "повторный запуск не состоялся")
+        self.assertEqual(started[0], 0x00000004)   # CREATE_SUSPENDED
+        self.assertEqual(started[1], 0)            # обычный запуск
 
     def test_saved_user_settings_do_not_hide_required_machine_registry_seed(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -437,19 +577,19 @@ class PortableExeLauncherTests(unittest.TestCase):
                 ],
             })
             config_path.write_text(json.dumps(config), encoding="utf-8")
-            completed = mock.Mock(returncode=0)
+            child = mock.Mock(**{"wait.return_value": 0})
 
             with mock.patch.object(exe_launcher, "find_portable_root",
-                                   return_value=root), mock.patch(
-                "portable_launcher_entry.subprocess.run", return_value=completed
+                                   return_value=root), mock.patch.object(
+                exe_launcher, "_spawn_target", return_value=child
             ) as run_process:
                 rc = exe_launcher.run(["--config"])
 
             self.assertEqual(rc, 0)
-            command = run_process.call_args.args[0]
+            command = list(run_process.call_args.args[0])
             self.assertEqual(command[0], str(configurator))
             self.assertNotIn("--config", command)
-            self.assertEqual(run_process.call_args.kwargs["cwd"],
+            self.assertEqual(run_process.call_args.args[1],
                              str(configurator.parent))
 
 
@@ -472,8 +612,8 @@ class PortableExeLauncherTests(unittest.TestCase):
                                    return_value=root), \
                     mock.patch.object(exe_launcher, "_show_error",
                                       side_effect=shown.append), \
-                    mock.patch("portable_launcher_entry.subprocess.run",
-                               side_effect=error):
+                    mock.patch.object(exe_launcher, "_spawn_target",
+                                      side_effect=error):
                 rc = exe_launcher.run([])
 
             # Симптом из жалобы «Ведьмака»: без пакета VC++ 2005/2008 Windows
@@ -494,8 +634,8 @@ class PortableExeLauncherTests(unittest.TestCase):
                                    return_value=root), \
                     mock.patch.object(exe_launcher, "_show_error",
                                       side_effect=lambda _msg: None), \
-                    mock.patch("portable_launcher_entry.subprocess.run",
-                               side_effect=error):
+                    mock.patch.object(exe_launcher, "_spawn_target",
+                                      side_effect=error):
                 with self.assertRaises(OSError):
                     exe_launcher.run([])
 
@@ -2628,6 +2768,10 @@ class GameLauncherHandoffTests(unittest.TestCase):
     если ключа нет, а его Launcher.exe стартует игру и сразу завершается.
     """
 
+    #: Пути-образцы: игра с окном и безоконный фоновый помощник.
+    GAME_IMAGE = r"C:\Games\Portable\App\game.exe"
+    HELPER_IMAGE = r"C:\Games\Portable\App\helper.exe"
+
     def _witcher_cfg(self):
         return launcher_mod.LauncherConfig(
             app_name="The Witcher",
@@ -2709,19 +2853,160 @@ class GameLauncherHandoffTests(unittest.TestCase):
             r"C:\Games\Portable\App\game.exe", prefix, ()))
 
     def test_waiting_stops_as_soon_as_the_program_is_gone(self):
-        counts = [1, 1, 0]
+        # (pid, image) списками: первый вызов отвечает на «уже запустилось?»,
+        # дальше идёт сам цикл ожидания.
+        snapshots = [[(10, self.GAME_IMAGE)], [(10, self.GAME_IMAGE)], []]
 
-        def fake_count(_root):
-            return counts.pop(0) if counts else 0
+        def fake_list(_root):
+            return snapshots.pop(0) if snapshots else []
 
         with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
-                mock.patch.object(exe_launcher, "_portable_processes",
-                                  side_effect=fake_count), \
+                mock.patch.object(exe_launcher, "_portable_process_list",
+                                  side_effect=fake_list), \
+                mock.patch.object(exe_launcher, "_visible_window_pids",
+                                  return_value={10}), \
                 mock.patch("time.sleep"):
             waited = exe_launcher._wait_for_portable_processes(
                 Path(r"C:\Games\Portable"))
         self.assertEqual(waited, 1)
-        self.assertEqual(counts, [])
+        self.assertEqual(snapshots, [])
+
+    def test_visible_program_is_never_treated_as_a_leftover(self):
+        """Окно на экране — пользователь работает: ждём сколько угодно."""
+        calls = {"n": 0}
+
+        def fake_list(_root):
+            calls["n"] += 1
+            # Игра идёт 100 циклов подряд, потом пользователь её закрывает.
+            return [(10, self.GAME_IMAGE)] if calls["n"] < 100 else []
+
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher, "_portable_process_list",
+                                  side_effect=fake_list), \
+                mock.patch.object(exe_launcher, "_visible_window_pids",
+                                  return_value={10}), \
+                mock.patch("time.sleep"):
+            waited = exe_launcher._wait_for_portable_processes(
+                Path(r"C:\Games\Portable"),
+                settings={"spawn_grace": 0.0, "idle_grace": 3.0,
+                          "max_wait": 86400.0})
+
+        # Ни одного досрочного выхода: полоса ожидания честно дошла до конца.
+        self.assertGreaterEqual(waited, 90)
+
+    def test_windowless_leftover_only_gets_the_idle_grace(self):
+        """Фоновый процесс без окна не должен держать папку сутками.
+
+        Это ровно тот баг, из-за которого папку портатива нельзя было
+        удалить: программа закрыта, а её апдейтер/крэш-хендлер продолжал
+        жить, и лончер (лежащий внутри App) ждал его до 24 часов.
+        """
+        clock = iter(float(n) for n in range(0, 100000))
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher, "_portable_process_list",
+                                  return_value=[(11, self.HELPER_IMAGE)]), \
+                mock.patch.object(exe_launcher, "_visible_window_pids",
+                                  return_value=set()), \
+                mock.patch("time.monotonic", side_effect=lambda: next(clock)), \
+                mock.patch("time.sleep"):
+            waited = exe_launcher._wait_for_portable_processes(
+                Path(r"C:\Games\Portable"),
+                settings={"spawn_grace": 0.0, "idle_grace": 5.0,
+                          "max_wait": 86400.0})
+
+        # Досрочный выход по idle_grace, а не «ждём вечно».
+        self.assertLess(waited, 20)
+
+    def test_release_closes_politely_and_then_terminates(self):
+        calls = {"posted": [], "killed": []}
+        # Процесс игнорирует WM_CLOSE и остаётся висеть.
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher, "_portable_process_list",
+                                  return_value=[(11, self.HELPER_IMAGE)]), \
+                mock.patch.object(
+                    exe_launcher, "_post_close_to_windows",
+                    side_effect=lambda pids: calls["posted"].extend(pids)), \
+                mock.patch.object(
+                    exe_launcher, "_terminate_pids",
+                    side_effect=lambda pids: calls["killed"].extend(pids)), \
+                mock.patch("time.sleep"):
+            stopped = exe_launcher.release_portable_folder(
+                Path(r"C:\Games\Portable"),
+                {"close_grace": 1.0, "kill_leftovers": 1.0})
+
+        self.assertEqual(stopped, ["helper.exe"])
+        self.assertEqual(calls["posted"], [11])
+        self.assertEqual(calls["killed"], [11])
+
+    def test_release_does_not_kill_when_the_process_obeys_wm_close(self):
+        states = [[(11, self.HELPER_IMAGE)], []]
+
+        def fake_list(_root):
+            return states.pop(0) if states else []
+
+        killed = []
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher, "_portable_process_list",
+                                  side_effect=fake_list), \
+                mock.patch.object(exe_launcher, "_post_close_to_windows",
+                                  return_value=1), \
+                mock.patch.object(exe_launcher, "_terminate_pids",
+                                  side_effect=killed.append), \
+                mock.patch("time.sleep"):
+            stopped = exe_launcher.release_portable_folder(
+                Path(r"C:\Games\Portable"), {"close_grace": 5.0})
+
+        self.assertEqual(stopped, ["helper.exe"])
+        self.assertEqual(killed, [], "процесс закрылся сам — убивать нечего")
+
+    def test_shutdown_settings_are_clamped_and_defaulted(self):
+        default = exe_launcher.shutdown_settings({})
+        self.assertEqual(default["idle_grace"], 20.0)
+        self.assertEqual(default["kill_leftovers"], 1.0)
+
+        custom = exe_launcher.shutdown_settings(
+            {"shutdown": {"idle_grace": 45, "kill_leftovers": False,
+                          "max_wait": "nonsense", "close_grace": -7}})
+        self.assertEqual(custom["idle_grace"], 45.0)
+        self.assertEqual(custom["kill_leftovers"], 0.0)
+        self.assertEqual(custom["max_wait"], 86400.0)
+        self.assertEqual(custom["close_grace"], 0.0)
+
+    def test_stop_switch_releases_the_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "App_Portable")
+            (root / "App").mkdir(parents=True)
+            (root / "launcher_config.json").write_text(
+                json.dumps({"shutdown": {"idle_grace": 9}}), encoding="utf-8")
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "release_portable_folder",
+                                      return_value=["helper.exe"]) as release, \
+                    mock.patch.object(exe_launcher, "_portable_process_list",
+                                      return_value=[]):
+                rc = exe_launcher.stop(root)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(release.call_args.args[1]["idle_grace"], 9.0)
+            log = (root / "PortableData" / "launcher-run.log").read_text(
+                encoding="utf-8")
+            self.assertIn("helper.exe", log)
+
+    def test_stop_reports_processes_it_could_not_release(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "App_Portable")
+            (root / "App").mkdir(parents=True)
+            shown = []
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "release_portable_folder",
+                                      return_value=["admin.exe"]), \
+                    mock.patch.object(exe_launcher, "_show_warning",
+                                      side_effect=shown.append), \
+                    mock.patch.object(exe_launcher, "_portable_process_list",
+                                      return_value=[(12, r"C:\\Games\\Portable\\App\\admin.exe")]):
+                rc = exe_launcher.stop(root)
+
+            self.assertEqual(rc, 1)
+            self.assertIn("admin.exe", shown[0])
 
 
 class RegistryVirtualizationTests(unittest.TestCase):
@@ -2759,6 +3044,587 @@ class RegistryVirtualizationTests(unittest.TestCase):
         self.assertEqual(len(roots), 2)
         self.assertIn(r"HKCU\Software\CD Projekt RED\The Witcher 2", roots)
         self.assertIn(r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\CD Projekt RED\The Witcher 2", roots)
+
+
+class FolderReleaseTests(unittest.TestCase):
+    """Готовая папка портатива обязана удаляться сразу после закрытия."""
+
+    ROOT = r"C:\Games\Type_Portable"
+
+    def test_is_inside_does_not_confuse_sibling_folders(self):
+        self.assertTrue(procutil.is_inside(
+            r"C:\Games\Type_Portable\App\game.exe", self.ROOT))
+        # Соседняя папка с похожим именем — чужая, её процессы не трогаем.
+        self.assertFalse(procutil.is_inside(
+            r"C:\Games\Type_Portable2\App\game.exe", self.ROOT))
+        self.assertFalse(procutil.is_inside(
+            r"C:\Windows\System32\notepad.exe", self.ROOT))
+        self.assertFalse(procutil.is_inside("", self.ROOT))
+
+    def test_processes_in_filters_the_system_snapshot(self):
+        snapshot = [
+            (1, r"C:\Windows\explorer.exe"),
+            (2, r"C:\Games\Type_Portable\App\updater.exe"),
+            (3, r"C:\Games\Type_Portable\App\bin\game.exe"),
+        ]
+        found = procutil.processes_in(self.ROOT, snapshot)
+        self.assertEqual([pid for pid, _ in found], [2, 3])
+
+    def test_release_folder_closes_then_kills(self):
+        posted, killed = [], []
+        with mock.patch.object(procutil, "IS_WINDOWS", True), \
+                mock.patch.object(
+                    procutil, "processes_in",
+                    return_value=[(2, r"C:\Games\Type_Portable\App\up.exe")]), \
+                mock.patch.object(procutil, "_post_close",
+                                  side_effect=lambda pids: posted.extend(pids)), \
+                mock.patch.object(procutil, "_terminate",
+                                  side_effect=lambda pids: killed.extend(pids)), \
+                mock.patch("time.sleep"):
+            stopped = procutil.release_folder(self.ROOT, close_grace=1.0,
+                                              kill_grace=1.0)
+
+        self.assertEqual(stopped, ["up.exe"])
+        self.assertEqual(posted, [2])
+        self.assertEqual(killed, [2])
+
+    def test_release_folder_is_a_no_op_outside_windows(self):
+        with mock.patch.object(procutil, "IS_WINDOWS", False):
+            self.assertEqual(procutil.release_folder(self.ROOT), [])
+
+    def test_config_carries_the_shutdown_policy(self):
+        cfg = launcher_mod.LauncherConfig(
+            app_name="Type", target_exe_rel="App/Type.exe")
+        data = json.loads(launcher_mod.render_config_json(cfg))["shutdown"]
+        self.assertEqual(data["idle_grace"], 20.0)
+        self.assertTrue(data["kill_leftovers"])
+        # Ровно эти значения читает готовый EXE-лончер.
+        settings = exe_launcher.shutdown_settings(
+            json.loads(launcher_mod.render_config_json(cfg)))
+        self.assertEqual(settings["idle_grace"], 20.0)
+
+    def test_bat_wait_routine_has_a_bounded_idle_grace(self):
+        cfg = launcher_mod.LauncherConfig(
+            app_name="Type", target_exe_rel="App/Type.exe",
+            shutdown_idle_grace=30.0)
+        bat = launcher_mod.render_bat(cfg)
+        self.assertIn('set "PORTABLE_IDLE_GRACE=30"', bat)
+        # Фоновые остатки закрываются, а не переживают лончер.
+        self.assertIn("CloseMainWindow", bat)
+        self.assertIn("$p.Kill()", bat)
+
+    def test_stop_script_is_ascii_and_prefers_the_exe_launcher(self):
+        cfg = launcher_mod.LauncherConfig(
+            app_name="Тип (кириллица)", target_exe_rel="App/Type.exe")
+        script = launcher_mod.render_stop_cmd(cfg)
+        self.assertTrue(script.isascii())
+        self.assertIn("LaunchPortable.exe\" --stop", script)
+        self.assertIn("CloseMainWindow", script)
+        self.assertIn("$p.Kill()", script)
+
+    def test_launcher_writes_the_stop_script_next_to_launch_bat(self):
+        engine = Portablizer(Logger())
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            (portable / "App").mkdir(parents=True)
+            created = engine._write_launcher(
+                str(portable), "Type", "App\\Type.exe",
+                PortableOptions(installer_path="setup.exe", output_dir=temp,
+                                build_exe_launcher=False),
+                [], None, [], None)
+
+            stop = portable / launcher_mod.STOP_SCRIPT_NAME
+            self.assertTrue(stop.is_file())
+            self.assertIn(launcher_mod.STOP_SCRIPT_NAME, created)
+            readme = (portable / "README_PORTABLE.txt").read_text(
+                encoding="utf-8-sig")
+            self.assertIn(launcher_mod.STOP_SCRIPT_NAME, readme)
+
+
+class FolderLockDiagnosticsTests(unittest.TestCase):
+    """Кто ещё может держать папку: чужая DLL, служба, открытый файл."""
+
+    ROOT = r"C:\Games\Type_Portable"
+
+    def test_module_holder_is_found_when_no_process_lives_in_the_folder(self):
+        """Программа закрыта, а её DLL подгрузил проводник — папка занята.
+
+        Сравнение путей процессов такой случай не ловит: из папки не
+        запущено ничего, но файл внутри открыт.
+        """
+        snapshot = [
+            (11, r"C:\Windows\explorer.exe"),
+            (12, r"C:\Windows\notepad.exe"),
+        ]
+        modules = {
+            11: [r"C:\Windows\explorer.exe",
+                 r"C:\Games\Type_Portable\App\shellext.dll"],
+            12: [r"C:\Windows\notepad.exe"],
+        }
+        with mock.patch.object(procutil, "modules_of",
+                               side_effect=lambda pid: modules[pid]):
+            found = procutil.holders(self.ROOT, snapshot)
+
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].kind, "module")
+        self.assertEqual(found[0].name, "explorer.exe")
+        self.assertEqual(procutil.image_name(found[0].detail), "shellext.dll")
+        # Проводник трогать нельзя — только назвать.
+        self.assertTrue(found[0].protected)
+
+    def test_process_from_the_folder_is_reported_without_a_module_scan(self):
+        snapshot = [(13, r"C:\Games\Type_Portable\App\game.exe")]
+        with mock.patch.object(procutil, "modules_of",
+                               side_effect=AssertionError("не нужен")):
+            found = procutil.holders(self.ROOT, snapshot, deep=False)
+        self.assertEqual([h.kind for h in found], ["exe"])
+        self.assertFalse(found[0].protected)
+
+    def test_folder_is_free_probe_renames_and_restores(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            (portable / "App").mkdir(parents=True)
+            (portable / "App" / "game.exe").write_bytes(b"MZ")
+
+            self.assertTrue(procutil.folder_is_free(str(portable)))
+            # Папка обязана остаться на месте и в целости.
+            self.assertTrue((portable / "App" / "game.exe").is_file())
+            self.assertEqual(
+                [p.name for p in Path(temp).iterdir()], ["Type_Portable"])
+
+    def test_folder_is_not_free_when_windows_refuses_to_rename(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            portable.mkdir()
+            with mock.patch("os.rename",
+                            side_effect=OSError(32, "used by another process")):
+                self.assertFalse(procutil.folder_is_free(str(portable)))
+            self.assertTrue(portable.is_dir())
+
+    def test_service_image_path_understands_every_spelling(self):
+        cases = {
+            r'"C:\P\App\guard.exe" -service': r"C:\P\App\guard.exe",
+            r"C:\P\App\guard.exe -k netsvcs": r"C:\P\App\guard.exe",
+            r"\??\C:\P\App\driver.sys": r"C:\P\App\driver.sys",
+            r"\SystemRoot\System32\drivers\http.sys": "",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(procutil.service_image_path(raw), expected, raw)
+
+    def test_release_folder_stops_services_before_killing_processes(self):
+        """Убивать процесс службы бесполезно: SCM поднимет его снова."""
+        order = []
+        with mock.patch.object(procutil, "IS_WINDOWS", True), \
+                mock.patch.object(procutil, "services_in",
+                                  return_value=["GameGuard"]), \
+                mock.patch.object(
+                    procutil, "stop_service",
+                    side_effect=lambda name, **_k: order.append(f"stop:{name}")), \
+                mock.patch.object(procutil, "processes_in",
+                                  return_value=[]):
+            stopped = procutil.release_folder(self.ROOT)
+
+        self.assertEqual(order, ["stop:GameGuard"])
+        self.assertEqual(stopped, ["служба GameGuard"])
+
+
+class BuildFolderVerdictTests(unittest.TestCase):
+    """Сборка обязана доказать, что папку можно удалить."""
+
+    def setUp(self):
+        self.engine = Portablizer(Logger())
+
+    def _result(self):
+        return PortableResult(success=True)
+
+    def test_free_folder_is_reported_as_such(self):
+        result = self._result()
+        with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                mock.patch.object(procutil, "folder_is_free",
+                                  return_value=True):
+            free = self.engine._verify_folder_is_free(r"C:\P", result)
+
+        self.assertTrue(free)
+        self.assertIn("можно удалить", self.engine.log.text)
+
+    def test_locked_folder_names_the_culprit(self):
+        result = self._result()
+        holders = [procutil.Holder(11, r"C:\Windows\explorer.exe", "module",
+                                   r"C:\P\App\shellext.dll")]
+        with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                mock.patch.object(procutil, "folder_is_free",
+                                  return_value=False), \
+                mock.patch.object(procutil, "holders", return_value=holders):
+            free = self.engine._verify_folder_is_free(r"C:\P", result)
+
+        self.assertFalse(free)
+        self.assertFalse(result.folder_is_free is False and not
+                         result.folder_holders)
+        self.assertIn("explorer.exe", " ".join(result.folder_holders))
+        self.assertIn("shellext.dll", " ".join(result.folder_holders))
+        # Системный процесс — подсказываем закрыть окна, а не убивать его.
+        self.assertIn("окно проводника", self.engine.log.text)
+
+    def test_service_from_the_portable_folder_is_unregistered(self):
+        result = self._result()
+        removed = []
+        with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                mock.patch("portablizer.core.portablizer.is_elevated",
+                           return_value=True), \
+                mock.patch.object(procutil, "services_in",
+                                  return_value=["GameGuard"]), \
+                mock.patch.object(
+                    procutil, "stop_service",
+                    side_effect=lambda name, **_k: removed.append(name)):
+            self.engine._remove_portable_services(
+                r"C:\P", PortableOptions(installer_path="s", output_dir="o"),
+                result)
+
+        self.assertEqual(removed, ["GameGuard"])
+        self.assertEqual(result.removed_services, ["GameGuard"])
+
+    def test_service_without_admin_rights_is_reported_not_ignored(self):
+        result = self._result()
+        with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                mock.patch("portablizer.core.portablizer.is_elevated",
+                           return_value=False), \
+                mock.patch.object(procutil, "services_in",
+                                  return_value=["GameGuard"]):
+            self.engine._remove_portable_services(
+                r"C:\P", PortableOptions(installer_path="s", output_dir="o"),
+                result)
+
+        self.assertTrue(result.cleanup_pending)
+        self.assertIn("GameGuard", self.engine.log.text)
+
+
+class LauncherFolderVerdictTests(unittest.TestCase):
+    """Лончер пишет в журнал, свободна ли папка, и называет виновника."""
+
+    def test_describe_holders_is_human_readable(self):
+        text = exe_launcher.describe_holders([
+            (11, r"C:\Windows\explorer.exe", r"C:\P\App\ext.dll")])
+        self.assertEqual(text, "explorer.exe (держит ext.dll)")
+
+    def test_verdict_names_the_outside_program_holding_a_dll(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            (root / "App").mkdir(parents=True)
+            with mock.patch.object(exe_launcher, "_portable_process_list",
+                                   return_value=[]), \
+                    mock.patch.object(
+                        exe_launcher, "module_holders",
+                        return_value=[(11, r"C:\Windows\explorer.exe",
+                                       r"C:\P\App\ext.dll")]):
+                exe_launcher._report_folder_state(root, {"deep_check": 1.0})
+
+            log = (root / "PortableData" / "launcher-run.log").read_text(
+                encoding="utf-8")
+            self.assertIn("explorer.exe", log)
+            self.assertIn("still held", log)
+
+    def test_verdict_confirms_a_released_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            (root / "App").mkdir(parents=True)
+            with mock.patch.object(exe_launcher, "_portable_process_list",
+                                   return_value=[]), \
+                    mock.patch.object(exe_launcher, "module_holders",
+                                      return_value=[]):
+                exe_launcher._report_folder_state(root, {"deep_check": 1.0})
+
+            log = (root / "PortableData" / "launcher-run.log").read_text(
+                encoding="utf-8")
+            self.assertIn("portable folder released", log)
+
+    def test_deep_check_can_be_switched_off_in_the_config(self):
+        settings = exe_launcher.shutdown_settings(
+            {"shutdown": {"deep_check": False}})
+        self.assertEqual(settings["deep_check"], 0.0)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            (root / "App").mkdir(parents=True)
+            with mock.patch.object(exe_launcher, "_portable_process_list",
+                                   return_value=[]), \
+                    mock.patch.object(exe_launcher, "module_holders",
+                                      side_effect=AssertionError("не нужен")):
+                exe_launcher._report_folder_state(root, settings)
+
+
+class HandsOffGuiTests(unittest.TestCase):
+    """Меньше кликов: перетаскивание, память о папке, автооткрытие."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "portablizer", "gui", "main_window.py")
+        with open(path, encoding="utf-8") as handle:
+            cls.source = handle.read()
+
+    def test_installer_can_be_dropped_onto_the_window(self):
+        self.assertIn("self.setAcceptDrops(True)", self.source)
+        self.assertIn("def dragEnterEvent", self.source)
+        self.assertIn("def dropEvent", self.source)
+
+    def test_output_folder_is_remembered_between_runs(self):
+        self.assertIn("QSettings", self.source)
+        self.assertIn('self.settings.setValue("output_dir"', self.source)
+        self.assertIn('self.settings.value("output_dir"', self.source)
+
+    def test_result_folder_opens_by_itself(self):
+        self.assertIn("self.cb_autoopen = QCheckBox(", self.source)
+        self.assertIn("self.cb_autoopen.setChecked(True)", self.source)
+        self.assertIn("if self.cb_autoopen.isChecked():", self.source)
+
+    def test_dropped_installer_accepts_only_installers(self):
+        tree = ast.parse(self.source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and \
+                    node.name == "_dropped_installer":
+                node.decorator_list = []
+                module = ast.Module(body=[node], type_ignores=[])
+                namespace = {"os": os}
+                exec(compile(module, "<gui>", "exec"), namespace)  # noqa: S102
+                picker = namespace["_dropped_installer"]
+                break
+        else:  # pragma: no cover
+            self.fail("_dropped_installer не найден")
+
+        class FakeUrl:
+            def __init__(self, path):
+                self._path = path
+
+            def toLocalFile(self):
+                return self._path
+
+        with tempfile.TemporaryDirectory() as temp:
+            text = Path(temp, "readme.txt")
+            text.write_text("x", encoding="ascii")
+            setup = Path(temp, "Setup.exe")
+            setup.write_bytes(b"MZ")
+            self.assertEqual(
+                picker([FakeUrl(str(text)), FakeUrl(str(setup))]), str(setup))
+            self.assertEqual(picker([FakeUrl(str(text))]), "")
+
+
+class ExistingPortableMaintenanceTests(unittest.TestCase):
+    """Портатив, собранный ПРЕЖНЕЙ версией, лечится без пересборки.
+
+    Исправления живут внутри каждой готовой папки: там своя копия
+    LaunchPortable.exe и свой Launch.bat. Обновление самого Portablizer
+    ничего не меняет в уже созданных портативах — их нужно либо пересобрать,
+    либо обновить на месте.
+    """
+
+    def _old_portable(self, temp, app_name="Old Game"):
+        root = Path(temp, "Old_Portable")
+        (root / "App").mkdir(parents=True)
+        (root / "App" / "game.exe").write_bytes(b"MZ")
+        cfg = launcher_mod.LauncherConfig(
+            app_name=app_name, target_exe_rel="App/game.exe",
+            extra_env={"GAME_HOME": "%PORTABLE_ROOT%/App"},
+            path_prepend=["App"],
+            targets=[launcher_mod.TargetInfo(name="game",
+                                             rel_path="App/game.exe")],
+            launcher_aliases={"Launch_Config.exe": "App/cfg.exe"},
+        )
+        data = json.loads(launcher_mod.render_config_json(cfg))
+        # Так выглядел конфиг до появления политики завершения сеанса.
+        data.pop("shutdown")
+        (root / "launcher_config.json").write_text(
+            json.dumps(data), encoding="utf-8")
+        (root / "Launch.bat").write_text("@echo off\nrem old", encoding="ascii")
+        return root
+
+    def test_refresh_reissues_launchers_and_adds_the_shutdown_policy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._old_portable(temp)
+            copied = []
+
+            report = maintenance.refresh(
+                str(root), Logger(),
+                copy_exe=lambda folder, rel: copied.append(rel) or rel)
+
+            self.assertTrue(report.success)
+            config = json.loads((root / "launcher_config.json").read_text(
+                encoding="utf-8-sig"))
+            # Главное: новый лончер знает, когда отпускать папку.
+            self.assertEqual(config["shutdown"]["idle_grace"], 20.0)
+            self.assertTrue(config["shutdown"]["kill_leftovers"])
+            # И появился аварийный «отпускатель».
+            self.assertTrue((root / launcher_mod.STOP_SCRIPT_NAME).is_file())
+            bat = (root / "Launch.bat").read_text(encoding="ascii")
+            self.assertIn("PORTABLE_IDLE_GRACE", bat)
+            self.assertIn("CloseMainWindow", bat)
+            # EXE-лончер и его именованные копии перевыпущены.
+            self.assertIn(os.path.join("App", "LaunchPortable.exe"), copied)
+            self.assertIn("Launch_Config.exe", copied)
+
+    def test_refresh_keeps_every_setting_of_the_portable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._old_portable(temp, app_name="Игра")
+            maintenance.refresh(str(root), Logger(),
+                                copy_exe=lambda folder, rel: rel)
+
+            config = json.loads((root / "launcher_config.json").read_text(
+                encoding="utf-8-sig"))
+            self.assertEqual(config["app_name"], "Игра")
+            self.assertEqual(config["target_exe_rel"], "App/game.exe")
+            self.assertEqual(config["extra_env"],
+                             {"GAME_HOME": "%PORTABLE_ROOT%/App"})
+            self.assertEqual(config["path_prepend"], ["App"])
+            self.assertEqual(config["launcher_aliases"],
+                             {"Launch_Config.exe": "App/cfg.exe"})
+            self.assertEqual(len(config["targets"]), 1)
+
+    def test_refresh_stops_the_old_launcher_before_overwriting_it(self):
+        """Работающий старый лончер нельзя перезаписать — сначала закрыть."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._old_portable(temp)
+            order = []
+            with mock.patch.object(
+                    procutil, "release_folder",
+                    side_effect=lambda folder, **_k:
+                    order.append("release") or ["LaunchPortable.exe"]):
+                report = maintenance.refresh(
+                    str(root), Logger(), copy_exe=lambda folder, rel: rel)
+
+            self.assertEqual(order, ["release"])
+            self.assertEqual(report.stopped, ["LaunchPortable.exe"])
+
+    def test_refresh_refuses_a_folder_that_is_not_a_portable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report = maintenance.refresh(temp, Logger())
+            self.assertFalse(report.success)
+            self.assertIn("launcher_config.json", " ".join(report.messages))
+
+    def test_release_reports_a_free_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._old_portable(temp)
+            with mock.patch.object(procutil, "release_folder",
+                                   return_value=["updater.exe"]):
+                report = maintenance.release(str(root), Logger())
+
+            self.assertTrue(report.success)
+            self.assertEqual(report.stopped, ["updater.exe"])
+            self.assertIn("можно удалить", " ".join(report.messages))
+
+    def test_release_names_the_program_holding_the_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._old_portable(temp)
+            holders = [procutil.Holder(11, r"C:\Windows\explorer.exe",
+                                       "module", r"C:\P\App\ext.dll")]
+            with mock.patch.object(procutil, "release_folder",
+                                   return_value=[]), \
+                    mock.patch.object(procutil, "folder_is_free",
+                                      return_value=False), \
+                    mock.patch.object(procutil, "holders",
+                                      return_value=holders):
+                report = maintenance.release(str(root), Logger())
+
+            self.assertFalse(report.success)
+            self.assertIn("explorer.exe (держит ext.dll)", report.holders)
+            self.assertIn("Закройте окна", " ".join(report.messages))
+
+    def test_release_works_on_any_folder_not_only_portables(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plain = Path(temp, "just a folder")
+            plain.mkdir()
+            with mock.patch.object(procutil, "release_folder",
+                                   return_value=[]):
+                report = maintenance.release(str(plain), Logger())
+            self.assertTrue(report.success)
+
+    def test_config_round_trip_survives_a_config_without_shutdown(self):
+        cfg = launcher_mod.LauncherConfig(
+            app_name="A", target_exe_rel="App/a.exe",
+            apply_registry=True, registry_keys=[r"HKCU\Software\A"])
+        data = json.loads(launcher_mod.render_config_json(cfg))
+        data.pop("shutdown")
+        restored = launcher_mod.config_from_dict(data)
+
+        self.assertEqual(restored.app_name, "A")
+        self.assertTrue(restored.apply_registry)
+        self.assertEqual(restored.registry_keys, [r"HKCU\Software\A"])
+        # Значения по умолчанию подставляются, а не теряются.
+        self.assertEqual(restored.shutdown_idle_grace, 20.0)
+        self.assertTrue(restored.shutdown_kill_leftovers)
+
+
+class MaintenanceGuiTests(unittest.TestCase):
+    """Обслуживание доступно из окна, а не только из кода."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "portablizer", "gui", "main_window.py"),
+                  encoding="utf-8") as handle:
+            cls.window = handle.read()
+        with open(os.path.join(root, "portablizer", "gui", "worker.py"),
+                  encoding="utf-8") as handle:
+            cls.worker = handle.read()
+
+    def test_window_has_release_and_refresh_buttons(self):
+        self.assertIn("self.release_btn = QPushButton(", self.window)
+        self.assertIn("self.refresh_btn = QPushButton(", self.window)
+        self.assertIn('self._maintenance("release")', self.window)
+        self.assertIn('self._maintenance("refresh")', self.window)
+
+    def test_maintenance_runs_in_a_background_thread(self):
+        self.assertIn("class MaintenanceWorker(QThread):", self.worker)
+        self.assertIn("maintenance.release", self.worker)
+        self.assertIn("maintenance.refresh", self.worker)
+
+    def test_built_folder_is_offered_for_maintenance(self):
+        self.assertIn("self.maintenance_edit.setText(result.portable_dir)",
+                      self.window)
+
+
+class ElevationTests(unittest.TestCase):
+    """Права администратора запрашиваются сами, один раз, при запуске."""
+
+    def test_relaunch_command_for_the_frozen_exe(self):
+        program, args = elevate_mod.relaunch_arguments(
+            ["C:\\setup.exe"], frozen=True, executable="C:\\Portablizer.exe")
+        self.assertEqual(program, "C:\\Portablizer.exe")
+        self.assertEqual(args, ["C:\\setup.exe", elevate_mod.NO_ELEVATE_FLAG])
+
+    def test_relaunch_command_from_sources_keeps_the_script(self):
+        program, args = elevate_mod.relaunch_arguments(
+            [], frozen=False, executable="python.exe", script="app.py")
+        self.assertEqual(program, "python.exe")
+        self.assertEqual(args, ["app.py", elevate_mod.NO_ELEVATE_FLAG])
+
+    def test_second_copy_never_tries_to_elevate_again(self):
+        """Предохранитель от бесконечного круга перезапусков."""
+        self.assertTrue(elevate_mod.elevation_disabled(
+            [elevate_mod.NO_ELEVATE_FLAG], {}))
+        self.assertTrue(elevate_mod.elevation_disabled(
+            [], {elevate_mod.NO_ELEVATE_ENV: "1"}))
+        self.assertFalse(elevate_mod.elevation_disabled([], {}))
+
+    def test_refused_uac_lets_the_build_continue_unelevated(self):
+        with mock.patch.object(elevate_mod, "IS_WINDOWS", True), \
+                mock.patch.object(elevate_mod, "is_elevated",
+                                  return_value=False), \
+                mock.patch.object(elevate_mod, "_shell_execute_runas",
+                                  return_value=5):  # SE_ERR_ACCESSDENIED
+            self.assertFalse(elevate_mod.ensure_elevated([]))
+
+    def test_successful_elevation_asks_this_copy_to_exit(self):
+        with mock.patch.object(elevate_mod, "IS_WINDOWS", True), \
+                mock.patch.object(elevate_mod, "is_elevated",
+                                  return_value=False), \
+                mock.patch.object(elevate_mod, "_shell_execute_runas",
+                                  return_value=42):
+            self.assertTrue(elevate_mod.ensure_elevated([]))
+
+    def test_already_elevated_process_does_not_restart_itself(self):
+        with mock.patch.object(elevate_mod, "IS_WINDOWS", True), \
+                mock.patch.object(elevate_mod, "is_elevated",
+                                  return_value=True):
+            self.assertFalse(elevate_mod.ensure_elevated([]))
 
 
 if __name__ == "__main__":

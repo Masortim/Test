@@ -1038,10 +1038,21 @@ def _counts_as_portable_process(image: str, prefix: str, own_image) -> bool:
     return image not in [item for item in own if item]
 
 
-def _portable_processes(root: Path) -> int:
-    """Count running processes whose executable lives inside the portable folder."""
+def _image_name(image: str) -> str:
+    """File name of a process image, whatever separator Windows reported."""
+    return str(image).replace("/", "\\").rsplit("\\", 1)[-1]
+
+
+def _portable_process_list(root: Path) -> "list[tuple[int, str]]":
+    """``(pid, image)`` of every running process started from the folder.
+
+    This is the raw material for two jobs: deciding how long the sandbox has
+    to stay alive, and making sure nothing is left holding the folder when the
+    launcher goes away.  Our own image is skipped (see
+    :func:`_counts_as_portable_process`).
+    """
     if not IS_WINDOWS:
-        return 0
+        return []
     try:
         import ctypes
         from ctypes import wintypes
@@ -1066,11 +1077,11 @@ def _portable_processes(root: Path) -> int:
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if snapshot in (0, -1, None):
-            return 0
+            return []
         prefix = str(root).rstrip("\\").casefold() + "\\"
         own = os.getpid()
         own_image = _own_executable_images()
-        found = 0
+        found: list[tuple[int, str]] = []
         try:
             entry = PROCESSENTRY32W()
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
@@ -1088,7 +1099,7 @@ def _portable_processes(root: Path) -> int:
                                     handle, 0, buffer, ctypes.byref(size)):
                                 if _counts_as_portable_process(
                                         buffer.value, prefix, own_image):
-                                    found += 1
+                                    found.append((pid, buffer.value))
                         finally:
                             kernel32.CloseHandle(handle)
                 more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
@@ -1096,12 +1107,304 @@ def _portable_processes(root: Path) -> int:
             kernel32.CloseHandle(snapshot)
         return found
     except Exception:
+        return []
+
+
+def _portable_processes(root: Path) -> int:
+    """Count running processes whose executable lives inside the folder."""
+    return len(_portable_process_list(root))
+
+
+def _visible_window_pids() -> "set[int]":
+    """PIDs that own at least one visible top-level window.
+
+    A program the user is actually looking at must never be killed, no matter
+    how long it runs.  A process without any window, on the other hand, is
+    either a crash handler, an updater or a leftover service - exactly the
+    kind of thing that keeps the portable folder undeletable.
+    """
+    if not IS_WINDOWS:
+        return set()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        pids: set[int] = set()
+        callback_type = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def collect(hwnd, _lparam):  # pragma: no cover - needs a desktop
+            if user32.IsWindowVisible(hwnd):
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value:
+                    pids.add(int(pid.value))
+            return True
+
+        user32.EnumWindows(callback_type(collect), 0)
+        return pids
+    except Exception:
+        return set()
+
+
+def _post_close_to_windows(pids: "Iterable[int]") -> int:
+    """Ask every window of these processes to close politely (WM_CLOSE)."""
+    if not IS_WINDOWS:
+        return 0
+    wanted = {int(pid) for pid in pids}
+    if not wanted:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        WM_CLOSE = 0x0010
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        sent = 0
+        callback_type = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def collect(hwnd, _lparam):  # pragma: no cover - needs a desktop
+            nonlocal sent
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if int(pid.value) in wanted:
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                sent += 1
+            return True
+
+        user32.EnumWindows(callback_type(collect), 0)
+        return sent
+    except Exception:
         return 0
 
 
+def _terminate_pids(pids: "Iterable[int]") -> "list[int]":
+    """Hard-kill the given processes; return the PIDs that really went away."""
+    if not IS_WINDOWS:
+        return []
+    killed: list[int] = []
+    try:
+        import ctypes
+
+        PROCESS_TERMINATE = 0x0001
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        for pid in {int(p) for p in pids}:
+            handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if not handle:
+                continue
+            try:
+                if kernel32.TerminateProcess(handle, 0):
+                    killed.append(pid)
+            finally:
+                kernel32.CloseHandle(handle)
+    except Exception:
+        return killed
+    return killed
+
+
+#: Процессы Windows, которые нельзя закрывать: снятие любого из них портит
+#: сеанс пользователя. Если такой процесс держит файл из портатива (обычно
+#: подгруженная DLL - расширение оболочки, хук, антивирусный сканер), его
+#: можно только НАЗВАТЬ в журнале.
+PROTECTED_IMAGES = frozenset({
+    "explorer.exe", "csrss.exe", "winlogon.exe", "wininit.exe", "services.exe",
+    "lsass.exe", "smss.exe", "svchost.exe", "dwm.exe", "taskhostw.exe",
+    "searchindexer.exe", "searchprotocolhost.exe", "searchfilterhost.exe",
+    "sihost.exe", "fontdrvhost.exe", "runtimebroker.exe", "ctfmon.exe",
+    "msmpeng.exe", "mssense.exe", "securityhealthservice.exe",
+    "system", "registry", "memory compression", "idle",
+})
+
+
+def _modules_of(pid: int) -> "list[str]":
+    """Пути DLL, загруженных процессом ``pid``."""
+    if not IS_WINDOWS:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPMODULE = 0x00000008
+        TH32CS_SNAPMODULE32 = 0x00000010
+
+        class MODULEENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("th32ModuleID", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("GlblcntUsage", wintypes.DWORD),
+                ("ProccntUsage", wintypes.DWORD),
+                ("modBaseAddr", ctypes.POINTER(ctypes.c_byte)),
+                ("modBaseSize", wintypes.DWORD),
+                ("hModule", wintypes.HMODULE),
+                ("szModule", ctypes.c_wchar * 256),
+                ("szExePath", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        snap = kernel32.CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, int(pid))
+        if snap in (0, -1, None):
+            return []
+        modules: list[str] = []
+        try:
+            entry = MODULEENTRY32W()
+            entry.dwSize = ctypes.sizeof(MODULEENTRY32W)
+            more = kernel32.Module32FirstW(snap, ctypes.byref(entry))
+            while more and len(modules) < 4096:
+                modules.append(entry.szExePath)
+                more = kernel32.Module32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+        return modules
+    except Exception:
+        return []
+
+
+def _all_processes() -> "list[tuple[int, str]]":
+    """Все процессы системы: ``(pid, путь к exe)``."""
+    if not IS_WINDOWS:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap in (0, -1, None):
+            return []
+        own = os.getpid()
+        found: list[tuple[int, str]] = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            more = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while more:
+                pid = int(entry.th32ProcessID)
+                if pid not in (0, 4, own):
+                    handle = kernel32.OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                    image = entry.szExeFile
+                    if handle:
+                        try:
+                            size = wintypes.DWORD(32768)
+                            buffer = ctypes.create_unicode_buffer(size.value)
+                            if kernel32.QueryFullProcessImageNameW(
+                                    handle, 0, buffer, ctypes.byref(size)):
+                                image = buffer.value
+                        finally:
+                            kernel32.CloseHandle(handle)
+                    found.append((pid, image))
+                more = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+        return found
+    except Exception:
+        return []
+
+
+def module_holders(root: Path, budget: float = 4.0
+                   ) -> "list[tuple[int, str, str]]":
+    """Чужие процессы, подгрузившие DLL из портативной папки.
+
+    Случай, который не ловится сравнением путей самих процессов: программа
+    закрыта, её процессов нет, но DLL из папки держит кто-то снаружи -
+    проводник (расширение контекстного меню), антивирус, хук ввода. Папка
+    при этом не удаляется, а пользователю не за что зацепиться.
+
+    Возвращает ``(pid, образ процесса, удерживаемый файл)``.
+    """
+    if not IS_WINDOWS:
+        return []
+    import time
+
+    prefix = str(root).rstrip("\\").casefold() + "\\"
+    own_images = {image.casefold() for image in _own_executable_images()}
+    result: list[tuple[int, str, str]] = []
+    # Перебор модулей всех процессов системы стоит заметного времени, а
+    # выполняется на выходе, когда пользователь уже закрыл программу.
+    # Ограничиваем бюджет: лучше неполный отчёт, чем задержка закрытия.
+    deadline = time.monotonic() + budget
+    for pid, image in _all_processes():
+        if time.monotonic() > deadline:
+            break
+        if image.casefold() in own_images or image.casefold().startswith(prefix):
+            continue
+        for module in _modules_of(pid):
+            if module.casefold().startswith(prefix):
+                result.append((pid, image, module))
+                break
+    return result
+
+
+def describe_holders(holders: "Sequence[tuple[int, str, str]]") -> str:
+    """Человеческое описание того, кто держит папку."""
+    parts = []
+    for _pid, image, module in holders:
+        parts.append(f"{_image_name(image)} (держит {_image_name(module)})")
+    return ", ".join(sorted(set(parts)))
+
+
+def shutdown_settings(cfg: Dict[str, Any]) -> Dict[str, float]:
+    """Timings of the shutdown sequence, with sane clamps.
+
+    Everything is configurable from ``launcher_config.json`` ("shutdown"
+    section) but never unbounded: the whole point of the section is that the
+    launcher must not outlive the program it started.
+    """
+    raw = cfg.get("shutdown") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def number(name: str, default: float, low: float, high: float) -> float:
+        try:
+            value = float(raw.get(name, default))
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(high, value))
+
+    kill = raw.get("kill_leftovers", True)
+    return {
+        # How long to wait for an official launcher to spawn the real program.
+        "spawn_grace": number("spawn_grace", 6.0, 0.0, 120.0),
+        # How long a windowless process from the folder may keep the session
+        # alive before it is treated as a leftover.
+        "idle_grace": number("idle_grace", 20.0, 1.0, 3600.0),
+        # Politeness window after WM_CLOSE, before TerminateProcess.
+        "close_grace": number("close_grace", 5.0, 0.0, 120.0),
+        # Absolute ceiling for a single portable session.
+        "max_wait": number("max_wait", 86400.0, 10.0, 604800.0),
+        "kill_leftovers": 1.0 if kill or kill is None else 0.0,
+        # Искать ли чужие процессы, подгрузившие DLL из папки. Стоит времени
+        # на выходе, зато называет виновника, когда папка всё же занята.
+        "deep_check": 0.0 if raw.get("deep_check") is False else 1.0,
+    }
+
+
 def _wait_for_portable_processes(root: Path, grace: float = 6.0,
-                                 limit: float = 86400.0) -> int:
-    """Wait until nothing inside the portable folder is running any more.
+                                 limit: float = 86400.0,
+                                 settings: Optional[Dict[str, float]] = None
+                                 ) -> int:
+    """Wait while the portable program is really being used.
 
     Official game launchers (The Witcher's ``Launcher.exe``, GOG splash
     screens, Configurator windows) start the real executable and exit
@@ -1109,23 +1412,298 @@ def _wait_for_portable_processes(root: Path, grace: float = 6.0,
     redirected environment at that moment, the game that had just been spawned
     lost its install keys and died silently.  So after the direct child exits we
     keep the sandbox alive while any process started from this folder lives.
+
+    The wait is no longer unconditional, though.  Anything that still runs
+    from the folder *without a single visible window* - crash handlers,
+    updaters, "helper" services, telemetry daemons - used to keep this
+    launcher alive for up to 24 hours, and the launcher EXE itself sits inside
+    ``App``: the user closed the program but could not delete the folder.
+    Such windowless stragglers now only get ``idle_grace`` seconds, after
+    which the caller shuts them down.
     """
     if not IS_WINDOWS:
         return 0
     import time
 
-    deadline = time.monotonic() + limit
+    cfg = settings or {}
+    spawn_grace = float(cfg.get("spawn_grace", grace))
+    idle_grace = float(cfg.get("idle_grace", 20.0))
+    deadline = time.monotonic() + float(cfg.get("max_wait", limit))
     waited = 0
     # Give the launcher a moment to spawn the real program.
-    spawn_deadline = time.monotonic() + grace
+    spawn_deadline = time.monotonic() + spawn_grace
     while time.monotonic() < spawn_deadline:
         if _portable_processes(root):
             break
         time.sleep(0.5)
-    while _portable_processes(root) and time.monotonic() < deadline:
+
+    idle_since: Optional[float] = None
+    while True:
+        running = _portable_process_list(root)
+        if not running:
+            return waited
+        now = time.monotonic()
+        if now >= deadline:
+            return waited
+        visible = _visible_window_pids()
+        if any(pid in visible for pid, _ in running):
+            idle_since = None
+        elif idle_since is None:
+            idle_since = now
+        elif now - idle_since >= idle_grace:
+            # Nothing on screen for a while: the user is done, whatever is
+            # left is background noise the caller will clean up.
+            return waited
         waited += 1
         time.sleep(1.0)
-    return waited
+
+
+def release_portable_folder(root: Path,
+                            settings: Optional[Dict[str, float]] = None
+                            ) -> "list[str]":
+    """Make sure nothing from the portable folder is running any more.
+
+    Returns the names of the processes that had to be stopped, so the caller
+    can write them into the run log.  Politeness first: every window gets a
+    ``WM_CLOSE`` and ``close_grace`` seconds to save its state; only then the
+    survivors are terminated.  Without this step the folder stays locked by
+    the very files the user is trying to delete.
+    """
+    if not IS_WINDOWS:
+        return []
+    import time
+
+    cfg = settings or {}
+    close_grace = float(cfg.get("close_grace", 5.0))
+    kill = bool(cfg.get("kill_leftovers", 1.0))
+    running = _portable_process_list(root)
+    if not running:
+        return []
+    stopped = [_image_name(image) for _, image in running]
+
+    _post_close_to_windows(pid for pid, _ in running)
+    deadline = time.monotonic() + close_grace
+    while time.monotonic() < deadline:
+        running = _portable_process_list(root)
+        if not running:
+            return stopped
+        time.sleep(0.25)
+
+    running = _portable_process_list(root)
+    if running and kill:
+        _terminate_pids(pid for pid, _ in running)
+        # Windows tears a process down asynchronously; give the handles a
+        # moment to close so the folder is really deletable afterwards.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and _portable_process_list(root):
+            time.sleep(0.25)
+    return stopped
+
+
+def _report_folder_state(root: Path,
+                         settings: Optional[Dict[str, float]] = None) -> None:
+    """Записывает в журнал честный вердикт: свободна ли папка.
+
+    Пользователь хочет удалить папку. Если это почему-то всё ещё нельзя,
+    он должен прочитать в журнале ИМЯ виновника, а не гадать.
+    """
+    remaining = _portable_process_list(root)
+    if remaining:
+        _run_log(root, "WARNING: still running from the portable folder: "
+                 + ", ".join(sorted({_image_name(i) for _, i in remaining})))
+        return
+    deep = True
+    if settings is not None:
+        deep = bool(settings.get("deep_check", 1.0))
+    holders = module_holders(root) if deep else []
+    if holders:
+        _run_log(root, "WARNING: the folder is still held by other programs: "
+                 + describe_holders(holders)
+                 + ". Close them (a file manager preview or an antivirus "
+                   "scan is the usual reason) and the folder can be deleted.")
+        return
+    _run_log(root, "portable folder released: no processes left")
+
+
+class _JobObject:
+    """Kill-on-close job: the safety net under the whole shutdown sequence.
+
+    Every process the portable program spawns - and every process *those*
+    spawn - is put into this job.  Whatever happens afterwards (the launcher
+    crashes, the user kills it from the Task Manager, a helper ignores
+    ``WM_CLOSE``), Windows destroys the job together with its last handle and
+    the folder is free again.  Nothing from the portable folder can outlive
+    the launcher any more.
+    """
+
+    def __init__(self) -> None:
+        self.handle = None
+        if not IS_WINDOWS:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            JobObjectExtendedLimitInformation = 9
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                            ("WriteOperationCount", ctypes.c_ulonglong),
+                            ("OtherOperationCount", ctypes.c_ulonglong),
+                            ("ReadTransferCount", ctypes.c_ulonglong),
+                            ("WriteTransferCount", ctypes.c_ulonglong),
+                            ("OtherTransferCount", ctypes.c_ulonglong)]
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
+                            ("PerJobUserTimeLimit", ctypes.c_longlong),
+                            ("LimitFlags", wintypes.DWORD),
+                            ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t),
+                            ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+                            ("PriorityClass", wintypes.DWORD),
+                            ("SchedulingClass", wintypes.DWORD)]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation",
+                             JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                            ("IoInfo", IO_COUNTERS),
+                            ("ProcessMemoryLimit", ctypes.c_size_t),
+                            ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                            ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel32.CreateJobObjectW(None, None)
+            if not handle:
+                return
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = \
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not kernel32.SetInformationJobObject(
+                    handle, JobObjectExtendedLimitInformation,
+                    ctypes.byref(info), ctypes.sizeof(info)):
+                kernel32.CloseHandle(handle)
+                return
+            self.handle = handle
+        except Exception:
+            self.handle = None
+
+    def assign(self, process_handle: int) -> bool:
+        if not self.handle or not process_handle:
+            return False
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            return bool(kernel32.AssignProcessToJobObject(
+                self.handle, int(process_handle)))
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        if not self.handle:
+            return
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.CloseHandle(  # type: ignore[attr-defined]
+                self.handle)
+        except Exception:
+            pass
+        finally:
+            self.handle = None
+
+
+def _resume_process_threads(pid: int) -> int:
+    """Resume every thread of a process created with ``CREATE_SUSPENDED``."""
+    if not IS_WINDOWS:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPTHREAD = 0x00000004
+        THREAD_SUSPEND_RESUME = 0x0002
+
+        class THREADENTRY32(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD),
+                        ("cntUsage", wintypes.DWORD),
+                        ("th32ThreadID", wintypes.DWORD),
+                        ("th32OwnerProcessID", wintypes.DWORD),
+                        ("tpBasePri", ctypes.c_long),
+                        ("tpDeltaPri", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD)]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+        if snapshot in (0, -1, None):
+            return 0
+        resumed = 0
+        try:
+            entry = THREADENTRY32()
+            entry.dwSize = ctypes.sizeof(THREADENTRY32)
+            more = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+            while more:
+                if int(entry.th32OwnerProcessID) == int(pid):
+                    thread = kernel32.OpenThread(
+                        THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                    if thread:
+                        try:
+                            if kernel32.ResumeThread(thread) != -1:
+                                resumed += 1
+                        finally:
+                            kernel32.CloseHandle(thread)
+                more = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return resumed
+    except Exception:
+        return 0
+
+
+def _spawn_target(command: Sequence[str], cwd: str, env: Dict[str, str],
+                  job: Optional["_JobObject"] = None) -> subprocess.Popen:
+    """Start the program already captured by the kill-on-close job.
+
+    The child is created suspended, put into the job and only then resumed:
+    that way even the very first process it spawns is inside the job, and no
+    descendant can escape the cleanup.  Every step degrades gracefully - if
+    the job cannot be created (very old Windows, an outer job that forbids
+    nesting), the program still starts, just without the safety net.
+    """
+    creationflags = 0
+    suspended = False
+    if IS_WINDOWS and job is not None and job.handle:
+        CREATE_SUSPENDED = 0x00000004
+        creationflags = CREATE_SUSPENDED
+        suspended = True
+    try:
+        process = subprocess.Popen(  # noqa: S603
+            list(command), cwd=cwd, env=env, creationflags=creationflags)
+    except Exception:
+        if not suspended:
+            raise
+        # Suspended start refused: fall back to an ordinary launch.
+        return subprocess.Popen(list(command), cwd=cwd, env=env)  # noqa: S603
+    if suspended and job is not None:
+        job.assign(int(process._handle))  # type: ignore[attr-defined]
+        if not _resume_process_threads(process.pid):
+            # Резюмировать не удалось - программа так и осталась бы висеть
+            # замороженной, а пользователь смотрел бы в пустой экран.
+            # Убираем неудачную попытку и стартуем обычным способом.
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+            return subprocess.Popen(  # noqa: S603
+                list(command), cwd=cwd, env=env)
+    elif job is not None:
+        job.assign(int(getattr(process, "_handle", 0) or 0))
+    return process
 
 
 def _is_elevated() -> bool:
@@ -1257,6 +1835,10 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
 
     shell_folders = ShellFolderSession(root, cfg)
     registry = RegistrySession(root, cfg)
+    shutdown = shutdown_settings(cfg)
+    # Kill-on-close job: nothing started from the portable folder may outlive
+    # this launcher, otherwise the user cannot delete the folder afterwards.
+    job = _JobObject()
     shell_folders.load()
     try:
         registry.load()
@@ -1267,14 +1849,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 *forwarded,
             ]
             _run_log(root, "start: " + subprocess.list2cmdline(command)
-                     + f" (cwd={target.parent}, elevated={_is_elevated()})")
+                     + f" (cwd={target.parent}, elevated={_is_elevated()}, "
+                     + f"job={'yes' if job.handle else 'no'})")
             try:
-                code = subprocess.run(
-                    command,
-                    cwd=str(target.parent),
-                    env=env,
-                    check=False,
-                ).returncode
+                code = _spawn_target(
+                    command, str(target.parent), env, job).wait()
             except OSError as exc:
                 if getattr(exc, "winerror", None) != 14001:
                     raise
@@ -1302,21 +1881,89 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             # The official launcher usually starts the game and exits at once.
             # Restoring the registry right now would pull the install keys out
             # from under the game that is just starting, so wait for it.
-            waited = _wait_for_portable_processes(root)
+            waited = _wait_for_portable_processes(root, settings=shutdown)
             if waited:
                 _run_log(root, f"waited {waited}s for programs started from "
                                f"the portable folder to finish")
+            # Whatever still runs from this folder is a leftover (updater,
+            # crash handler, silent helper).  It is closed down HERE, while
+            # the sandbox is still in place: a helper saving its settings on
+            # exit writes them into the portable folder, not into the host
+            # registry it would see a moment later.
+            stopped = release_portable_folder(root, shutdown)
+            if stopped:
+                _run_log(root, "stopped leftover processes from the portable "
+                               "folder: " + ", ".join(sorted(set(stopped))))
             return code
         finally:
             registry.save_and_restore()
     finally:
         shell_folders.restore()
+        # Safety net for every path that skipped the block above (an error,
+        # a program that spawned something during shutdown): sweep again and
+        # drop the job handle - Windows finishes off anything that ignored
+        # us.  Only after this the folder can really be deleted.
+        release_portable_folder(root, shutdown)
+        job.close()
+        _report_folder_state(root, shutdown)
+
+
+def stop(root: Optional[Path] = None) -> int:
+    """``LaunchPortable.exe --stop``: free the folder, then report the result.
+
+    A rescue hatch for the case the user notices too late: the program was
+    closed, but something from the folder is still running and Windows
+    refuses to delete it.  The same politeness rules apply - windows are
+    asked to close first, survivors are terminated.
+    """
+    root = root or find_portable_root()
+    settings = {"close_grace": 5.0, "kill_leftovers": 1.0}
+    try:
+        with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
+            settings = shutdown_settings(json.load(fh))
+    except (OSError, ValueError):
+        pass
+    stopped = release_portable_folder(root, settings)
+    remaining = _portable_process_list(root)
+    if remaining:
+        names = ", ".join(sorted({_image_name(i) for _, i in remaining}))
+        _run_log(root, f"--stop: could not release the folder: {names}")
+        _show_warning(
+            "Часть процессов из портативной папки остановить не удалось:\n"
+            f"{names}\n\n"
+            "Обычно это значит, что они запущены от имени администратора. "
+            "Запустите этот же файл от имени администратора.")
+        return 1
+
+    # Процессов из папки нет — но её может держать кто-то снаружи,
+    # подгрузивший оттуда DLL. Это самый непонятный для пользователя
+    # случай, поэтому виновник называется по имени.
+    holders = module_holders(root)
+    if holders:
+        description = describe_holders(holders)
+        _run_log(root, f"--stop: the folder is held from outside: {description}")
+        _show_warning(
+            "Из портативной папки ничего не запущено, но её файлы держат "
+            "другие программы:\n"
+            f"{description}\n\n"
+            "Обычно это проводник Windows (открыт предпросмотр или окно "
+            "папки) либо антивирус. Закройте окна этой папки и повторите — "
+            "после этого папка удалится.")
+        return 1
+
+    _run_log(root, "--stop: portable folder released"
+             + (": " + ", ".join(sorted(set(stopped))) if stopped else
+                " (nothing was running)"))
+    return 0
 
 
 def main() -> int:
     root: Optional[Path] = None
     try:
         root = find_portable_root()
+        if any(str(arg).casefold() in ("--stop", "/stop")
+               for arg in sys.argv[1:]):
+            return stop(root)
         return run()
     except Exception as exc:
         details = f"Не удалось запустить портативную программу.\n\n{exc}"

@@ -15,7 +15,7 @@ import subprocess
 import sys
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
@@ -24,10 +24,11 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
+from ..core import elevate
 from ..core.detect import detect_installer
 from ..core.portablizer import PortableOptions, PortableResult
 from . import style
-from .worker import PortableWorker
+from .worker import MaintenanceWorker, PortableWorker
 
 
 def _resource(rel: str) -> str:
@@ -63,7 +64,14 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.worker: Optional[PortableWorker] = None
+        self.maintenance_worker: Optional[MaintenanceWorker] = None
         self.last_result: Optional[PortableResult] = None
+        #: Запоминаем папку вывода между запусками: каждый раз искать её
+        #: заново — лишнее вмешательство пользователя в то, что программа
+        #: прекрасно помнит сама.
+        self.settings = QSettings("Portablizer", "Portablizer")
+        # Установщик можно просто перетащить в окно.
+        self.setAcceptDrops(True)
 
         self.setWindowTitle(
             f"Portablizer {__version__} — портативизатор установщиков"
@@ -96,10 +104,15 @@ class MainWindow(QMainWindow):
         cl.addWidget(self._build_source_card())
         cl.addWidget(self._build_options_card())
         cl.addWidget(self._build_process_card())
+        cl.addWidget(self._build_maintenance_card())
         cl.addStretch(1)
         outer.addWidget(scroll, 1)
 
         outer.addWidget(self._build_footer())
+
+        remembered = str(self.settings.value("output_dir", "") or "")
+        if remembered and os.path.isdir(remembered):
+            self.output_edit.setText(remembered)
 
     # -- шапка ----------------------------------------------------------------
     def _build_header(self) -> QWidget:
@@ -261,6 +274,11 @@ class MainWindow(QMainWindow):
         self.cb_runtimes.toggled.connect(self.cb_silent_redist.setEnabled)
         self.cb_runtimes.toggled.connect(self.cb_fetch_runtimes.setEnabled)
         self.cb_runtimes.toggled.connect(self.cb_full_runtimes.setEnabled)
+        self.cb_autoopen = QCheckBox("Открыть папку результата по окончании")
+        self.cb_autoopen.setChecked(True)
+        self.cb_autoopen.setToolTip(
+            "Когда портатив готов, папка сразу открывается в проводнике — "
+            "не нужно искать её вручную.")
         self.cb_assisted = QCheckBox("Разрешить окно мастера установки")
         self.cb_assisted.setToolTip(
             "Нужно старым установщикам InstallShield InstallScript 5/6 "
@@ -276,6 +294,7 @@ class MainWindow(QMainWindow):
         checks.addWidget(self.cb_integration, 1, 1)
         checks.addWidget(self.cb_exelauncher, 2, 0)
         checks.addWidget(self.cb_assisted, 2, 1)
+        checks.addWidget(self.cb_autoopen, 6, 0, 1, 2)
         checks.addWidget(self.cb_runtimes, 3, 0)
         checks.addWidget(self.cb_fetch_runtimes, 3, 1)
         checks.addWidget(self.cb_full_runtimes, 4, 0, 1, 2)
@@ -284,10 +303,12 @@ class MainWindow(QMainWindow):
         lay.addLayout(checks)
 
         hint = QLabel(
-            "Подсказка: реальная тихая установка и работа с реестром "
-            "выполняются только под Windows. Запускайте Portablizer от имени "
-            "администратора — это нужно и для снимка HKLM, и для полной "
-            "очистки следов установки с этого компьютера.")
+            "Сборка идёт автоматически: права администратора Portablizer "
+            "запрашивает сам при запуске (одно окно UAC), тихий сценарий "
+            "подбирается перебором, распространяемые пакеты ставятся молча, "
+            "а по окончании папка результата освобождается от посторонних "
+            "процессов — её сразу можно копировать и удалять. Реальная "
+            "установка и работа с реестром выполняются только под Windows.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -325,6 +346,88 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.log_view)
         return frame
 
+    # -- карточка «Обслуживание готового портатива» ---------------------------
+    def _build_maintenance_card(self) -> QFrame:
+        frame, lay = _card("Готовый портатив: освободить папку или обновить", "4")
+
+        hint = QLabel(
+            "Если папку портатива не удаётся удалить («файл открыт в другой "
+            "программе»), укажите её здесь и нажмите «Освободить папку»: "
+            "Portablizer остановит службы и процессы, запущенные из неё, и "
+            "назовёт виновника, если файл держит посторонняя программа.\n"
+            "«Обновить лончер» перевыпускает Launch.bat, LaunchPortable.exe и "
+            "StopPortable.cmd текущей версией — нужно для портативов, "
+            "собранных прежними версиями Portablizer: они не умеют закрывать "
+            "за собой фоновые процессы. Настройки портатива сохраняются.")
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        row = QHBoxLayout()
+        self.maintenance_edit = QLineEdit()
+        self.maintenance_edit.setPlaceholderText(
+            "Папка портатива (та, где лежит Launch.bat)…")
+        browse = QPushButton("Обзор…")
+        browse.clicked.connect(self._browse_maintenance)
+        row.addWidget(self.maintenance_edit, 1)
+        row.addWidget(browse)
+        lay.addLayout(row)
+
+        buttons = QHBoxLayout()
+        self.release_btn = QPushButton("Освободить папку")
+        self.release_btn.clicked.connect(lambda: self._maintenance("release"))
+        self.refresh_btn = QPushButton("Обновить лончер")
+        self.refresh_btn.setObjectName("Ghost")
+        self.refresh_btn.clicked.connect(lambda: self._maintenance("refresh"))
+        buttons.addWidget(self.release_btn)
+        buttons.addWidget(self.refresh_btn)
+        buttons.addStretch(1)
+        self.maintenance_status = QLabel("")
+        self.maintenance_status.setObjectName("Hint")
+        buttons.addWidget(self.maintenance_status, 1)
+        lay.addLayout(buttons)
+        return frame
+
+    def _browse_maintenance(self) -> None:
+        start = self.maintenance_edit.text().strip() or (
+            self.last_result.portable_dir if self.last_result else "")
+        path = QFileDialog.getExistingDirectory(
+            self, "Папка готового портатива", start)
+        if path:
+            self.maintenance_edit.setText(path)
+
+    def _maintenance(self, action: str) -> None:
+        folder = self.maintenance_edit.text().strip()
+        if not folder and self.last_result:
+            folder = self.last_result.portable_dir
+            self.maintenance_edit.setText(folder)
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, "Portablizer",
+                                "Укажите существующую папку портатива.")
+            return
+        if self.maintenance_worker and self.maintenance_worker.isRunning():
+            return
+        self.release_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        self.maintenance_status.setText(
+            "Освобождаю папку…" if action == "release" else "Обновляю…")
+        self.maintenance_worker = MaintenanceWorker(folder, action)
+        self.maintenance_worker.log_line.connect(self._on_log)
+        self.maintenance_worker.finished_report.connect(
+            self._on_maintenance_done)
+        self.maintenance_worker.start()
+
+    def _on_maintenance_done(self, report) -> None:
+        self.release_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+        text = "\n".join(report.messages) or "Готово."
+        if report.success:
+            self.maintenance_status.setText("✔ Готово")
+            QMessageBox.information(self, "Portablizer", text)
+        else:
+            self.maintenance_status.setText("✖ Не удалось")
+            QMessageBox.warning(self, "Portablizer", text)
+
     # -- нижняя панель --------------------------------------------------------
     def _build_footer(self) -> QWidget:
         w = QWidget()
@@ -351,6 +454,28 @@ class MainWindow(QMainWindow):
         self.start_btn.clicked.connect(self._start)
         lay.addWidget(self.start_btn)
         return w
+
+    # -- перетаскивание установщика в окно ------------------------------------
+    @staticmethod
+    def _dropped_installer(urls) -> str:
+        """Первый подходящий установщик среди перетащенных файлов."""
+        for url in urls:
+            path = url.toLocalFile()
+            if path and os.path.isfile(path) and \
+                    os.path.splitext(path)[1].lower() in (".exe", ".msi"):
+                return path
+        return ""
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt API
+        mime = event.mimeData()
+        if mime.hasUrls() and self._dropped_installer(mime.urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt API
+        path = self._dropped_installer(event.mimeData().urls())
+        if path:
+            self.installer_edit.setText(path)
+            event.acceptProposedAction()
 
     # -- обработчики ----------------------------------------------------------
     def _browse_installer(self) -> None:
@@ -559,6 +684,10 @@ class MainWindow(QMainWindow):
         self.open_btn.setEnabled(
             bool(result.portable_dir and os.path.isdir(result.portable_dir))
         )
+        # Папка результата сразу подставляется в обслуживание: если позже её
+        # не удастся удалить, нажать «Освободить папку» можно не выбирая её.
+        if result.portable_dir and not self.maintenance_edit.text().strip():
+            self.maintenance_edit.setText(result.portable_dir)
         self._on_detail(0, "")
         if result.success:
             self.progress.setFormat("Готово — 100%")
@@ -651,6 +780,29 @@ class MainWindow(QMainWindow):
                 "Скопируйте папку целиком на флешку — установка на другом "
                 "компьютере не потребуется.",
             ]
+            if result.removed_services:
+                details += [
+                    "",
+                    "С этого ПК снята служба, зарегистрированная "
+                    "установщиком: " + ", ".join(result.removed_services)
+                    + ". Иначе она держала бы папку портатива открытой.",
+                ]
+            if result.folder_is_free:
+                details += [
+                    "",
+                    "Проверено: папку можно удалить, перенести и скопировать "
+                    "— ничего из неё не занято. После выхода из программы "
+                    "лончер так же освобождает её сам.",
+                ]
+            else:
+                holders = ", ".join(result.folder_holders[:4]) or "неизвестно"
+                details += [
+                    "",
+                    f"⚠ Папку сейчас держат: {holders}. Обычно это открытое "
+                    "окно проводника или проверка антивирусом — через "
+                    "несколько секунд всё освободится. Если нет, запустите "
+                    "StopPortable.cmd из папки портатива.",
+                ]
             if result.removed_from_installed_list:
                 details += [
                     "",
@@ -665,6 +817,13 @@ class MainWindow(QMainWindow):
                     "портатива от имени администратора.",
                 ]
             QMessageBox.information(self, "Portablizer", "\n".join(details))
+            # Папку вывода запоминаем только после успеха: неудачный путь
+            # подсказывать в следующий раз незачем.
+            output = os.path.dirname(result.portable_dir.rstrip("\\/"))
+            if output:
+                self.settings.setValue("output_dir", output)
+            if self.cb_autoopen.isChecked():
+                self._open_result()
         else:
             self.progress.setFormat("Ошибка")
             msg = "\n\n".join(result.messages) or "См. журнал."
@@ -701,12 +860,15 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self.start_btn.setEnabled(not running)
+        self.release_btn.setEnabled(not running)
+        self.refresh_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         for w in (self.installer_edit, self.output_edit, self.name_edit,
                   self.args_edit, self.env_edit, self.cb_redirect,
                   self.cb_registry, self.cb_exelauncher, self.cb_cleanup,
                   self.cb_integration, self.cb_runtimes,
-                  self.cb_fetch_runtimes, self.cb_assisted):
+                  self.cb_fetch_runtimes, self.cb_assisted,
+                  self.cb_autoopen):
             w.setEnabled(not running)
         # Загрузка пакетов имеет смысл только вместе с самим переносом.
         self.cb_fetch_runtimes.setEnabled(
@@ -714,6 +876,13 @@ class MainWindow(QMainWindow):
 
 
 def run() -> int:
+    # Права администратора нужны почти на каждом шаге (манифест
+    # requireAdministrator у установщика, снимок HKLM, тихая установка
+    # пакетов, уборка следов). Просим их сразу и один раз: щелчок «Да» в
+    # окне UAC вместо ручного перезапуска на середине сборки.
+    if elevate.ensure_elevated():
+        return 0
+
     app = QApplication(sys.argv)
     app.setApplicationName("Portablizer")
     ico = _resource(os.path.join("resources", "app.ico"))
