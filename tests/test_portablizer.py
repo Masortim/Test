@@ -825,16 +825,24 @@ class LaunchBatSafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ensure_ascii_bat("echo привет")
 
-    def test_vbs_wrapper_is_ascii_and_calls_launch_bat(self):
+    def test_vbs_wrapper_is_ascii_and_prefers_exe_launcher(self):
         vbs = render_vbs()
         self.assertTrue(vbs.isascii())
+        self.assertIn("App\\LaunchPortable.exe", vbs)
         self.assertIn("Launch.bat", vbs)
         self.assertIn("--nopause", vbs)
+
+    def test_launch_bat_prefers_windowed_exe_launcher_when_available(self):
+        bat = self._bat()
+        self.assertIn('if exist "%~dp0App\\LaunchPortable.exe"', bat)
+        self.assertIn('start "" "%~dp0App\\LaunchPortable.exe" %*', bat)
+        self.assertIn("--bat-fallback", bat)
 
     def test_launcher_help_and_switches_exist(self):
         bat = self._bat()
         for switch in ("--nopause", "--pause", "--no-registry",
-                       "--keep-registry", "--reset", "--help"):
+                       "--keep-registry", "--reset", "--bat-fallback",
+                       "--help"):
             self.assertIn(switch, bat)
 
     def test_generated_game_launcher_redirects_windows_documents_known_folder(self):
@@ -864,6 +872,20 @@ class LaunchBatSafetyTests(unittest.TestCase):
         # after the user approved the prompt.
         self.assertIn("-FilePath $env:ComSpec", bat)
         self.assertIn("/d /c call ", bat)
+
+    def test_powershell_helpers_do_not_shadow_builtin_aliases(self):
+        # PowerShell has a built-in alias "gp" for Get-ItemProperty. Function
+        # names are resolved case-insensitively, so a generated helper named
+        # Gp() was ignored and PowerShell prompted the user for Path[0] after
+        # the game launch instead of checking leftover portable processes.
+        bat = render_bat(LauncherConfig(app_name="App", target_exe_rel="App/Game.exe"))
+        stop = launcher_mod.render_stop_cmd(
+            LauncherConfig(app_name="App", target_exe_rel="App/Game.exe"))
+        combined = bat + "\n" + stop
+        self.assertNotIn("function Gp()", combined)
+        self.assertNotIn("@(Gp)", combined)
+        self.assertIn("function GetPortableProcesses()", combined)
+        self.assertIn("@(GetPortableProcesses)", combined)
 
 
 class LaunchBatExecutionTests(unittest.TestCase):
