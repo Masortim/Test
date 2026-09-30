@@ -2747,6 +2747,45 @@ class StuckAt85PercentRegressionTests(unittest.TestCase):
 
         self.assertEqual(outcome.status, "installed")
 
+    def test_a_requirement_stuck_on_an_unknown_step_does_not_stall_the_build(self):
+        """Последний рубеж: даже застрявшая ступень лестницы не бесконечна.
+
+        ``_from_sources`` подменена вечно работающей функцией — ни одна из
+        уже описанных защит (декодер кабинетов, внешний процесс) тут не
+        участвует. ``provision()`` всё равно обязан не ждать дольше
+        ``REQUIREMENT_TIMEOUT`` и пойти дальше.
+        """
+        import threading as _threading
+
+        def never_returns(_requirement):
+            _threading.Event().wait(30)
+            return "", ""
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("msvcp110.dll",))
+            scan = redist.scan_app_runtime(str(app))
+
+            with mock.patch.object(redist, "REQUIREMENT_TIMEOUT", 0.2), \
+                    mock.patch.object(redist, "CABINET_HEARTBEAT_SECONDS", 0.05), \
+                    mock.patch.object(redist.RuntimeProvisioner, "_from_sources",
+                                      lambda self, requirement: never_returns(requirement)):
+                started_at = __import__("time").monotonic()
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="",
+                ).provision(scan, str(app), str(portable), "Game")
+                elapsed = __import__("time").monotonic() - started_at
+
+        self.assertLess(elapsed, 3.0,
+                        "застрявшая ступень не должна стоить сборке минут")
+        self.assertEqual([r.dll for r in report.missing], ["msvcp110.dll"])
+
+    def _portable(self, temp):
+        portable = Path(temp, "Game_Portable")
+        app = portable / "App"
+        app.mkdir(parents=True)
+        return portable, app
+
 
 class ProgressWiringTests(unittest.TestCase):
     """Проценты доходят до окна: ядро → воркер → вторая полоса прогресса."""

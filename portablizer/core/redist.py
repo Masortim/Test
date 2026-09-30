@@ -1443,6 +1443,20 @@ def _kill_tree(process: "subprocess.Popen") -> None:
 #: не грузить систему пустыми системными вызовами.
 _WAIT_POLL_SECONDS = 2.0
 
+#: Сколько ждём штатный инструмент распаковки (expand/extrac32/7-Zip/
+#: wextract): на большом пакете (DirectX — почти 100 МБ, плюс антивирус,
+#: который сканирует каждый распакованный файл) 10 минут — реальный
+#: сценарий, а не признак зависания.
+NATIVE_TOOL_TIMEOUT = 600
+
+#: Верхний потолок на доставку ОДНОЙ библиотеки целиком: поиск в источниках
+#: + распаковка + скачивание + тихая установка. Это последняя линия
+#: обороны: даже если внутри лестницы источников найдётся ступень без
+#: собственного таймаута (сейчас или в будущем), сборка всё равно не
+#: останется на одном requirement дольше этого предела — библиотека
+#: помечается недостающей, и доставка продолжается со следующей.
+REQUIREMENT_TIMEOUT = 20 * 60
+
 
 def _run_quiet(args: Sequence[str], timeout: int = 600,
                on_tick: Optional[Callable[[float, int], None]] = None) -> int:
@@ -2515,7 +2529,7 @@ class RuntimeProvisioner:
         #: System32/WinSxS, откуда их уже можно взять в портатив.
         self.allow_install = allow_install
         self._download = downloader or _download_file
-        self._run = runner or _run_quiet
+        self._run = runner or self._default_runner
         self._install_run = installer_runner
         self._index: Optional[Dict[str, List[str]]] = None
         self._extracted: Dict[str, str] = {}
@@ -2553,6 +2567,36 @@ class RuntimeProvisioner:
             return bool(self._cancel())
         except Exception:  # noqa: BLE001
             return False
+
+    def _default_runner(self, args: Sequence[str]) -> int:
+        """Штатный ``expand``/``extrac32``/7-Zip/wextract — но с heartbeat.
+
+        Это единственный запускатель внешних программ, общий для всей
+        лестницы распаковки (``_extract_installer``, ``_expand_payloads``,
+        ``_expand_one``). Раньше он был просто ``_run_quiet`` без единой
+        точки прогресса: если наш собственный (Python) декодер кабинетов
+        не укладывался в потолок и уступал место штатному инструменту (см.
+        :data:`CABINET_DECODE_TIMEOUT`), а тот на большом пакете
+        (``directx_Jun2010_redist.exe`` — почти 100 МБ, антивирус может
+        сканировать каждый распакованный файл) работал не одну секунду —
+        сборка снова выглядела «висящей на 85%», просто чуть позже. Теперь
+        каждые 15 секунд ожидания в журнал уходит строка о том, что процесс
+        ещё жив.
+        """
+        tool = os.path.basename(args[0]) if args else "инструмент"
+        last = [-1]
+
+        def on_tick(elapsed: float, total: int) -> None:
+            step = int(elapsed // 15)
+            if step == last[0]:
+                return
+            last[0] = step
+            self._report(
+                None,
+                f"{tool}: работает уже {int(elapsed)} с из {int(total)} — "
+                "это большой пакет, не зависание", -1)
+
+        return _run_quiet(args, NATIVE_TOOL_TIMEOUT, on_tick=on_tick)
 
     def _fetch(self, url: str, destination: str, title: str) -> bool:
         """Скачивает пакет, показывая проценты в логе и в интерфейсе.
@@ -3371,22 +3415,38 @@ class RuntimeProvisioner:
                 report.unknown.append(requirement)
                 continue
 
-            path, source = self._from_sources(requirement)
-            if not path:
-                path, source = self._from_system(requirement)
-            if not path:
-                path, source = self._from_sxs(requirement)
-            if not path:
-                path, source = self._from_package_payload(requirement, work_dir)
-            if not path:
-                path, source = self._from_download(requirement, portable_dir,
-                                                   work_dir)
-            if not path and not requirement.proactive:
-                # Запас «про запас» ради установки пакета в систему не
-                # ставим: молча менять чужой ПК можно только ради того, без
-                # чего программа действительно не запустится.
-                path, source = self._from_silent_install(requirement,
-                                                         portable_dir)
+            def _resolve(requirement=requirement) -> Tuple[str, str]:
+                path, source = self._from_sources(requirement)
+                if not path:
+                    path, source = self._from_system(requirement)
+                if not path:
+                    path, source = self._from_sxs(requirement)
+                if not path:
+                    path, source = self._from_package_payload(requirement, work_dir)
+                if not path:
+                    path, source = self._from_download(requirement, portable_dir,
+                                                       work_dir)
+                if not path and not requirement.proactive:
+                    # Запас «про запас» ради установки пакета в систему не
+                    # ставим: молча менять чужой ПК можно только ради того,
+                    # без чего программа действительно не запустится.
+                    path, source = self._from_silent_install(requirement,
+                                                             portable_dir)
+                return path, source
+
+            def _on_requirement_tick(elapsed: float,
+                                     requirement=requirement) -> None:
+                # Последний рубеж обороны от «висит на N%»: даже если поиск
+                # застрял на неизвестной нам ступени, полоса и журнал
+                # продолжают сообщать, что сборка жива, а не молчат.
+                self._report(
+                    index / total,
+                    f"Компоненты: {requirement.dll} ({index + 1} из {total}) "
+                    f"— идёт уже {int(elapsed)} с, это не зависание", -1)
+
+            path, source = _bounded_call(
+                _resolve, timeout=REQUIREMENT_TIMEOUT, default=("", ""),
+                on_tick=_on_requirement_tick)
             if not path:
                 requirement.status = "missing"
                 (report.stock_missing if requirement.proactive
