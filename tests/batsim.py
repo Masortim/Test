@@ -80,6 +80,15 @@ class FakeFS:
         for path in self.glob(pattern):
             self.files.pop(path, None)
 
+    def remove_tree(self, path: str) -> None:
+        """``rd /s /q``: удалить каталог со всем содержимым."""
+        norm = self._norm(path)
+        for file_path in [p for p in self.files
+                          if p == norm or p.startswith(norm + "\\")]:
+            self.files.pop(file_path, None)
+        self.dirs -= {d for d in self.dirs
+                      if d == norm or d.startswith(norm + "\\")}
+
     def copy(self, src: str, dst: str) -> None:
         src_norm = self._norm(src)
         if src_norm in self.files:
@@ -143,8 +152,21 @@ class BatchInterpreter:
         self.dir_stack: List[str] = []
         self.call_stack: List[int] = []
         self.call_argv_stack: List[List[str]] = []
-        self.errorlevel = 0
+        self._errorlevel = 0
+        self.env["ERRORLEVEL"] = "0"
         self.labels = self._index_labels()
+
+    @property
+    def errorlevel(self) -> int:
+        return self._errorlevel
+
+    @errorlevel.setter
+    def errorlevel(self, value: int) -> None:
+        # cmd.exe: %ERRORLEVEL% отражает код последней команды. Раньше
+        # переменная окружения отставала от значения, поэтому
+        # «set "X=%ERRORLEVEL%"» после powershell/reg читал мусор.
+        self._errorlevel = int(value)
+        self.env["ERRORLEVEL"] = str(self._errorlevel)
 
     # -- подготовка -----------------------------------------------------------
     def _index_labels(self) -> Dict[str, int]:
@@ -288,10 +310,53 @@ class BatchInterpreter:
         parts.append(current)
         return parts
 
+    def _split_chain(self, text: str) -> List[Tuple[str, str]]:
+        """Делит строку на команды с коннекторами ``&``, ``&&`` и ``||``.
+
+        Возвращает список «(коннектор перед командой, команда)». У первой
+        команды коннектор пустой. Перенаправление ``2>&1`` — не коннектор.
+        """
+        parts: List[Tuple[str, str]] = []
+        current, depth, in_quotes, connector = "", 0, False, ""
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == '"':
+                in_quotes = not in_quotes
+            elif not in_quotes:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                elif depth == 0 and ch in "&|":
+                    if ch == "&" and current.rstrip().endswith(">"):
+                        current += ch
+                        i += 1
+                        continue
+                    if i + 1 < len(text) and text[i + 1] == ch:
+                        parts.append((connector, current))
+                        current, connector = "", ch + ch
+                        i += 2
+                        continue
+                    if ch == "&":
+                        parts.append((connector, current))
+                        current, connector = "", "&"
+                        i += 1
+                        continue
+            current += ch
+            i += 1
+        parts.append((connector, current))
+        return parts
+
     def _exec(self, command: str):
-        for part in self._split_top(command, "&"):
+        for connector, part in self._split_chain(command):
             part = part.strip()
             if not part:
+                continue
+            # «a && b»: b выполняется при успехе a; «a || b» — при отказе.
+            if connector == "&&" and self.errorlevel != 0:
+                continue
+            if connector == "||" and self.errorlevel == 0:
                 continue
             jump = self._exec_single(part)
             if jump is not None:
@@ -385,12 +450,51 @@ class BatchInterpreter:
                 self.cwd = self.dir_stack.pop()
             return None
         if low.startswith("reg "):
-            self.result.reg_commands.append(self.expand(command))
+            expanded = self.expand(command)
+            self.result.reg_commands.append(expanded)
             self.errorlevel = 0
+            if low.startswith("reg query"):
+                # BATSIM_MISSING_REG=HKLM\A;HKLM\B — ключи, которых «на этом
+                # ПК нет»: reg query завершится кодом 1, как на чистой машине.
+                missing = [part.strip().lower()
+                           for part in self.env.get(
+                               "BATSIM_MISSING_REG", "").split(";")
+                           if part.strip()]
+                if any(part in expanded.lower() for part in missing):
+                    self.errorlevel = 1
             return None
         if low.startswith("powershell"):
+            expanded = self.expand(command)
+            if "-verb runas" not in expanded.lower():
+                self.errorlevel = 0
+                return None
+            return self._simulate_elevated_relaunch()
+        if low == "net" or low.startswith("net session"):
+            # «net session» без прав администратора возвращает код <> 0.
+            # BATSIM_ADMIN=1 эмулирует уже поднятый процесс.
+            self.errorlevel = 0 if self.env.get("BATSIM_ADMIN") == "1" else 1
+            return None
+        if low.startswith(("rd ", "rmdir ")):
+            for token in self._tokens(command.split(None, 1)[1]):
+                if token.startswith("/"):
+                    continue
+                self.fs.remove_tree(self.expand(token).strip('"'))
+                break
+            return None
+        if low.startswith(("timeout", "ping ")):
+            return None
+        if low.startswith("where "):
+            # Поиск по PATH в симуляции пуст — ветки «не найдено» честнее.
+            self.errorlevel = 1
+            return None
+        if low.startswith(("msiexec", "wusa")):
+            program, _, args = command.partition(" ")
+            self.result.launches.append(
+                Launch(program, self.expand(args).strip(), self.cwd))
             self.errorlevel = 0
             return None
+        if low.startswith("start"):
+            return self._exec_start(command)
         if low.startswith("shift"):
             self.argv = self.argv[1:]
             return None
@@ -421,6 +525,64 @@ class BatchInterpreter:
             self.env["ERRORLEVEL"] = str(self.program_exit_code)
             return None
         raise BatError(f"неизвестная команда: {command!r}")
+
+    def _exec_start(self, command: str):
+        """Упрощённый ``start [/wait] [/b] ["заголовок"] программа аргументы``.
+
+        Фоновый запуск в симуляции не нужен: программа отмечается в списке
+        запусков (если файл есть в FakeFS), а код возврата остаётся 0, как у
+        настоящего start, который не ждёт процесс.
+        """
+        tokens = self._tokens(command[5:].strip())
+        tokens = [t for t in tokens if not t.lstrip('"/"').startswith("/")]
+        positional: List[str] = []
+        for token in tokens:
+            low_token = token.strip('"').lower()
+            if not positional and low_token.startswith("/"):
+                continue  # /wait /b /min /d ...
+            positional.append(token)
+        if not positional:
+            return None
+        program = self.expand(positional[0]).strip('"')
+        args = " ".join(self.expand(a) for a in positional[1:])
+        if self.fs.exists(program):
+            # Второй токен без пути — это программа: у команды start первый
+            # токен в кавычках считается заголовком окна. У наших лончеров
+            # start не используется, поэтому хватает простой записи запуска.
+            self.result.launches.append(Launch(program, args, self.cwd))
+        self.errorlevel = 0
+        return None
+
+    def _simulate_elevated_relaunch(self):
+        """Симуляция ``Start-Process -Verb RunAs -Wait`` (второе окно cmd).
+
+        ``BATSIM_UAC=deny`` — пользователь нажал «Нет» в диалоге UAC: код
+        1223 (ERROR_CANCELLED), дочерний процесс не появляется. Иначе тот же
+        сценарий исполняется заново с флагами, которые собирает PowerShell-
+        обёртка лончера (``/d /c call "<self>" --nopause --elevated
+        --machine-registry --target "..."``), а код его выхода становится
+        кодом возврата powershell-процесса.
+        """
+        if self.env.get("BATSIM_UAC", "allow").lower() == "deny":
+            self.result.output.append("[BATSIM] UAC prompt declined (1223)")
+            self.errorlevel = 1223
+            return None
+        flags = ["--nopause", "--elevated", "--machine-registry"]
+        target = self.env.get("PORTABLE_ELEVATION_TARGET", "")
+        if target:
+            flags += ["--target", target]
+        child = BatchInterpreter("\n".join(self.lines), self.script_path,
+                                 self.fs, argv=flags, env=dict(self.env),
+                                 program_exit_code=self.program_exit_code)
+        sub_res = child.run()
+        self.result.launches.extend(sub_res.launches)
+        self.result.reg_commands.extend(sub_res.reg_commands)
+        self.result.output.extend(sub_res.output)
+        self.result.paused += sub_res.paused
+        self.result.output.append(
+            f"[BATSIM] elevated child finished with code {sub_res.exit_code}")
+        self.errorlevel = sub_res.exit_code or 0
+        return None
 
     @staticmethod
     def _tokens(text: str) -> List[str]:

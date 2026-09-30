@@ -109,6 +109,76 @@ def _library_search_dirs(root: Path, target: Path,
     return unique
 
 
+def _winsxs_has_family(windir: Path, family: str) -> bool:
+    """True when WinSxS holds at least one folder of the assembly family.
+
+    Visual C++ 2005/2008 runtimes exist ONLY as side-by-side assemblies in
+    ``%SystemRoot%\\WinSxS`` - their DLLs are never copied into System32, so
+    probing well-known directories for ``msvcr90.dll`` always says "missing"
+    even on a fully working computer.  The folder names embed version and
+    hash (``x86_microsoft.vc90.crt_1fc8b3b9a1e18e3b_9.0.30729.9635_...``),
+    therefore the probe matches by the architecture+assembly prefix.
+    """
+    family = (family or "").strip().lower()
+    if len(family) < 4 or not family.endswith("_"):
+        return False
+    try:
+        for entry in os.listdir(str(windir / "WinSxS")):
+            if entry.lower().startswith(family):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _requirement_satisfied(root: Path, target: Optional[Path],
+                           env: Dict[str, str],
+                           search_dirs: Optional[list[Path]],
+                           item: Dict[str, Any]) -> bool:
+    """True when this one runtime requirement is met on THIS computer.
+
+    A plain DLL requirement is satisfied wherever Windows resolves it.  A
+    side-by-side requirement (Visual C++ 2005/2008) works differently: a
+    bare ``msvcr90.dll`` next to the program is IGNORED unless the matching
+    private ``Microsoft.VC90.CRT.manifest`` sits beside it - without one
+    the program dies at start with error 14001 ("side-by-side configuration
+    is incorrect").  Hence the pair is checked, and the system copy is
+    looked up in WinSxS by the assembly family prefix, never in System32.
+    """
+    name = str(item.get("dll", "")).strip()
+    if not name:
+        return True
+    manifest = str(item.get("manifest", "") or "").strip()
+    family = str(item.get("sxs_family", "") or "").strip()
+    if manifest and family:
+        candidates: list[Path] = [root, root / "App"]
+        if target is not None:
+            candidates.insert(0, target.parent)
+        for directory in candidates:
+            try:
+                if (directory / name).is_file() and \
+                        (directory / manifest).is_file():
+                    return True
+            except OSError:
+                continue
+        windir = Path(env.get("SystemRoot") or env.get("WINDIR")
+                      or r"C:\Windows")
+        return _winsxs_has_family(windir, family)
+    if search_dirs is None:
+        search_dirs = [root, root / "App",
+                       Path(env.get("SystemRoot") or r"C:\Windows")
+                       / "System32",
+                       Path(env.get("SystemRoot") or r"C:\Windows")
+                       / "SysWOW64"]
+    for directory in search_dirs:
+        try:
+            if (directory / name).is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def missing_runtime_components(root: Path, cfg: Dict[str, Any], target: Path,
                                env: Dict[str, str]) -> list[Dict[str, str]]:
     """Redistributable libraries that are absent on THIS computer.
@@ -116,7 +186,11 @@ def missing_runtime_components(root: Path, cfg: Dict[str, Any], target: Path,
     Portablizer bundles everything it can find while building the portable
     folder.  Whatever is left over is listed in ``launcher_config.json``;
     checking it here turns the cryptic Windows box ("MSVCR110.dll is
-    missing") into the name of the package and a link to it.
+    missing") into the name of the package and a link to it.  For Visual
+    C++ 2005/2008 entries the check is honest about side-by-side rules:
+    a DLL without its private manifest is not usable, and a system copy
+    lives in WinSxS rather than System32.  This kills both false alarms on
+    healthy PCs and false approval of a broken bundle (error 14001).
     """
     requirements = cfg.get("runtime_requirements") or []
     if not isinstance(requirements, list) or not requirements:
@@ -126,18 +200,9 @@ def missing_runtime_components(root: Path, cfg: Dict[str, Any], target: Path,
     for item in requirements[:32]:
         if not isinstance(item, dict):
             continue
-        name = str(item.get("dll", "")).strip()
-        if not name:
+        if not str(item.get("dll", "")).strip():
             continue
-        found = False
-        for directory in search_dirs:
-            try:
-                if (directory / name).is_file():
-                    found = True
-                    break
-            except OSError:
-                continue
-        if not found:
+        if not _requirement_satisfied(root, target, env, search_dirs, item):
             missing.append(item)
     return missing
 
@@ -318,7 +383,8 @@ def install_missing_runtime(root: Path, cfg: Dict[str, Any],
                                               ["/c", str(path)]))
             _run_log(root, f"silent runtime install script -> {code}")
             still = [item for item in missing
-                     if not _library_present(root, str(item.get("dll", "")))]
+                     if not _requirement_satisfied(root, None, dict(os.environ),
+                                                   None, item)]
             if not still:
                 return still
 
@@ -341,23 +407,11 @@ def install_missing_runtime(root: Path, cfg: Dict[str, Any],
                 break
     if installed:
         _run_log(root, "installed silently: " + ", ".join(installed))
+    # Re-check every requirement properly: for a VC++ 2005/2008 assembly the
+    # proof of installation is a WinSxS family folder, not a System32 file.
+    env = dict(os.environ)
     return [item for item in missing
-            if not _library_present(root, str(item.get("dll", "")))]
-
-
-def _library_present(root: Path, name: str) -> bool:
-    """True when Windows can resolve the library right now."""
-    if not name:
-        return True
-    windir = os.environ.get("SystemRoot") or r"C:\Windows"
-    for directory in (root / "App", Path(windir) / "System32",
-                      Path(windir) / "SysWOW64"):
-        try:
-            if (directory / name).is_file():
-                return True
-        except OSError:
-            continue
-    return False
+            if not _requirement_satisfied(root, None, env, None, item)]
 
 
 def _runtime_warning_is_new(root: Path, cfg: Dict[str, Any],
@@ -1143,6 +1197,14 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             and not _is_elevated():
         elevated_code = _run_elevated(raw_arguments)
         if elevated_code is not None:
+            # The elevated copy already reported its own result (including
+            # the friendly error 14001 box when the runtime is missing), so
+            # only record what happened.
+            _run_log(root, f"elevated run finished with code "
+                           f"{elevated_code}")
+            if elevated_code == 1223:
+                _run_log(root, "elevation declined at the UAC prompt; "
+                               "the captured HKLM entries stay unimported")
             return elevated_code
         # UAC refused or unavailable: keep going with the VirtualStore
         # fallback instead of refusing to start the program at all.
@@ -1186,12 +1248,36 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             ]
             _run_log(root, "start: " + subprocess.list2cmdline(command)
                      + f" (cwd={target.parent}, elevated={_is_elevated()})")
-            code = subprocess.run(
-                command,
-                cwd=str(target.parent),
-                env=env,
-                check=False,
-            ).returncode
+            try:
+                code = subprocess.run(
+                    command,
+                    cwd=str(target.parent),
+                    env=env,
+                    check=False,
+                ).returncode
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 14001:
+                    raise
+                # ERROR_SXS_CANT_GEN_ACTCTX: Windows could not resolve the
+                # program's side-by-side assembly.  The Visual C++ 2005/2008
+                # runtime the program was built with is missing on this PC -
+                # everything else (registry, rights) is irrelevant; without
+                # that package the program can never start here.
+                _run_log(root, f"{target.name} failed with error 14001 "
+                               "(side-by-side configuration is incorrect)")
+                _show_error(
+                    f"Windows отказалась запускать {target.name} "
+                    "(ошибка 14001: параллельная конфигурация "
+                    "неправильна).\n\n"
+                    "Программа собрана с рантаймом Visual C++ 2005/2008, "
+                    "а на этом компьютере его нет. Это не проблема прав "
+                    "или реестра — без пакета программа не запустится "
+                    "вообще.\n\n"
+                    "Чинится один раз: запустите Redist\\Install-Redist.cmd "
+                    "из портативной папки — он поставит нужные пакеты молча, "
+                    "с одним UAC-запросом. Подробности и ссылки — в файле "
+                    "redistributables.txt.")
+                return 14001
             _run_log(root, f"{target.name} exited with code {code}")
             # The official launcher usually starts the game and exits at once.
             # Restoring the registry right now would pull the install keys out

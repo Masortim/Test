@@ -814,6 +814,22 @@ class RuntimeLauncherTests(unittest.TestCase):
          "url": "https://download.microsoft.com/download/8/4/A/dx.exe",
          "arch": "x86"},
     ]
+
+    # Зонд работоспособности доставленной сборки VC++ 2005 — формат, который
+    # выдаёт redist.launcher_requirements.
+    SXS_REQUIREMENT = {
+        "dll": "msvcr80.dll",
+        "title": "Microsoft Visual C++ 2005 SP1 Redistributable",
+        "url": "https://download.microsoft.com/download/8/B/4/vcredist_x86.exe",
+        "arch": "x86",
+        "sxs": "Microsoft.VC80.CRT",
+        "manifest": "Microsoft.VC80.CRT.manifest",
+        "sxs_family": "x86_microsoft.vc80.crt_",
+        "dlls": "msvcr80.dll",
+    }
+    SXS_WINSXS_FOLDER = (
+        r"C:\Windows\WinSxS\x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_"
+        r"8.0.50727.6195_none_4ff29c7c0b2f2a62")
     ROOT = r"E:\Games\Game_Portable"
 
     def _cfg(self, requirements=None):
@@ -900,6 +916,76 @@ class RuntimeLauncherTests(unittest.TestCase):
         self.assertNotIn("missing Microsoft runtime", result.text)
         self.assertTrue(result.launched)
 
+    # -- зонды side-by-side сборок VC++ 2005/2008 в Launch.bat ---------------
+    def test_sxs_probe_accept_the_assembly_pair_next_to_the_program(self):
+        # msvcr80.dll вместе со своим private-манифестом — рабочая сборка.
+        fs = self._fs(present=("msvcr80.dll", "Microsoft.VC80.CRT.manifest"))
+        result = self._run(self._cfg(requirements=[self.SXS_REQUIREMENT]), fs)
+        self.assertNotIn("missing Microsoft runtime", result.text)
+        self.assertTrue(result.launched)
+
+    def test_sxs_probe_flags_a_bare_dll_without_its_manifest(self):
+        # Одинокий msvcr80.dll Windows игнорирует: именно такой «почти
+        # рабочий» набор и вызывал ошибку 14001 у «Ведьмака» безо всяких
+        # видимых причин. Лончер обязан сказать, чего не хватает.
+        result = self._run(self._cfg(requirements=[self.SXS_REQUIREMENT]),
+                           self._fs(present=("msvcr80.dll",)))
+        self.assertIn("missing Microsoft runtime", result.text)
+        self.assertIn("Visual C++ 2005", result.text)
+        self.assertIn("redistributables.txt", result.text)
+        self.assertIn("14001", result.text)
+        self.assertTrue(result.launched)
+
+    def test_sxs_probe_accepts_the_runtime_installed_in_winsxs(self):
+        fs = self._fs()
+        fs.add_dir(self.SXS_WINSXS_FOLDER)
+        bat = render_bat(self._cfg(requirements=[self.SXS_REQUIREMENT]))
+        fs.add_file(rf"{self.ROOT}\Launch.bat", bat)
+        result = batsim.run_batch(bat, rf"{self.ROOT}\Launch.bat", fs,
+                                  argv=["--nopause"],
+                                  env={"SystemRoot": r"C:\Windows"})
+        self.assertNotIn("missing Microsoft runtime", result.text)
+        self.assertTrue(result.launched)
+
+    def test_sxs_repair_is_reverified_after_the_silent_install(self):
+        # Тихий Install-Redist.cmd «поставил» пакет — признак: папка сборки
+        # появилась в WinSxS. Проверка повторяется и пускает программу без
+        # ссылки на redistributables.txt.
+        fs = self._fs(present=("msvcr80.dll",))
+        fs.add_file(
+            rf"{self.ROOT}\Redist\{redist.SILENT_SCRIPT_NAME}",
+            ("@echo off\r\n"
+             "echo redist installed silently\r\n"
+             'md "%SystemRoot%\\WinSxS\\x86_microsoft.vc80.crt_'
+             '1fc8b3b9a1e18e3b_8.0.50727.6195_none_4ff29c7c0b2f2a62"\r\n'))
+        bat = render_bat(self._cfg(requirements=[self.SXS_REQUIREMENT]))
+        fs.add_file(rf"{self.ROOT}\Launch.bat", bat)
+        result = batsim.run_batch(bat, rf"{self.ROOT}\Launch.bat", fs,
+                                  argv=["--nopause"],
+                                  env={"SystemRoot": r"C:\Windows"})
+        self.assertIn("installed silently", result.text)
+        self.assertIn("The packages are in place now", result.text)
+        self.assertNotIn("redistributables.txt", result.text)
+        self.assertTrue(result.launched)
+
+    def test_sxs_probe_still_names_the_package_when_repair_failed(self):
+        # Скрипт «отработал», но файлы не появились (UAC отклонён, пакет
+        # сломан): повторная проверка честно снова называет пакет и путь —
+        # вместо того чтобы молча пойти в ошибку 14001.
+        fs = self._fs(present=("msvcr80.dll",))
+        fs.add_file(
+            rf"{self.ROOT}\Redist\{redist.SILENT_SCRIPT_NAME}",
+            "@echo off\r\necho redist installer ran\r\n")
+        bat = render_bat(self._cfg(requirements=[self.SXS_REQUIREMENT]))
+        fs.add_file(rf"{self.ROOT}\Launch.bat", bat)
+        result = batsim.run_batch(bat, rf"{self.ROOT}\Launch.bat", fs,
+                                  argv=["--nopause"],
+                                  env={"SystemRoot": r"C:\Windows"})
+        self.assertIn("redist installer ran", result.text)
+        self.assertIn("Visual C++ 2005", result.text)
+        self.assertIn("redistributables.txt", result.text)
+        self.assertTrue(result.launched)
+
     def test_program_without_requirements_gets_no_check_calls(self):
         bat = render_bat(self._cfg(requirements=[]))
         self.assertIn("needs no extra Microsoft runtime", bat)
@@ -959,6 +1045,53 @@ class RuntimeLauncherTests(unittest.TestCase):
                 root, cfg, app / "game.exe", {"PATH": str(app / "bin")})
 
             self.assertEqual(missing, [])
+
+    def test_launcher_requirements_emit_winsxs_probe_for_bundled_vc90(self):
+        """Доставленная сборка VC++ 2008 получает зонд работоспособности.
+
+        Библиотека рядом с программой действует только в паре со своим
+        private-манифестом, а system-копия живёт исключительно в WinSxS —
+        обычная проверка System32 здесь бессмысленна. Зонд несёт имя
+        манифеста и префикс папки сборки, которыми проверяется и то и
+        другое; иначе на чистом ПК пользователь получил бы голую ошибку
+        14001, как у «Ведьмака» из жалобы.
+        """
+
+        manifest = (
+            '<?xml version="1.0"?><assembly '
+            'xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">'
+            '<dependency><dependentAssembly><assemblyIdentity type="win32" '
+            'name="Microsoft.VC90.CRT" version="9.0.21022.8" '
+            'processorArchitecture="x86" publicKeyToken="1fc8b3b9a1e18e3b"/>'
+            '</dependentAssembly></dependency></assembly>')
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Game_Portable")
+            app = portable / "App"
+            app.mkdir(parents=True)
+            write_pe(app / "old.exe", imports=("MSVCR90.dll",),
+                     manifest=manifest)
+            sxs = Path(temp, "WinSxS")
+            folder = sxs / ("x86_microsoft.vc90.crt_1fc8b3b9a1e18e3b_"
+                            "9.0.30729.9635_none_508ed732bcbc0e5a")
+            folder.mkdir(parents=True)
+            write_runtime_dll(folder / "msvcr90.dll")
+
+            scan = redist.scan_app_runtime(str(app))
+            report = redist.RuntimeProvisioner(
+                Logger(), system_dirs=[], sxs_dir=str(sxs),
+            ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertEqual([r.dll for r in report.provided], ["msvcr90.dll"])
+            entries = redist.launcher_requirements(report)
+
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["dll"], "msvcr90.dll")
+        self.assertEqual(entry["sxs"], "Microsoft.VC90.CRT")
+        self.assertEqual(entry["manifest"], "Microsoft.VC90.CRT.manifest")
+        self.assertEqual(entry["sxs_family"], "x86_microsoft.vc90.crt_")
+        self.assertIn("msvcr90.dll", entry["dlls"])
+        self.assertTrue(entry["url"].startswith("https://"))
 
 
 class PortablizerRuntimeIntegrationTests(unittest.TestCase):
