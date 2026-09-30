@@ -2601,6 +2601,153 @@ class DownloadProgressTests(unittest.TestCase):
         self.assertTrue(calls)
 
 
+class StuckAt85PercentRegressionTests(unittest.TestCase):
+    """Жалоба: «после скачивания DirectX сборка виснет на 85% и не сдвигается».
+
+    Скачивание уже показывает проценты (см. ``DownloadProgressTests``), а вот
+    следующий шаг — распаковка ~100 МБ пакета собственным (чисто питоновским)
+    декодером кабинетов и последующий тихий запуск ``DXSETUP.exe`` — раньше
+    был ОДНИМ блокирующим вызовом без единой точки прогресса или потолка по
+    времени. Здесь проверяется, что оба вызова теперь ограничены по времени
+    и «докладывают», что ещё работают, а не просто пропадают на минуты.
+    """
+
+    def setUp(self):
+        self.log = Logger()
+
+    def test_bounded_call_never_waits_longer_than_its_timeout(self):
+        """Даже «зависший» чисто питоновский вызов не блокирует сборку вечно."""
+        import threading as _threading
+
+        started = _threading.Event()
+
+        def slow():
+            started.set()
+            _threading.Event().wait(30)  # никогда не установится за тест
+            return ["never"]
+
+        ticks = []
+        started_at = __import__("time").monotonic()
+        result = redist._bounded_call(
+            slow, timeout=0.3, heartbeat=0.1, default=[],
+            on_tick=lambda elapsed: ticks.append(elapsed))
+        elapsed_total = __import__("time").monotonic() - started_at
+
+        self.assertTrue(started.wait(1))
+        self.assertEqual(result, [])
+        # Не «зависли» дольше отведённого потолка (с небольшим запасом).
+        self.assertLess(elapsed_total, 2.0)
+        # И при этом хотя бы раз «доложили», что работа идёт.
+        self.assertTrue(ticks, "heartbeat не сработал")
+
+    def test_bounded_call_returns_the_real_result_when_fast_enough(self):
+        result = redist._bounded_call(lambda: [1, 2, 3], timeout=5,
+                                      heartbeat=0.05, default=[])
+        self.assertEqual(result, [1, 2, 3])
+
+    def test_directx_bundle_extraction_does_not_stall_the_build(self):
+        """Собственный декодер «висит» на бандле — сборка не должна ждать его.
+
+        Ступень 1 (:mod:`.cabinet`) подменена вечно работающей функцией;
+        ``install_directx_bundle`` обязан вовремя перейти к ступени 2
+        (штатный wextract, здесь — фиктивный ``run``) вместо того, чтобы
+        стоять на месте до просветления.
+        """
+        import threading as _threading
+
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            if args[0].lower().endswith("directx_jun2010_redist.exe"):
+                target = args[-1].split(":", 1)[1]
+                os.makedirs(target, exist_ok=True)
+                Path(target, "DXSETUP.exe").write_bytes(b"MZ")
+                return 0
+            # Финальный запуск DXSETUP.exe /silent — просто «успех».
+            return 0
+
+        def never_returns(*_args, **_kwargs):
+            _threading.Event().wait(30)
+            return []
+
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp, "directx_Jun2010_redist.exe")
+            bundle.write_bytes(b"MZ" + b"\x00" * 4096)
+
+            with mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "CABINET_DECODE_TIMEOUT", 0.2), \
+                    mock.patch.object(redist, "CABINET_HEARTBEAT_SECONDS", 0.05), \
+                    mock.patch.object(redist.cabinet, "extract_file",
+                                      never_returns):
+                started_at = __import__("time").monotonic()
+                code, command = redist.install_directx_bundle(
+                    str(bundle), runner, self.log)
+                elapsed = __import__("time").monotonic() - started_at
+
+        self.assertLess(elapsed, 3.0,
+                        "install_directx_bundle не должен ждать дольше потолка")
+        self.assertEqual(code, 0)
+        self.assertIn("DXSETUP.exe", command)
+        self.assertTrue(calls)
+
+    def test_silent_install_reports_progress_while_it_waits(self):
+        """Тихая установка сообщает в журнал, что ещё жива, а не молчит."""
+
+        class FakeProcess:
+            def __init__(self):
+                self.pid = 4242
+                self._polls = 0
+
+            def wait(self, timeout=None):
+                self._polls += 1
+                if self._polls < 3:
+                    raise __import__("subprocess").TimeoutExpired(
+                        ["fake"], timeout)
+                return 0
+
+            def kill(self):
+                pass
+
+        with mock.patch.object(redist, "IS_WINDOWS", True), \
+                mock.patch.object(redist, "_WAIT_POLL_SECONDS", 0.01), \
+                mock.patch("subprocess.Popen", return_value=FakeProcess()):
+            ticks = []
+            code = redist._run_quiet(
+                ["fake.exe", "/silent"], timeout=5,
+                on_tick=lambda elapsed, total: ticks.append((elapsed, total)))
+
+        self.assertEqual(code, 0)
+        self.assertTrue(ticks, "on_tick обязан сработать, пока процесс идёт")
+        self.assertEqual(ticks[0][1], 5)
+
+    def test_default_runner_of_run_silent_install_pings_the_log(self):
+        class FakeProcess:
+            def __init__(self):
+                self.pid = 1
+                self._polls = 0
+
+            def wait(self, timeout=None):
+                self._polls += 1
+                if self._polls < 3:
+                    raise __import__("subprocess").TimeoutExpired(
+                        ["fake"], timeout)
+                return 0
+
+            def kill(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "vc_redist.x64.exe")
+            path.write_bytes(b"MZ")
+            with mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "_WAIT_POLL_SECONDS", 0.01), \
+                    mock.patch("subprocess.Popen", return_value=FakeProcess()):
+                outcome = redist.run_silent_install(str(path), log=self.log)
+
+        self.assertEqual(outcome.status, "installed")
+
+
 class ProgressWiringTests(unittest.TestCase):
     """Проценты доходят до окна: ядро → воркер → вторая полоса прогресса."""
 

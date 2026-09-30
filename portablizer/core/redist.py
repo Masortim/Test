@@ -59,6 +59,8 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -1275,6 +1277,76 @@ def _accepts_keyword(func: Callable, name: str) -> bool:
 DOWNLOAD_TICK_SECONDS = 0.5
 
 
+#: Сколько максимум ждём собственный (чисто питоновский) декодер кабинетов
+#: на ОДНОЙ операции: он читает LZX/MSZIP побитно и на огромном пакете
+#: (``directx_Jun2010_redist.exe`` — почти 100 МБ) может оказаться на порядок
+#: медленнее штатного ``expand``/wextract. Раньше это выглядело как «сборка
+#: висит на 85%»: скачивание доходило до 100%, а дальше единственный вызов
+#: ``cabinet.extract_file`` без единой точки прогресса или отмены мог идти
+#: сколько угодно. Теперь у него есть потолок: не уложился — переходим к
+#: следующей ступени лестницы (штатный ``expand``/wextract), а не ждём.
+CABINET_DECODE_TIMEOUT = 60
+
+#: Как часто, пока decoder работает, обновляем «живой» индикатор прогресса.
+CABINET_HEARTBEAT_SECONDS = 3.0
+
+
+def _bounded_call(func: Callable[..., object], *args,
+                  timeout: Optional[float] = None,
+                  heartbeat: Optional[float] = None,
+                  on_tick: Optional[Callable[[float], None]] = None,
+                  default: object = None, **kwargs) -> object:
+    """Выполняет ``func`` в отдельном потоке и не ждёт его дольше ``timeout``.
+
+    Наш декодер кабинетов — чистый Python без единой точки, где его можно
+    прервать посередине, поэтому единственный надёжный способ не дать ему
+    подвесить сборку — вынести вызов в daemon-поток и ограничить ожидание
+    снаружи. Поток остаётся daemon'ом: если он всё же не уложится, он тихо
+    доработает в фоне (или будет снят вместе с процессом), а сборка в это
+    время уже перейдёт к следующей, более быстрой ступени лестницы
+    (``expand``/wextract). ``on_tick(elapsed)`` вызывается каждые
+    ``heartbeat`` секунд ожидания — сюда подключается индикатор прогресса,
+    чтобы «висит» и «просто небыстро» не выглядели одинаково.
+
+    ``timeout``/``heartbeat`` при отсутствии берутся из модульных констант
+    в момент ВЫЗОВА, а не при определении функции — иначе их нельзя было бы
+    переопределить ни тестам, ни будущим настройкам.
+    """
+    if timeout is None:
+        timeout = CABINET_DECODE_TIMEOUT
+    if heartbeat is None:
+        heartbeat = CABINET_HEARTBEAT_SECONDS
+    box: List[object] = [default]
+
+    def worker() -> None:
+        try:
+            box[0] = func(*args, **kwargs)
+        except Exception:  # noqa: BLE001 — чужой файл не должен ронять сборку
+            pass
+
+    done = threading.Event()
+
+    def run_and_signal() -> None:
+        try:
+            worker()
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=run_and_signal, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    while not done.wait(timeout=heartbeat):
+        elapsed = time.monotonic() - started
+        if on_tick is not None:
+            try:
+                on_tick(elapsed)
+            except Exception:  # noqa: BLE001
+                pass
+        if elapsed >= timeout:
+            break
+    return box[0]
+
+
 def _download_file(url: str, destination: str, timeout: int = 120,
                    progress: Optional[Callable[[int, int, float], None]] = None,
                    cancel: Optional[Callable[[], bool]] = None) -> bool:
@@ -1366,11 +1438,22 @@ def _kill_tree(process: "subprocess.Popen") -> None:
         pass
 
 
-def _run_quiet(args: Sequence[str], timeout: int = 600) -> int:
-    """Запускает внешний инструмент (expand/msiexec) без окна консоли.
+#: Сколько ждём между опросами долгого процесса (секунды): достаточно
+#: часто, чтобы heartbeat не выглядел «мёртвым», и достаточно редко, чтобы
+#: не грузить систему пустыми системными вызовами.
+_WAIT_POLL_SECONDS = 2.0
+
+
+def _run_quiet(args: Sequence[str], timeout: int = 600,
+               on_tick: Optional[Callable[[float, int], None]] = None) -> int:
+    """Запускает внешний инструмент (expand/msiexec/DXSETUP) без окна.
 
     Возвращает код возврата; :data:`TIMEOUT_EXIT_CODE` означает, что пакет
     не уложился в отведённое время и был снят вместе со своими детьми.
+    Ждём не одним блокирующим ``wait(timeout=...)``, а короткими порциями:
+    так вызывающий может показать, что установка «жива» — ``on_tick(elapsed,
+    timeout)`` вызывается при каждом опросе, — а не только итог через
+    15 минут молчаливого ожидания DirectX/.NET/обновлений Windows.
     """
     if not IS_WINDOWS:
         return 1
@@ -1381,8 +1464,21 @@ def _run_quiet(args: Sequence[str], timeout: int = 600) -> int:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return 1
+    started = time.monotonic()
     try:
-        return process.wait(timeout=timeout)
+        while True:
+            elapsed = time.monotonic() - started
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(list(args), timeout)
+            try:
+                return process.wait(timeout=min(_WAIT_POLL_SECONDS, remaining))
+            except subprocess.TimeoutExpired:
+                if on_tick is not None:
+                    try:
+                        on_tick(time.monotonic() - started, timeout)
+                    except Exception:  # noqa: BLE001
+                        pass
     except subprocess.TimeoutExpired:
         _kill_tree(process)
         return TIMEOUT_EXIT_CODE
@@ -1945,14 +2041,19 @@ def install_directx_bundle(path: str, run: Callable[[Sequence[str]], int],
         # Сначала — собственный распаковщик: бандл DirectX это IExpress,
         # то есть обычный кабинет, приклеенный к PE. Запускать сам бандл
         # (и гадать с ключами) не нужно вовсе.
-        try:
-            # recurse=False: DXSETUP ждёт кабинеты кабинетами. Разворачивать
-            # сотню архивов June 2010 (это минуты) перед установкой не нужно
-            # и вредно — ставит их он сам.
-            cabinet.extract_file(path, work, recurse=False)
-        except Exception as exc:  # noqa: BLE001
+        # recurse=False: DXSETUP ждёт кабинеты кабинетами. Разворачивать
+        # сотню архивов June 2010 (это минуты) перед установкой не нужно
+        # и вредно — ставит их он сам. Вызов ограничен по времени: это
+        # чистый Python без точки отмены, и на ~100 МБ бандла он может
+        # оказаться заметно медленнее штатного wextract из ступени ниже.
+        def _on_decode_tick(elapsed: float) -> None:
             if log is not None:
-                log.debug(f"Свой распаковщик DirectX: {exc}")
+                log.debug(
+                    f"Свой распаковщик DirectX: работает уже {int(elapsed)} с "
+                    "— жду ещё немного, затем перейду на штатный wextract.")
+
+        _bounded_call(cabinet.extract_file, path, work, recurse=False,
+                     default=[], on_tick=_on_decode_tick)
         if not _find_file(work, "dxsetup.exe", allow_mangled=False):
             for command in extraction_commands(path, work, "directx_bundle"):
                 code = run(command)
@@ -2007,11 +2108,12 @@ def install_legacy_vcredist(path: str, run: Callable[[Sequence[str]], int],
         return code, subprocess.list2cmdline(fallback)
     work = cmdline_safe_dir(base) or base
     try:
-        try:
-            cabinet.extract_file(path, work, wanted="vc_red.msi")
-        except Exception as exc:  # noqa: BLE001 — чужой файл не роняет сборку
-            if log is not None:
-                log.debug(f"Свой распаковщик VC++: {exc}")
+        _bounded_call(
+            cabinet.extract_file, path, work, wanted="vc_red.msi",
+            default=[],
+            on_tick=(lambda elapsed: log.debug(
+                f"Свой распаковщик VC++: работает уже {int(elapsed)} с."))
+            if log is not None else None)
         package = (_find_file(work, "vc_red.msi", allow_mangled=False)
                    or _find_file(work, "vcredist.msi", allow_mangled=False))
         if package:
@@ -2050,7 +2152,30 @@ def run_silent_install(path: str, *,
     """
     rule = installer_rule(path)
     kind = installer_kind(path)
-    run = runner or (lambda args: _run_quiet(args, silent_timeout(kind)))
+    timeout = silent_timeout(kind)
+    display_name = title or (rule.title if rule else os.path.basename(path))
+
+    def _default_run(args: Sequence[str]) -> int:
+        """Тихая установка с heartbeat: без него DirectX/.NET на 15 минут
+        превращались в тишину в журнале — неотличимую от настоящего
+        зависания сборки."""
+        last = [-1]
+
+        def on_tick(elapsed: float, total: int) -> None:
+            # Не чаще раза в 20 секунд — иначе журнал завален «жду».
+            step = int(elapsed // 20)
+            if step == last[0]:
+                return
+            last[0] = step
+            if log is not None:
+                log.info(
+                    f"  {display_name}: установка идёт уже {int(elapsed)} с "
+                    f"из {int(total)} — это нормально для крупных пакетов "
+                    "(DirectX, .NET, обновления Windows), ждём.")
+
+        return _run_quiet(args, timeout, on_tick=on_tick)
+
+    run = runner or _default_run
     outcome = SilentInstall(
         path=os.path.abspath(path), kind=kind, arch=arch,
         title=title or (rule.title if rule else os.path.basename(path)),
@@ -2562,7 +2687,11 @@ class RuntimeProvisioner:
            может сорвать ни пробел с кириллицей в пути, ни политика запуска
            exe, ни отсутствие ``expand`` в PATH. Пакеты VC++ 2005-2022 и
            DirectX — это PE с приклеенными кабинетами, и читаются они
-           напрямую;
+           напрямую. Вызов ограничен по времени (:data:`CABINET_DECODE_TIMEOUT`):
+           это чистый Python без точки отмены, и на огромном пакете
+           (``directx_Jun2010_redist.exe`` — почти 100 МБ) он может оказаться
+           на порядок медленнее ступени 3 — не уложился, переходим дальше, а
+           не ждём молча;
         2. запуск самого пакета с ключом распаковки, подобранным по его
            движку (wextract, WiX Burn, MSI), в путь без пробелов и не-ASCII;
         3. штатные ``expand``/``extrac32``/7-Zip как последняя надежда.
@@ -2570,14 +2699,22 @@ class RuntimeProvisioner:
         if not os.path.isfile(archive):
             return False
         os.makedirs(destination, exist_ok=True)
-        self._report(None, f"Распаковываю {os.path.basename(archive)}…", -1)
+        base_name = os.path.basename(archive)
+        self._report(None, f"Распаковываю {base_name}…", -1)
 
-        # Ступень 1: читаем кабинеты сами.
-        try:
-            written = cabinet.extract_file(archive, destination, wanted=wanted)
-        except Exception as exc:  # noqa: BLE001 — чужой файл не должен ронять сборку
-            self.log.debug(f"Собственный распаковщик не справился: {exc}")
-            written = []
+        # Ступень 1: читаем кабинеты сами — но не бесконечно (см.
+        # CABINET_DECODE_TIMEOUT и _bounded_call): без потолка загрузка,
+        # доходившая до 100%, дальше могла идти сколько угодно молча — то
+        # самое «сборка висит на 85%».
+        def _on_decode_tick(elapsed: float) -> None:
+            self._report(
+                None,
+                f"Распаковываю {base_name}… ({int(elapsed)} с — большой "
+                "пакет, это не зависание)", -1)
+
+        written = _bounded_call(
+            cabinet.extract_file, archive, destination, wanted=wanted,
+            default=[], on_tick=_on_decode_tick)
         if written:
             self.log.debug(
                 f"{os.path.basename(archive)}: собственным распаковщиком "
@@ -2718,11 +2855,11 @@ class RuntimeProvisioner:
             self._run([system_tool("expand"), "-F:*", archive, destination])
             if produced():
                 return True
-        try:
-            written = cabinet.extract_file(archive, destination)
-        except Exception as exc:  # noqa: BLE001
-            self.log.debug(f"Кабинет {os.path.basename(archive)}: {exc}")
-            written = []
+        written = _bounded_call(
+            cabinet.extract_file, archive, destination, default=[],
+            on_tick=lambda elapsed: self.log.debug(
+                f"Кабинет {os.path.basename(archive)}: свой распаковщик "
+                f"работает уже {int(elapsed)} с."))
         if written:
             return True
         if not IS_WINDOWS:
