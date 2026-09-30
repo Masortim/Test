@@ -453,6 +453,147 @@ class PortableExeLauncherTests(unittest.TestCase):
                              str(configurator.parent))
 
 
+
+    SXS_ITEM = {
+        "dll": "msvcr80.dll",
+        "manifest": "Microsoft.VC80.CRT.manifest",
+        "sxs_family": "x86_microsoft.vc80.crt_",
+        "title": "Microsoft Visual C++ 2005 SP1 Redistributable",
+    }
+
+    def test_launch_rejected_with_14001_gets_a_friendly_message(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, app, _target = self._portable(temp)
+            error = OSError("side-by-side configuration is incorrect")
+            error.winerror = 14001  # ERROR_SXS_CANT_GEN_ACTCTX
+            shown = []
+
+            with mock.patch.object(exe_launcher, "find_portable_root",
+                                   return_value=root), \
+                    mock.patch.object(exe_launcher, "_show_error",
+                                      side_effect=shown.append), \
+                    mock.patch("portable_launcher_entry.subprocess.run",
+                               side_effect=error):
+                rc = exe_launcher.run([])
+
+            # Симптом из жалобы «Ведьмака»: без пакета VC++ 2005/2008 Windows
+            # не запускает программу и показывает криптичное окно. Теперь —
+            # понятное сообщение и код выхода, равный коду ошибки.
+            self.assertEqual(rc, 14001)
+            self.assertTrue(shown, "пользователь не получил объяснение")
+            self.assertIn("14001", shown[0])
+            self.assertIn("Visual C++", shown[0])
+            self.assertIn("Install-Redist.cmd", shown[0])
+
+    def test_other_oserror_is_not_disguised_as_14001(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, _app, _target = self._portable(temp)
+            error = OSError("access denied")
+            error.winerror = 5
+            with mock.patch.object(exe_launcher, "find_portable_root",
+                                   return_value=root), \
+                    mock.patch.object(exe_launcher, "_show_error",
+                                      side_effect=lambda _msg: None), \
+                    mock.patch("portable_launcher_entry.subprocess.run",
+                               side_effect=error):
+                with self.assertRaises(OSError):
+                    exe_launcher.run([])
+
+    # -- то же правило side-by-side, что и в Launch.bat ----------------------
+    def test_bare_sxs_dll_without_manifest_counts_as_missing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "Game_Portable")
+            app = root / "App"
+            app.mkdir(parents=True)
+            (app / "game.exe").write_bytes(b"MZ")
+            (app / "msvcr80.dll").write_bytes(b"MZ")
+            cfg = {"runtime_requirements": [self.SXS_ITEM]}
+            env = {"SystemRoot": str(Path(temp, "Windows"))}
+
+            # «dll же лежит рядом!» — да, но без private-манифеста Windows
+            # её игнорирует и вылетает с 14001: считаем недостающей.
+            missing = exe_launcher.missing_runtime_components(
+                root, cfg, app / "game.exe", env)
+            self.assertEqual([item["dll"] for item in missing],
+                             ["msvcr80.dll"])
+
+            (app / "Microsoft.VC80.CRT.manifest").write_text(
+                "<assembly/>", encoding="utf-8")
+            missing = exe_launcher.missing_runtime_components(
+                root, cfg, app / "game.exe", env)
+            self.assertEqual(missing, [])
+
+    def test_sxs_requirement_is_met_by_the_winsxs_family_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "Game_Portable")
+            app = root / "App"
+            app.mkdir(parents=True)
+            (app / "game.exe").write_bytes(b"MZ")
+            windir = Path(temp, "Windows")
+            family = windir / "WinSxS" / (
+                "x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_"
+                "8.0.50727.6195_none_4ff29c7c0b2f2a62")
+            family.mkdir(parents=True)
+            cfg = {"runtime_requirements": [self.SXS_ITEM]}
+
+            # Система «видна» только через WinSxS: System32 пуст — и это
+            # не должно считаться отсутствием рантайма.
+            missing = exe_launcher.missing_runtime_components(
+                root, cfg, app / "game.exe", {"SystemRoot": str(windir)})
+            self.assertEqual(missing, [])
+
+    def test_silent_install_is_accepted_once_winsxs_folder_appears(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "Game_Portable")
+            redist_dir = root / "Redist"
+            redist_dir.mkdir(parents=True)
+            (redist_dir / "vcredist_x86.exe").write_bytes(b"MZ")
+            windir = Path(temp, "Windows")
+            cfg = {"runtime_installers": [
+                {"file": "Redist/vcredist_x86.exe", "title": "VC++ 2005",
+                 "kind": "vcredist_legacy", "args": "/q",
+                 "dlls": "msvcr80.dll", "arch": "x86"}]}
+
+            def run_and_plant(_command, timeout=900):
+                family = windir / "WinSxS" / (
+                    "x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_"
+                    "8.0.50727.6195_none_4ff29c7c0b2f2a62")
+                family.mkdir(parents=True)
+                return 0
+
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_run_hidden",
+                                      side_effect=run_and_plant), \
+                    mock.patch.dict(os.environ,
+                                    {"SystemRoot": str(windir)}):
+                still = exe_launcher.install_missing_runtime(
+                    root, cfg, [self.SXS_ITEM])
+            self.assertEqual(still, [])
+
+    def test_silent_install_that_changed_nothing_keeps_the_warning(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "Game_Portable")
+            redist_dir = root / "Redist"
+            redist_dir.mkdir(parents=True)
+            (redist_dir / "vcredist_x86.exe").write_bytes(b"MZ")
+            windir = Path(temp, "Windows")
+            cfg = {"runtime_installers": [
+                {"file": "Redist/vcredist_x86.exe", "title": "VC++ 2005",
+                 "kind": "vcredist_legacy", "args": "/q",
+                 "dlls": "msvcr80.dll", "arch": "x86"}]}
+
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_run_hidden",
+                                      return_value=0), \
+                    mock.patch.dict(os.environ,
+                                    {"SystemRoot": str(windir)}):
+                still = exe_launcher.install_missing_runtime(
+                    root, cfg, [self.SXS_ITEM])
+            # Установщик завершился «успешно», но сборки нигде нет (UAC был
+            # отменён внутри /q, пакет повреждён): предупреждение остаётся.
+            self.assertEqual([item["dll"] for item in still], ["msvcr80.dll"])
+
+
 class LaunchBatSafetyTests(unittest.TestCase):
     """Регрессии на «окно мигнуло и закрылось»."""
 
@@ -577,12 +718,12 @@ class LaunchBatExecutionTests(unittest.TestCase):
             fs.add_file(f"{self.ROOT}\\{path}", "data")
         return fs
 
-    def _run(self, cfg, fs=None, argv=None, program_exit_code=0):
+    def _run(self, cfg, fs=None, argv=None, program_exit_code=0, env=None):
         bat = render_bat(cfg)
         fs = fs or self._fs()
         fs.add_file(f"{self.ROOT}\\Launch.bat", bat)
         return batsim.run_batch(bat, f"{self.ROOT}\\Launch.bat", fs,
-                                argv=argv or [],
+                                argv=argv or [], env=env,
                                 program_exit_code=program_exit_code)
 
     def test_launcher_actually_starts_the_program(self):
@@ -718,6 +859,85 @@ class LaunchBatExecutionTests(unittest.TestCase):
         )
         with self.assertRaises(batsim.BatError):
             batsim.run_batch(broken, rf"{self.ROOT}\Launch.bat", self._fs())
+
+
+
+    # -- сценарий из жалобы: «Ведьмак», machine-реестр, UAC, ошибка 14001 -----
+    def _witcher_cfg(self):
+        return LauncherConfig(
+            app_name="The Witcher", target_exe_rel="App/witcher.exe",
+            apply_registry=True,
+            registry_keys=[r"HKLM\\SOFTWARE\\CD Projekt Red\\The Witcher"],
+            registry_created_keys=[
+                r"HKLM\\SOFTWARE\\CD Projekt Red\\The Witcher"],
+            machine_reg_file_name="portable_machine.reg")
+
+    def _witcher_env(self, uac="allow"):
+        # На целевом ПК захваченных HKLM-ключей нет (как и должно быть на
+        # чистой машине): reg query вернёт ошибку — пойдём за правами.
+        return {"BATSIM_MISSING_REG": r"HKLM\\SOFTWARE\\CD Projekt Red",
+                "BATSIM_UAC": uac}
+
+    def _witcher_fs(self):
+        return self._fs(exe_rel=r"App\witcher.exe",
+                        extra=["portable_machine.reg"])
+
+    def test_declined_uac_is_named_as_declined_not_as_generic_failure(self):
+        res = self._run(self._witcher_cfg(), fs=self._witcher_fs(),
+                        env=self._witcher_env(uac="deny"))
+        # Раньше здесь было «Administrator rights were not granted or the
+        # tool failed» — непонятно, кто виноват: пользователь или программа.
+        self.assertIn("Administrator rights were declined at the UAC prompt",
+                      res.text)
+        self.assertNotIn("were not granted or the tool failed", res.text)
+        self.assertEqual(res.exit_code, 1223)
+        self.assertFalse(res.launched)
+
+    def test_elevated_child_crash_14001_points_to_the_redist_fix(self):
+        res = self._run(self._witcher_cfg(), fs=self._witcher_fs(),
+                        program_exit_code=14001,
+                        env=self._witcher_env())
+        # Исходная жалоба: дочернее окно с «параллельная конфигурация
+        # неправильна», а родитель сообщал «права не получены». Теперь лончер
+        # различает отказ в правах и ошибку запуска — и даёт рецепт.
+        self.assertIn("error 14001", res.text)
+        self.assertIn("side-by-side", res.text)
+        self.assertIn(r"Redist\Install-Redist.cmd", res.text)
+        self.assertNotIn("were declined", res.text)
+        self.assertNotIn("were not granted", res.text)
+        self.assertEqual(res.exit_code, 14001)
+        self.assertTrue(res.launched)
+
+    def test_elevated_child_failure_is_not_blamed_on_permissions(self):
+        res = self._run(self._witcher_cfg(), fs=self._witcher_fs(),
+                        program_exit_code=1, env=self._witcher_env())
+        self.assertIn("finished with exit code 1", res.text)
+        self.assertIn("WERE granted", res.text)
+        self.assertEqual(res.exit_code, 1)
+
+    def test_elevated_run_imports_machine_registry_once_and_starts_game(self):
+        res = self._run(self._witcher_cfg(), fs=self._witcher_fs(),
+                        env=self._witcher_env())
+        self.assertEqual(res.exit_code, 0)
+        self.assertTrue(res.launched)
+        self.assertEqual(len(res.launches), 1,
+                         "игра стартует один раз — в поднятом окне")
+        self.assertEqual(res.launches[0].command,
+                         rf"{self.ROOT}\App\witcher.exe")
+        joined = " | ".join(res.reg_commands).lower()
+        self.assertIn("reg import", joined)
+        self.assertIn("portable_machine.reg", joined)
+
+    def test_direct_launch_exit_14001_explains_the_sxs_fix(self):
+        cfg = LauncherConfig(app_name="The Witcher",
+                             target_exe_rel="App/witcher.exe")
+        res = self._run(cfg, fs=self._fs(exe_rel=r"App\witcher.exe"),
+                        program_exit_code=14001)
+        self.assertIn("[ERROR 14001]", res.text)
+        self.assertIn("Visual C++ 2005/2008", res.text)
+        self.assertIn(r"Redist\Install-Redist.cmd", res.text)
+        self.assertEqual(res.exit_code, 14001)
+        self.assertGreaterEqual(res.paused, 1)
 
 
 class RegistryPortabilityTests(unittest.TestCase):
@@ -1052,6 +1272,10 @@ class ExitCodeTests(unittest.TestCase):
         self.assertEqual(_format_exit_code(740), "740")
         self.assertIn("администратора", _exit_code_hint(740))
         self.assertIn("UAC", _exit_code_hint(1223))
+        # Ошибка из жалобы о «Ведьмаке»: битая/отсутствующая параллельная
+        # сборка VC++ — отдельная подсказка, а не «неизвестный код».
+        self.assertIn("side-by-side", _exit_code_hint(14001))
+        self.assertIn("Install-Redist.cmd", _exit_code_hint(14001))
 
     def test_success_and_unknown_codes_have_no_hint(self):
         self.assertEqual(_format_exit_code(None), "неизвестен")

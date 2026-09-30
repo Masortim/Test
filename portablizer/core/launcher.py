@@ -224,12 +224,16 @@ def _ascii_token(value: str) -> str:
 def _runtime_check_block(cfg: LauncherConfig) -> str:
     """Предстартовая проверка распространяемых компонентов.
 
-    Список формируется при сборке: в него попадает только то, что Portablizer
-    НЕ смог принести в портатив. Если на целевом ПК такой библиотеки тоже нет,
-    пользователь увидит название пакета и ссылку, а не системное окно
-    «Запуск программы невозможен: отсутствует MSVCR110.dll».
+    Список формируется при сборке: в него попадает то, что Portablizer НЕ
+    смог принести в портатив, плюс зонды работоспособности доставленных
+    сборок VC++ 2005/2008. Если на целевом ПК библиотеки нет, пользователь
+    увидит название пакета и ссылку, а не системное окно «Запуск программы
+    невозможен: отсутствует MSVCR110.dll» — а после тихой установки пакета
+    проверка повторяется, так что «установлено» не объявляется, пока файлы
+    реально не появились.
     """
     calls: List[str] = []
+    has_sxs = False
     for item in cfg.runtime_requirements[:MAX_RUNTIME_CHECKS]:
         dll = _ascii_token(item.get("dll", ""))
         if not dll:
@@ -237,7 +241,16 @@ def _runtime_check_block(cfg: LauncherConfig) -> str:
         title = ascii_display(item.get("title", ""),
                               fallback="Microsoft runtime package")
         url = _ascii_token(item.get("url", ""))
-        calls.append(f'call :portable_need_dll "{dll}" "{title}" "{url}"')
+        manifest = _ascii_token(item.get("manifest", ""))
+        family = _ascii_token(item.get("sxs_family", ""))
+        if not (manifest and family):
+            manifest = ""
+            family = ""
+        else:
+            has_sxs = True
+        calls.append(
+            f'call :portable_need_dll "{dll}" "{title}" "{url}" '
+            f'"{manifest}" "{family}"')
     if not calls:
         return ("rem (this program needs no extra Microsoft runtime "
                 "components)\ngoto :eof")
@@ -252,13 +265,30 @@ def _runtime_check_block(cfg: LauncherConfig) -> str:
         "echo   Installing the missing packages silently from the "
         f"{REDIST_DIR_NAME} folder...",
         f'call "{script}"',
-        "if not errorlevel 1 (",
-        "  echo   Done: the packages were installed without any dialogs.",
-        "  echo.",
-        "  goto :eof",
-        ")",
+        # Молчаливой установке install-скрипт сообщить о результате не может
+        # (его повторный запуск с UAC - отдельный процесс), поэтому итог
+        # проверяем самым надёжным способом: ищем файлы ещё раз. Только
+        # появившиеся реально библиотеки позволяют сказать «готово».
+        'set "PORTABLE_RUNTIME_MISSING="',
+    ]
+    lines += calls
+    lines += [
+        "if defined PORTABLE_RUNTIME_MISSING goto portable_runtime_manual",
+        "echo   The packages are in place now - starting the program.",
+        "echo.",
+        "goto :eof",
         ":portable_runtime_manual",
         "echo   Details and download links: redistributables.txt",
+    ]
+    if has_sxs:
+        lines += [
+            "echo   The missing parts are Visual C++ 2005/2008 side-by-side",
+            "echo   assemblies. Windows error 14001 - side-by-side",
+            "echo   configuration is incorrect - means exactly this problem:",
+            "echo   install the package above, or run "
+            f"{REDIST_DIR_NAME}\\{REDIST_SCRIPT_NAME} manually.",
+        ]
+    lines += [
         "echo   The program may still start: some components load on demand.",
         "echo.",
         "goto :eof",
@@ -457,16 +487,40 @@ def _machine_elevation_block(cfg: LauncherConfig) -> str:
         'if not errorlevel 1 goto :eof',
         'set "PORTABLE_SELF=%~f0"',
         'set "PORTABLE_ELEVATION_TARGET=%PORTABLE_TARGET%"',
-        'echo This settings tool needs the captured machine registry data.',
+        'echo This portable program keeps its installation entries in the',
+        'echo machine registry (HKLM); on this PC those entries are missing.',
         'echo Requesting administrator rights for this run only...',
         'powershell -NoProfile -ExecutionPolicy Bypass -Command "$q=[char]34; $a=\'/d /c call \'+$q+$env:PORTABLE_SELF+$q+\' --nopause --elevated --machine-registry --target \'+$q+$env:PORTABLE_ELEVATION_TARGET+$q; $p=Start-Process -FilePath $env:ComSpec -ArgumentList $a -Verb RunAs -WindowStyle Normal -Wait -PassThru; exit $p.ExitCode"',
         'set "PORTABLE_RELAUNCH_RC=%ERRORLEVEL%"',
         'set "PORTABLE_RELAUNCHED=1"',
-        'if not "%PORTABLE_RELAUNCH_RC%" == "0" (',
-        '  echo.',
-        '  echo [ERROR] Administrator rights were not granted or the tool failed.',
-        '  if not "%PORTABLE_PAUSE%" == "never" pause',
-        ')',
+        'if "%PORTABLE_RELAUNCH_RC%" == "0" goto :eof',
+        'echo.',
+        'if "%PORTABLE_RELAUNCH_RC%" == "1223" goto portable_relaunch_declined',
+        'if "%PORTABLE_RELAUNCH_RC%" == "14001" goto portable_relaunch_sxs',
+        'echo [ERROR] The elevated run finished with exit code '
+        '%PORTABLE_RELAUNCH_RC%.',
+        'echo Administrator rights WERE granted for that run, so this is not',
+        'echo a permission problem: the program itself failed to start.',
+        'echo Run this file from an already open cmd window to read the exact',
+        'echo error message the program printed above, and see portablizer.log',
+        'echo and PortableData for details.',
+        'goto portable_relaunch_failed',
+        ':portable_relaunch_declined',
+        'echo [ERROR] Administrator rights were declined at the UAC prompt.',
+        'echo They are needed only to import the captured installation entries',
+        'echo into the machine registry (HKLM) for this single run. Without',
+        'echo them this program cannot find its own install data and quits.',
+        'echo Run again and allow the request - or use --no-registry.',
+        'goto portable_relaunch_failed',
+        ':portable_relaunch_sxs',
+        'echo [ERROR] Windows refused to start the program (error 14001):',
+        'echo the side-by-side configuration is incorrect. The Visual C++',
+        'echo 2005/2008 runtime this program was built with is missing here.',
+        f'echo Fix: run {REDIST_DIR_NAME}\\{REDIST_SCRIPT_NAME} from this folder - it puts',
+        'echo the needed packages in silently. Without that package the',
+        'echo program cannot start at all. Details: redistributables.txt.',
+        ':portable_relaunch_failed',
+        'if not "%PORTABLE_PAUSE%" == "never" pause',
         'goto :eof',
     ])
 
@@ -717,19 +771,25 @@ if not exist "%PORTABLE_TARGET%" (
   exit /b 1
 )
 
-rem --- Microsoft runtime components (VC++, DirectX, ...) ---------------------
-rem Windows only reports "the program can't start because MSVCR110.dll is
-rem missing" after the fact. The check below names the package instead.
 for %%I in ("%PORTABLE_TARGET%") do set "PORTABLE_TARGET_DIR=%%~dpI"
-call :portable_check_runtime
 
-rem Launchers/configurators of older games often require their captured HKLM
-rem InstallFolder. VirtualStore is ignored by manifest-aware programs, so only
-rem those auxiliary targets are relaunched with UAC when a machine file exists.
+rem --- Captured HKLM data: elevation FIRST, before anything that needs it ---
+rem Old games read their install folder from HKLM and quit silently when it is
+rem missing, and VirtualStore does not help manifest-aware programs. When the
+rem captured machine keys really are absent here, this run is relaunched once
+rem through UAC - and the elevated copy then performs every privileged step
+rem (silent runtime install included) with no second prompt.
 call :portable_elevate_for_machine
 if defined PORTABLE_RELAUNCHED (
   endlocal & exit /b %PORTABLE_RELAUNCH_RC%
 )
+
+rem --- Microsoft runtime components (VC++, DirectX, ...) ---------------------
+rem Windows only reports "the program can't start because MSVCR110.dll is
+rem missing" after the fact; an invalid side-by-side setup reports even later,
+rem as error 14001 at start. The check below names the package instead and
+rem silently repairs what it can.
+call :portable_check_runtime
 
 call :portable_documents_load
 call :portable_registry_load
@@ -749,7 +809,18 @@ call :portable_wait_children
 call :portable_registry_save
 call :portable_documents_restore
 
-if not "%PORTABLE_RC%" == "0" (
+rem Error 14001 deserves its own explanation: it is never about registry or
+rem rights, it is the missing Visual C++ runtime the program was built with.
+if "%PORTABLE_RC%" == "14001" (
+  echo.
+  echo [ERROR 14001] Windows could not apply the program's side-by-side
+  echo configuration. The Visual C++ 2005/2008 runtime the program was built
+  echo with is not available to it, so it did not start at all.
+  echo Fix once: run {redist_dir}\{redist_script} from this folder - it puts
+  echo the needed packages in silently, with a single UAC prompt.
+  echo Details and download links: redistributables.txt
+)
+if not "%PORTABLE_RC%" == "0" if not "%PORTABLE_RC%" == "14001" (
   echo.
   echo [WARNING] The program exited with code %PORTABLE_RC%.
   echo If it did not start at all, run this file from an open cmd window
@@ -795,13 +866,26 @@ endlocal & exit /b 0
 {runtime_check}
 
 :portable_need_dll
-rem %1 = library, %2 = package that provides it, %3 = where to get it.
+rem %1 = library, %2 = package that provides it, %3 = where to get it,
+rem %4 = private assembly manifest (VC++ 2005/2008 only), %5 = WinSxS probe.
 rem A library next to the program or in the Windows folders is fine; only a
 rem really missing one is reported.
+if not "%~5" == "" goto portable_need_sxs_dll
 if exist "%PORTABLE_TARGET_DIR%%~1" goto :eof
 if exist "%PORTABLE_ROOT%\App\%~1" goto :eof
 if exist "%SystemRoot%\System32\%~1" goto :eof
 if exist "%SystemRoot%\SysWOW64\%~1" goto :eof
+goto portable_need_dll_missing
+:portable_need_sxs_dll
+rem VC++ 2005/2008 exist ONLY as side-by-side assemblies: their files never
+rem live in System32, a bare DLL next to the program is ignored by Windows
+rem unless a matching private manifest sits beside it, and a DLL without that
+rem manifest produces error 14001, not a "file not found" box. So check the
+rem manifest + library pair first, and the WinSxS folders by wildcard.
+if exist "%PORTABLE_TARGET_DIR%%~4" if exist "%PORTABLE_TARGET_DIR%%~1" goto :eof
+if exist "%PORTABLE_ROOT%\App\%~4" if exist "%PORTABLE_ROOT%\App\%~1" goto :eof
+if exist "%SystemRoot%\WinSxS\%~5*" goto :eof
+:portable_need_dll_missing
 if not defined PORTABLE_RUNTIME_MISSING (
   echo.
   echo [WARNING] This PC is missing Microsoft runtime components:
@@ -988,6 +1072,8 @@ def render_bat(cfg: LauncherConfig) -> str:
         documents_load=_documents_load_block(cfg),
         documents_restore=_documents_restore_block(cfg),
         runtime_check=_runtime_check_block(cfg),
+        redist_dir=REDIST_DIR_NAME,
+        redist_script=REDIST_SCRIPT_NAME,
     )
     return ensure_ascii_bat(text)
 

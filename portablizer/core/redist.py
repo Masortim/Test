@@ -373,6 +373,20 @@ _SXS_SUFFIXES: Tuple[Tuple[str, str], ...] = (
     ("msvcm", "CRT"), ("msvcp", "CRT"), ("msvcr", "CRT"),
 )
 
+#: Открытый ключ подписи всех сборок Microsoft (у VC++ 2005/2008 один и тот
+#: же). Манифест без корректного publicKeyToken недействителен: с ним Windows
+#: отвечает той же ошибкой 14001, что и без манифеста вовсе.
+_SXS_PUBLIC_KEY_TOKEN = "1fc8b3b9a1e18e3b"
+
+#: Канонические версии сборок — последние публичные обновления каждой линейки
+#: (MS11-025). Используются только как запасной вариант, когда точную версию
+#: не удалось взять ни из манифеста программы, ни из имени папки WinSxS, откуда
+#: был взят файл: private-манифест обязан объявить какую-то версию.
+_SXS_DEFAULT_VERSIONS: Dict[str, str] = {
+    "vc2005": "8.0.50727.6195",
+    "vc2008": "9.0.30729.6161",
+}
+
 
 def _dll_range(prefix: str, start: int, end: int) -> Tuple[str, ...]:
     """``d3dx9_24.dll`` … ``d3dx9_43.dll`` одним кортежем."""
@@ -549,6 +563,20 @@ def sxs_assembly_for(dll: str, package: RedistPackage) -> str:
         if name.startswith(prefix):
             return f"{package.sxs}.{suffix}"
     return f"{package.sxs}.CRT"
+
+
+def sxs_family_prefix(assembly: str, arch: str) -> str:
+    """Префикс папок сборки в WinSxS для проверки наличия рантайма.
+
+    Например, ``x86_microsoft.vc80.crt_`` — по одному ``if exist`` с такой
+    маской лончер понимает, стоит ли на целевом ПК Visual C++ 2005 runtime,
+    хотя самих файлов в System32 нет и никогда не было (обычная проверка
+    «лежит ли msvcr80.dll в System32/SysWOW64» там бесполезна в принципе).
+    """
+    if not assembly:
+        return ""
+    prefix = "x86" if arch == "x86" else "amd64"
+    return f"{prefix}_{assembly.lower()}_"
 
 
 # =============================================================================
@@ -2834,7 +2862,18 @@ class RuntimeProvisioner:
 
         Без него библиотека рядом с exe просто игнорируется: программа с
         манифестом ищет сборку в WinSxS и падает с «не удалось запустить
-        приложение, поскольку его параллельная конфигурация неправильна».
+        приложение, поскольку его параллельная конфигурация неправильна»
+        (ошибка 14001, ERROR_SXS_CANT_GEN_ACTCTX).
+
+        Два правила, без которых манифест недействителен и приводит ровно к
+        той же ошибке:
+
+        * в ``<file name=.../>`` перечисляются только библиотеки ЭТОЙ сборки —
+          ``Microsoft.VC80.CRT.manifest``, в котором записан mfc80.dll,
+          Windows отвергает целиком (MFC/ATL/OpenMP — отдельные сборки с
+          собственными манифестами);
+        * ``publicKeyToken`` обязан быть корректным — у всех сборок Microsoft
+          он один и известен, поэтому пустым его не оставляем никогда.
         """
         package = requirement.package
         if package is None or not package.sxs:
@@ -2848,15 +2887,40 @@ class RuntimeProvisioner:
                 importer = os.path.join(app_dir, rel.replace("/", os.sep))
                 if os.path.dirname(importer) != directory:
                     continue
+                # Версия из встроенного манифеста программы важнее всего:
+                # private-сборка связывается с программой по ПОЛНОМУ имени,
+                # включая версию, и никакая publisher-политика WinSxS тогда
+                # не применяется.
                 wanted = manifest_identity(read_pe_manifest(importer), assembly)
                 if wanted.get("version"):
                     identity.update(wanted)
                     break
+            if not identity.get("publicKeyToken"):
+                identity["publicKeyToken"] = _SXS_PUBLIC_KEY_TOKEN
             if not identity.get("version"):
+                canonical = _SXS_DEFAULT_VERSIONS.get(package.key, "")
+                if canonical:
+                    self.log.warn(
+                        f"{assembly}: версию не удалось взять ни из манифеста "
+                        f"программы, ни из имени папки WinSxS — в private-"
+                        f"манифест записана каноническая {canonical}. Если "
+                        f"Windows сообщит об ошибке 14001 (side-by-side), "
+                        f"установите пакет из папки {REDIST_DIR_NAME} — он "
+                        "поставит настоящую сборку в систему."
+                    )
+                    identity["version"] = canonical
+            if not identity.get("version"):
+                self.log.warn(
+                    f"Не удалось определить версию сборки {assembly} — "
+                    "private-манифест не создан. Программа на чистом ПК "
+                    "потребует установки официального пакета."
+                )
                 continue
             files = sorted(
                 name for name in os.listdir(directory)
-                if name.lower().endswith(".dll") and package.matches(name.lower())
+                if name.lower().endswith(".dll")
+                and package.matches(name.lower())
+                and sxs_assembly_for(name, package) == assembly
             )
             if not files:
                 continue
@@ -2871,7 +2935,7 @@ class RuntimeProvisioner:
                 f'name="{assembly}" version="{identity["version"]}" '
                 f'processorArchitecture='
                 f'"{identity.get("processorArchitecture", requirement.arch or "x86")}" '
-                f'publicKeyToken="{identity.get("publicKeyToken", "")}"/>\n'
+                f'publicKeyToken="{identity.get("publicKeyToken", _SXS_PUBLIC_KEY_TOKEN)}"/>\n'
                 f'{body}\n'
                 '</assembly>\n'
             )
@@ -3027,19 +3091,34 @@ class RuntimeProvisioner:
 
     def _stage_installers(self, report: ProvisionReport,
                           portable_dir: str) -> None:
-        """Кладёт в ``Redist`` портатива установщики недостающих пакетов.
+        """Кладёт в ``Redist`` портатива установщики пакетов-страховки.
 
-        Это страховка на «все случаи жизни»: файлы библиотек принести не
-        удалось, значит на целевом ПК их может не быть. Установщик рядом с
-        портативом позволяет лончеру поставить пакет **молча**, одним
-        запросом UAC, вместо череды окон с «OK» — или обойтись вовсе без
-        интернета, если пакет уже скачан.
+        Две ситуации покрываются одним механизмом:
+
+        * библиотеки принести не удалось (``report.missing``) — значит, на
+          целевом ПК их может не быть;
+        * библиотеки VC++ 2005/2008 принести удалось, но работают они рядом с
+          программой только при исправном private-манифесте сборки — самом
+          хрупком элементе портатива: его версия/идентичность обязаны
+          совпадать с тем, что запрашивает программа, иначе Windows отвечает
+          ошибкой 14001 («параллельная конфигурация неправильна»). Официальный
+          установщик рядом — гарантированный путь починки: он ставит настоящую
+          сборку в WinSxS целевого ПК.
+
+        Установщик рядом с портативом позволяет лончеру поставить пакет
+        **молча**, одним запросом UAC, вместо череды окон с «OK» — или
+        обойтись вовсе без интернета, если пакет уже скачан.
         """
-        if not report.missing:
+        repair: List[RuntimeRequirement] = list(report.missing)
+        repair += [
+            item for item in list(report.provided) + list(report.stock)
+            if item.package is not None and item.package.sxs
+        ]
+        if not repair:
             return
         redist_dir = os.path.join(portable_dir, REDIST_DIR_NAME)
         staged: Dict[str, Dict[str, str]] = {}
-        for requirement in report.missing:
+        for requirement in repair:
             package = requirement.package
             if package is None:
                 continue
@@ -3217,22 +3296,73 @@ def _identity_from_folder(name: str) -> Dict[str, str]:
 
 def launcher_requirements(report: ProvisionReport, limit: int = 24
                           ) -> List[Dict[str, str]]:
-    """Список для предстартовой проверки лончера (только недостающее)."""
+    """Список для предстартовой проверки лончера.
+
+    Сюда попадают:
+
+    1. **Недостающее** — то, что принести в портатив не удалось.
+    2. **Зонды работоспособности** доставленных сборок VC++ 2005/2008
+       (``sxs``, ``manifest``, ``sxs_family``): библиотека рядом с программой
+       помогает, только когда рядом же лежит её private-манифест, а иначе —
+       когда сборка стоит в WinSxS целевого ПК. Ни одно из условий обычной
+       проверкой «есть ли файл в System32» не выражается, поэтому зонд несёт
+       с собой имя манифеста и префикс папки сборки. Если на целевом ПК не
+       сработает ни одно условие, лончер молча ставит пакет из ``Redist`` —
+       вместо ошибки 14001 при старте программы.
+    """
     out: List[Dict[str, str]] = []
-    seen = set()
-    for requirement in report.missing:
-        if requirement.dll in seen:
+    by_assembly: Dict[Tuple[str, str], Dict[str, str]] = {}
+    plain_seen = set()
+    # Недостающее идёт первым: оно обязательное. Доставленные сборки VC++
+    # 2005/2008 — следом, как зонды работоспособности: их библиотека в папке
+    # программы работает только вместе со своим private-манифестом, и это
+    # надо проверить на целевом ПК.
+    for requirement in (list(report.missing)
+                        + list(report.provided) + list(report.stock)):
+        package = requirement.package
+        if package is not None and package.sxs:
+            # Одна сборка — один зонд: её файлы приезжают только вместе, и
+            # проверка по ведущей библиотеке отвечает за всех.
+            assembly = sxs_assembly_for(requirement.dll, package)
+            key = (assembly, requirement.arch)
+            entry = by_assembly.get(key)
+            if entry is None:
+                if len(out) >= limit:
+                    continue
+                entry = _requirement_entry(requirement)
+                by_assembly[key] = entry
+                out.append(entry)
+            else:
+                dlls = entry["dlls"].split(",")
+                if requirement.dll not in dlls:
+                    entry["dlls"] = ",".join(sorted(dlls + [requirement.dll]))
             continue
-        seen.add(requirement.dll)
-        out.append({
-            "dll": requirement.dll,
-            "title": requirement.plain_title,
-            "url": requirement.url,
-            "arch": requirement.arch,
-        })
+        # Остальное проверяется построчно по имени файла — как раньше.
+        if requirement.status != "missing" or requirement.dll in plain_seen:
+            continue
         if len(out) >= limit:
             break
+        plain_seen.add(requirement.dll)
+        out.append(_requirement_entry(requirement))
     return out
+
+
+def _requirement_entry(requirement: RuntimeRequirement) -> Dict[str, str]:
+    """Запись ``runtime_requirements`` для лончера (с SxS-реквизитами)."""
+    entry: Dict[str, str] = {
+        "dll": requirement.dll,
+        "title": requirement.plain_title,
+        "url": requirement.url,
+        "arch": requirement.arch,
+    }
+    package = requirement.package
+    if package is not None and package.sxs:
+        assembly = sxs_assembly_for(requirement.dll, package)
+        entry["sxs"] = assembly
+        entry["manifest"] = f"{assembly}.manifest"
+        entry["sxs_family"] = sxs_family_prefix(assembly, requirement.arch)
+        entry["dlls"] = requirement.dll
+    return entry
 
 
 def launcher_installers(report: ProvisionReport, limit: int = 12
