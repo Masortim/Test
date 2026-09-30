@@ -593,6 +593,31 @@ class PortableExeLauncherTests(unittest.TestCase):
             # отменён внутри /q, пакет повреждён): предупреждение остаётся.
             self.assertEqual([item["dll"] for item in still], ["msvcr80.dll"])
 
+    def test_uppercase_env_keys_do_not_leak_the_real_windows(self):
+        # dict(os.environ) на Windows хранит ключи в ВЕРХНЕМ регистре:
+        # «SYSTEMROOT», а не «SystemRoot». Регистрозависимый поиск молча
+        # пропускал подменённый SystemRoot и проваливался на WINDIR —
+        # с настоящим C:\Windows сборочной машины. Проверяем, что
+        # SYSTEMROOT в любом регистре важнее WINDIR.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "Game_Portable")
+            app = root / "App"
+            app.mkdir(parents=True)
+            (app / "game.exe").write_bytes(b"MZ")
+            fake = Path(temp, "FakeWindows")
+            fake.mkdir()
+            real = Path(temp, "RealWindows", "WinSxS", (
+                "x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_"
+                "8.0.50727.6195_none_4ff29c7c0b2f2a62"))
+            real.mkdir(parents=True)
+            cfg = {"runtime_requirements": [self.SXS_ITEM]}
+            env = {"SYSTEMROOT": str(fake), "WINDIR": str(
+                Path(temp, "RealWindows"))}
+            missing = exe_launcher.missing_runtime_components(
+                root, cfg, app / "game.exe", env)
+            self.assertEqual([item["dll"] for item in missing],
+                             ["msvcr80.dll"])
+
 
 class LaunchBatSafetyTests(unittest.TestCase):
     """Регрессии на «окно мигнуло и закрылось»."""

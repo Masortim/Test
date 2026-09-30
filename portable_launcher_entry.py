@@ -88,15 +88,36 @@ def _show_warning(message: str) -> None:
         pass
 
 
+def _env_value(env: Dict[str, str], name: str, default: str = "") -> str:
+    """Environment value honouring the key in ANY letter case.
+
+    A plain ``dict(os.environ)`` copy on Windows keeps keys uppercased
+    (``SYSTEMROOT``), while callers and configs spell them ``SystemRoot``.
+    A case-sensitive ``get`` then silently misses the variable and the
+    ``WINDIR`` fallback leaks the *real* ``C:\\Windows`` through - which
+    ignored the caller's SystemRoot exactly where it matters most: the
+    WinSxS probe for VC++ 2005/2008 assemblies.
+    """
+    value = env.get(name)
+    if value is None:
+        wanted = name.upper()
+        for key, candidate in env.items():
+            if str(key).upper() == wanted:
+                value = candidate
+                break
+    return value if value else default
+
+
 def _library_search_dirs(root: Path, target: Path,
                          env: Dict[str, str]) -> list[Path]:
     """Folders Windows will really look into when resolving a DLL."""
     dirs: list[Path] = [target.parent, root / "App", root]
-    for entry in str(env.get("PATH", "")).split(os.pathsep)[:48]:
+    for entry in str(_env_value(env, "PATH")).split(os.pathsep)[:48]:
         entry = entry.strip().strip('"')
         if entry:
             dirs.append(Path(entry))
-    windir = env.get("SystemRoot") or env.get("WINDIR") or r"C:\Windows"
+    windir = _env_value(env, "SystemRoot") or _env_value(env, "WINDIR") \
+        or r"C:\Windows"
     dirs.append(Path(windir) / "System32")
     dirs.append(Path(windir) / "SysWOW64")
     unique: list[Path] = []
@@ -161,15 +182,14 @@ def _requirement_satisfied(root: Path, target: Optional[Path],
                     return True
             except OSError:
                 continue
-        windir = Path(env.get("SystemRoot") or env.get("WINDIR")
-                      or r"C:\Windows")
+        windir = Path(_env_value(env, "SystemRoot")
+                      or _env_value(env, "WINDIR") or r"C:\Windows")
         return _winsxs_has_family(windir, family)
     if search_dirs is None:
+        system_root = _env_value(env, "SystemRoot") or r"C:\Windows"
         search_dirs = [root, root / "App",
-                       Path(env.get("SystemRoot") or r"C:\Windows")
-                       / "System32",
-                       Path(env.get("SystemRoot") or r"C:\Windows")
-                       / "SysWOW64"]
+                       Path(system_root) / "System32",
+                       Path(system_root) / "SysWOW64"]
     for directory in search_dirs:
         try:
             if (directory / name).is_file():
