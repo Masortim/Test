@@ -129,6 +129,63 @@ jobs:
             throw "Portable profile tree was not created"
           }
 
+      - name: Smoke test - the portable folder must be deletable afterwards
+        shell: pwsh
+        run: |
+          # Регрессия на главную жалобу: программа закрыта, а папку удалить
+          # нельзя, потому что из неё остался работать фоновый процесс.
+          # Цель запускает «помощника» из той же папки и сразу завершается.
+          # Лончер обязан дождаться, закрыть остаток и отпустить папку.
+          $root = Join-Path $env:RUNNER_TEMP "Portable Leftover Smoke"
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "App") | Out-Null
+          Copy-Item dist/PortableLauncher.exe (Join-Path $root "App/LaunchPortable.exe")
+          Copy-Item $env:ComSpec (Join-Path $root "App/cmd.exe")
+          $culture = (Get-UICulture).Name
+          $muiSource = Join-Path (Split-Path $env:ComSpec) "$culture/cmd.exe.mui"
+          if (Test-Path $muiSource) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $root "App/$culture") | Out-Null
+            Copy-Item $muiSource (Join-Path $root "App/$culture/cmd.exe.mui")
+          }
+          @{
+            app_name = "Leftover"
+            target_exe_rel = "App/cmd.exe"
+            target_args = @()
+            data_dir_name = "PortableData"
+            registry = @{ enabled = $false }
+            # Ускоряем именно то, что проверяем: фоновому процессу без окна
+            # даётся 5 секунд вместо штатных 20.
+            shutdown = @{ spawn_grace = 4.0; idle_grace = 5.0; close_grace = 2.0 }
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $root "launcher_config.json")
+
+          $leftover = '/d /c start /b "" "' + (Join-Path $root "App/cmd.exe") + '" /c ping -n 300 127.0.0.1'
+          $process = Start-Process -FilePath (Join-Path $root "App/LaunchPortable.exe") `
+            -ArgumentList $leftover -PassThru
+          if (-not $process.WaitForExit(180000)) {
+            $process.Kill()
+            Write-Host "::error title=Leftover smoke failure::the launcher did not exit within 180 s"
+            throw "LaunchPortable.exe did not exit within 180 s"
+          }
+
+          $prefix = $root.TrimEnd('\') + '\'
+          $still = @()
+          foreach ($p in [Diagnostics.Process]::GetProcesses()) {
+            $f = ''
+            try { $f = $p.Path } catch { $f = '' }
+            if ($f -and $f.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $still += $f }
+          }
+          if ($still.Count -gt 0) {
+            Write-Host "::error title=Leftover smoke failure::still running: $($still -join ', ')"
+            throw "Processes from the portable folder outlived the launcher"
+          }
+
+          # Финальная проверка ровно в формулировке пользователя: папка
+          # удаляется без «файл открыт в другой программе».
+          Remove-Item -Recurse -Force $root -ErrorAction Stop
+          if (Test-Path $root) {
+            Write-Host "::error title=Leftover smoke failure::the portable folder could not be deleted"
+            throw "The portable folder could not be deleted"
+          }
+
       - name: Smoke test (import only)
         run: |
           python -c "import portablizer, portablizer.core.portablizer, portablizer.gui.main_window; print('import OK')"
