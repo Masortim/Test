@@ -1273,6 +1273,124 @@ class SilentInstallTests(unittest.TestCase):
             self.assertEqual(redist.installer_kind(inno), "inno")
             self.assertIn("/VERYSILENT", redist.silent_commands(inno)[0])
 
+    def test_wextract_signature_never_overrides_the_whitelist(self):
+        """«Command line option syntax error» у VC++ 2005 — больше нет.
+
+        Пакет VC++ 2005 упакован wextract, и по сигнатуре он «iexpress».
+        Лестница ключей iexpress перебирает ``/Q``, ``/q``, ``/quiet`` — и
+        на ``/quiet`` пакет показывает модальное окно с этой ошибкой.
+        Правило белого списка сильнее сигнатуры: разрешён только ``/q``.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            legacy = Path(temp, "vcredist_x86.exe")
+            legacy.write_bytes(b"MZ" + b"\x00" * 200 + b"wextract"
+                               + os.urandom(2048))
+
+            self.assertEqual(redist.installer_kind(str(legacy)),
+                             "vcredist_legacy")
+            commands = redist.silent_commands(str(legacy))
+            self.assertEqual(commands, [[str(legacy), "/q"]])
+            for command in commands:
+                self.assertNotIn("/quiet", command)
+                self.assertNotIn("/norestart", command)
+
+    def test_wextract_signature_does_not_turn_directx_into_an_installer(self):
+        """«Установка DirectX. Неверная операция командной строки» — больше нет.
+
+        Бандл DirectX — тоже wextract, но это архив, а не установщик:
+        любой ключ он пробрасывает вложенному DXSETUP, и тот отвечает
+        именно этим окном. Прямых команд у бандла быть не должно.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp, "directx_Jun2010_redist.exe")
+            bundle.write_bytes(b"MZ" + b"\x00" * 200 + b"wextract"
+                               + os.urandom(2048))
+
+            self.assertEqual(redist.installer_kind(str(bundle)),
+                             "directx_bundle")
+            self.assertEqual(redist.silent_commands(str(bundle)), [])
+
+    def test_wixburn_section_still_wins_over_the_file_name(self):
+        """VC++ 2012/2013 зовутся vcredist_x86.exe, но внутри у них Burn."""
+        with tempfile.TemporaryDirectory() as temp:
+            burn = Path(temp, "vcredist_x86.exe")
+            burn.write_bytes(b"MZ" + b"\x00" * 200 + b".wixburn"
+                             + os.urandom(2048))
+
+            self.assertEqual(redist.installer_kind(str(burn)), "burn")
+            self.assertEqual(redist.silent_commands(str(burn))[0][1:],
+                             ["/install", "/quiet", "/norestart"])
+
+    def test_legacy_vcredist_is_installed_through_its_own_msi(self):
+        """Обёртку VC++ 2005-2010 не запускаем вовсе: ставим вложенный msi."""
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            package = Path(temp, "vcredist_x86.exe")
+            package.write_bytes(make_self_extracting_exe({
+                "vc_red.msi": b"\xd0\xcf\x11\xe0" + os.urandom(4000),
+                "vc_red.cab": make_cabinet({"msvcr80.dll": b"MZ" + b"z" * 5000}),
+            }))
+            with mock.patch.object(redist, "IS_WINDOWS", True):
+                outcome = redist.run_silent_install(
+                    str(package), runner=runner)
+
+        self.assertEqual(outcome.status, "installed")
+        self.assertEqual(len(calls), 1)
+        command = calls[0]
+        self.assertEqual(
+            os.path.splitext(os.path.basename(command[0]))[0].lower(),
+            "msiexec")
+        self.assertIn("/qn", command)
+        self.assertTrue(command[2].lower().endswith("vc_red.msi"))
+        # Сама обёртка не запускалась ни разу — значит, и окна не было.
+        self.assertFalse(any("vcredist_x86.exe" in item.lower()
+                             for call in calls for item in call))
+
+    def test_legacy_vcredist_falls_back_to_the_only_safe_switch(self):
+        """Внутри не нашлось msi — остаётся голый ``/q``, и только он."""
+        calls = []
+
+        with tempfile.TemporaryDirectory() as temp:
+            package = Path(temp, "vcredist_x86.exe")
+            package.write_bytes(b"MZ" + b"\x00" * 512 + b"wextract")
+            with mock.patch.object(redist, "IS_WINDOWS", True):
+                outcome = redist.run_silent_install(
+                    str(package),
+                    runner=lambda args: (calls.append(list(args)), 0)[1])
+
+        self.assertEqual(outcome.status, "installed")
+        self.assertEqual(calls, [[str(package), "/q"]])
+
+    def test_a_package_that_hangs_stops_the_switch_ladder(self):
+        """Застрявшее окно не должно стоить сборке ещё нескольких попыток."""
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            return redist.TIMEOUT_EXIT_CODE
+
+        with tempfile.TemporaryDirectory() as temp:
+            package = Path(temp, "oddredist.exe")
+            package.write_bytes(b"MZ ... Inno Setup Setup Data")
+
+            outcome = redist.run_silent_install(str(package), runner=runner)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(outcome.status, "failed")
+
+    def test_slow_packages_get_more_time_than_the_rest(self):
+        self.assertEqual(redist.silent_timeout("dxsetup"),
+                         redist.SILENT_INSTALL_TIMEOUT)
+        self.assertEqual(redist.silent_timeout("burn"),
+                         redist.SILENT_INSTALL_TIMEOUT_FAST)
+        self.assertLess(redist.SILENT_INSTALL_TIMEOUT_FAST,
+                        redist.SILENT_INSTALL_TIMEOUT)
+
     def test_vc2005_script_discards_the_invalid_norestart_option(self):
         text = redist.render_silent_install_script([{
             "file": "Redist/vcredist_x86.exe",
