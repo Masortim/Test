@@ -3649,5 +3649,360 @@ class ElevationTests(unittest.TestCase):
             self.assertFalse(elevate_mod.ensure_elevated([]))
 
 
+
+class OpenFileHolderTests(unittest.TestCase):
+    """Папку держит открытый ФАЙЛ, а не процесс: главный случай жалоб.
+
+    Пользовательский сценарий целиком: портатив не запущен, процессов из
+    папки нет, а два системных процесса держат шрифты из
+    ``PortableData\\Temp\\is-XXXX.tmp`` — и папка не удаляется, хотя
+    программа бодро рапортует «папка свободна».
+    """
+
+    ROOT = r"D:\Portable\Fallout_New_Vegas_Portable"
+    FONT = (r"D:\Portable\Fallout_New_Vegas_Portable\PortableData\Temp"
+            r"\is-UQUS2.tmp\OpenSans-Semibold.ttf")
+
+    def test_holders_report_the_open_file_and_its_owner(self):
+        opened = [procutil.OpenFile(17208, 900, self.FONT,
+                                    r"C:\Windows\System32\svchost.exe")]
+        with mock.patch.object(procutil, "_snapshot", return_value=[]), \
+                mock.patch.object(procutil, "open_files_in",
+                                  return_value=opened):
+            found = procutil.holders(self.ROOT)
+
+        self.assertEqual([item.kind for item in found], ["file"])
+        self.assertEqual(found[0].handle, 900)
+        self.assertEqual(
+            procutil.describe_holders(found),
+            ["svchost.exe (pid 17208, открыт файл OpenSans-Semibold.ttf)"])
+
+    def test_folder_is_free_is_not_fooled_by_a_successful_rename(self):
+        """Переименование проходит, а файл внутри открыт — папка занята.
+
+        Файл, открытый с FILE_SHARE_DELETE (шрифты, отображённые в память
+        файлы), не мешает переименовать каталог. Раньше именно поэтому
+        пользователю говорили «папка свободна», а удаление падало.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Type_Portable")
+            portable.mkdir()
+            with mock.patch.object(procutil, "busy_files",
+                                   return_value=[self.FONT]):
+                errors = []
+                self.assertFalse(procutil.folder_is_free(str(portable), errors))
+                self.assertIn("OpenSans-Semibold.ttf", " ".join(errors))
+                # Быстрая проба по-прежнему доступна явным флагом.
+                self.assertTrue(
+                    procutil.folder_is_free(str(portable), deep=False))
+            self.assertTrue(portable.is_dir())
+
+    def test_release_open_files_kills_background_and_frees_system_handles(self):
+        """Фон — завершить, системный процесс — закрыть его дескриптор."""
+        items = [
+            procutil.OpenFile(17208, 900, self.FONT,
+                              r"C:\Windows\System32\svchost.exe"),
+            procutil.OpenFile(321, 7, self.FONT,
+                              r"D:\Other\updater.exe"),
+            procutil.OpenFile(555, 8, self.FONT,
+                              r"C:\Program Files\Editor\editor.exe"),
+        ]
+        killed, closed = [], []
+        with mock.patch.object(procutil, "IS_WINDOWS", True), \
+                mock.patch.object(procutil, "open_files_in",
+                                  return_value=items), \
+                mock.patch.object(procutil, "visible_window_pids",
+                                  return_value={555}), \
+                mock.patch.object(procutil, "_post_close"), \
+                mock.patch.object(procutil, "_terminate",
+                                  side_effect=lambda pids: killed.extend(pids)), \
+                mock.patch.object(
+                    procutil, "close_remote_handle",
+                    side_effect=lambda pid, handle:
+                    closed.append((pid, handle)) or True), \
+                mock.patch("time.sleep"):
+            stopped = procutil.release_open_files(self.ROOT, close_grace=0.0)
+
+        # Фоновый держатель завершён, окно пользователя не тронуто.
+        self.assertEqual(killed, [321])
+        # Дескрипторы закрыты у всех, кто пережил завершение.
+        self.assertIn((17208, 900), closed)
+        self.assertIn((555, 8), closed)
+        self.assertTrue(any("updater.exe" in line for line in stopped))
+        self.assertTrue(any("OpenSans-Semibold.ttf" in line
+                            for line in stopped))
+
+    def test_release_folder_also_frees_open_files_and_fonts(self):
+        order = []
+        with mock.patch.object(procutil, "IS_WINDOWS", True), \
+                mock.patch.object(procutil, "services_in", return_value=[]), \
+                mock.patch.object(procutil, "processes_in", return_value=[]), \
+                mock.patch.object(procutil, "busy_files",
+                                  return_value=[self.FONT]), \
+                mock.patch.object(
+                    procutil, "forget_fonts",
+                    side_effect=lambda root, **_k: order.append("fonts") or 1), \
+                mock.patch.object(
+                    procutil, "release_open_files",
+                    side_effect=lambda root, **_k:
+                    order.append("handles") or ["svchost.exe: освобождён файл"]):
+            stopped = procutil.release_folder(self.ROOT)
+
+        self.assertEqual(order, ["fonts", "handles"])
+        self.assertEqual(stopped, ["svchost.exe: освобождён файл"])
+
+    def test_release_folder_can_skip_the_expensive_handle_scan(self):
+        with mock.patch.object(procutil, "IS_WINDOWS", True), \
+                mock.patch.object(procutil, "services_in", return_value=[]), \
+                mock.patch.object(procutil, "processes_in", return_value=[]), \
+                mock.patch.object(procutil, "release_open_files",
+                                  side_effect=AssertionError("не нужен")):
+            self.assertEqual(procutil.release_folder(self.ROOT, deep=False), [])
+
+    def test_release_folder_does_not_scan_handles_of_a_free_folder(self):
+        """Ничего не занято - значит и разбирать нечего: сборка не ждёт."""
+        with mock.patch.object(procutil, "IS_WINDOWS", True), \
+                mock.patch.object(procutil, "services_in", return_value=[]), \
+                mock.patch.object(procutil, "processes_in", return_value=[]), \
+                mock.patch.object(procutil, "busy_files", return_value=[]), \
+                mock.patch.object(procutil, "release_open_files",
+                                  side_effect=AssertionError("не нужен")), \
+                mock.patch.object(procutil, "forget_fonts",
+                                  side_effect=AssertionError("не нужен")):
+            self.assertEqual(procutil.release_folder(self.ROOT), [])
+
+    def test_maintenance_names_the_locked_files_instead_of_shrugging(self):
+        """Вместо «виновника определить не удалось» — имена файлов и совет."""
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp, "Fallout_New_Vegas_Portable")
+            folder.mkdir()
+            with mock.patch.object(procutil, "release_folder",
+                                   return_value=[]), \
+                    mock.patch.object(procutil, "folder_is_free",
+                                      return_value=False), \
+                    mock.patch.object(procutil, "holders", return_value=[]), \
+                    mock.patch.object(procutil, "busy_files",
+                                      return_value=[self.FONT]):
+                report = maintenance.release(str(folder), Logger())
+
+            self.assertFalse(report.success)
+            text = " ".join(report.messages)
+            self.assertIn("OpenSans-Semibold.ttf", text)
+            self.assertIn("администратора", text)
+            self.assertNotIn("виновника определить не удалось", text)
+
+
+class LauncherLeftoverCleanupTests(unittest.TestCase):
+    """Портатив не запущен — значит и фоновых остатков быть не должно."""
+
+    FONT = r"D:\P\PortableData\Temp\is-UQUS2.tmp\OpenSans-Regular.ttf"
+
+    def test_open_files_are_described_with_pid_and_file_name(self):
+        text = exe_launcher.describe_open_files([
+            (17208, 900, self.FONT, r"C:\Windows\System32\svchost.exe")])
+        self.assertEqual(text, "svchost.exe (pid 17208): OpenSans-Regular.ttf")
+
+    def test_temp_leftovers_are_wiped_between_sessions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            stale = root / "PortableData" / "Temp" / "is-UQUS2.tmp"
+            stale.mkdir(parents=True)
+            (stale / "OpenSans-Regular.ttf").write_bytes(b"font")
+            (root / "PortableData" / "Temp" / "note.tmp").write_bytes(b"x")
+            keep = root / "PortableData" / "User"
+            keep.mkdir(parents=True)
+            (keep / "save.dat").write_bytes(b"save")
+
+            removed = exe_launcher.purge_portable_temp(root, {})
+
+            self.assertEqual(removed, 2)
+            self.assertFalse(stale.exists())
+            self.assertTrue((root / "PortableData" / "Temp").is_dir())
+            # Пользовательские данные портатива остаются нетронутыми.
+            self.assertTrue((keep / "save.dat").is_file())
+
+    def test_temp_cleanup_can_be_switched_off_in_the_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            stale = root / "PortableData" / "Temp" / "is-UQUS2.tmp"
+            stale.mkdir(parents=True)
+            removed = exe_launcher.purge_portable_temp(
+                root, {"shutdown": {"purge_temp": False}})
+            self.assertEqual(removed, 0)
+            self.assertTrue(stale.is_dir())
+
+    def test_startup_sweep_leaves_a_running_second_copy_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            (root / "PortableData" / "Temp" / "is-1.tmp").mkdir(parents=True)
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_portable_process_list",
+                                      return_value=[(7, r"D:\P\App\game.exe")]), \
+                    mock.patch.object(exe_launcher, "release_leftover_handles",
+                                      side_effect=AssertionError("не трогаем")):
+                self.assertEqual(exe_launcher.sweep_stale_session(root, {}), [])
+            # Второй экземпляр программы не должен потерять свою временную папку.
+            self.assertTrue((root / "PortableData" / "Temp" / "is-1.tmp").is_dir())
+
+    def test_startup_sweep_clears_the_previous_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            (root / "PortableData" / "Temp" / "is-1.tmp").mkdir(parents=True)
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_portable_process_list",
+                                      return_value=[]), \
+                    mock.patch.object(exe_launcher, "release_leftover_handles",
+                                      side_effect=AssertionError(
+                                          "нечего разбирать")):
+                done = exe_launcher.sweep_stale_session(root, {})
+
+            self.assertIn("очищена временная папка портатива (1)", done)
+            self.assertFalse((root / "PortableData" / "Temp" / "is-1.tmp").exists())
+
+    def test_startup_sweep_forces_an_undeletable_leftover(self):
+        """Временную папку не удалить — значит её держат, и это разбирается."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            (root / "PortableData" / "Temp" / "is-1.tmp").mkdir(parents=True)
+            calls = []
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_portable_process_list",
+                                      return_value=[]), \
+                    mock.patch.object(
+                        exe_launcher, "purge_portable_temp",
+                        side_effect=lambda *_a, **_k:
+                        calls.append("purge") or 0), \
+                    mock.patch.object(exe_launcher, "release_leftover_handles",
+                                      return_value=["svchost.exe: файл"]):
+                done = exe_launcher.sweep_stale_session(root, {})
+
+            self.assertIn("svchost.exe: файл", done)
+            # Удаление пробуется до разбора и ещё раз после него.
+            self.assertEqual(calls, ["purge", "purge"])
+
+    def test_verdict_refuses_to_call_a_locked_folder_free(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            (root / "App").mkdir(parents=True)
+            with mock.patch.object(exe_launcher, "_portable_process_list",
+                                   return_value=[]), \
+                    mock.patch.object(exe_launcher, "folder_looks_clean",
+                                      return_value=False), \
+                    mock.patch.object(exe_launcher, "busy_files",
+                                      return_value=[self.FONT]), \
+                    mock.patch.object(
+                        exe_launcher, "open_files_in",
+                        return_value=[(17208, 900, self.FONT,
+                                       r"C:\Windows\System32\svchost.exe")]):
+                exe_launcher._report_folder_state(root, {"deep_check": 1.0})
+
+            log = (root / "PortableData" / "launcher-run.log").read_text(
+                encoding="utf-8")
+            self.assertIn("still locked", log)
+            self.assertIn("OpenSans-Regular.ttf", log)
+            self.assertNotIn("portable folder released", log)
+
+    def test_stop_asks_for_administrator_rights_before_giving_up(self):
+        """Чужой дескриптор закрывает только администратор — и лончер это знает."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            (root / "App").mkdir(parents=True)
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "release_portable_folder",
+                                      return_value=[]), \
+                    mock.patch.object(exe_launcher, "_portable_process_list",
+                                      return_value=[]), \
+                    mock.patch.object(exe_launcher, "busy_files",
+                                      return_value=[self.FONT]), \
+                    mock.patch.object(exe_launcher, "open_files_in",
+                                      return_value=[]), \
+                    mock.patch.object(exe_launcher, "_is_elevated",
+                                      return_value=False), \
+                    mock.patch.object(exe_launcher, "_run_elevated",
+                                      return_value=0) as elevated, \
+                    mock.patch.object(exe_launcher, "_show_warning") as warned:
+                code = exe_launcher.stop(root)
+
+            self.assertEqual(code, 0)
+            elevated.assert_called_once_with(["--stop"])
+            warned.assert_not_called()
+
+    def test_stop_reports_the_locked_files_when_even_admin_cannot_help(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "P")
+            (root / "App").mkdir(parents=True)
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "release_portable_folder",
+                                      return_value=[]), \
+                    mock.patch.object(exe_launcher, "_portable_process_list",
+                                      return_value=[]), \
+                    mock.patch.object(exe_launcher, "busy_files",
+                                      return_value=[self.FONT]), \
+                    mock.patch.object(
+                        exe_launcher, "open_files_in",
+                        return_value=[(17208, 900, self.FONT,
+                                       r"C:\Windows\System32\svchost.exe")]), \
+                    mock.patch.object(exe_launcher, "_is_elevated",
+                                      return_value=True), \
+                    mock.patch.object(exe_launcher, "_show_warning") as warned:
+                code = exe_launcher.stop(root)
+
+            self.assertEqual(code, 1)
+            message = warned.call_args[0][0]
+            self.assertIn("svchost.exe (pid 17208): OpenSans-Regular.ttf",
+                          message)
+            self.assertIn("администратора", message)
+
+    def test_release_sweeps_handles_even_without_processes(self):
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher, "_portable_process_list",
+                                  return_value=[]), \
+                mock.patch.object(exe_launcher, "release_leftover_handles",
+                                  return_value=["svchost.exe: файл"]):
+            stopped = exe_launcher.release_portable_folder(
+                Path(r"D:\P"), {"close_grace": 0.0})
+        self.assertEqual(stopped, ["svchost.exe: файл"])
+
+    def test_stop_script_verifies_the_result_and_elevates_itself(self):
+        cfg = launcher_mod.LauncherConfig(
+            app_name="Fallout New Vegas", target_exe_rel="App/game.exe")
+        script = launcher_mod.render_stop_cmd(cfg)
+
+        self.assertTrue(script.isascii())
+        # Вердикт лончера окончателен: раньше при его отказе запускался
+        # слабый PowerShell-запасной вариант, который видел только процессы
+        # и радостно сообщал «The folder is free».
+        self.assertIn('"%PORTABLE_ROOT%\\App\\LaunchPortable.exe" --stop',
+                      script)
+        self.assertIn("--stop\nif errorlevel 1 goto stillbusy", script)
+        # Запасной вариант (портатив без EXE-лончера) при неудаче ещё
+        # попросит права администратора.
+        self.assertIn("if errorlevel 1 goto locked", script)
+        # Запасной вариант теперь тоже проверяет результат делом.
+        self.assertIn("[IO.File]::Open", script)
+        self.assertIn("These files are still open", script)
+        # И умеет попросить права администратора.
+        self.assertIn("-Verb RunAs", script)
+        self.assertIn("exit /b %STOP_RC%", script)
+
+    def test_config_carries_the_new_cleanup_policy(self):
+        cfg = launcher_mod.LauncherConfig(
+            app_name="Type", target_exe_rel="App/Type.exe")
+        data = json.loads(launcher_mod.render_config_json(cfg))["shutdown"]
+        self.assertTrue(data["deep_check"])
+        self.assertTrue(data["purge_temp"])
+        self.assertEqual(data["handle_budget"], 8.0)
+        settings = exe_launcher.shutdown_settings(
+            json.loads(launcher_mod.render_config_json(cfg)))
+        self.assertEqual(settings["handle_budget"], 8.0)
+        self.assertEqual(settings["purge_temp"], 1.0)
+        # Старый конфиг без новых полей читается со значениями по умолчанию.
+        restored = launcher_mod.config_from_dict(
+            {"app_name": "Type", "target_exe_rel": "App/Type.exe"})
+        self.assertTrue(restored.shutdown_deep_check)
+        self.assertTrue(restored.shutdown_purge_temp)
+
+
+
 if __name__ == "__main__":
     unittest.main()

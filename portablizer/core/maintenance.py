@@ -94,14 +94,28 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
         return report
 
     for line in errors:
-        log.debug(f"Проба переименования не прошла: {line}")
+        log.debug(f"Папка не отпускается: {line}")
+
+    # Вторая попытка: первый проход мог завершить процесс, который как раз
+    # в этот момент открывал новые файлы (апдейтер, перезапускающий себя).
+    again = procutil.release_folder(folder, stop_services=False)
+    if again:
+        report.stopped.extend(again)
+        for name in again:
+            log.ok(f"Остановлено: {name}")
+        errors = []
+        if procutil.folder_is_free(folder, errors):
+            report.success = True
+            message = ("Папка свободна: её можно удалить, перенести или "
+                       "скопировать прямо сейчас.")
+            log.ok(message)
+            report.messages.append(message)
+            return report
+        for line in errors:
+            log.debug(f"Папка не отпускается: {line}")
 
     holders = procutil.holders(folder)
-    report.holders = sorted({
-        (f"{item.name} (держит {procutil.image_name(item.detail)})"
-         if item.kind == "module" else item.name)
-        for item in holders
-    })
+    report.holders = procutil.describe_holders(holders)
     if report.holders:
         message = "Папку держат: " + ", ".join(report.holders)
         log.warn(message + ".")
@@ -112,6 +126,14 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
                     "предпросмотр файла и повторите.")
             log.warn(hint)
             report.messages.append(hint)
+        if any(item.kind == "file" and item.protected for item in holders):
+            hint = ("Системный процесс держит открытым файл из папки "
+                    "(так бывает со шрифтами из PortableData\\Temp). Его "
+                    "дескриптор закрывается принудительно, но на это нужны "
+                    "права администратора — запустите Portablizer от имени "
+                    "администратора.")
+            log.warn(hint)
+            report.messages.append(hint)
         if any(not item.protected for item in holders):
             hint = ("Процессы, запущенные от имени администратора, обычной "
                     "программе не подчиняются: запустите Portablizer от "
@@ -119,10 +141,20 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
             log.info(hint)
             report.messages.append(hint)
     else:
-        message = ("Папка занята, но виновника определить не удалось. Чаще "
-                   "всего это открытое окно проводника, предпросмотр файла "
-                   "или проверка антивирусом — через несколько секунд папка "
-                   "освободится сама.")
+        locked = procutil.busy_files(folder)
+        if locked:
+            report.holders = [os.path.basename(path) for path in locked]
+            message = ("Папку держат открытые файлы: "
+                       + ", ".join(report.holders[:6])
+                       + ". Кто именно их открыл, без прав администратора "
+                         "не видно — запустите Portablizer от имени "
+                         "администратора, и держатель будет закрыт "
+                         "принудительно.")
+        else:
+            message = ("Папка занята, но виновника определить не удалось. "
+                       "Чаще всего это открытое окно проводника, "
+                       "предпросмотр файла или проверка антивирусом — "
+                       "через несколько секунд папка освободится сама.")
         log.warn(message)
         report.messages.append(message)
     return report
