@@ -20,9 +20,12 @@
 ``refresh``
     «Пусть этот портатив ведёт себя правильно». Перевыпускает лончеры
     (``LaunchPortable.exe``, ``Launch.bat``, ``LaunchHidden.vbs``,
-    ``StopPortable.cmd``) и дописывает в конфиг секцию ``shutdown``,
+    ``StopPortable.cmd``), дописывает в конфиг секции ``shutdown`` и
+    ``shared_saves`` и настраивает сквозные сохранения прямо на месте —
     сохраняя все настройки портатива: цели, реестр, переменные среды,
-    требования к распространяемым компонентам.
+    требования к распространяемым компонентам. Именно так лечится портатив,
+    у которого прямой запуск ``App\\Game.exe`` и ``LaunchPortable.exe``
+    видели разные сейвы: пересобирать его не нужно.
 
 Обе операции ничего не устанавливают и не трогают ничего за пределами
 указанной папки.
@@ -36,6 +39,7 @@ from typing import List, Optional
 
 from . import launcher as launcher_mod
 from . import procutil
+from . import saves as saves_mod
 from .logutil import Logger
 
 CONFIG_NAME = "launcher_config.json"
@@ -53,6 +57,10 @@ class MaintenanceReport:
     holders: List[str] = field(default_factory=list)
     #: Какие файлы портатива перевыпущены.
     updated: List[str] = field(default_factory=list)
+    #: Режим сквозных сохранений, настроенный на месте.
+    saves_mode: str = ""
+    #: Сколько сейвов сведено в общее хранилище.
+    saves_migrated: int = 0
     #: Человеческие сообщения (они же уходят в журнал).
     messages: List[str] = field(default_factory=list)
 
@@ -161,12 +169,15 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
 
 
 def refresh(folder: str, log: Optional[Logger] = None,
-            copy_exe=None) -> MaintenanceReport:
+            copy_exe=None, shared_saves: bool = True) -> MaintenanceReport:
     """Перевыпускает лончеры существующего портатива текущей версией.
 
     ``copy_exe`` — функция ``(portable_dir, destination_rel) -> str``,
     копирующая встроенный ``LaunchPortable.exe`` (передаётся оркестратором,
     чтобы не тянуть сюда весь Portablizer).
+
+    ``shared_saves`` — настроить ли заодно сквозные сохранения: свести
+    сейвы прямого запуска и лончера в одно хранилище внутри портатива.
     """
     log = log or Logger()
     report = MaintenanceReport(folder=folder)
@@ -196,6 +207,35 @@ def refresh(folder: str, log: Optional[Logger] = None,
 
     cfg = launcher_mod.config_from_dict(data)
     log.info(f"Обновляю лончеры портатива «{cfg.app_name}»")
+
+    # Сквозные сохранения настраиваются ЗДЕСЬ, а не только при сборке: иначе
+    # уже готовый портатив так и остался бы с двумя разными хранилищами
+    # сейвов — одним для прямого запуска App\Game.exe, другим для лончера.
+    if shared_saves:
+        try:
+            setup = saves_mod.plan(
+                folder, cfg.app_name,
+                [t.rel_path for t in cfg.targets] or [cfg.target_exe_rel],
+                data_dir_name=cfg.data_dir_name)
+            saves_mod.apply(folder, setup, log)
+            cfg.shared_saves = setup.to_dict()
+            report.saves_mode = setup.mode
+            report.saves_migrated = setup.migrated
+            for line in saves_mod.describe(setup):
+                log.ok(line) if setup.enabled else log.info(line)
+                report.messages.append(line)
+            if setup.patched:
+                report.updated.extend(setup.patched)
+            if setup.migrated:
+                message = ("Сохранения сведены в общее хранилище портатива: "
+                           f"{setup.migrated} файлов. Их видят все способы "
+                           "запуска.")
+                log.ok(message)
+                report.messages.append(message)
+        except OSError as exc:
+            message = f"Сквозные сохранения настроить не удалось: {exc}"
+            log.warn(message)
+            report.messages.append(message)
 
     files = {
         "Launch.bat": (launcher_mod.render_bat(cfg), "ascii"),
@@ -236,7 +276,8 @@ def refresh(folder: str, log: Optional[Logger] = None,
     report.success = bool(report.updated)
     if report.success:
         message = ("Портатив обновлён: теперь он сам закрывает фоновые "
-                   "процессы при выходе и освобождает свою папку. "
+                   "процессы при выходе, освобождает свою папку и держит "
+                   "единые сохранения для всех способов запуска. "
                    "Обновлено файлов: " + str(len(report.updated)))
         log.ok(message)
         report.messages.append(message)
