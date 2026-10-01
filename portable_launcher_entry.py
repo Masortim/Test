@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -740,6 +741,64 @@ def _inside(path: Path, parent: Path) -> bool:
         return False
 
 
+def _clear_readonly(path: Path) -> None:
+    """Remove the Windows read-only flag from a user-owned settings file."""
+    try:
+        mode = path.stat().st_mode
+        if not mode & stat.S_IWRITE:
+            path.chmod(mode | stat.S_IWRITE)
+    except OSError:
+        pass
+
+
+def _is_ini_pattern(pattern: object) -> bool:
+    """Whether a sync pattern selects INI files rather than a data folder."""
+    name = str(pattern).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return name.casefold().endswith(".ini")
+
+
+def _runtime_save_patterns(entry: Dict[str, Any], mode: str) -> list[str]:
+    """Keep Gamebryo configuration files out of recurring save syncs.
+
+    The game reads its active INIs beside the executable (``store``). They
+    are imported from old profile copies once, then must not be copied over
+    the user's edits on every launch. Save folders remain synchronized.
+    """
+    patterns = entry.get("patterns")
+    patterns = [str(p) for p in patterns] if isinstance(patterns, list) else []
+    if str(mode).casefold() != "inplace":
+        return patterns
+    filtered = [pattern for pattern in patterns if not _is_ini_pattern(pattern)]
+    # Old and hand-written configs sometimes had an empty pattern list, which
+    # means "copy everything". In inplace mode that would re-enable INI sync.
+    return filtered or ["Saves"]
+
+
+def _make_ini_files_writable(directory: Path, recursive: bool = True) -> None:
+    """Make portable user INIs editable, including files marked read-only by
+    an installer or copied from a read-only source.
+    """
+    try:
+        if not directory.is_dir():
+            return
+    except OSError:
+        return
+    if recursive:
+        for root, dirs, files in os.walk(str(directory), followlinks=False):
+            dirs[:] = [name for name in dirs if not name.startswith((".", "$"))]
+            for name in files:
+                if name.casefold().endswith(".ini"):
+                    _clear_readonly(Path(root) / name)
+    else:
+        try:
+            files = list(directory.iterdir())
+        except OSError:
+            return
+        for path in files:
+            if path.is_file() and path.suffix.casefold() == ".ini":
+                _clear_readonly(path)
+
+
 def merge_saves(source: Path, destination: Path,
                 patterns: Sequence[str] = ()) -> "list[str]":
     """Копирует то, чего в приёмнике нет или что там старее.
@@ -784,11 +843,12 @@ def merge_saves(source: Path, destination: Path,
             try:
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
                 if dst_file.exists():
-                    try:
-                        dst_file.chmod(dst_file.stat().st_mode | 0o200)
-                    except OSError:
-                        pass
+                    _clear_readonly(dst_file)
                 shutil.copy2(str(src_file), str(dst_file))
+                # copy2 preserves the source's read-only flag. Clear it after
+                # the copy so a Fallout.ini copied from a locked profile stays
+                # editable in the portable store.
+                _clear_readonly(dst_file)
             except OSError:
                 continue
             copied.append(rel)
@@ -846,7 +906,14 @@ class SharedSaveSession:
         self.portable_profile = self.data_dir / "User"
         self.host_profile, self.host_documents = self._resolve_host()
         self.two_way = self._load_state()
+        self.settings_imported = self._load_settings_imported()
         self.entries = self._configured_entries()
+        self.has_legacy_ini_sync = (
+            self.enabled and self.mode.casefold() == "inplace"
+            and any(_is_ini_pattern(pattern)
+                    for entry in self.entries
+                    for pattern in entry.get("patterns", []))
+        )
 
     # -- настоящий профиль пользователя ------------------------------------
     def _resolve_host(self) -> "tuple[Optional[Path], Optional[Path]]":
@@ -912,12 +979,21 @@ class SharedSaveSession:
         except (OSError, ValueError, AttributeError):
             return set()
 
+    def _load_settings_imported(self) -> bool:
+        try:
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+            return bool(data.get("settings_imported", False))
+        except (OSError, ValueError, AttributeError):
+            return False
+
     def _save_state(self) -> None:
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             self.state_file.write_text(
-                json.dumps({"two_way": sorted(self.two_way)},
-                           ensure_ascii=False),
+                json.dumps({
+                    "two_way": sorted(self.two_way),
+                    "settings_imported": self.settings_imported,
+                }, ensure_ascii=False),
                 encoding="utf-8")
         except OSError:
             pass
@@ -1002,6 +1078,73 @@ class SharedSaveSession:
     def _two_way(self, entry: Dict[str, Any]) -> bool:
         return entry["direction"] == "both" or entry["name"] in self.two_way
 
+    def _runtime_patterns(self, entry: Dict[str, Any]) -> list[str]:
+        return _runtime_save_patterns(entry, self.mode)
+
+    def prepare_settings(self) -> None:
+        """Ensure portable INI files can be edited by the current user."""
+        candidates: list[tuple[Path, bool]] = []
+        for entry in self.entries:
+            store = self.root.joinpath(*entry["store"].split("/"))
+            candidates.append((store, self.mode.casefold() != "inplace"))
+            portable = str(entry.get("portable", "")).replace("\\", "/")
+            if portable:
+                local_copy = self.root.joinpath(
+                    *(part for part in portable.split("/") if part))
+                if _inside(local_copy, self.root):
+                    candidates.append((local_copy, True))
+
+        # Also cover portable Documents when synchronization is disabled and
+        # there are no per-game directories in the config. With entries above,
+        # scanning all of My Games on every launch is unnecessary.
+        roots = (self.roots or list(_SAVE_ROOTS)) if not self.entries else []
+        for root in roots:
+            relative = str(root).replace("\\", "/").strip("/")
+            local_root = self.portable_profile.joinpath(
+                *(part for part in relative.split("/") if part))
+            if _inside(local_root, self.root):
+                candidates.append((local_root, True))
+
+        seen: set[tuple[str, bool]] = set()
+        for directory, recursive in candidates:
+            try:
+                key = (os.path.normcase(str(directory.resolve())), recursive)
+            except OSError:
+                key = (os.path.normcase(str(directory)), recursive)
+            if key in seen:
+                continue
+            seen.add(key)
+            _make_ini_files_writable(directory, recursive=recursive)
+
+    def _import_legacy_settings_once(self) -> "list[str]":
+        """Import INIs once from old Gamebryo portables, then stop syncing them.
+
+        Previous configs included ``*.ini`` in their save-sync rules. Keep their
+        existing hand-edited profile files useful on upgrade, but record the
+        migration so an older duplicate can never overwrite future edits.
+        """
+        if not self.has_legacy_ini_sync or self.settings_imported:
+            return []
+        report: "list[str]" = []
+        for entry in self.entries:
+            patterns = [str(pattern) for pattern in entry.get("patterns", [])
+                        if _is_ini_pattern(pattern)]
+            if not patterns:
+                continue
+            store = self.root.joinpath(*entry["store"].split("/"))
+            for satellite in self._satellites(entry):
+                copied = merge_saves(satellite, store, patterns)
+                if copied:
+                    report.append(
+                        f"{entry['name']}: imported {len(copied)} INI file(s) "
+                        f"once from {satellite}; future launches keep the "
+                        "game-folder settings unchanged")
+        # Mark even an empty first pass: from now on only the canonical INIs
+        # beside the game executable are authoritative.
+        self.settings_imported = True
+        self._save_state()
+        return report
+
     # -- синхронизация ------------------------------------------------------
     def pull(self) -> "list[str]":
         """Забрать в портатив всё, что новее, из папок профиля."""
@@ -1011,7 +1154,8 @@ class SharedSaveSession:
         for entry in self._all_entries():
             store = self.root.joinpath(*entry["store"].split("/"))
             for satellite in self._satellites(entry):
-                copied = merge_saves(satellite, store, entry["patterns"])
+                copied = merge_saves(satellite, store,
+                                     self._runtime_patterns(entry))
                 if copied:
                     report.append(
                         f"{entry['name']}: {len(copied)} file(s) taken into "
@@ -1032,7 +1176,8 @@ class SharedSaveSession:
             for satellite in self._satellites(entry):
                 # Чужой профиль не трогаем, пока отдавать нечего: пустая
                 # папка в чужом Documents - это след, которого быть не должно.
-                copied = merge_saves(store, satellite, entry["patterns"])
+                copied = merge_saves(store, satellite,
+                                     self._runtime_patterns(entry))
                 if copied:
                     report.append(
                         f"{entry['name']}: {len(copied)} file(s) written back "
@@ -1040,7 +1185,12 @@ class SharedSaveSession:
         return report
 
     def before(self) -> "list[str]":
-        return self.pull()
+        self.prepare_settings()
+        if not self.enabled:
+            return []
+        report = self._import_legacy_settings_once()
+        report.extend(self.pull())
+        return report
 
     def after(self) -> "list[str]":
         """После выхода: забрать новое и, если нужно, отдать обратно.
@@ -1051,6 +1201,7 @@ class SharedSaveSession:
         режим навсегда — иначе прямой запуск так и не увидел бы сейвы,
         сделанные через лончер.
         """
+        self.prepare_settings()
         if not self.enabled:
             return []
         report: "list[str]" = []
@@ -1058,7 +1209,8 @@ class SharedSaveSession:
         for entry in self._all_entries():
             store = self.root.joinpath(*entry["store"].split("/"))
             for satellite in self._satellites(entry):
-                copied = merge_saves(satellite, store, entry["patterns"])
+                copied = merge_saves(satellite, store,
+                                     self._runtime_patterns(entry))
                 if not copied:
                     continue
                 report.append(
@@ -3068,9 +3220,10 @@ def sync_saves(root: Optional[Path] = None) -> int:
         cfg: Dict[str, Any] = json.load(fh)
     session = SharedSaveSession(root, cfg)
     if not session.enabled:
+        session.prepare_settings()
         _run_log(root, "shared saves: disabled for this portable app")
         return 0
-    report = [*session.pull(), *session.push()]
+    report = [*session.before(), *session.push()]
     for line in report:
         _run_log(root, "shared saves: " + line)
     if not report:

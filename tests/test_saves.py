@@ -12,6 +12,7 @@ BAT) и лечение уже готовой папки без пересбор�
 """
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -131,6 +132,27 @@ class SharedSavesForFalloutTests(unittest.TestCase):
             self.assertIn(b"\r\n", text)
             self.assertIn(b"iSize W=1024", text)
             self.assertIn(b"SStartingCell=", text)
+
+    def test_runtime_sync_rules_include_saves_but_not_game_inis(self):
+        with tempfile.TemporaryDirectory() as temp:
+            game = FalloutPortable(temp)
+            setup = game.plan()
+
+            self.assertEqual(setup.entries[0].patterns, ["Saves"])
+            # Настройки всё ещё переносятся при сборке; правило runtime
+            # отвечает только за данные сохранений.
+            _write(game.host_game / "Fallout.ini", "[Audio]\niAudioCacheSize=8192\n")
+            game.apply(setup)
+            self.assertTrue((game.app / "Fallout.ini").is_file())
+
+    def test_result_explains_the_canonical_manual_ini_location(self):
+        with tempfile.TemporaryDirectory() as temp:
+            game = FalloutPortable(temp)
+            description = "\n".join(saves.describe(game.apply()))
+
+            self.assertIn("редактируйте прямо в App", description)
+            self.assertIn("не является активной", description)
+            self.assertIn("не синхронизируются при каждом запуске", description)
 
     def test_read_only_default_ini_is_patched_too(self):
         """У установленной игры этот файл часто помечен «только чтение»."""
@@ -270,6 +292,18 @@ class IniPatchTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(text, original)
 
+    def test_already_correct_readonly_ini_is_made_editable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, "Fallout.ini")
+            path.write_text("[General]\nbUseMyGamesDirectory=0\n",
+                            encoding="utf-8")
+            os.chmod(path, 0o444)
+
+            changed = saves.patch_ini_file(str(path), self.SETTINGS)
+
+            self.assertFalse(changed)
+            self.assertTrue(path.stat().st_mode & stat.S_IWUSR)
+
     def test_comments_and_duplicates_survive(self):
         text, _ = saves.patch_ini_text(
             "; комментарий\n[General]\n;bUseMyGamesDirectory=1\n"
@@ -324,6 +358,20 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(
                 (destination / "save.fos").read_text(encoding="utf-8"),
                 "новая")
+
+    def test_copied_readonly_settings_are_writable_in_the_portable_store(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, destination = Path(temp, "profile"), Path(temp, "App")
+            ini = _write(source / "Fallout.ini", "[Audio]\niAudioCacheSize=8192\n")
+            os.chmod(ini, 0o444)
+
+            self.assertEqual(saves.merge_tree(str(source), str(destination),
+                                              ["*.ini"]), 1)
+
+            copied = destination / "Fallout.ini"
+            self.assertEqual(copied.read_text(encoding="utf-8"),
+                             "[Audio]\niAudioCacheSize=8192\n")
+            self.assertTrue(copied.stat().st_mode & stat.S_IWUSR)
 
     def test_patterns_limit_what_is_merged(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -497,6 +545,62 @@ class RuntimeSyncTests(unittest.TestCase):
             session.after()
 
             self.assertFalse((game.host_saves / "Portable.fos").exists())
+
+    def test_game_ini_edits_are_not_overwritten_during_startup_sync(self):
+        with tempfile.TemporaryDirectory() as temp:
+            game = FalloutPortable(temp)
+            game.apply()
+            active = _write(game.app / "Fallout.ini",
+                            "[Audio]\niAudioCacheSize=8192\n")
+            legacy = _write(game.portable_game / "Fallout.ini",
+                            "[Audio]\niAudioCacheSize=2048\n")
+            _touch(active, 20000)
+            _touch(legacy, 30000)  # even a newer duplicate must not win
+            os.chmod(legacy, 0o444)
+
+            session = self._session(game)
+            session.before()
+            session.after()
+
+            self.assertIn("iAudioCacheSize=8192",
+                          active.read_text(encoding="utf-8"))
+            self.assertTrue(active.stat().st_mode & stat.S_IWUSR)
+            self.assertTrue(legacy.stat().st_mode & stat.S_IWUSR)
+
+    def test_legacy_ini_mirror_is_imported_once_then_never_overwrites_edits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            game = FalloutPortable(temp)
+            game.apply()
+            legacy_setup = game.plan()
+            legacy_setup.entries[0].patterns = ["Saves", "*.ini"]
+            active = _write(game.app / "Fallout.ini",
+                            "[Audio]\niAudioCacheSize=1024\n")
+            legacy = _write(game.portable_game / "Fallout.ini",
+                            "[Audio]\niAudioCacheSize=8192\n")
+            _touch(active, 10000)
+            _touch(legacy, 20000)
+            os.chmod(legacy, 0o444)
+
+            first = self._session(game, legacy_setup)
+            report = first.before()
+
+            self.assertIn("iAudioCacheSize=8192",
+                          active.read_text(encoding="utf-8"))
+            self.assertTrue(any("imported 1 INI file(s) once" in line
+                                for line in report))
+            state = json.loads((game.root / "PortableData" / "SharedSaves" /
+                                "state.json").read_text(encoding="utf-8"))
+            self.assertTrue(state["settings_imported"])
+
+            _write(active, "[Audio]\niAudioCacheSize=16384\n")
+            _write(legacy, "[Audio]\niAudioCacheSize=2048\n")
+            _touch(active, 30000)
+            _touch(legacy, 40000)  # deliberately newer, but it is obsolete
+            second = self._session(game, legacy_setup)
+            second.before()
+
+            self.assertIn("iAudioCacheSize=16384",
+                          active.read_text(encoding="utf-8"))
 
     def test_a_program_that_ignores_the_ini_switches_to_two_way_sync(self):
         """Страховка: если игра всё равно пишет в My Games, сводим обе папки.
@@ -698,6 +802,16 @@ class LaunchBatSavesTests(unittest.TestCase):
                                              rel_path="App/FalloutNV.exe")],
             shared_saves=setup.to_dict())
 
+    def test_legacy_inplace_config_does_not_resync_inis_in_bat(self):
+        with tempfile.TemporaryDirectory() as temp:
+            game = FalloutPortable(temp)
+            setup = game.plan()
+            setup.entries[0].patterns = ["Saves", "*.ini"]
+
+            bat = launcher_mod.render_bat(self._cfg(setup))
+
+            self.assertNotIn("*.ini", bat)
+
     def test_the_bat_remembers_the_real_profile_before_redirecting(self):
         with tempfile.TemporaryDirectory() as temp:
             game = FalloutPortable(temp)
@@ -719,6 +833,8 @@ class LaunchBatSavesTests(unittest.TestCase):
             self.assertIn(launch, bat)
             self.assertIn("call :portable_saves_import", bat)
             self.assertIn("call :portable_saves_export", bat)
+            self.assertNotIn("*.ini", bat,
+                             "fallback launcher must not resync Gamebryo INIs")
             self.assertLess(bat.index("call :portable_saves_import"),
                             bat.index(launch),
                             "сейвы надо забрать ДО старта программы")
@@ -904,6 +1020,10 @@ class BuildPipelineSavesTests(unittest.TestCase):
                 encoding="utf-8-sig")
             self.assertIn("Сохранения", readme)
             self.assertIn("App", readme)
+            self.assertIn("Fallout.ini", readme)
+            self.assertIn("Fallout_default.ini", readme)
+            self.assertIn("редактируйте прямо в App", readme)
+            self.assertIn("не синхронизируются", readme)
 
     def test_the_launcher_config_carries_the_setup(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -915,6 +1035,7 @@ class BuildPipelineSavesTests(unittest.TestCase):
             self.assertTrue(setup.enabled)
             self.assertEqual(setup.mode, "inplace")
             self.assertEqual([e.name for e in setup.entries], ["FalloutNV"])
+            self.assertEqual(setup.entries[0].patterns, ["Saves"])
             bat = (portable / "Launch.bat").read_text(encoding="ascii")
             self.assertIn(":portable_saves_import", bat)
 

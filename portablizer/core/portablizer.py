@@ -2803,6 +2803,15 @@ class Portablizer:
             store = (save_setup.store.replace("/", "\\")
                      or "PortableData")
             if save_setup.mode == "inplace":
+                profile = next((item for item in saves_mod.GAME_PROFILES
+                                if item.id == save_setup.profile), None)
+                settings_names = (", ".join(profile.user_inis)
+                                  if profile else "INI-файлы игры")
+                settings_example = (profile.user_inis[0]
+                                    if profile and profile.user_inis
+                                    else "<игра>.ini")
+                default_template = (profile.default_ini if profile
+                                   else "*_default.ini")
                 saves_section = (
                     saves_lead
                     + "Сохранения (общие для всех способов запуска):\n"
@@ -2814,7 +2823,17 @@ class Portablizer:
                     "набор видят и прямой\n"
                     "    запуск exe из App, и LaunchPortable.exe, и "
                     "комплектный лаунчер;\n"
-                    "  • в «Документы» этого компьютера ничего не пишется.\n"
+                    f"  • активные настроечные файлы ({settings_names}) "
+                    f"редактируйте прямо в {store}\\ — рядом с exe;\n"
+                    f"    например, личные параметры меняйте в {settings_example}; "
+                    f"{default_template} — только шаблон значений по умолчанию;\n"
+                    "  • копии INI в PortableData\\User\\Documents\\My Games "
+                    "не являются активными;\n"
+                    "    старые копии импортируются один раз, а при "
+                    "последующих запусках настройки\n"
+                    "    не синхронизируются и не перезаписываются;\n"
+                    "  • эти INI доступны для записи; в «Документы» этого "
+                    "компьютера ничего не пишется.\n"
                 )
             else:
                 saves_section = (
@@ -2885,8 +2904,8 @@ _README = """{app_name} — портативная версия
 Если есть Launch_Configurator.exe (или его запасной Launch_Configurator.bat),
 сначала запустите его, выберите графику, язык и разрешение, сохраните настройки
 и закройте окно. Затем запускайте игру
-через App\\LaunchPortable.exe или Launch.bat. Оба запуска используют один
-портативный каталог Documents, поэтому выбранные настройки применятся в игре.
+через App\\LaunchPortable.exe или Launch.bat. Оба запуска используют одно
+портативное хранилище; точное расположение активных INI указано ниже.
 
 Что внутри:
   App\\                  — установленная программа ({main_exe_rel})
@@ -2921,7 +2940,8 @@ _README = """{app_name} — портативная версия
     из App, LaunchPortable.exe и комплектный лаунчер читают и пишут один и
     тот же набор файлов внутри портатива;
   • Windows Known Folder Documents тоже временно направляется в PortableData,
-    поэтому Configurator.exe и сама игра используют один файл настроек;
+    поэтому программы, которые хранят настройки в профиле пользователя,
+    используют один файл настроек;
   • если программе нужны записи реестра, лончер перед стартом сохраняет
     прежнее состояние чужого ПК, подставляет настройки из портатива (включая
     UAC VirtualStore для бесправного доступа к machine-ключам), а после выхода
@@ -2967,7 +2987,7 @@ _README = """{app_name} — портативная версия
     рантаймом Visual C++ 2005/2008, а на этом компьютере его нет либо
     его копия в папке App повреждена (например, нет manifest-файла —
     Windows тогда игнорирует копию рядом с exe, как будто её нет вообще);
-  • чинится один раз: запустите Redist\Install-Redist.cmd из этой папки —
+  • чинится один раз: запустите Redist\\Install-Redist.cmd из этой папки —
     он поставит нужные пакеты Visual C++ молча, с одним UAC-запросом;
   • после установки Launch.bat сам проверит наличие сборок ещё раз и
     запустит программу;

@@ -481,9 +481,13 @@ def patch_ini_file(path: str,
     except OSError:
         return False
     patched, changed = patch_ini_text(text, settings)
+    # Настроечные INI должны оставаться доступными пользователю даже тогда,
+    # когда их содержимое уже совпадает с шаблоном. Раньше флаг снимался лишь
+    # при фактической правке bUseMyGamesDirectory, а исходные Fallout.ini и
+    # FalloutPrefs.ini могли остаться read-only.
+    _clear_readonly(path)
     if not changed:
         return False
-    _clear_readonly(path)
     try:
         with open(path, "wb") as handle:
             handle.write(patched.encode(encoding))
@@ -540,6 +544,10 @@ def merge_tree(source: str, destination: str,
                 os.makedirs(os.path.dirname(dst_file), exist_ok=True)
                 _clear_readonly(dst_file)
                 shutil.copy2(src_file, dst_file)
+                # copy2 сохраняет и атрибут «только для чтения» источника.
+                # Снимаем его ПОСЛЕ копирования, иначе пользовательские INI
+                # снова становятся недоступны для ручного редактирования.
+                _clear_readonly(dst_file)
             except OSError:
                 continue
             count += 1
@@ -757,7 +765,11 @@ def plan(portable_dir: str, app_name: str,
         setup.profile = detected.profile.id
         setup.title = detected.profile.title
         setup.store = store_rel
-        patterns = [detected.profile.saves_dir, "*.ini"]
+        # INI-файлы переносятся в store один раз при сборке/обновлении
+        # портатива ниже. В runtime entries обслуживают только сейвы: если
+        # синхронизировать *.ini перед каждым запуском, устаревшая копия из
+        # Documents\My Games может перезаписать ручные правки пользователя.
+        patterns = [detected.profile.saves_dir]
         for root, name in unique:
             setup.entries.append(SaveEntry(
                 name=name,
@@ -916,6 +928,13 @@ def describe(setup: SaveSetup) -> List[str]:
             f"Сквозные сохранения: {setup.title or 'программа'} хранит сейвы "
             f"и настройки в {store} — одинаково при запуске "
             f"{store}\\<exe>, LaunchPortable.exe и комплектного лаунчера.")
+        lines.append(
+            f"  • Настроечные INI редактируйте прямо в {store} — рядом с exe. "
+            "Копия в PortableData\\User\\Documents\\My Games не является "
+            "активной.")
+        lines.append(
+            "    INI не синхронизируются при каждом запуске, поэтому ручные "
+            "изменения не заменяются старыми копиями.")
     else:
         lines.append(
             "Сквозные сохранения: папки сейвов сводятся между портативом и "

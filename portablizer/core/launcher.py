@@ -692,6 +692,12 @@ def _saves_block(cfg: LauncherConfig, direction: str) -> str:
         patterns = entry.get("patterns")
         patterns = [str(p) for p in patterns] if isinstance(patterns, list) \
             else []
+        if str(data.get("mode", "")).casefold() == "inplace":
+            # Gamebryo INIs are canonical beside the executable. They are
+            # migrated during build/refresh, but must never be copied from an
+            # old Documents mirror on every BAT launch.
+            patterns = [p for p in patterns if not p.casefold().endswith(".ini")]
+            patterns = patterns or ["Saves"]
         for satellite in satellites:
             source, destination = ((satellite, store) if direction == "in"
                                    else (store, satellite))
