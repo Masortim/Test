@@ -202,6 +202,75 @@ jobs:
             throw "The portable folder could not be deleted"
           }
 
+      - name: Smoke test - a file locked from outside must be released
+        shell: pwsh
+        run: |
+          # Регрессия на жалобу, ради которой всё затевалось: портатив НЕ
+          # запущен, процессов из папки нет, а папку не удалить, потому что
+          # внутри открыт файл (у пользователя - шрифт, распакованный
+          # установщиком в PortableData\Temp и подхваченный службой Windows).
+          # Файл открывается с FILE_SHARE_DELETE: именно поэтому пробное
+          # переименование папки проходит, и старая проверка врала
+          # "The folder is free".
+          $root = Join-Path $env:RUNNER_TEMP "Portable Locked File Smoke"
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "App") | Out-Null
+          Copy-Item dist/PortableLauncher.exe (Join-Path $root "App/LaunchPortable.exe")
+          @{
+            app_name = "Locked"
+            target_exe_rel = "App/cmd.exe"
+            data_dir_name = "PortableData"
+            registry = @{ enabled = $false }
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $root "launcher_config.json")
+
+          $tempDir = Join-Path $root "PortableData/Temp/is-UQUS2.tmp"
+          New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+          $font = Join-Path $tempDir "OpenSans-Regular.ttf"
+          Set-Content -LiteralPath $font -Value "font" -Encoding ascii
+
+          $script = "`$s=[IO.File]::Open('$font','Open','Read','Delete'); Start-Sleep -Seconds 180"
+          $holder = Start-Process powershell -PassThru -WindowStyle Hidden `
+            -ArgumentList '-NoProfile', '-Command', $script
+          Start-Sleep -Seconds 3
+
+          # Файл действительно занят (проверяем, не ломая папку: удалять её
+          # сейчас нельзя - рекурсивное удаление снесло бы половину до
+          # первой ошибки, и проверять было бы уже нечего).
+          $locked = $false
+          try { $probe = [IO.File]::Open($font, 'Open', 'Read', 'None'); $probe.Close() }
+          catch { $locked = $true }
+          if (-not $locked) {
+            if (-not $holder.HasExited) { $holder.Kill() }
+            Write-Host "::warning title=Locked file smoke::the helper did not lock the file, nothing to test"
+            exit 0
+          }
+
+          # --elevated гасит повторный запрос прав: на раннере UAC-окна быть
+          # не может, а ждать его было бы нечем.
+          $stop = Start-Process -FilePath (Join-Path $root "App/LaunchPortable.exe") `
+            -ArgumentList '--stop', '--elevated' -PassThru
+          if (-not $stop.WaitForExit(180000)) {
+            $stop.Kill()
+            if (-not $holder.HasExited) { $holder.Kill() }
+            throw "LaunchPortable.exe --stop did not finish within 180 s"
+          }
+          $runLog = Join-Path $root "PortableData/launcher-run.log"
+          if (Test-Path $runLog) { Write-Host (Get-Content $runLog -Raw) }
+          if ($stop.ExitCode -ne 0) {
+            if (-not $holder.HasExited) { $holder.Kill() }
+            Write-Host "::error title=Locked file smoke::--stop reported $($stop.ExitCode)"
+            throw "--stop could not release the folder"
+          }
+
+          # Главная проверка: вердикт правдив - папка действительно удаляется.
+          try {
+            Remove-Item -Recurse -Force $root -ErrorAction Stop
+          } catch {
+            if (-not $holder.HasExited) { $holder.Kill() }
+            Write-Host "::error title=Locked file smoke::--stop said the folder is free, but it is not: $_"
+            throw "The folder is still locked after --stop"
+          }
+          if (-not $holder.HasExited) { $holder.Kill() }
+
       - name: Smoke test (import only)
         run: |
           python -c "import portablizer, portablizer.core.portablizer, portablizer.gui.main_window; print('import OK')"

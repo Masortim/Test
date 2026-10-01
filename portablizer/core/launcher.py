@@ -135,6 +135,16 @@ class LauncherConfig:
     # Добивать то, что не закрылось само. Выключать стоит только при отладке:
     # без этого папка снова может остаться заблокированной.
     shutdown_kill_leftovers: bool = True
+    # Разбирать ли открытые файлы папки (таблица дескрипторов ядра). Это
+    # единственный способ отпустить файл, который держит системная служба
+    # (кэш шрифтов и `PortableData\Temp\is-XXXX.tmp` — типичный случай).
+    shutdown_deep_check: bool = True
+    # Сколько секунд отводится на обход дескрипторов: лучше неполный
+    # разбор, чем лончер, который не выходит.
+    shutdown_handle_budget: float = 8.0
+    # Чистить ли PortableData\Temp между запусками: распакованное туда
+    # установщиками и держит потом папку.
+    shutdown_purge_temp: bool = True
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -956,6 +966,11 @@ rem     portable folder.
 if not defined PORTABLE_IDLE_GRACE set "PORTABLE_IDLE_GRACE={idle_grace}"
 if not defined PORTABLE_KILL_LEFTOVERS set "PORTABLE_KILL_LEFTOVERS={kill_leftovers}"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$r=$env:PORTABLE_ROOT.TrimEnd('\')+'\'; function GetPortableProcesses(){{ $a=@(); foreach($p in [Diagnostics.Process]::GetProcesses()){{ if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $a+=$p }} }} }}; return $a }}; $grace=8; $idle=[int]$env:PORTABLE_IDLE_GRACE; if($idle -le 0){{ $idle=20 }}; $t=0; $seen=$false; $q=0; while($t -lt 86400){{ $ps=@(GetPortableProcesses); if($ps.Count -gt 0){{ $seen=$true; $vis=0; foreach($p in $ps){{ if($p.MainWindowHandle.ToInt64() -ne 0){{ $vis++ }} }}; if($vis -gt 0){{ $q=0 }} else {{ $q++; if($q -ge $idle){{ break }} }} }} elseif($seen -or $t -ge $grace){{ break }}; Start-Sleep -Seconds 1; $t++ }}; if($env:PORTABLE_KILL_LEFTOVERS -eq '0'){{ exit 0 }}; $ps=@(GetPortableProcesses); if($ps.Count -gt 0){{ foreach($p in $ps){{ try{{ [void]$p.CloseMainWindow() }}catch{{}} }}; Start-Sleep -Seconds 3; foreach($p in @(GetPortableProcesses)){{ try{{ $p.Kill() }}catch{{}} }} }}" >nul 2>&1
+rem The temp folder of the portable app must not outlive the session: the
+rem files installers unpack there (fonts above all) are picked up by Windows
+rem services and keep the whole folder locked long after the program is gone.
+if exist "%PORTABLE_ROOT%\{data_dir}\Temp" rd /s /q "%PORTABLE_ROOT%\{data_dir}\Temp" >nul 2>&1
+if not exist "%PORTABLE_ROOT%\{data_dir}\Temp" md "%PORTABLE_ROOT%\{data_dir}\Temp" >nul 2>&1
 goto :eof
 
 :portable_documents_load
@@ -1130,6 +1145,7 @@ def render_bat(cfg: LauncherConfig) -> str:
         redist_script=REDIST_SCRIPT_NAME,
         idle_grace=int(max(1, round(cfg.shutdown_idle_grace))),
         kill_leftovers="1" if cfg.shutdown_kill_leftovers else "0",
+        data_dir=data_dir,
     )
     return ensure_ascii_bat(text)
 
@@ -1244,6 +1260,9 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         shutdown_close_grace=number("close_grace", 5.0),
         shutdown_max_wait=number("max_wait", 86400.0),
         shutdown_kill_leftovers=bool(shutdown.get("kill_leftovers", True)),
+        shutdown_deep_check=shutdown.get("deep_check", True) is not False,
+        shutdown_handle_budget=number("handle_budget", 8.0),
+        shutdown_purge_temp=shutdown.get("purge_temp", True) is not False,
     )
 
 
@@ -1252,40 +1271,105 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
 #: Имя аварийного «отпускателя» папки в корне портатива.
 STOP_SCRIPT_NAME = "StopPortable.cmd"
 
+_STOP_PS_FALLBACK = (
+    "powershell -NoProfile -ExecutionPolicy Bypass -Command \""
+    "$r=$env:PORTABLE_ROOT.TrimEnd('\\')+'\\'; "
+    "function Running(){{ $a=@(); foreach($p in [Diagnostics.Process]::GetProcesses()){{ "
+    "if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; "
+    "if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $a+=$p }} }} }}; return $a }}; "
+    "function Busy(){{ $b=@(); $sw=[Diagnostics.Stopwatch]::StartNew(); "
+    "foreach($f in (Get-ChildItem -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue | "
+    "Where-Object {{ -not $_.PSIsContainer }})){{ "
+    "if($sw.Elapsed.TotalSeconds -gt 20){{ break }}; "
+    "try{{ $s=[IO.File]::Open($f.FullName,'Open','Read','None'); $s.Close() }}"
+    "catch [IO.IOException]{{ $b+=$f.FullName; if($b.Count -ge 12){{ break }} }}catch{{}} }}; return $b }}; "
+    "$ps=@(Running); foreach($p in $ps){{ Write-Host ('Closing ' + $p.ProcessName + ' (pid ' + $p.Id + ')'); "
+    "try{{ [void]$p.CloseMainWindow() }}catch{{}} }}; "
+    "if($ps.Count -gt 0){{ Start-Sleep -Seconds 3; foreach($p in @(Running)){{ try{{ $p.Kill() }}catch{{}} }}; Start-Sleep -Seconds 1 }}; "
+    "$left=@(Running); if($left.Count -gt 0){{ foreach($p in $left){{ Write-Host ('Still running: ' + $p.ProcessName) }}; exit 1 }}; "
+    "$tmp=Join-Path $r 'PortableData\Temp'; if(Test-Path -LiteralPath $tmp){{ "
+    "Get-ChildItem -LiteralPath $tmp -Force -ErrorAction SilentlyContinue | "
+    "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }}; "
+    "$busy=@(Busy); if($busy.Count -gt 0){{ Start-Sleep -Seconds 1; $busy=@(Busy) }}; "
+    "if($busy.Count -gt 0){{ Write-Host 'These files are still open and keep the folder locked:'; "
+    "foreach($f in $busy){{ Write-Host ('  ' + $f) }}; exit 1 }}; "
+    "Write-Host 'Nothing from this folder is running and no file inside is open.'; exit 0\""
+)
+
 _STOP_TEMPLATE = r"""@echo off
 rem ============================================================================
 rem  {title} - free this portable folder
 rem
 rem  Run this file when the program has been closed but Windows still refuses
 rem  to delete or move the folder ("the file is open in another program").
-rem  It closes every process whose executable lives inside this folder -
-rem  politely first, by force afterwards - and touches nothing else on the PC.
 rem
-rem  The normal launcher does this on its own; this script is the manual
-rem  rescue hatch (and works even without App\LaunchPortable.exe).
+rem  What it does, in order:
+rem    1. closes every process whose executable lives inside this folder -
+rem       politely first, by force afterwards;
+rem    2. forces every OPEN FILE inside the folder to be released, even when
+rem       the holder is a Windows service (the font cache keeps fonts from
+rem       PortableData\Temp open long after the installer is gone);
+rem    3. wipes the leftovers in PortableData\Temp;
+rem    4. PROVES the result by trying to open every file inside exclusively -
+rem       and only then reports that the folder is free.
+rem
+rem  Step 2 needs administrator rights, so the script asks for them itself
+rem  when the folder is still locked.  Nothing outside this folder is touched.
 rem ============================================================================
 setlocal
 set "PORTABLE_ROOT=%~dp0"
 if "%PORTABLE_ROOT:~-1%" == "\" set "PORTABLE_ROOT=%PORTABLE_ROOT:~0,-1%"
-
-if exist "%PORTABLE_ROOT%\App\{exe_launcher}" (
-  "%PORTABLE_ROOT%\App\{exe_launcher}" --stop
-  if not errorlevel 1 goto report
+set "PORTABLE_SELF=%~f0"
+set "STOP_ELEVATED="
+set "STOP_PAUSE=1"
+set "STOP_RC=0"
+for %%A in (%*) do (
+  if /i "%%~A" == "--elevated" set "STOP_ELEVATED=1"
+  if /i "%%~A" == "--nopause" set "STOP_PAUSE="
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$r=$env:PORTABLE_ROOT.TrimEnd('\')+'\'; function GetPortableProcesses(){{ $a=@(); foreach($p in [Diagnostics.Process]::GetProcesses()){{ if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $a+=$p }} }} }}; return $a }}; $ps=@(GetPortableProcesses); if($ps.Count -eq 0){{ Write-Host 'Nothing from this folder is running.'; exit 0 }}; foreach($p in $ps){{ Write-Host ('Closing ' + $p.ProcessName + ' (pid ' + $p.Id + ')'); try{{ [void]$p.CloseMainWindow() }}catch{{}} }}; Start-Sleep -Seconds 3; foreach($p in @(GetPortableProcesses)){{ try{{ $p.Kill() }}catch{{}} }}; Start-Sleep -Seconds 1; $left=@(GetPortableProcesses); if($left.Count -gt 0){{ foreach($p in $left){{ Write-Host ('Still running: ' + $p.ProcessName) }}; exit 1 }}"
+if not exist "%PORTABLE_ROOT%\App\{exe_launcher}" goto fallback
+rem The launcher knows how to free the folder AND how to prove it, and it
+rem asks for administrator rights on its own when a handle has to be forced
+rem closed.  Its verdict is final: no silent fallback to a weaker check.
+"%PORTABLE_ROOT%\App\{exe_launcher}" --stop
+if errorlevel 1 goto stillbusy
+goto free
 
-:report
-if errorlevel 1 (
-  echo.
-  echo Some processes could not be stopped. They are probably running as
-  echo administrator - start this file again with "Run as administrator".
-) else (
-  echo.
-  echo The folder is free: it can be deleted, moved or copied now.
-)
-if not "%~1" == "--nopause" pause
-endlocal & exit /b 0
+:fallback
+{powershell}
+if errorlevel 1 goto locked
+goto free
+
+:locked
+if defined STOP_ELEVATED goto stillbusy
+if not defined STOP_PAUSE goto stillbusy
+echo.
+echo Something still holds this folder. Most often it is a Windows service
+echo (the font cache keeps a font from PortableData\Temp open), and only an
+echo administrator can force such a handle closed. Asking for rights now...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Start-Process -FilePath $env:PORTABLE_SELF -ArgumentList '--elevated' -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+if errorlevel 1 goto stillbusy
+goto free
+
+:stillbusy
+echo.
+echo The folder is STILL locked. The names above say who holds it:
+echo   - a program with a window: close that window;
+echo   - explorer.exe: close the folder window and the preview pane;
+echo   - an antivirus: wait a few seconds and run this file again.
+set "STOP_RC=1"
+goto done
+
+:free
+echo.
+echo The folder is free: it can be deleted, moved or copied now.
+set "STOP_RC=0"
+goto done
+
+:done
+if defined STOP_PAUSE pause
+endlocal & exit /b %STOP_RC%
 """
 
 
@@ -1295,6 +1379,7 @@ def render_stop_cmd(cfg: LauncherConfig,
     return ensure_ascii_bat(_STOP_TEMPLATE.format(
         title=_bat_echo(ascii_display(cfg.app_name)),
         exe_launcher=exe_launcher_name,
+        powershell=_STOP_PS_FALLBACK.format(),
     ))
 
 
@@ -1612,6 +1697,10 @@ def render_config_json(cfg: LauncherConfig) -> str:
             "close_grace": cfg.shutdown_close_grace,
             "max_wait": cfg.shutdown_max_wait,
             "kill_leftovers": cfg.shutdown_kill_leftovers,
+            # Кто держит файлы папки — и как это прекратить.
+            "deep_check": cfg.shutdown_deep_check,
+            "handle_budget": cfg.shutdown_handle_budget,
+            "purge_temp": cfg.shutdown_purge_temp,
         },
         "registry": {
             "enabled": cfg.apply_registry,
