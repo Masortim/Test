@@ -145,6 +145,13 @@ class LauncherConfig:
     # Чистить ли PortableData\Temp между запусками: распакованное туда
     # установщиками и держит потом папку.
     shutdown_purge_temp: bool = True
+    # --- сквозные сохранения -------------------------------------------------
+    # Описание общего хранилища сейвов (см. core/saves.py). Прямой запуск
+    # App\Game.exe получает настоящий профиль Windows, а лончер —
+    # перенаправленный: без этой секции каждый способ запуска видел бы свои
+    # собственные сохранения. Структура: {"enabled", "mode", "store",
+    # "entries": [...], "discovery": {...}}.
+    shared_saves: Dict[str, object] = field(default_factory=dict)
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -605,6 +612,99 @@ def _documents_restore_block(cfg: LauncherConfig) -> str:
     ])
 
 
+#: Максимум записей сквозных сохранений, обслуживаемых BAT-лончером. Всё
+#: остальное делает LaunchPortable.exe: он умеет и поиск новых папок, и
+#: сравнение по времени файла, а не целого каталога.
+MAX_SAVE_ENTRIES = 12
+
+
+def _bat_save_paths(entry: Dict[str, object]) -> "tuple":
+    """(хранилище, спутники) в терминах переменных BAT — или ничего."""
+    store = str(entry.get("store", "")).replace("/", "\\").strip("\\")
+    if not store or not is_ascii_safe(store):
+        return "", []
+    store_path = f"%PORTABLE_ROOT%\\{store}"
+    satellites: List[str] = []
+
+    host = str(entry.get("host", "")).replace("/", "\\").strip("\\")
+    if host and is_ascii_safe(host):
+        head, _, tail = host.partition("\\")
+        if head.lower() == "documents":
+            satellites.append(f"%PORTABLE_HOST_DOCUMENTS%\\{tail}"
+                              if tail else "%PORTABLE_HOST_DOCUMENTS%")
+        else:
+            satellites.append(f"%PORTABLE_HOST_PROFILE%\\{host}")
+
+    portable = str(entry.get("portable", "")).replace("/", "\\").strip("\\")
+    if portable and is_ascii_safe(portable):
+        satellites.append(f"%PORTABLE_ROOT%\\{portable}")
+    return store_path, satellites
+
+
+def _bat_copy_lines(source: str, destination: str,
+                    patterns: Sequence[str]) -> List[str]:
+    """xcopy /D копирует только то, что новее приёмника, — это и нужно."""
+    lines: List[str] = []
+    usable = [str(p).replace("/", "\\").strip("\\") for p in patterns
+              if str(p) and is_ascii_safe(str(p))]
+    if not usable:
+        lines.append(
+            f'if exist "{source}\\" xcopy "{source}" "{destination}\\" '
+            "/D /E /I /Y /Q >nul 2>&1")
+        return lines
+    for pattern in usable:
+        if any(ch in pattern for ch in "*?"):
+            lines.append(
+                f'if exist "{source}\\" xcopy "{source}\\{pattern}" '
+                f'"{destination}\\" /D /Y /Q >nul 2>&1')
+        else:
+            lines.append(
+                f'if exist "{source}\\{pattern}\\" xcopy '
+                f'"{source}\\{pattern}" "{destination}\\{pattern}\\" '
+                "/D /E /I /Y /Q >nul 2>&1")
+    return lines
+
+
+def _saves_block(cfg: LauncherConfig, direction: str) -> str:
+    """Сведение сохранений в запасном BAT-лончере.
+
+    ``direction='in'``  — забрать в портатив то, что появилось мимо лончера
+    (прямой запуск ``App\\Game.exe`` пишет в настоящий профиль Windows).
+    ``direction='out'`` — вернуть обновлённое наружу для записей с
+    двусторонним обменом, чтобы прямой запуск увидел новые сейвы.
+    """
+    data = cfg.shared_saves or {}
+    if not data.get("enabled"):
+        return "goto :eof"
+    raw_entries = data.get("entries")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        return "goto :eof"
+
+    lines: List[str] = []
+    for entry in raw_entries[:MAX_SAVE_ENTRIES]:
+        if not isinstance(entry, dict):
+            continue
+        if direction == "out" and str(entry.get("direction", "both")) != "both":
+            continue
+        store, satellites = _bat_save_paths(entry)
+        if not store or not satellites:
+            continue
+        patterns = entry.get("patterns")
+        patterns = [str(p) for p in patterns] if isinstance(patterns, list) \
+            else []
+        for satellite in satellites:
+            source, destination = ((satellite, store) if direction == "in"
+                                   else (store, satellite))
+            lines.extend(_bat_copy_lines(source, destination, patterns))
+    if not lines:
+        return "goto :eof"
+    header = ("rem Take into the portable folder everything that was saved "
+              "past this launcher." if direction == "in"
+              else "rem Hand the updated files back so a direct start of the "
+                   "EXE sees them too.")
+    return "\n".join([header, *lines, "goto :eof"])
+
+
 _BAT_TEMPLATE = r"""@echo off
 setlocal EnableExtensions DisableDelayedExpansion
 rem Prefer the windowed EXE launcher when it is available. Launch.bat remains
@@ -748,6 +848,19 @@ set "PORTABLE_REG_BACKUP=%PORTABLE_DATA%\RegistryHostBackup"
 rem Placeholder standing in for this folder inside the captured settings.
 set "PORTABLE_REG_MARKER={root_token}"
 
+rem --- The REAL profile of this PC, remembered before the redirect ----------
+rem Shared saves need it: a direct start of the program inside App writes into
+rem the real Documents folder, the launcher writes inside the portable folder.
+rem Both have to end up in the same place, so the real path is captured here,
+rem while the variables below still point at this computer.
+set "PORTABLE_HOST_PROFILE=%USERPROFILE%"
+set "PORTABLE_HOST_DOCUMENTS=%USERPROFILE%\Documents"
+rem On modern Windows the Documents folder is often moved into OneDrive. The
+rem EXE launcher asks the Known Folder API and is always right; this console
+rem fallback checks the two usual places instead.
+if not exist "%PORTABLE_HOST_DOCUMENTS%\" if exist "%USERPROFILE%\OneDrive\Documents\" set "PORTABLE_HOST_DOCUMENTS=%USERPROFILE%\OneDrive\Documents"
+if not exist "%PORTABLE_HOST_DOCUMENTS%\" if defined OneDrive if exist "%OneDrive%\Documents\" set "PORTABLE_HOST_DOCUMENTS=%OneDrive%\Documents"
+
 rem --- Redirect the user profile into the portable folder --------------------
 set "APPDATA=%PORTABLE_DATA%\AppData\Roaming"
 set "LOCALAPPDATA=%PORTABLE_DATA%\AppData\Local"
@@ -844,6 +957,7 @@ rem as error 14001 at start. The check below names the package instead and
 rem silently repairs what it can.
 call :portable_check_runtime
 
+call :portable_saves_import
 call :portable_documents_load
 call :portable_registry_load
 
@@ -861,6 +975,7 @@ call :portable_wait_children
 
 call :portable_registry_save
 call :portable_documents_restore
+call :portable_saves_export
 
 rem Error 14001 deserves its own explanation: it is never about registry or
 rem rights, it is the missing Visual C++ runtime the program was built with.
@@ -972,6 +1087,12 @@ rem services and keep the whole folder locked long after the program is gone.
 if exist "%PORTABLE_ROOT%\{data_dir}\Temp" rd /s /q "%PORTABLE_ROOT%\{data_dir}\Temp" >nul 2>&1
 if not exist "%PORTABLE_ROOT%\{data_dir}\Temp" md "%PORTABLE_ROOT%\{data_dir}\Temp" >nul 2>&1
 goto :eof
+
+:portable_saves_import
+{saves_import}
+
+:portable_saves_export
+{saves_export}
 
 :portable_documents_load
 {documents_load}
@@ -1138,6 +1259,8 @@ def render_bat(cfg: LauncherConfig) -> str:
         menu_block=menu_block,
         list_items=list_items,
         machine_elevation=_machine_elevation_block(cfg),
+        saves_import=_saves_block(cfg, "in"),
+        saves_export=_saves_block(cfg, "out"),
         documents_load=_documents_load_block(cfg),
         documents_restore=_documents_restore_block(cfg),
         runtime_check=_runtime_check_block(cfg),
@@ -1249,6 +1372,8 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         extra_env=mapping("extra_env"),
         path_prepend=items("path_prepend"),
         redirect_known_folders=bool(data.get("redirect_known_folders", False)),
+        shared_saves=(data.get("shared_saves")
+                      if isinstance(data.get("shared_saves"), dict) else {}),
         targets=targets,
         launcher_target_rel=text("launcher_target_rel"),
         config_target_rel=text("config_target_rel"),
@@ -1681,6 +1806,9 @@ def render_config_json(cfg: LauncherConfig) -> str:
         "extra_env": cfg.extra_env,
         "path_prepend": cfg.path_prepend,
         "redirect_known_folders": cfg.redirect_known_folders,
+        # Сквозные сохранения: одно хранилище сейвов для прямого запуска
+        # exe, лончера и комплектного launcher'а (см. core/saves.py).
+        "shared_saves": cfg.shared_saves,
         # Чего не хватает на чужом ПК: лончер проверяет этот список перед
         # стартом и называет пакет вместо системной ошибки про DLL.
         "runtime_requirements": cfg.runtime_requirements,

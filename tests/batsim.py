@@ -13,7 +13,8 @@
 * ``if``/``if not`` с ``==``, ``/i``, ``exist``, ``defined``, ``errorlevel N``;
 * многострочные блоки в скобках и ``else``;
 * ``for %%I in (...) do ...`` по списку значений;
-* ``mkdir``, ``del``, ``copy``, ``pushd``/``popd``, ``echo``, ``rem``, ``title``;
+* ``mkdir``, ``del``, ``copy``, ``xcopy``, ``pushd``/``popd``, ``echo``,
+  ``rem``, ``title``;
 * ``exit /b N`` и ``endlocal & exit /b N``;
 * запуск внешней программы (``"%TARGET%" args``) — фиксируется, не выполняется.
 
@@ -94,6 +95,38 @@ class FakeFS:
         if src_norm in self.files:
             self.add_file(dst, self.files[src_norm])
 
+    def copy_tree(self, src: str, dst: str) -> List[str]:
+        """``xcopy src dst /E``: скопировать файл, маску или всё поддерево.
+
+        Возвращает относительные имена скопированных файлов — этого хватает,
+        чтобы проверить, что сквозные сохранения действительно переносятся.
+        """
+        src = src.strip('"')
+        dst = dst.strip('"').rstrip("\\")
+        copied: List[str] = []
+        if "*" in src or "?" in src:
+            for path in self.glob(src):
+                if path in self.files:
+                    name = ntpath.basename(path)
+                    self.add_file(ntpath.join(dst, name), self.files[path])
+                    copied.append(name)
+            return copied
+        src_norm = self._norm(src)
+        if src_norm in self.files:
+            self.add_file(ntpath.join(dst, ntpath.basename(src)),
+                          self.files[src_norm])
+            return [ntpath.basename(src)]
+        prefix = src_norm + "\\"
+        for path in sorted(self.files):
+            if not path.startswith(prefix):
+                continue
+            rel = path[len(prefix):]
+            self.add_file(ntpath.join(dst, rel), self.files[path])
+            copied.append(rel)
+        if copied or src_norm in self.dirs:
+            self.add_dir(dst)
+        return copied
+
 
 @dataclass
 class Launch:
@@ -110,6 +143,8 @@ class Result:
     output: List[str] = field(default_factory=list)
     launches: List[Launch] = field(default_factory=list)
     reg_commands: List[str] = field(default_factory=list)
+    #: Выполненные xcopy: (источник, приёмник, что скопировано).
+    copies: List[Tuple[str, str, List[str]]] = field(default_factory=list)
     env: Dict[str, str] = field(default_factory=dict)
     paused: int = 0
 
@@ -440,6 +475,16 @@ class BatchInterpreter:
                       if not t.startswith("/")]
             if len(tokens) >= 2:
                 self.fs.copy(self.expand(tokens[0]), self.expand(tokens[1]))
+            return None
+        if low.startswith("xcopy "):
+            tokens = [t for t in self._tokens(command[6:])
+                      if not t.startswith("/")]
+            if len(tokens) >= 2:
+                source = self.expand(tokens[0]).strip('"')
+                destination = self.expand(tokens[1]).strip('"')
+                copied = self.fs.copy_tree(source, destination)
+                self.result.copies.append((source, destination, copied))
+                self.errorlevel = 0 if copied else 4
             return None
         if low.startswith("pushd"):
             self.dir_stack.append(self.cwd)

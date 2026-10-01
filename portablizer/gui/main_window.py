@@ -274,6 +274,20 @@ class MainWindow(QMainWindow):
         self.cb_runtimes.toggled.connect(self.cb_silent_redist.setEnabled)
         self.cb_runtimes.toggled.connect(self.cb_fetch_runtimes.setEnabled)
         self.cb_runtimes.toggled.connect(self.cb_full_runtimes.setEnabled)
+        self.cb_shared_saves = QCheckBox(
+            "Сквозные сохранения (общие для всех способов запуска)")
+        self.cb_shared_saves.setChecked(True)
+        self.cb_shared_saves.setToolTip(
+            "Прямой запуск App\\Game.exe получает настоящий профиль Windows, "
+            "а LaunchPortable.exe — перенаправленный внутрь портатива: без "
+            "этой галочки у каждого способа запуска свои сохранения, и сейвы "
+            "одного не видны другому. Portablizer сводит их в одно хранилище "
+            "внутри портативной папки: играм на движке Gamebryo (Fallout 3, "
+            "Fallout: New Vegas, Oblivion) прописывается хранение сейвов и "
+            "настроек рядом с exe (bUseMyGamesDirectory=0), остальным "
+            "программам лончер синхронизирует папки при каждом запуске. "
+            "Уже существующие сохранения переносятся в общее хранилище, "
+            "ничего не удаляется.")
         self.cb_autoopen = QCheckBox("Открыть папку результата по окончании")
         self.cb_autoopen.setChecked(True)
         self.cb_autoopen.setToolTip(
@@ -294,11 +308,12 @@ class MainWindow(QMainWindow):
         checks.addWidget(self.cb_integration, 1, 1)
         checks.addWidget(self.cb_exelauncher, 2, 0)
         checks.addWidget(self.cb_assisted, 2, 1)
-        checks.addWidget(self.cb_autoopen, 6, 0, 1, 2)
+        checks.addWidget(self.cb_autoopen, 7, 0, 1, 2)
         checks.addWidget(self.cb_runtimes, 3, 0)
         checks.addWidget(self.cb_fetch_runtimes, 3, 1)
         checks.addWidget(self.cb_full_runtimes, 4, 0, 1, 2)
         checks.addWidget(self.cb_silent_redist, 5, 0, 1, 2)
+        checks.addWidget(self.cb_shared_saves, 6, 0, 1, 2)
         checks.setColumnStretch(2, 1)
         lay.addLayout(checks)
 
@@ -361,7 +376,10 @@ class MainWindow(QMainWindow):
             "«Обновить лончер» перевыпускает Launch.bat, LaunchPortable.exe и "
             "StopPortable.cmd текущей версией — нужно для портативов, "
             "собранных прежними версиями Portablizer: они не умеют закрывать "
-            "за собой фоновые процессы. Настройки портатива сохраняются.")
+            "за собой фоновые процессы. Заодно включаются сквозные "
+            "сохранения: сейвы прямого запуска exe и запуска через лончер "
+            "сводятся в одно хранилище внутри портатива. Настройки "
+            "портатива сохраняются, пересобирать его не нужно.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -615,6 +633,7 @@ class MainWindow(QMainWindow):
                                and self.cb_fetch_runtimes.isChecked()),
             silent_runtime_install=(self.cb_runtimes.isChecked()
                                     and self.cb_silent_redist.isChecked()),
+            shared_saves=self.cb_shared_saves.isChecked(),
             extra_install_args=args,
             extra_env=self._parse_env(),
         )
@@ -778,6 +797,12 @@ class MainWindow(QMainWindow):
                     *[f"  • {p}" for p in result.runtime_packages[:4]],
                     f"Полный список — в {result.runtime_report_rel or 'redistributables.txt'}.",
                 ]
+            if result.saves_notes:
+                details += ["", *result.saves_notes]
+                if result.saves_migrated:
+                    details.append(
+                        "В общее хранилище перенесено файлов сохранений и "
+                        f"настроек: {result.saves_migrated}.")
             details += [
                 "",
                 "Скопируйте папку целиком на флешку — установка на другом "

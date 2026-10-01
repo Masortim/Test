@@ -49,6 +49,7 @@ from . import launcher as launcher_mod
 from . import procutil
 from . import redist as redist_mod
 from . import registry as reg_mod
+from . import saves as saves_mod
 from .detect import DetectionResult, InstallerType, detect_installer
 from .logutil import Logger
 from .silentargs import SilentPlan, build_attempts, build_silent_plan
@@ -316,6 +317,11 @@ class PortableOptions:
     # забрать из системы в портатив. Ставится только то, что опознано как
     # известный распространяемый пакет.
     silent_runtime_install: bool = True
+    # Сквозные портативные сохранения: одно хранилище сейвов для ВСЕХ
+    # способов запуска. Без этого прямой запуск App\Game.exe пишет в
+    # настоящий профиль Windows, а LaunchPortable.exe — в PortableData, и
+    # сохранения одного способа не видны другому (см. core/saves.py).
+    shared_saves: bool = True
 
 
 @dataclass
@@ -391,6 +397,14 @@ class PortableResult:
     folder_holders: List[str] = field(default_factory=list)
     #: Службы Windows, снятые с регистрации (их бинарник лежал в портативе).
     removed_services: List[str] = field(default_factory=list)
+    #: Режим сквозных сохранений: ``inplace`` | ``mirror`` | ``off``.
+    saves_mode: str = "off"
+    #: Где лежит общее хранилище сейвов (относительно папки портатива).
+    saves_store_rel: str = ""
+    #: Сколько сохранений перенесено в это хранилище при сборке.
+    saves_migrated: int = 0
+    #: Человеческое описание режима (идёт в журнал, README и окно итога).
+    saves_notes: List[str] = field(default_factory=list)
 
 
 class Portablizer:
@@ -868,13 +882,20 @@ class Portablizer:
             self.progress(87, "Учёт зависимостей и переменных среды")
             path_prepend = self._collect_dep_dirs(app_dir, portable_dir)
 
+            # 7в. Сквозные сохранения: один набор сейвов для прямого запуска
+            # exe, лончера и комплектного launcher'а.
+            self._check_cancel()
+            self.progress(90, "Сквозные портативные сохранения")
+            save_setup = self._setup_shared_saves(
+                portable_dir, app_dir, name, targets, opts, result)
+
             # 8. Генерация лончера и вспомогательных скриптов
             self._check_cancel()
             self.progress(92, "Генерация портативного лончера и меню")
             companion_files = self._write_launcher(
                 portable_dir, name, result.main_exe_rel,
                 opts, path_prepend, capture, targets,
-                runtime_report=runtime_report)
+                runtime_report=runtime_report, save_setup=save_setup)
             result.companion_launchers = companion_files
             exe_launcher = os.path.join(
                 portable_dir, "App", APP_EXE_LAUNCHER_NAME)
@@ -2557,11 +2578,51 @@ class Portablizer:
         )
         return rel
 
+    # -- сквозные сохранения --------------------------------------------------
+    def _setup_shared_saves(
+        self, portable_dir: str, app_dir: str, name: str,
+        targets: Optional[List[launcher_mod.TargetInfo]],
+        opts: PortableOptions, result: PortableResult,
+    ) -> "Optional[saves_mod.SaveSetup]":
+        """Сводит сохранения всех способов запуска в одно хранилище.
+
+        Прямой запуск ``App\\Game.exe`` получает настоящий профиль Windows, а
+        лончер — перенаправленный внутрь портатива. Пока эти два хранилища
+        существуют порознь, сохранения одного способа не видны другому. Здесь
+        они сводятся: игре движка Gamebryo объясняется, что данные надо
+        держать рядом с exe, а всем остальным назначается синхронизация,
+        которую лончер выполняет при каждом запуске.
+        """
+        if not opts.shared_saves:
+            result.saves_mode = "off"
+            self.log.info("Сквозные сохранения отключены в настройках сборки.")
+            return None
+        try:
+            executables = [t.rel_path for t in (targets or [])]
+            setup = saves_mod.plan(portable_dir, name, executables)
+            saves_mod.apply(portable_dir, setup, self.log)
+        except OSError as exc:
+            self.log.warn(f"Сквозные сохранения настроить не удалось: {exc}")
+            return None
+
+        result.saves_mode = setup.mode
+        result.saves_store_rel = setup.store.replace("/", os.sep)
+        result.saves_migrated = setup.migrated
+        result.saves_notes = saves_mod.describe(setup)
+        for line in result.saves_notes:
+            self.log.ok(line) if setup.enabled else self.log.info(line)
+        if setup.migrated:
+            self.log.ok(
+                f"В общее хранилище перенесено файлов сохранений и настроек: "
+                f"{setup.migrated}. Их увидят все способы запуска.")
+        return setup
+
     def _write_launcher(self, portable_dir: str, name: str, main_exe_rel: str,
                         opts: PortableOptions, path_prepend: List[str],
                         capture: Optional[RegistryCapture] = None,
                         targets: Optional[List[launcher_mod.TargetInfo]] = None,
-                        runtime_report: "Optional[redist_mod.ProvisionReport]" = None
+                        runtime_report: "Optional[redist_mod.ProvisionReport]" = None,
+                        save_setup: "Optional[saves_mod.SaveSetup]" = None
                         ) -> List[str]:
         has_registry = bool(
             capture and (capture.reg_file or capture.machine_reg_file
@@ -2593,6 +2654,8 @@ class Portablizer:
                 redist_mod.launcher_installers(runtime_report)
                 if runtime_report is not None else []
             ),
+            shared_saves=(save_setup.to_dict()
+                          if save_setup is not None else {}),
         )
         # Launch.bat — CRLF, чистый ASCII и без BOM. cmd.exe читает .bat по
         # байтовым смещениям: BOM, LF-концы строк или многобайтовый символ
@@ -2731,11 +2794,48 @@ class Portablizer:
                         "делает это сам, когда\n"
                         "  видит, что библиотеки на этом компьютере нет.\n"
                     )
+        # Раздел о сохранениях: пользователю важно знать, где они лежат и
+        # почему их теперь видно при любом способе запуска.
+        saves_section = ""
+        # Отступ перед разделом нужен, только когда выше уже что-то есть.
+        saves_lead = "\n" if runtime_section else ""
+        if save_setup is not None and save_setup.enabled:
+            store = (save_setup.store.replace("/", "\\")
+                     or "PortableData")
+            if save_setup.mode == "inplace":
+                saves_section = (
+                    saves_lead
+                    + "Сохранения (общие для всех способов запуска):\n"
+                    f"  • лежат в {store}\\Saves внутри этой папки и "
+                    "переносятся вместе с ней;\n"
+                    f"  • {save_setup.title or 'программа'} переведена на "
+                    "хранение сейвов и настроек рядом с exe\n"
+                    "    (bUseMyGamesDirectory=0), поэтому один и тот же "
+                    "набор видят и прямой\n"
+                    "    запуск exe из App, и LaunchPortable.exe, и "
+                    "комплектный лаунчер;\n"
+                    "  • в «Документы» этого компьютера ничего не пишется.\n"
+                )
+            else:
+                saves_section = (
+                    saves_lead
+                    + "Сохранения (общие для всех способов запуска):\n"
+                    f"  • хранятся внутри портатива ({store}) и переносятся "
+                    "вместе с папкой;\n"
+                    "  • при каждом запуске лончер сводит их с профилем "
+                    "этого ПК: сейв, сделанный\n"
+                    "    прямым запуском exe, виден в портативе, и "
+                    "наоборот. Побеждает более\n"
+                    "    свежий файл, ничего не удаляется;\n"
+                    "  • свести вручную: App\\LaunchPortable.exe "
+                    "--sync-saves.\n"
+                )
         self._write_text(
             os.path.join(portable_dir, "README_PORTABLE.txt"),
             _README.format(
                 app_name=name,
                 main_exe_rel=main_exe_rel,
+                saves_section=saves_section,
                 companion_section=companion_section,
                 companion_files_list=companion_files_list,
                 registry_note=registry_note,
@@ -2813,10 +2913,13 @@ _README = """{app_name} — портативная версия
   --help            справка
   -- <аргументы>    передать аргументы самой программе
 
-{runtime_section}
+{runtime_section}{saves_section}
 Как это работает:
   • стандартные каталоги профиля (AppData, Temp, Документы и др.) на время
     работы перенаправляются в PortableData — программа не пишет в C:\\Users;
+  • сохранения при этом общие для ВСЕХ способов запуска: прямой запуск exe
+    из App, LaunchPortable.exe и комплектный лаунчер читают и пишут один и
+    тот же набор файлов внутри портатива;
   • Windows Known Folder Documents тоже временно направляется в PortableData,
     поэтому Configurator.exe и сама игра используют один файл настроек;
   • если программе нужны записи реестра, лончер перед стартом сохраняет

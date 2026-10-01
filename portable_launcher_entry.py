@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -673,6 +674,406 @@ def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
         if key:
             env[str(key)] = _expand_environment(value, env)
     return env
+
+
+# --- сквозные сохранения ------------------------------------------------------
+#
+# Прямой запуск ``App\\Game.exe`` получает НАСТОЯЩИЙ профиль Windows, а запуск
+# через лончер — перенаправленный профиль внутри портатива.  Без этой секции
+# получались два независимых хранилища сейвов: сделанное одним способом не
+# видно другому.  Канонической копией всегда остаётся та, что внутри
+# портатива; папки профиля с ней сводятся — по времени изменения, без единого
+# удаления.
+
+#: Мусор, который синхронизировать бессмысленно.
+_SAVE_JUNK = frozenset({"desktop.ini", "thumbs.db", ".ds_store"})
+
+#: FAT32 хранит время с точностью до 2 секунд: без допуска один и тот же файл
+#: вечно считался бы «более новым», и копирование шло бы каждый запуск.
+_SAVE_MTIME_TOLERANCE = 2.0
+
+#: Предохранитель: «папка сохранений» не должна оказаться игровым каталогом
+#: на 100 ГБ, который лончер будет копировать часами.
+_SAVE_MAX_FILES = 20000
+_SAVE_MAX_BYTES = 20 * 1024 ** 3
+
+#: Корни профиля, в которых игры держат сохранения.
+_SAVE_ROOTS = ("Documents/My Games", "Saved Games")
+
+
+def _save_pattern_regex(pattern: str) -> "Optional[re.Pattern]":
+    """``Saves`` -> поддерево, ``*.ini`` -> файлы верхнего уровня."""
+    text = str(pattern).replace("\\", "/").strip("/")
+    if not text:
+        return None
+    if not any(ch in text for ch in "*?["):
+        return re.compile(r"(?i)^" + re.escape(text) + r"(/.*)?$")
+    out = ["(?i)^"]
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "*":
+            if text.startswith("**", index):
+                out.append(".*")
+                index += 2
+                continue
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        else:
+            out.append(re.escape(char))
+        index += 1
+    out.append("$")
+    return re.compile("".join(out))
+
+
+def _save_patterns(patterns: Sequence[str]) -> list:
+    return [rule for rule in (_save_pattern_regex(p) for p in patterns)
+            if rule is not None]
+
+
+def _inside(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def merge_saves(source: Path, destination: Path,
+                patterns: Sequence[str] = ()) -> "list[str]":
+    """Копирует то, чего в приёмнике нет или что там старее.
+
+    Ничего не удаляет и никогда не затирает более свежий файл, поэтому
+    вызывать её можно в любую сторону и сколько угодно раз: при расхождении
+    побеждает последняя по времени версия, остальное дополняется.
+    """
+    if not source or not destination:
+        return []
+    try:
+        if not source.is_dir():
+            return []
+    except OSError:
+        return []
+    if _inside(source, destination) or _inside(destination, source):
+        return []
+
+    compiled = _save_patterns(patterns)
+    copied: "list[str]" = []
+    total = 0
+    for root, dirs, files in os.walk(str(source), followlinks=False):
+        dirs[:] = [d for d in dirs if not d.startswith("$")]
+        for name in files:
+            if name.lower() in _SAVE_JUNK:
+                continue
+            src_file = Path(root) / name
+            rel = os.path.relpath(str(src_file), str(source)).replace("\\", "/")
+            if compiled and not any(rule.match(rel) for rule in compiled):
+                continue
+            dst_file = destination / rel.replace("/", os.sep)
+            try:
+                src_stat = src_file.stat()
+            except OSError:
+                continue
+            try:
+                if dst_file.stat().st_mtime + _SAVE_MTIME_TOLERANCE \
+                        >= src_stat.st_mtime:
+                    continue
+            except OSError:
+                pass
+            try:
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                if dst_file.exists():
+                    try:
+                        dst_file.chmod(dst_file.stat().st_mode | 0o200)
+                    except OSError:
+                        pass
+                shutil.copy2(str(src_file), str(dst_file))
+            except OSError:
+                continue
+            copied.append(rel)
+            total += src_stat.st_size
+            if len(copied) >= _SAVE_MAX_FILES or total >= _SAVE_MAX_BYTES:
+                return copied
+    return copied
+
+
+def _normalized_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+
+def _matches_tokens(name: str, tokens: Sequence[str]) -> bool:
+    normalized = _normalized_name(name)
+    if not normalized:
+        return False
+    for token in tokens:
+        token = str(token)
+        if len(token) < 4:
+            continue
+        if normalized == token or token in normalized or normalized in token:
+            return True
+    return False
+
+
+class SharedSaveSession:
+    """Сводит сохранения портатива и профиля этого ПК в одно хранилище.
+
+    Запускается дважды: перед стартом программы (забрать всё, что появилось
+    мимо лончера — например, после прямого запуска ``App\\Game.exe``) и после
+    её закрытия (вернуть обновлённое наружу, если данные пишутся в профиль).
+
+    Важно: настоящие пути профиля определяются В КОНСТРУКТОРЕ — до того, как
+    ``ShellFolderSession`` подменит Known Folder «Документы». Иначе лончер
+    синхронизировал бы портатив сам с собой.
+    """
+
+    def __init__(self, root: Path, cfg: Dict[str, Any]) -> None:
+        self.root = root
+        data = cfg.get("shared_saves")
+        self.cfg: Dict[str, Any] = data if isinstance(data, dict) else {}
+        self.mode = str(self.cfg.get("mode", "off"))
+        self.enabled = bool(self.cfg.get("enabled")) and self.mode != "off"
+        self.data_dir = root / str(cfg.get("data_dir_name", "PortableData"))
+        self.state_file = self.data_dir / "SharedSaves" / "state.json"
+        discovery = self.cfg.get("discovery")
+        discovery = discovery if isinstance(discovery, dict) else {}
+        self.discovery = bool(discovery.get("enabled", True))
+        self.tokens = [str(t) for t in discovery.get("tokens", [])
+                       if isinstance(discovery.get("tokens", []), list)]
+        roots = discovery.get("roots")
+        self.roots = [str(r) for r in roots] if isinstance(roots, list) \
+            else list(_SAVE_ROOTS)
+        self.portable_profile = self.data_dir / "User"
+        self.host_profile, self.host_documents = self._resolve_host()
+        self.two_way = self._load_state()
+        self.entries = self._configured_entries()
+
+    # -- настоящий профиль пользователя ------------------------------------
+    def _resolve_host(self) -> "tuple[Optional[Path], Optional[Path]]":
+        # PORTABLE_HOST_PROFILE/PORTABLE_HOST_DOCUMENTS задают профиль явно:
+        # так поступает запасной Launch.bat (он запоминает настоящие пути до
+        # перенаправления) и так же работают тесты.
+        forced_profile = os.environ.get("PORTABLE_HOST_PROFILE", "").strip()
+        forced_documents = os.environ.get("PORTABLE_HOST_DOCUMENTS",
+                                          "").strip()
+        raw = forced_profile or os.environ.get("USERPROFILE") \
+            or os.path.expanduser("~")
+        profile = Path(raw) if raw else None
+        if profile is not None and (_inside(profile, self.root)
+                                    or not profile.is_dir()):
+            profile = None
+
+        documents: Optional[Path] = None
+        if forced_documents and os.path.isabs(forced_documents):
+            documents = Path(forced_documents)
+        elif forced_profile:
+            documents = (profile / "Documents") if profile is not None else None
+        elif IS_WINDOWS:
+            try:
+                import winreg
+
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+                    r"\User Shell Folders", 0, winreg.KEY_QUERY_VALUE,
+                ) as key:
+                    value, _type = winreg.QueryValueEx(key, "Personal")
+                expanded = os.path.expandvars(str(value))
+                if expanded and os.path.isabs(expanded):
+                    documents = Path(expanded)
+            except (OSError, ValueError):
+                documents = None
+        # Прерванный прошлый сеанс мог оставить Known Folder направленным
+        # внутрь портатива: такой путь «настоящим профилем» считать нельзя.
+        if documents is not None and _inside(documents, self.root):
+            documents = None
+        if documents is None and profile is not None:
+            documents = profile / "Documents"
+        return profile, documents
+
+    def _host_path(self, relative: str) -> Optional[Path]:
+        parts = [p for p in str(relative).replace("\\", "/").split("/") if p]
+        if not parts:
+            return None
+        if parts[0].lower() == "documents":
+            if self.host_documents is None:
+                return None
+            return self.host_documents.joinpath(*parts[1:]) if len(parts) > 1 \
+                else self.host_documents
+        if self.host_profile is None:
+            return None
+        return self.host_profile.joinpath(*parts)
+
+    # -- состояние ----------------------------------------------------------
+    def _load_state(self) -> "set[str]":
+        try:
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+            return {str(name) for name in data.get("two_way", [])}
+        except (OSError, ValueError, AttributeError):
+            return set()
+
+    def _save_state(self) -> None:
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            self.state_file.write_text(
+                json.dumps({"two_way": sorted(self.two_way)},
+                           ensure_ascii=False),
+                encoding="utf-8")
+        except OSError:
+            pass
+
+    # -- записи -------------------------------------------------------------
+    def _configured_entries(self) -> "list[Dict[str, Any]]":
+        entries: "list[Dict[str, Any]]" = []
+        raw = self.cfg.get("entries")
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                store = str(item.get("store", "")).replace("\\", "/").strip("/")
+                if not store:
+                    continue
+                entries.append({
+                    "name": str(item.get("name", store)),
+                    "store": store,
+                    "host": str(item.get("host", "")),
+                    "portable": str(item.get("portable", "")),
+                    "patterns": [str(p) for p in item.get("patterns", [])
+                                 if isinstance(item.get("patterns", []), list)],
+                    "direction": ("in" if str(item.get("direction", "both"))
+                                  == "in" else "both"),
+                })
+        return entries
+
+    def _discovered_entries(self) -> "list[Dict[str, Any]]":
+        """Папки сохранений, появившиеся уже после сборки портатива."""
+        if not self.discovery or not self.tokens:
+            return []
+        known = {str(e.get("host", "")).replace("\\", "/").lower()
+                 for e in self.entries}
+        data_dir = self.data_dir.name
+        found: "list[Dict[str, Any]]" = []
+        for root in self.roots:
+            root_rel = str(root).replace("\\", "/").strip("/")
+            bases = []
+            host_base = self._host_path(root_rel)
+            if host_base is not None:
+                bases.append(host_base)
+            bases.append(self.portable_profile.joinpath(*root_rel.split("/")))
+            names: "set[str]" = set()
+            for base in bases:
+                try:
+                    names.update(item.name for item in base.iterdir()
+                                 if item.is_dir())
+                except OSError:
+                    continue
+            for name in sorted(names):
+                host_rel = f"{root_rel}/{name}"
+                if host_rel.lower() in known \
+                        or not _matches_tokens(name, self.tokens):
+                    continue
+                found.append({
+                    "name": name,
+                    "store": f"{data_dir}/User/{host_rel}",
+                    "host": host_rel,
+                    "portable": "",
+                    "patterns": [],
+                    "direction": "both",
+                    "discovered": True,
+                })
+        return found
+
+    def _all_entries(self) -> "list[Dict[str, Any]]":
+        return [*self.entries, *self._discovered_entries()]
+
+    def _satellites(self, entry: Dict[str, Any]) -> "list[Path]":
+        store = self.root.joinpath(*entry["store"].split("/"))
+        result: "list[Path]" = []
+        if entry.get("host"):
+            host = self._host_path(entry["host"])
+            if host is not None:
+                result.append(host)
+        if entry.get("portable"):
+            result.append(
+                self.root.joinpath(*str(entry["portable"]).split("/")))
+        return [p for p in result if p.resolve() != store.resolve()] \
+            if result else []
+
+    def _two_way(self, entry: Dict[str, Any]) -> bool:
+        return entry["direction"] == "both" or entry["name"] in self.two_way
+
+    # -- синхронизация ------------------------------------------------------
+    def pull(self) -> "list[str]":
+        """Забрать в портатив всё, что новее, из папок профиля."""
+        if not self.enabled:
+            return []
+        report: "list[str]" = []
+        for entry in self._all_entries():
+            store = self.root.joinpath(*entry["store"].split("/"))
+            for satellite in self._satellites(entry):
+                copied = merge_saves(satellite, store, entry["patterns"])
+                if copied:
+                    report.append(
+                        f"{entry['name']}: {len(copied)} file(s) taken into "
+                        f"the portable store from {satellite}")
+        return report
+
+    def push(self) -> "list[str]":
+        """Вернуть обновлённое наружу — для записей с двусторонним обменом."""
+        if not self.enabled:
+            return []
+        report: "list[str]" = []
+        for entry in self._all_entries():
+            if not self._two_way(entry):
+                continue
+            store = self.root.joinpath(*entry["store"].split("/"))
+            if not store.is_dir():
+                continue
+            for satellite in self._satellites(entry):
+                # Чужой профиль не трогаем, пока отдавать нечего: пустая
+                # папка в чужом Documents - это след, которого быть не должно.
+                copied = merge_saves(store, satellite, entry["patterns"])
+                if copied:
+                    report.append(
+                        f"{entry['name']}: {len(copied)} file(s) written back "
+                        f"to {satellite}")
+        return report
+
+    def before(self) -> "list[str]":
+        return self.pull()
+
+    def after(self) -> "list[str]":
+        """После выхода: забрать новое и, если нужно, отдать обратно.
+
+        Если данные пришли из папки профиля ПОСЛЕ старта программы, значит
+        программа пишет туда, а не в портатив (например, игра проигнорировала
+        ``bUseMyGamesDirectory``). Такая запись переводится в двусторонний
+        режим навсегда — иначе прямой запуск так и не увидел бы сейвы,
+        сделанные через лончер.
+        """
+        if not self.enabled:
+            return []
+        report: "list[str]" = []
+        changed = False
+        for entry in self._all_entries():
+            store = self.root.joinpath(*entry["store"].split("/"))
+            for satellite in self._satellites(entry):
+                copied = merge_saves(satellite, store, entry["patterns"])
+                if not copied:
+                    continue
+                report.append(
+                    f"{entry['name']}: {len(copied)} file(s) taken into the "
+                    f"portable store from {satellite}")
+                if not self._two_way(entry):
+                    self.two_way.add(entry["name"])
+                    changed = True
+                    report.append(
+                        f"{entry['name']}: the program keeps writing to "
+                        f"{satellite}; both folders are kept in sync from now")
+        if changed:
+            self._save_state()
+        report.extend(self.push())
+        return report
 
 
 class ShellFolderSession:
@@ -2379,6 +2780,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         _run_log(root, "cleaned up after the previous session: "
                  + ", ".join(sorted(set(stale))))
 
+    # Сквозные сохранения. Сессия создаётся ДО любых перенаправлений: она
+    # обязана запомнить настоящие «Документы» этого ПК, пока Known Folder
+    # ещё указывает на них, а не внутрь портатива.
+    shared_saves = SharedSaveSession(root, cfg)
+
     raw_arguments = _arguments_with_executable_alias(
         cfg, list(argv if argv is not None else sys.argv[1:])
     )
@@ -2444,6 +2850,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         missing_runtime = install_missing_runtime(root, cfg, missing_runtime)
     if missing_runtime and _runtime_warning_is_new(root, cfg, missing_runtime):
         _warn_about_runtime(root, missing_runtime)
+
+    # Сейвы, сделанные мимо лончера (прямой запуск App\Game.exe), забираются
+    # в портатив ПЕРЕД стартом: иначе программа их просто не увидит.
+    for line in shared_saves.before():
+        _run_log(root, "shared saves: " + line)
 
     shell_folders = ShellFolderSession(root, cfg)
     registry = RegistrySession(root, cfg)
@@ -2517,6 +2928,14 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         # us.  Only after this the folder can really be deleted.
         release_portable_folder(root, shutdown)
         job.close()
+        # Теперь, когда из портатива уже ничего не выполняется и все файлы
+        # закрыты, сохранения сводятся обратно: сделанное в этом сеансе
+        # должно быть видно и при следующем прямом запуске exe.
+        try:
+            for line in shared_saves.after():
+                _run_log(root, "shared saves: " + line)
+        except OSError as exc:
+            _run_log(root, f"shared saves: synchronisation failed ({exc})")
         # Временная папка портатива не должна пережить сеанс: именно
         # распакованные в неё файлы (шрифты установщика, DLL «помощников»)
         # потом подхватывает система и держит их месяцами.
@@ -2637,6 +3056,28 @@ def _retry_stop_elevated(root: Path, reason: str) -> int:
     return 1
 
 
+def sync_saves(root: Optional[Path] = None) -> int:
+    """``LaunchPortable.exe --sync-saves``: свести сохранения вручную.
+
+    Нужно ровно в одном случае: программу запускали напрямую из ``App``,
+    мимо лончера, и теперь её сейвы хочется увидеть в портативе (или
+    наоборот) не дожидаясь следующего запуска через лончер.
+    """
+    root = root or find_portable_root()
+    with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
+        cfg: Dict[str, Any] = json.load(fh)
+    session = SharedSaveSession(root, cfg)
+    if not session.enabled:
+        _run_log(root, "shared saves: disabled for this portable app")
+        return 0
+    report = [*session.pull(), *session.push()]
+    for line in report:
+        _run_log(root, "shared saves: " + line)
+    if not report:
+        _run_log(root, "shared saves: everything is already in sync")
+    return 0
+
+
 def main() -> int:
     root: Optional[Path] = None
     try:
@@ -2644,6 +3085,9 @@ def main() -> int:
         if any(str(arg).casefold() in ("--stop", "/stop")
                for arg in sys.argv[1:]):
             return stop(root)
+        if any(str(arg).casefold() in ("--sync-saves", "/sync-saves")
+               for arg in sys.argv[1:]):
+            return sync_saves(root)
         return run()
     except Exception as exc:
         details = f"Не удалось запустить портативную программу.\n\n{exc}"
