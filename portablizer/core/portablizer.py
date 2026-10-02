@@ -322,9 +322,6 @@ class PortableOptions:
     # настоящий профиль Windows, а LaunchPortable.exe — в PortableData, и
     # сохранения одного способа не видны другому (см. core/saves.py).
     shared_saves: bool = True
-    # Значение Fallout.ini [Audio]/iAudioCacheSize. Для New Vegas по умолчанию
-    # применяется рекомендуемый фикс 4096; GUI также предлагает 2048 и 8192.
-    fallout_audio_cache_size: int = 4096
 
 
 @dataclass
@@ -2602,9 +2599,7 @@ class Portablizer:
             return None
         try:
             executables = [t.rel_path for t in (targets or [])]
-            setup = saves_mod.plan(
-                portable_dir, name, executables,
-                fallout_audio_cache_size=opts.fallout_audio_cache_size)
+            setup = saves_mod.plan(portable_dir, name, executables)
             saves_mod.apply(portable_dir, setup, self.log)
         except OSError as exc:
             self.log.warn(f"Сквозные сохранения настроить не удалось: {exc}")
@@ -2661,8 +2656,6 @@ class Portablizer:
             ),
             shared_saves=(save_setup.to_dict()
                           if save_setup is not None else {}),
-            game_settings=(dict(save_setup.game_settings)
-                           if save_setup is not None else {}),
         )
         # Launch.bat — CRLF, чистый ASCII и без BOM. cmd.exe читает .bat по
         # байтовым смещениям: BOM, LF-концы строк или многобайтовый символ
@@ -2836,21 +2829,6 @@ class Portablizer:
                     "    свежий файл, ничего не удаляется;\n"
                     "  • свести вручную: App\\LaunchPortable.exe "
                     "--sync-saves.\n"
-                )
-            if save_setup.game_settings.get("profile") == "gamebryo-falloutnv":
-                raw_settings = save_setup.game_settings.get("ini_settings", [])
-                cache = next((str(item[2]) for item in raw_settings
-                              if isinstance(item, (list, tuple))
-                              and len(item) == 3
-                              and str(item[0]).casefold() == "audio"
-                              and str(item[1]).casefold()
-                              == "iaudiocachesize"), "4096")
-                saves_section += (
-                    f"  • Fallout: New Vegas: iAudioCacheSize={cache}; "
-                    "Fallout.ini и его копии остаются редактируемыми, а "
-                    "лончер восстанавливает это значение после запуска.\n"
-                    "    Для проверки/починки: App\\LaunchPortable.exe "
-                    "--doctor.\n"
                 )
         self._write_text(
             os.path.join(portable_dir, "README_PORTABLE.txt"),

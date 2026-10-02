@@ -191,23 +191,6 @@ class MainWindow(QMainWindow):
         self.env_edit = QLineEdit()
         self.env_edit.setPlaceholderText("KEY1=VAL1; KEY2=VAL2 (добавятся в лончер)")
         grid.addWidget(self.env_edit, 3, 1, 1, 2)
-
-        grid.addWidget(QLabel("Аудиокэш Fallout: New Vegas:"), 4, 0)
-        self.fallout_audio_cache_combo = QComboBox()
-        self.fallout_audio_cache_combo.addItem(
-            "2048 — оставить штатное значение", 2048)
-        self.fallout_audio_cache_combo.addItem(
-            "4096 — рекомендуется (меньше задержек музыки/радио)", 4096)
-        self.fallout_audio_cache_combo.addItem(
-            "8192 — максимальный вариант", 8192)
-        self.fallout_audio_cache_combo.setCurrentIndex(1)
-        self.fallout_audio_cache_combo.setToolTip(
-            "Применяется только если Portablizer распознаёт Fallout: New Vegas. "
-            "Значение записывается в Fallout_default.ini и во все копии "
-            "Fallout.ini/FalloutPrefs.ini, включая профиль портатива; "
-            "LaunchPortable.exe повторно синхронизирует их перед игрой и "
-            "после выхода.")
-        grid.addWidget(self.fallout_audio_cache_combo, 4, 1, 1, 2)
         grid.setColumnStretch(1, 1)
         lay.addLayout(grid)
 
@@ -651,8 +634,6 @@ class MainWindow(QMainWindow):
             silent_runtime_install=(self.cb_runtimes.isChecked()
                                     and self.cb_silent_redist.isChecked()),
             shared_saves=self.cb_shared_saves.isChecked(),
-            fallout_audio_cache_size=int(
-                self.fallout_audio_cache_combo.currentData() or 4096),
             extra_install_args=args,
             extra_env=self._parse_env(),
         )

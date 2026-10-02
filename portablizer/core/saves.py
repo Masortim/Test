@@ -115,14 +115,6 @@ GAME_PROFILES: Tuple[GameProfile, ...] = (
         default_ini="Fallout_default.ini",
         user_inis=("Fallout.ini", "FalloutPrefs.ini", "FalloutCustom.ini"),
         my_games=("FalloutNV",),
-        # Bethesda's launcher and the game keep several copies of this INI.
-        # Set the audio cache in the template and every user copy so New Vegas
-        # does not silently fall back to its stock 2048-entry cache.
-        ini_settings=(
-            ("General", "bUseMyGamesDirectory", "0"),
-            ("General", "SLocalSavePath", "Saves\\"),
-            ("Audio", "iAudioCacheSize", "4096"),
-        ),
     ),
     GameProfile(
         id="gamebryo-fallout3",
@@ -231,10 +223,6 @@ class SaveSetup:
     patched: List[str] = field(default_factory=list)
     #: Сколько файлов перенесено в общее хранилище при сборке.
     migrated: int = 0
-    #: Настройки INI, которыми лончер поддерживает общий конфиг игры.
-    #: Выносятся отдельно от схемы сейвов, но сохраняются и в ней для
-    #: совместимости с портативами, собранными предыдущими версиями.
-    game_settings: Dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -249,7 +237,6 @@ class SaveSetup:
                 "tokens": list(self.tokens),
                 "roots": [_posix(r) for r in self.roots],
             },
-            "game_settings": self.game_settings,
         }
 
     @staticmethod
@@ -275,9 +262,6 @@ class SaveSetup:
             roots=[str(r) for r in roots] if isinstance(roots, list)
             else list(WATCHED_ROOTS),
             discovery=bool(discovery.get("enabled", True)),
-            game_settings=(dict(data.get("game_settings", {}))
-                           if isinstance(data.get("game_settings"), dict)
-                           else {}),
         )
 
 
@@ -394,16 +378,14 @@ def path_allowed(rel_path: str, compiled: Sequence[re.Pattern]) -> bool:
     return any(rule.match(text) for rule in compiled)
 
 
-def _clear_readonly(path: str) -> bool:
-    """Снимает «только для чтения»; возвращает True, если флаг был снят."""
+def _clear_readonly(path: str) -> None:
+    """Fallout.ini часто помечен «только для чтения» — снимаем флаг."""
     try:
         mode = os.stat(path).st_mode
-        if mode & stat.S_IWRITE:
-            return False
-        os.chmod(path, mode | stat.S_IWRITE)
-        return bool(os.stat(path).st_mode & stat.S_IWRITE)
+        if not mode & stat.S_IWRITE:
+            os.chmod(path, mode | stat.S_IWRITE)
     except OSError:
-        return False
+        pass
 
 
 def read_ini(path: str) -> Tuple[str, str]:
@@ -499,11 +481,9 @@ def patch_ini_file(path: str,
     except OSError:
         return False
     patched, changed = patch_ini_text(text, settings)
-    # Ини-файл должен оставаться доступным для лаунчера и пользователя даже
-    # если его содержимое уже правильное (раньше этот путь оставлял атрибут).
-    _clear_readonly(path)
     if not changed:
         return False
+    _clear_readonly(path)
     try:
         with open(path, "wb") as handle:
             handle.write(patched.encode(encoding))
@@ -560,9 +540,6 @@ def merge_tree(source: str, destination: str,
                 os.makedirs(os.path.dirname(dst_file), exist_ok=True)
                 _clear_readonly(dst_file)
                 shutil.copy2(src_file, dst_file)
-                # copy2 копирует и атрибут read-only; для пользовательских
-                # настроек портатива сохраняем именно содержимое, не запрет.
-                _clear_readonly(dst_file)
             except OSError:
                 continue
             count += 1
@@ -730,57 +707,12 @@ def discover_profile_dirs(roots: Sequence[str], tokens: Sequence[str],
     return found
 
 
-def _game_ini_settings(profile: GameProfile,
-                       fallout_audio_cache_size: int = 4096
-                       ) -> Tuple[Tuple[str, str, str], ...]:
-    """Return portable INI keys, including the New Vegas audio-cache fix."""
-    settings = list(profile.ini_settings)
-    if profile.id == "gamebryo-falloutnv":
-        try:
-            requested = int(fallout_audio_cache_size)
-        except (TypeError, ValueError):
-            requested = 4096
-        # These are the values known to work with the Gamebryo audio cache;
-        # reject accidental values from a damaged or hand-edited config.
-        if requested not in (2048, 4096, 8192):
-            requested = 4096
-        found = False
-        for index, (section, key, _value) in enumerate(settings):
-            if section.casefold() == "audio" and key.casefold() == "iaudiocachesize":
-                settings[index] = (section, key, str(requested))
-                found = True
-        if not found:
-            settings.append(("Audio", "iAudioCacheSize", str(requested)))
-    return tuple(settings)
-
-
-def _game_settings_record(profile: GameProfile, store: str,
-                          entries: Sequence[SaveEntry],
-                          ini_settings: Sequence[Tuple[str, str, str]]) -> Dict[str, object]:
-    """Serializable runtime recipe for keeping every Gamebryo INI in sync."""
-    return {
-        "enabled": True,
-        "title": profile.title,
-        "profile": profile.id,
-        "store": _posix(store),
-        "default_ini": profile.default_ini,
-        "user_inis": list(profile.user_inis),
-        "ini_settings": [list(item) for item in ini_settings],
-        "saves_dir": profile.saves_dir,
-        "profile_dirs": list(dict.fromkeys(
-            _posix(entry.portable) for entry in entries if entry.portable)),
-        "host_dirs": list(dict.fromkeys(
-            _posix(entry.host) for entry in entries if entry.host)),
-    }
-
-
 def plan(portable_dir: str, app_name: str,
          executables: Sequence[str] = (),
          data_dir_name: str = DEFAULT_DATA_DIR,
          app_rel: str = "App",
          profile_dir: str = "",
-         documents_dir: str = "",
-         fallout_audio_cache_size: int = 4096) -> SaveSetup:
+         documents_dir: str = "") -> SaveSetup:
     """Строит описание сквозных сохранений для готовой папки портатива."""
     portable_dir = os.path.abspath(portable_dir)
     app_dir = os.path.join(portable_dir, *_posix(app_rel).split("/"))
@@ -825,8 +757,6 @@ def plan(portable_dir: str, app_name: str,
         setup.profile = detected.profile.id
         setup.title = detected.profile.title
         setup.store = store_rel
-        ini_settings = _game_ini_settings(
-            detected.profile, fallout_audio_cache_size)
         patterns = [detected.profile.saves_dir, "*.ini"]
         for root, name in unique:
             setup.entries.append(SaveEntry(
@@ -847,8 +777,6 @@ def plan(portable_dir: str, app_name: str,
                     portable=f"{data_dir}/User/Documents/My Games/{name}",
                     patterns=list(patterns), direction="in",
                 ))
-        setup.game_settings = _game_settings_record(
-            detected.profile, store_rel, setup.entries, ini_settings)
         setup.notes.append(
             f"{detected.profile.title}: сохранения и настройки переведены в "
             f"{store_rel.replace('/', os.sep)} — их видят и прямой запуск exe, "
@@ -925,78 +853,17 @@ def apply(portable_dir: str, setup: SaveSetup,
             setup.migrated += merge_tree(source, store_dir, patterns=["*.ini"])
 
         # 2. Включаем хранение данных рядом с exe — это и делает сохранения
-        #    сквозными: профиль Windows перестаёт участвовать вообще. Для New
-        #    Vegas сюда же входит Audio/iAudioCacheSize: 4096 по умолчанию.
-        settings = profile.ini_settings
-        if isinstance(setup.game_settings, dict):
-            configured = setup.game_settings.get("ini_settings")
-            if isinstance(configured, list):
-                parsed = []
-                for item in configured:
-                    if isinstance(item, (list, tuple)) and len(item) == 3:
-                        parsed.append(tuple(str(part) for part in item))
-                if parsed:
-                    settings = tuple(parsed)
-        default_path = os.path.join(store_dir, profile.default_ini)
-        # Официальный Bethesda launcher создаёт пользовательские INI из
-        # шаблона. Подготавливаем все копии заранее, чтобы их можно было
-        # редактировать и чтобы первая запись не вернула заводские значения.
-        if os.path.isfile(default_path):
-            for name in profile.user_inis:
-                candidate = os.path.join(store_dir, name)
-                if not os.path.lexists(candidate):
-                    try:
-                        shutil.copy2(default_path, candidate)
-                        _clear_readonly(candidate)
-                        setup.patched.append(
-                            _posix(os.path.relpath(candidate, portable_dir)))
-                    except OSError as exc:
-                        log.warn(f"Не удалось создать {name} из шаблона: {exc}")
+        #    сквозными: профиль Windows перестаёт участвовать вообще.
         for name in (profile.default_ini, *profile.user_inis):
             candidate = os.path.join(store_dir, name)
-            if not os.path.isfile(candidate):
-                continue
-            unlocked = _clear_readonly(candidate)
-            changed = patch_ini_file(candidate, settings)
-            if changed or unlocked:
-                rel = _posix(os.path.relpath(candidate, portable_dir))
-                if rel not in setup.patched:
-                    setup.patched.append(rel)
-
-        # Пользовательский профиль портатива тоже содержит копии Bethesda
-        # INI. Делаем их редактируемыми и синхронными с canonical App/*.ini:
-        # при каждом запуске native launcher повторит эту процедуру.
-        for entry in setup.entries:
-            if not entry.portable:
-                continue
-            profile_copy_dir = os.path.join(
-                portable_dir, *_posix(entry.portable).split("/"))
-            for name in profile.user_inis:
-                source = os.path.join(store_dir, name)
-                if not os.path.isfile(source):
-                    continue
-                destination = os.path.join(profile_copy_dir, name)
-                try:
-                    os.makedirs(profile_copy_dir, exist_ok=True)
-                    _clear_readonly(destination)
-                    shutil.copy2(source, destination)
-                    _clear_readonly(destination)
-                    rel = _posix(os.path.relpath(destination, portable_dir))
-                    if rel not in setup.patched:
-                        setup.patched.append(rel)
-                except OSError as exc:
-                    log.warn(f"Не удалось подготовить копию {name}: {exc}")
-
+            if os.path.isfile(candidate) \
+                    and patch_ini_file(candidate, profile.ini_settings):
+                setup.patched.append(
+                    _posix(os.path.relpath(candidate, portable_dir)))
         if setup.patched:
-            log.ok(f"{profile.default_ini}: INI настроены для хранения "
-                   "данных внутри портатива; атрибут read-only снят.")
-        audio_cache = next((value for section, key, value in settings
-                            if section.casefold() == "audio"
-                            and key.casefold() == "iaudiocachesize"), None)
-        if audio_cache is not None and profile.id == "gamebryo-falloutnv":
-            log.ok("Fallout: New Vegas: iAudioCacheSize="
-                   f"{audio_cache} применён к шаблону, игровым INI и "
-                   "переносимому профилю.")
+            log.ok(f"{profile.default_ini}: включено хранение сохранений и "
+                   "настроек внутри портатива (bUseMyGamesDirectory=0, "
+                   f"SLocalSavePath={profile.saves_dir}\\).")
 
         # 3. Переносим сейвы, уже накопленные обоими способами запуска.
         saves_target = os.path.join(store_dir, profile.saves_dir)
@@ -1056,17 +923,6 @@ def describe(setup: SaveSetup) -> List[str]:
             "файл, ничего не удаляется).")
     for entry in setup.entries[:6]:
         lines.append(f"  • {entry.name}: {entry.store.replace('/', os.sep)}")
-    game_settings = setup.game_settings
-    if game_settings.get("profile") == "gamebryo-falloutnv":
-        raw_settings = game_settings.get("ini_settings", [])
-        cache = next((str(item[2]) for item in raw_settings
-                      if isinstance(item, (list, tuple)) and len(item) == 3
-                      and str(item[0]).casefold() == "audio"
-                      and str(item[1]).casefold() == "iaudiocachesize"),
-                     "4096") if isinstance(raw_settings, list) else "4096"
-        lines.append(
-            f"Fallout: New Vegas: аудиокэш задан в {cache}; все копии INI "
-            "синхронизируются и остаются доступными для редактирования.")
     if len(setup.entries) > 6:
         lines.append(f"  • … и ещё {len(setup.entries) - 6}")
     return lines

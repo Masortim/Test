@@ -91,8 +91,6 @@ class FakeFS:
                       if d == norm or d.startswith(norm + "\\")}
 
     def copy(self, src: str, dst: str) -> None:
-        src = src.strip('"')
-        dst = dst.strip('"')
         src_norm = self._norm(src)
         if src_norm in self.files:
             self.add_file(dst, self.files[src_norm])
@@ -145,8 +143,6 @@ class Result:
     output: List[str] = field(default_factory=list)
     launches: List[Launch] = field(default_factory=list)
     reg_commands: List[str] = field(default_factory=list)
-    #: Вызовы attrib, включая снятие read-only у пользовательских INI.
-    attrib_calls: List[str] = field(default_factory=list)
     #: Выполненные xcopy: (источник, приёмник, что скопировано).
     copies: List[Tuple[str, str, List[str]]] = field(default_factory=list)
     env: Dict[str, str] = field(default_factory=dict)
@@ -511,9 +507,6 @@ class BatchInterpreter:
                            if part.strip()]
                 if any(part in expanded.lower() for part in missing):
                     self.errorlevel = 1
-            return None
-        if low.startswith("attrib "):
-            self.result.attrib_calls.append(self.expand(command))
             return None
         if low.startswith("powershell"):
             expanded = self.expand(command)
