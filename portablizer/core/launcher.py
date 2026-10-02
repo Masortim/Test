@@ -45,7 +45,7 @@ import json
 import os
 import string
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .. import __version__
 from .redist import REDIST_DIR_NAME, SILENT_SCRIPT_NAME as REDIST_SCRIPT_NAME
@@ -152,6 +152,27 @@ class LauncherConfig:
     # собственные сохранения. Структура: {"enabled", "mode", "store",
     # "entries": [...], "discovery": {...}}.
     shared_saves: Dict[str, object] = field(default_factory=dict)
+    # --- настройки игры (Gamebryo) ------------------------------------------
+    # Готовая инструкция для лончера: какие INI держать рядом с exe, какие
+    # ключи в них подтверждать (bUseMyGamesDirectory=0, SLocalSavePath) и
+    # какие копии в перенаправленном профиле обслуживать. По ней
+    # LaunchPortable.exe перед каждым запуском создаёт и разблокирует
+    # настройки, а после выхода забирает в папку игры то, что лаунчер игры
+    # записал в профиль. Структура — см. ``saves.runtime_settings``.
+    game_settings: Dict[str, object] = field(default_factory=dict)
+    # --- защита от цикла лаунчера игры --------------------------------------
+    # Лаунчер Bethesda, которому не удаётся сохранить настройки,
+    # закрывается и запускается снова — бесконечно. Лончер портатива считает
+    # такие перезапуски и, когда их становится слишком много, прерывает цикл:
+    # лечит настройки и запускает игру напрямую.
+    loop_guard_enabled: bool = True
+    #: Сколько быстрых перезапусков считаются циклом.
+    loop_guard_max_restarts: int = 3
+    #: Окно наблюдения, секунды.
+    loop_guard_window: float = 120.0
+    #: Перезапуск считается «самопроизвольным», только если новый экземпляр
+    #: появился в пределах этого времени после исчезновения предыдущего.
+    loop_guard_relaunch_grace: float = 10.0
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -671,6 +692,60 @@ def _bat_copy_lines(source: str, destination: str,
     return lines
 
 
+def _settings_block(cfg: LauncherConfig) -> str:
+    """Запасной BAT не должен оставлять настройки игры «только для чтения».
+
+    Основную работу делает ``LaunchPortable.exe`` (создаёт сквозные INI,
+    подтверждает portable-ключи и проверяет запись делом). Но этот файл
+    существует именно как аварийный путь — на случай, когда EXE-лончера нет.
+    В таком режиме хотя бы снимаем «только для чтения»: ``FalloutNVLauncher``
+    переписывает свои INI при каждом нажатии «Играть», и недоступный для
+    записи файл заставляет его закрываться и открываться снова.
+
+    Содержимое INI здесь не правится: ``cmd.exe`` для этого не годится, а
+    сквозные ключи уже выставлены при сборке. Если их всё же нет (портатив
+    собран прежней версией), в блоке печатается подсказка про ``--doctor``.
+    """
+    data = cfg.game_settings or {}
+    if not data.get("enabled"):
+        return "goto :eof"
+    store = _win_rel(str(data.get("store", "")))
+    if not store or not is_ascii_safe(store):
+        return "goto :eof"
+    lines = [
+        "rem --- Game settings: never leave them read-only -----------------------",
+        "rem Bethesda's own launcher rewrites its INI files on every press of",
+        "rem \"Play\" and loops forever when it cannot: closed - opened again -",
+        "rem closed ... Clear the flag before the program starts.",
+        f'if exist "%PORTABLE_ROOT%\\{store}\\" attrib -r '
+        f'"%PORTABLE_ROOT%\\{store}\\*.ini" /s >nul 2>&1',
+    ]
+    user_inis = [str(name) for name in data.get("user_inis", [])] \
+        if isinstance(data.get("user_inis"), list) else []
+    default_ini = str(data.get("default_ini", ""))
+    if not is_ascii_safe(default_ini):
+        # Репак с кириллическим шаблоном: имя в .bat не подставляется
+        # литералом (см. «Почему Launch.bat строго ASCII»), копирование из
+        # шаблона остаётся за EXE-лончером и --doctor.
+        default_ini = ""
+    for name in user_inis:
+        if not is_ascii_safe(name) or not name:
+            continue
+        lines.append(
+            f'if not exist "%PORTABLE_ROOT%\\{store}\\{name}" '
+            f'if exist "%PORTABLE_ROOT%\\{store}\\{default_ini}" '
+            f'copy /y "%PORTABLE_ROOT%\\{store}\\{default_ini}" '
+            f'"%PORTABLE_ROOT%\\{store}\\{name}" >nul 2>&1')
+    lines.append(
+        "rem If the launcher still loops, the settings need more than the flag:"
+    )
+    lines.append(
+        "rem run App\\LaunchPortable.exe --doctor (it recreates the portable")
+    lines.append(
+        "rem configuration and names the exact file it cannot write).")
+    return "\n".join(lines)
+
+
 def _saves_block(cfg: LauncherConfig, direction: str) -> str:
     """Сведение сохранений в запасном BAT-лончере.
 
@@ -970,6 +1045,7 @@ rem silently repairs what it can.
 call :portable_check_runtime
 
 call :portable_saves_import
+call :portable_settings_repair
 call :portable_documents_load
 call :portable_registry_load
 
@@ -1102,6 +1178,9 @@ goto :eof
 
 :portable_saves_import
 {saves_import}
+
+:portable_settings_repair
+{settings_repair}
 
 :portable_saves_export
 {saves_export}
@@ -1272,6 +1351,7 @@ def render_bat(cfg: LauncherConfig) -> str:
         list_items=list_items,
         machine_elevation=_machine_elevation_block(cfg),
         saves_import=_saves_block(cfg, "in"),
+        settings_repair=_settings_block(cfg),
         saves_export=_saves_block(cfg, "out"),
         documents_load=_documents_load_block(cfg),
         documents_restore=_documents_restore_block(cfg),
@@ -1337,10 +1417,14 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
     registry = registry if isinstance(registry, dict) else {}
     shutdown = data.get("shutdown")
     shutdown = shutdown if isinstance(shutdown, dict) else {}
+    loop_guard = data.get("loop_guard")
+    loop_guard = loop_guard if isinstance(loop_guard, dict) else {}
 
-    def number(key: str, default: float) -> float:
+    def number(key: str, default: float, source: Optional[Dict[str, object]] = None
+               ) -> float:
         try:
-            return float(shutdown.get(key, default))
+            return float((source if source is not None else shutdown)
+                         .get(key, default))
         except (TypeError, ValueError):
             return default
 
@@ -1400,6 +1484,13 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         shutdown_deep_check=shutdown.get("deep_check", True) is not False,
         shutdown_handle_budget=number("handle_budget", 8.0),
         shutdown_purge_temp=shutdown.get("purge_temp", True) is not False,
+        game_settings=(data.get("game_settings")
+                       if isinstance(data.get("game_settings"), dict) else {}),
+        loop_guard_enabled=loop_guard.get("enabled", True) is not False,
+        loop_guard_max_restarts=int(number("max_restarts", 3.0,
+                                           loop_guard)) or 3,
+        loop_guard_window=number("window", 120.0, loop_guard),
+        loop_guard_relaunch_grace=number("relaunch_grace", 10.0, loop_guard),
     )
 
 
@@ -1821,6 +1912,18 @@ def render_config_json(cfg: LauncherConfig) -> str:
         # Сквозные сохранения: одно хранилище сейвов для прямого запуска
         # exe, лончера и комплектного launcher'а (см. core/saves.py).
         "shared_saves": cfg.shared_saves,
+        # Инструкция по настройкам игры: какие INI держать рядом с exe и как
+        # проверять их записываемость (см. core/saves.py, runtime_settings).
+        "game_settings": cfg.game_settings,
+        # Защита от бесконечного цикла лаунчера игры: лончер считает
+        # самопроизвольные перезапуски и, когда их слишком много, прерывает
+        # цикл и запускает игру напрямую.
+        "loop_guard": {
+            "enabled": cfg.loop_guard_enabled,
+            "max_restarts": cfg.loop_guard_max_restarts,
+            "window": cfg.loop_guard_window,
+            "relaunch_grace": cfg.loop_guard_relaunch_grace,
+        },
         # Чего не хватает на чужом ПК: лончер проверяет этот список перед
         # стартом и называет пакет вместо системной ошибки про DLL.
         "runtime_requirements": cfg.runtime_requirements,
