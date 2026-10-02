@@ -648,6 +648,12 @@ def _bat_copy_lines(source: str, destination: str,
     usable = [str(p).replace("/", "\\").strip("\\") for p in patterns
               if str(p) and is_ascii_safe(str(p))]
     if not usable:
+        # Настроечные файлы не должны оставаться «только для чтения»:
+        # xcopy молча не переписывает такой файл, а игра (и её лаунчер)
+        # при выходе снова помечает настройки «только для чтения».
+        lines.append(
+            f'if exist "{destination}\\" attrib -r "{destination}\\*.ini" /s '
+            ">nul 2>&1")
         lines.append(
             f'if exist "{source}\\" xcopy "{source}" "{destination}\\" '
             "/D /E /I /Y /Q >nul 2>&1")
