@@ -1010,8 +1010,20 @@ _GAMEBRYO_FALLBACKS: Dict[str, Dict[str, Any]] = {
     "gamebryo-oblivion": {
         "title": "The Elder Scrolls IV: Oblivion",
         "default_ini": "Oblivion_default.ini",
-        "user_inis": ["Oblivion.ini"],
+        "user_inis": ["Oblivion.ini", "OblivionPrefs.ini"],
         "my_games": ["Oblivion"],
+    },
+    "gamebryo-skyrim": {
+        "title": "The Elder Scrolls V: Skyrim",
+        "default_ini": "Skyrim_default.ini",
+        "user_inis": ["Skyrim.ini", "SkyrimPrefs.ini", "SkyrimCustom.ini"],
+        "my_games": ["Skyrim", "Skyrim Special Edition", "Skyrim VR"],
+    },
+    "gamebryo-fallout4": {
+        "title": "Fallout 4",
+        "default_ini": "Fallout4_default.ini",
+        "user_inis": ["Fallout4.ini", "Fallout4Prefs.ini", "Fallout4Custom.ini"],
+        "my_games": ["Fallout4", "Fallout4VR"],
     },
 }
 
@@ -1033,7 +1045,7 @@ def _discover_gamebryo(store: Path) -> Optional[Dict[str, Any]]:
         return {
             "title": f"{stem} (Gamebryo)",
             "default_ini": template.name,
-            "user_inis": [f"{stem}.ini", f"{stem}Prefs.ini"],
+            "user_inis": [f"{stem}.ini", f"{stem}Prefs.ini", f"{stem}Custom.ini"],
             "my_games": [stem],
         }
     return None
@@ -1206,9 +1218,10 @@ class GameSettingsGuard:
                 + "): otherwise the game's own launcher would close and "
                 "reopen itself in an endless loop")
 
-        # Копии в перенаправленном профиле должны существовать: лаунчер
-        # Bethesda пишет свои настройки именно туда, и если файла нет, а
-        # создать его не удаётся — это ровно тот же цикл.
+        # Копии в перенаправленном профиле должны существовать и быть актуальными:
+        # лаунчер Bethesda пишет свои настройки именно туда. Если пользователь
+        # отредактировал сквозной INI в App, изменения сразу переносятся в профиль,
+        # а если профиль новее — переносятся в App.
         profile_created: "list[str]" = []
         for directory in self.profile_dirs():
             try:
@@ -1217,17 +1230,44 @@ class GameSettingsGuard:
                 continue
             for name in self.user_inis:
                 candidate = directory / name
-                if candidate.is_file():
-                    continue
                 source = store / name
                 if not source.is_file():
                     continue
-                try:
-                    shutil.copyfile(str(source), str(candidate))
-                except OSError:
-                    continue
-                _clear_readonly(candidate)
-                profile_created.append(f"{directory.name}/{name}")
+                if not candidate.is_file():
+                    try:
+                        shutil.copyfile(str(source), str(candidate))
+                    except OSError:
+                        continue
+                    _clear_readonly(candidate)
+                    if self.ini_settings:
+                        _patch_ini_file(candidate, self.ini_settings)
+                    profile_created.append(f"{directory.name}/{name}")
+                else:
+                    try:
+                        source_stat = source.stat()
+                        candidate_stat = candidate.stat()
+                        if source_stat.st_mtime > candidate_stat.st_mtime + _SETTINGS_MTIME_TOLERANCE:
+                            _clear_readonly(candidate)
+                            shutil.copy2(str(source), str(candidate))
+                            _clear_readonly(candidate)
+                            if self.ini_settings:
+                                _patch_ini_file(candidate, self.ini_settings)
+                            profile_created.append(f"{directory.name}/{name} (updated from App)")
+                        elif candidate_stat.st_mtime > source_stat.st_mtime + _SETTINGS_MTIME_TOLERANCE:
+                            _clear_readonly(source)
+                            shutil.copy2(str(candidate), str(source))
+                            _clear_readonly(source)
+                            if self.ini_settings:
+                                _patch_ini_file(source, self.ini_settings)
+                            profile_created.append(f"{name} (updated from profile)")
+                        else:
+                            _clear_readonly(candidate)
+                            _clear_readonly(source)
+                            if self.ini_settings:
+                                _patch_ini_file(candidate, self.ini_settings)
+                                _patch_ini_file(source, self.ini_settings)
+                    except OSError:
+                        pass
         if profile_created:
             lines.append(
                 "the game launcher keeps writing its settings to the profile "
@@ -1293,12 +1333,14 @@ class GameSettingsGuard:
                 except OSError:
                     pass
                 try:
+                    _clear_readonly(destination)
                     shutil.copy2(str(source), str(destination))
                 except OSError:
                     continue
                 _clear_readonly(destination)
                 if self.ini_settings:
                     _patch_ini_file(destination, self.ini_settings)
+                    _patch_ini_file(source, self.ini_settings)
                 adopted.append(name)
         if adopted:
             lines.append(
@@ -3476,14 +3518,15 @@ class LauncherRestartWatcher:
 
     Признак настоящего цикла: лаунчер закрывается и **сам** запускается
     снова, то есть новый экземпляр появляется почти сразу после исчезновения
-    предыдущего. Если пользователь просто открывает лончер повторно вручную,
+    предыдущего (включая паузы на диалоговые окна русификации или выбора DLC).
+    Если пользователь просто открывает лончер повторно вручную,
     между экземплярами проходит заметно больше времени — такие запуски в
     счёт не идут, и лончер портатива не вмешивается в ручную работу с
     настройками игры.
     """
 
     def __init__(self, *, max_restarts: int = 3, window: float = 120.0,
-                 relaunch_grace: float = 10.0,
+                 relaunch_grace: float = 30.0,
                  clock=time.monotonic) -> None:
         self.max_restarts = max(1, int(max_restarts))
         self.window = max(1.0, float(window))
@@ -3492,7 +3535,7 @@ class LauncherRestartWatcher:
         self.starts: "list[float]" = []
         self.quick: "list[float]" = []
         self.last_closed: Optional[float] = None
-        self.game_started = False
+        self.game_running = False
 
     def opened(self, when: Optional[float] = None) -> None:
         """Экземпляр лаунчера появился."""
@@ -3507,9 +3550,17 @@ class LauncherRestartWatcher:
         """Экземпляр лаунчера исчез."""
         self.last_closed = self.clock() if when is None else when
 
+    def set_game_running(self, running: bool) -> None:
+        """Настоящая игра в данный момент активна."""
+        self.game_running = running
+
     def note_game_started(self) -> None:
-        """Настоящая игра пошла: лаунчер сделал своё дело, цикла нет."""
-        self.game_started = True
+        """Настоящая игра пошла: лаунчер сделал своё дело."""
+        self.game_running = True
+
+    @property
+    def game_started(self) -> bool:
+        return self.game_running
 
     def restarts(self, when: Optional[float] = None) -> int:
         """Сколько самопроизвольных перезапусков уложилось в окно.
@@ -3535,7 +3586,7 @@ class LauncherRestartWatcher:
         return 0
 
     def loop_detected(self, when: Optional[float] = None) -> bool:
-        return not self.game_started and self.restarts(when) >= self.max_restarts
+        return not self.game_running and self.restarts(when) >= self.max_restarts
 
 
 class _SessionOutcome:
@@ -3590,7 +3641,7 @@ def _supervise_launcher(process, *, target: Path, main_target: Optional[Path],
     watcher = LauncherRestartWatcher(
         max_restarts=int(settings.get("max_restarts", 3) or 3),
         window=float(settings.get("window", 120.0) or 120.0),
-        relaunch_grace=float(settings.get("relaunch_grace", 10.0) or 10.0),
+        relaunch_grace=float(settings.get("relaunch_grace", 30.0) or 30.0),
         clock=clock,
     )
     target_key = os.path.normcase(str(target))
@@ -3606,8 +3657,8 @@ def _supervise_launcher(process, *, target: Path, main_target: Optional[Path],
         target_pids = {pid for pid, key in images if key == target_key}
         main_running = any(key == main_key for _, key in images)
 
+        watcher.set_game_running(main_running)
         if main_running:
-            watcher.note_game_started()
             outcome.game_started = True
 
         # Считаются именно НОВЫЕ экземпляры: цикл лаунчера — это появление
@@ -3634,7 +3685,7 @@ def _supervise_launcher(process, *, target: Path, main_target: Optional[Path],
             # раньше, до появления наблюдателя.
             outcome.code = _process_code(process)
             outcome.restarts = watcher.restarts()
-            outcome.game_started = watcher.game_started
+            outcome.game_started = watcher.game_running or outcome.game_started
             if outcome.restarts:
                 outcome.notes.append(
                     f"the launcher was restarted {outcome.restarts} time(s) "
@@ -3662,6 +3713,7 @@ def _loop_guard_settings(cfg: Dict[str, Any], arguments: Sequence[str]
     if disabled:
         settings["enabled"] = False
     settings.setdefault("enabled", True)
+    settings.setdefault("relaunch_grace", 30.0)
     return settings
 
 

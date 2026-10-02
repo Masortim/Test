@@ -172,7 +172,7 @@ class LauncherConfig:
     loop_guard_window: float = 120.0
     #: Перезапуск считается «самопроизвольным», только если новый экземпляр
     #: появился в пределах этого времени после исчезновения предыдущего.
-    loop_guard_relaunch_grace: float = 10.0
+    loop_guard_relaunch_grace: float = 30.0
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -736,6 +736,26 @@ def _settings_block(cfg: LauncherConfig) -> str:
             f'if exist "%PORTABLE_ROOT%\\{store}\\{default_ini}" '
             f'copy /y "%PORTABLE_ROOT%\\{store}\\{default_ini}" '
             f'"%PORTABLE_ROOT%\\{store}\\{name}" >nul 2>&1')
+    profile_dirs = [str(d) for d in data.get("profile_dirs", [])] \
+        if isinstance(data.get("profile_dirs"), list) else []
+    for pdir in profile_dirs:
+        pdir_win = _win_rel(pdir)
+        if not pdir_win or not is_ascii_safe(pdir_win):
+            continue
+        lines.append(
+            f'if not exist "%PORTABLE_ROOT%\\{pdir_win}\\" '
+            f'md "%PORTABLE_ROOT%\\{pdir_win}" >nul 2>&1')
+        lines.append(
+            f'if exist "%PORTABLE_ROOT%\\{pdir_win}\\" attrib -r '
+            f'"%PORTABLE_ROOT%\\{pdir_win}\\*.ini" /s >nul 2>&1')
+        for name in user_inis:
+            if not is_ascii_safe(name) or not name:
+                continue
+            lines.append(
+                f'if not exist "%PORTABLE_ROOT%\\{pdir_win}\\{name}" '
+                f'if exist "%PORTABLE_ROOT%\\{store}\\{name}" '
+                f'copy /y "%PORTABLE_ROOT%\\{store}\\{name}" '
+                f'"%PORTABLE_ROOT%\\{pdir_win}\\{name}" >nul 2>&1')
     lines.append(
         "rem If the launcher still loops, the settings need more than the flag:"
     )
@@ -1490,7 +1510,7 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         loop_guard_max_restarts=int(number("max_restarts", 3.0,
                                            loop_guard)) or 3,
         loop_guard_window=number("window", 120.0, loop_guard),
-        loop_guard_relaunch_grace=number("relaunch_grace", 10.0, loop_guard),
+        loop_guard_relaunch_grace=number("relaunch_grace", 30.0, loop_guard),
     )
 
 
