@@ -613,32 +613,6 @@ class GameSettingsReport:
     checked: int = 0
     writable: bool = True
 
-    def messages(self) -> List[str]:
-        """Человеческие строки для журнала: что сделано и что мешает."""
-        lines: List[str] = []
-        if self.created:
-            lines.append(
-                "Создан сквозной конфигурационный файл рядом с exe: "
-                + ", ".join(self.created)
-                + ". Копировать INI из PortableData вручную не нужно.")
-        if self.patched:
-            lines.append(
-                "Хранение настроек и сохранений внутри портатива подтверждено "
-                "(bUseMyGamesDirectory=0): " + ", ".join(self.patched) + ".")
-        if self.unlocked:
-            lines.append(
-                "Снят флаг «только для чтения» с настроечных файлов ("
-                + ", ".join(self.unlocked)
-                + "): иначе лаунчер игры не смог бы их переписать и уходил бы "
-                  "в бесконечный цикл «закрылся — открылся — закрылся…».")
-        for blocker in self.blockers:
-            lines.append(
-                "Настройки игры записать нельзя: " + blocker
-                + ". Пока это не исправлено, лаунчер Bethesda может "
-                  "зацикливаться на кнопке «Играть».")
-        return lines
-
-
 def prepare_game_settings(store_dir: str, profile: GameProfile,
                           extra_dirs: Sequence[str] = (),
                           create: bool = True, patch: bool = True,
@@ -727,61 +701,6 @@ def unlock_settings_files(directory: str,
         if _clear_readonly(path):
             repaired.append(_posix(os.path.relpath(path, directory)))
     return repaired
-
-
-def adopt_profile_settings(store_dir: str, profile: GameProfile,
-                           directories: Sequence[str],
-                           since: float) -> List[str]:
-    """Забирает в папку игры INI, переписанные лаунчером в профиле.
-
-    Комплектный лаунчер Bethesda (``FalloutNVLauncher.exe``) пишет свои
-    настройки **в профиль** — в портативе это
-    ``PortableData\\User\\Documents\\My Games\\FalloutNV``. Движок же читает
-    пользовательские INI рядом с exe. Пока настройки, выбранные в лаунчере
-    (разрешение, качество графики), остаются в профиле, они до игры не
-    доходят, а пользователь видит «настройки не сохраняются».
-
-    Синхронизировать профиль с папкой игры постоянно нельзя: устаревшая
-    копия перезапишет ручные правки. Поэтому переносятся только файлы,
-    изменённые **во время этого сеанса** (``since`` — время старта лончера),
-    и побеждает более свежая версия. Возвращает имена перенесённых файлов.
-    """
-    if not store_dir or not os.path.isdir(store_dir):
-        return []
-    adopted: List[str] = []
-    for directory in directories:
-        if not directory or not os.path.isdir(directory):
-            continue
-        for name in profile.user_inis:
-            source = os.path.join(directory, name)
-            destination = os.path.join(store_dir, name)
-            try:
-                source_stat = os.stat(source)
-            except OSError:
-                continue
-            if source_stat.st_mtime + MTIME_TOLERANCE < since:
-                continue
-            try:
-                if source_stat.st_size == 0:
-                    continue
-                if os.path.exists(destination):
-                    destination_stat = os.stat(destination)
-                    if destination_stat.st_size == source_stat.st_size \
-                            and destination_stat.st_mtime > source_stat.st_mtime:
-                        continue
-            except OSError:
-                pass
-            try:
-                shutil.copy2(source, destination)
-            except OSError:
-                continue
-            # Копия не должна приносить «только для чтения» и не должна
-            # терять portable-ключи: лаунчер пишет INI целиком, из своих
-            # внутренних значений.
-            _clear_readonly(destination)
-            patch_ini_file(destination, profile.ini_settings)
-            adopted.append(name)
-    return adopted
 
 
 def read_ini(path: str) -> Tuple[str, str]:
