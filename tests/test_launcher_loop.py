@@ -451,12 +451,28 @@ class LauncherLoopEndToEndTests(unittest.TestCase):
             return processes[min(len(spawned) - 1, len(processes) - 1)]
 
         clock = FakeClock(step=0.5)
+        real_supervise = exe_launcher._supervise_launcher
+
+        def supervise(process, **kwargs):
+            # Часы подменяются и внутри наблюдателя: сценарий теста не должен
+            # зависеть от того, сколько раз до наблюдения спросили список
+            # процессов. На Windows его спрашивает ещё и уборка остатков
+            # прошлой сессии, и на реальном sleep цикл мог бы крутиться часами
+            # (именно так тест однажды повесил сборку).
+            kwargs.setdefault("clock", clock)
+            kwargs.setdefault("sleep", clock.sleep)
+            return real_supervise(process, **kwargs)
+
         with mock.patch.object(exe_launcher, "find_portable_root",
                                return_value=portable.root), \
                 mock.patch.object(exe_launcher, "_spawn_target",
                                   side_effect=fake_spawn), \
                 mock.patch.object(exe_launcher, "_portable_process_list",
                                   ScriptedLister(snapshots)), \
+                mock.patch.object(exe_launcher, "sweep_stale_session",
+                                  return_value=[]), \
+                mock.patch.object(exe_launcher, "_supervise_launcher",
+                                  side_effect=supervise), \
                 mock.patch.object(exe_launcher, "_wait_for_portable_processes",
                                   return_value=0), \
                 mock.patch.object(exe_launcher, "release_portable_folder",
@@ -475,7 +491,11 @@ class LauncherLoopEndToEndTests(unittest.TestCase):
             snapshots = [[(1, launcher)], [], [(2, launcher)], [],
                          [(3, launcher)], [], [(4, launcher)], []]
 
-            code, spawned, warning = self._run(portable, snapshots, [0, 0])
+            # exit_after — страховка от зависания: если цикл вдруг не будет
+            # распознан, фейковый процесс завершится сам и тест упадёт с
+            # внятным сообщением, а не будет ждать вечно.
+            code, spawned, warning = self._run(portable, snapshots, [0, 0],
+                                               exit_after=60)
 
             self.assertEqual(code, 0)
             # Первым запущен лончер игры, вторым — сама игра, напрямую.
