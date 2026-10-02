@@ -226,8 +226,47 @@ class SettingsGuardTests(unittest.TestCase):
             # Portable-ключи подтверждены заново: лаунчер пишет файл целиком,
             # из своих внутренних значений.
             self.assertIn("bUseMyGamesDirectory=0", adopted)
+            # Даже та копия, из которой настройки были приняты, немедленно
+            # получает исправленный portable-ключ: следующий прямой старт не
+            # должен снова вернуть bUseMyGamesDirectory=1.
+            self.assertIn("bUseMyGamesDirectory=0",
+                          launcher_copy.read_text(encoding="utf-8"))
             self.assertTrue(any("chosen in the launcher" in line
                                 for line in lines), lines)
+
+    def test_a_direct_app_launcher_change_is_imported_on_next_portable_run(self):
+        """Прямой App\launcher.exe может писать реальный Documents профиль.
+
+        Мы не оставляем туда новую копию сами, но более новую настройку,
+        выбранную при таком прямом запуске, принимаем при следующем запуске
+        переносимого launcher-а.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            portable = LauncherLoopPortable(temp)
+            host_documents = Path(temp, "Player Documents")
+            settings = dict(GAME_SETTINGS)
+            settings["host_dirs"] = ["Documents/My Games/FalloutNV"]
+            portable.write_config(game_settings=settings)
+            canonical = portable.app / "Fallout.ini"
+            canonical.write_text("[Display]\niSize W=1024\n", encoding="utf-8")
+            os.utime(canonical, (1000, 1000))
+            host_ini = host_documents / "My Games" / "FalloutNV" / "Fallout.ini"
+            host_ini.parent.mkdir(parents=True)
+            host_ini.write_text(
+                "[General]\nbUseMyGamesDirectory=1\n"
+                "[Display]\niSize W=1920\n", encoding="utf-8")
+            os.utime(host_ini, (2000, 2000))
+
+            with mock.patch.dict(os.environ, {
+                    "PORTABLE_HOST_DOCUMENTS": str(host_documents)}, clear=False):
+                portable.guard().repair()
+
+            accepted = canonical.read_text(encoding="utf-8")
+            self.assertIn("iSize W=1920", accepted)
+            self.assertIn("bUseMyGamesDirectory=0", accepted)
+            # Host is only a source; no hidden writeback/trace is left there.
+            self.assertIn("bUseMyGamesDirectory=1",
+                          host_ini.read_text(encoding="utf-8"))
 
     def test_a_manual_edit_next_to_the_exe_is_not_overwritten(self):
         """Устаревшая копия из профиля не заменяет ручные правки."""
@@ -438,6 +477,28 @@ class LauncherSupervisorTests(unittest.TestCase):
         self.assertEqual(outcome.restarts, 3)
         self.assertTrue(any("without FalloutNV.exe" in note
                             for note in outcome.notes), outcome.notes)
+
+    def test_the_native_process_lister_receives_the_portable_root(self):
+        """Реальный lister ищет процессы только внутри папки портатива."""
+        launcher = Path("C:/Portable/App/launcher.exe")
+        game = Path("C:/Portable/App/FalloutNV.exe")
+        root = Path("C:/Portable")
+        received = []
+
+        def lister(value):
+            received.append(value)
+            return []
+
+        clock = FakeClock()
+        outcome = exe_launcher._supervise_launcher(
+            FakeProcess(0, exit_after=1), target=launcher, main_target=game,
+            settings={"enabled": True, "poll_interval": 0.5,
+                      "relaunch_grace": 0.5},
+            lister=lister, clock=clock, sleep=clock.sleep, root=root)
+
+        self.assertFalse(outcome.loop_broken)
+        self.assertTrue(received)
+        self.assertTrue(all(value == root for value in received), received)
 
     def test_the_game_that_started_stops_the_supervision(self):
         launcher = Path("C:/Portable/App/launcher.exe")
@@ -653,6 +714,7 @@ class BuiltPortableTests(unittest.TestCase):
                          "Fallout_default.ini")
         self.assertEqual(data["game_settings"]["user_inis"],
                          GAME_SETTINGS["user_inis"])
+        self.assertNotIn("host_dirs", data["game_settings"])
         self.assertTrue(data["loop_guard"]["enabled"])
         self.assertEqual(data["loop_guard"]["max_restarts"], 3)
 
@@ -699,6 +761,31 @@ class BuiltPortableTests(unittest.TestCase):
         # Отсутствующий Fallout.ini создан из шаблона ещё до запуска игры.
         self.assertTrue(fs.exists(root + r"\App\Fallout.ini"))
 
+    def test_the_bat_pushes_a_manual_app_edit_before_launch(self):
+        """Даже одинаковые метки времени не оставляют launcher-у старый INI."""
+        bat = launcher_mod.render_bat(self._cfg())
+        self.assertNotIn('if not exist "%PORTABLE_ROOT%\\App\\Fallout.ini" if', bat)
+        root = r"E:\Fallout_New_Vegas_Portable"
+        fs = batsim.FakeFS()
+        fs.add_file(root + r"\App\FalloutNV.exe", "MZ")
+        fs.add_file(root + r"\App\Fallout_default.ini", "template")
+        fs.add_file(root + r"\App\Fallout.ini", "manual language and graphics")
+        fs.add_file(root + r"\PortableData\User\Documents\My Games\FalloutNV\Fallout.ini",
+                    "old profile copy")
+        fs.add_file(root + r"\Launch.bat", bat)
+
+        result = batsim.run_batch(
+            bat, root + r"\Launch.bat", fs,
+            argv=["--bat-fallback", "--nopause"],
+            env={"USERPROFILE": r"C:\Users\Player",
+                 "SystemRoot": r"C:\Windows"})
+
+        self.assertTrue(result.launched)
+        profile_ini = (root + r"\PortableData\User\Documents\My Games"
+                       r"\FalloutNV\Fallout.ini")
+        self.assertEqual(fs.files[fs._norm(profile_ini)],
+                         "manual language and graphics")
+
     def test_the_build_writes_the_settings_section_the_launcher_reads(self):
         """Сборка и лончер договариваются через launcher_config.json."""
         with tempfile.TemporaryDirectory() as temp:
@@ -708,6 +795,8 @@ class BuiltPortableTests(unittest.TestCase):
             saves_mod.apply(str(portable.root), setup, Logger())
             self.assertEqual(setup.mode, "inplace")
             self.assertTrue(setup.game_settings.get("enabled"))
+            self.assertIn("Documents/My Games/FalloutNV",
+                          setup.game_settings.get("host_dirs", []))
 
             engine = portablizer_mod.Portablizer(Logger())
             options = portablizer_mod.PortableOptions(

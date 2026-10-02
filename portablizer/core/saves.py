@@ -223,6 +223,12 @@ class SaveSetup:
     patched: List[str] = field(default_factory=list)
     #: Сколько файлов перенесено в общее хранилище при сборке.
     migrated: int = 0
+    #: Описание единственного редактируемого INI игры.  Это отдельная от
+    #: ``shared_saves`` настройка рантайм-лончера, но она живёт рядом с
+    #: планом, потому что только здесь уже известны движок, каталог игры и
+    #: все его INI.  У старых портативов поля нет; рантайм умеет восстановить
+    #: его из ``profile``/``entries``.
+    game_settings: Dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -237,6 +243,9 @@ class SaveSetup:
                 "tokens": list(self.tokens),
                 "roots": [_posix(r) for r in self.roots],
             },
+            # Сохраняем и здесь для обратимого плана: отдельную копию в
+            # launcher_config.json пишет launcher.render_config_json().
+            "game_settings": dict(self.game_settings),
         }
 
     @staticmethod
@@ -262,6 +271,9 @@ class SaveSetup:
             roots=[str(r) for r in roots] if isinstance(roots, list)
             else list(WATCHED_ROOTS),
             discovery=bool(discovery.get("enabled", True)),
+            game_settings=(dict(data.get("game_settings"))
+                           if isinstance(data.get("game_settings"), dict)
+                           else {}),
         )
 
 
@@ -490,6 +502,156 @@ def patch_ini_file(path: str,
     except (OSError, UnicodeEncodeError):
         return False
     return True
+
+
+def _game_settings_description(profile: GameProfile, store: str,
+                               entries: Sequence[SaveEntry]) -> Dict[str, object]:
+    """Данные, по которым лончеры поддерживают один редактируемый INI.
+
+    Bethesda launcher не всегда уважает расположенный рядом с exe
+    ``Fallout.ini``: часть его версий открывает копию в перенаправленном
+    ``Documents\\My Games`` и переписывает её целиком.  Поэтому недостаточно
+    единожды поправить ``Fallout_default.ini``.  Рантайм должен знать
+    канонический каталог и все его профильные копии, чтобы перед стартом
+    отдавать им ручные правки, а после настроек, выбранных в launcher, принять
+    только действительно новую версию обратно.
+    """
+    profile_dirs: List[str] = []
+    host_dirs: List[str] = []
+    for entry in entries:
+        portable = _posix(entry.portable)
+        if portable and portable.lower() not in {p.lower() for p in profile_dirs}:
+            profile_dirs.append(portable)
+        host = _posix(entry.host)
+        if host and host.lower() not in {p.lower() for p in host_dirs}:
+            host_dirs.append(host)
+    return {
+        "enabled": True,
+        "title": profile.title,
+        "profile": profile.id,
+        "store": _posix(store),
+        "default_ini": profile.default_ini,
+        "user_inis": list(profile.user_inis),
+        "ini_settings": [list(item) for item in profile.ini_settings],
+        "saves_dir": profile.saves_dir,
+        "profile_dirs": profile_dirs,
+        # Прямой App\launcher.exe может всё ещё записать настоящий
+        # Documents. Рантайм только читает эти папки при следующем запуске,
+        # чтобы принять более новую настройку, но никогда не оставляет там
+        # копию сам.
+        "host_dirs": host_dirs,
+    }
+
+
+def _copy_ini_template(template: str, destination: str) -> bool:
+    """Создаёт пользовательский INI из шаблона, не делая его read-only.
+
+    ``copy2`` намеренно сохраняет время и атрибуты, что хорошо для обычной
+    миграции, но плохо для Fallout_default.ini: установщики часто ставят ему
+    read-only. Поэтому флаг записи снимается до и после копирования.
+    """
+    try:
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        if os.path.isfile(template):
+            _clear_readonly(template)
+            shutil.copy2(template, destination)
+        else:
+            with open(destination, "wb") as handle:
+                handle.write(b"[General]\r\n")
+        _clear_readonly(destination)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_game_settings(store_dir: str, profile: GameProfile,
+                         portable_profile_dirs: Sequence[str] = (),
+                         portable_dir: str = "") -> List[str]:
+    """Подготавливает канонические INI рядом с игрой и её копии профиля.
+
+    Возвращает относительные (если известен ``portable_dir``) имена реально
+    изменённых файлов. Функция используется при сборке и обновлении старого
+    портатива; EXE-лончер содержит эквивалентную самодостаточную реализацию,
+    потому что в frozen-версии этого пакета рядом нет.
+    """
+    changed: List[str] = []
+    store_dir = os.path.abspath(store_dir)
+    template = os.path.join(store_dir, profile.default_ini)
+
+    def remember(path: str) -> None:
+        value = (_posix(os.path.relpath(path, portable_dir)) if portable_dir
+                 else path)
+        if value not in changed:
+            changed.append(value)
+
+    # Шаблон тоже обязан указывать на App: прямой запуск ещё до появления
+    # Fallout.ini берёт именно его.
+    if os.path.isfile(template):
+        before_mode = None
+        try:
+            before_mode = os.stat(template).st_mode
+        except OSError:
+            pass
+        _clear_readonly(template)
+        if before_mode is not None and not before_mode & stat.S_IWRITE:
+            remember(template)
+        if patch_ini_file(template, profile.ini_settings):
+            remember(template)
+
+    # Fallout.ini — не одноразовый generated-файл, а явная каноническая
+    # точка редактирования. Создаём также Prefs/Custom: официальный launcher
+    # ожидает, что может записать каждый из них ещё до кнопки «Играть».
+    for name in profile.user_inis:
+        path = os.path.join(store_dir, name)
+        created = not os.path.isfile(path)
+        before_mode = None
+        if not created:
+            try:
+                before_mode = os.stat(path).st_mode
+            except OSError:
+                pass
+        if created and _copy_ini_template(template, path):
+            remember(path)
+        elif not created:
+            _clear_readonly(path)
+            if before_mode is not None and not before_mode & stat.S_IWRITE:
+                remember(path)
+        if os.path.isfile(path) and patch_ini_file(path, profile.ini_settings):
+            remember(path)
+
+    # Лаунчер Bethesda иногда смотрит в Documents даже при
+    # bUseMyGamesDirectory=0. Копия внутри *портативного* профиля предотвращает
+    # его цикл записи; настоящие Documents пользователя здесь не трогаем.
+    for relative in portable_profile_dirs:
+        if not relative:
+            continue
+        directory = (os.path.join(portable_dir, *(_posix(relative).split("/")))
+                     if portable_dir else "")
+        if not directory:
+            continue
+        for name in profile.user_inis:
+            source = os.path.join(store_dir, name)
+            target = os.path.join(directory, name)
+            if not os.path.isfile(source):
+                continue
+            try:
+                os.makedirs(directory, exist_ok=True)
+                # Canonical file wins only when it is at least as fresh. A
+                # later profile copy is left for the runtime guard to adopt
+                # after the launcher session, rather than being silently
+                # destroyed at build/refresh time.
+                source_mtime = os.stat(source).st_mtime
+                target_mtime = os.stat(target).st_mtime if os.path.isfile(target) else -1
+                if source_mtime + MTIME_TOLERANCE >= target_mtime:
+                    _clear_readonly(target)
+                    shutil.copy2(source, target)
+                    _clear_readonly(target)
+                    remember(target)
+                elif patch_ini_file(target, profile.ini_settings):
+                    remember(target)
+            except OSError:
+                continue
+    return changed
 
 
 # --- слияние каталогов --------------------------------------------------------
@@ -781,6 +943,8 @@ def plan(portable_dir: str, app_name: str,
             f"{detected.profile.title}: сохранения и настройки переведены в "
             f"{store_rel.replace('/', os.sep)} — их видят и прямой запуск exe, "
             "и лончер, и комплектный launcher.")
+        setup.game_settings = _game_settings_description(
+            detected.profile, store_rel, setup.entries)
         return setup
 
     if not unique:
@@ -853,13 +1017,20 @@ def apply(portable_dir: str, setup: SaveSetup,
             setup.migrated += merge_tree(source, store_dir, patterns=["*.ini"])
 
         # 2. Включаем хранение данных рядом с exe — это и делает сохранения
-        #    сквозными: профиль Windows перестаёт участвовать вообще.
-        for name in (profile.default_ini, *profile.user_inis):
-            candidate = os.path.join(store_dir, name)
-            if os.path.isfile(candidate) \
-                    and patch_ini_file(candidate, profile.ini_settings):
-                setup.patched.append(
-                    _posix(os.path.relpath(candidate, portable_dir)))
+        #    сквозными: профиль Windows перестаёт участвовать вообще. Помимо
+        #    шаблона создаём редактируемый Fallout.ini (и соседние INI), иначе
+        #    Bethesda launcher создаст свои дубликаты в Documents и однажды
+        #    перетрёт ручные правки.
+        portable_profiles = [entry.portable for entry in setup.entries
+                             if entry.portable]
+        prepared = ensure_game_settings(
+            store_dir, profile, portable_profiles, portable_dir)
+        for rel in prepared:
+            if rel not in setup.patched:
+                setup.patched.append(rel)
+        if not setup.game_settings:
+            setup.game_settings = _game_settings_description(
+                profile, setup.store, setup.entries)
         if setup.patched:
             log.ok(f"{profile.default_ini}: включено хранение сохранений и "
                    "настроек внутри портатива (bUseMyGamesDirectory=0, "
