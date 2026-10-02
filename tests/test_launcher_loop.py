@@ -247,6 +247,32 @@ class SettingsGuardTests(unittest.TestCase):
                               encoding="utf-8"))
             self.assertEqual(lines, [])
 
+    def test_manual_edit_in_app_ini_is_propagated_to_profile_on_repair(self):
+        """Правка сквозного INI в App сразу передаётся в копию профиля."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable = LauncherLoopPortable(temp)
+            portable.write_config()
+            # Профиль содержал старые настройки
+            (portable.profile / "Fallout.ini").write_text(
+                "[General]\nsLanguage=ENGLISH\n", encoding="utf-8")
+            os.utime(portable.profile / "Fallout.ini", (1000, 1000))
+
+            # Пользователь отредактировал сквозной INI в App (например, русский язык / DLC)
+            (portable.app / "Fallout.ini").write_text(
+                "[General]\nsLanguage=RUSSIAN\nbLoadFaceGenHeadEGTFiles=1\n",
+                encoding="utf-8")
+            os.utime(portable.app / "Fallout.ini", (5000, 5000))
+
+            lines = portable.guard().repair()
+
+            profile_ini = (portable.profile / "Fallout.ini").read_text(
+                encoding="utf-8")
+            self.assertIn("sLanguage=RUSSIAN", profile_ini)
+            self.assertIn("bLoadFaceGenHeadEGTFiles=1", profile_ini)
+            self.assertIn("bUseMyGamesDirectory=0", profile_ini)
+            self.assertTrue(any("updated from App" in line for line in lines),
+                            lines)
+
     def test_doctor_reports_a_healthy_portable(self):
         with tempfile.TemporaryDirectory() as temp:
             portable = LauncherLoopPortable(temp)
@@ -319,6 +345,20 @@ class LauncherRestartWatcherTests(unittest.TestCase):
         watcher.note_game_started()
 
         self.assertFalse(watcher.loop_detected())
+
+    def test_dlc_dialog_delay_does_not_prevent_loop_detection(self):
+        """Пауза на диалог о DLC/русификации (15-20 с) не сбивает счётчик цикла."""
+        watcher, _ = self._watcher(relaunch_grace=30.0)
+        watcher.opened()
+        for _ in range(3):
+            self.now += 1.0
+            watcher.closed()
+            # Пользователь читает диалог и нажимает «Да» (18 секунд)
+            self.now += 18.0
+            watcher.opened()
+
+        self.assertEqual(watcher.restarts(), 3)
+        self.assertTrue(watcher.loop_detected())
 
 
 class FakeProcess:
@@ -413,6 +453,32 @@ class LauncherSupervisorTests(unittest.TestCase):
 
         self.assertFalse(outcome.loop_broken)
         self.assertTrue(outcome.game_started)
+
+    def test_game_failing_briefly_and_restarting_launcher_is_detected_as_loop(self):
+        """Если игра мелькнула и упала, вернув в лаунчер — цикл распознаётся."""
+        launcher = Path("C:/Portable/App/launcher.exe")
+        game = Path("C:/Portable/App/FalloutNV.exe")
+        # Лаунчер -> игра мелькнула -> лаунчер вернулся -> игра мелькнула -> лаунчер вернулся...
+        snapshots = [
+            [(1, str(launcher))],
+            [(2, str(game))],
+            [(3, str(launcher))],
+            [(4, str(game))],
+            [(5, str(launcher))],
+            [(6, str(game))],
+            [(7, str(launcher))],
+            [],
+        ]
+        clock = FakeClock()
+        outcome = exe_launcher._supervise_launcher(
+            FakeProcess(0), target=launcher, main_target=game,
+            settings={"enabled": True, "max_restarts": 3, "window": 120.0,
+                      "relaunch_grace": 30.0, "poll_interval": 0.5},
+            lister=ScriptedLister(snapshots), clock=clock,
+            sleep=clock.sleep)
+
+        self.assertTrue(outcome.loop_broken)
+        self.assertEqual(outcome.restarts, 3)
 
     def test_the_main_executable_is_never_supervised_as_a_launcher(self):
         game = Path("C:/Portable/App/FalloutNV.exe")
@@ -528,6 +594,44 @@ class LauncherLoopEndToEndTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(len(spawned), 1)
             self.assertFalse(warning.called)
+
+    def test_direct_run_without_launcher_prepares_and_uses_through_config(self):
+        """Прямой запуск игры без лончера готовит сквозной INI и не трогает loop-guard."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable = LauncherLoopPortable(temp)
+            portable.write_config()
+            game = str(portable.app / "FalloutNV.exe")
+            snapshots = [[(1, game)], []]
+
+            processes = [FakeProcess(0, exit_after=2)]
+            spawned = []
+
+            def fake_spawn(command, cwd, env, job=None):
+                spawned.append(list(command))
+                return processes[0]
+
+            with mock.patch.object(exe_launcher, "find_portable_root",
+                                   return_value=portable.root), \
+                    mock.patch.object(exe_launcher, "_spawn_target",
+                                      side_effect=fake_spawn), \
+                    mock.patch.object(exe_launcher, "_portable_process_list",
+                                      ScriptedLister(snapshots)), \
+                    mock.patch.object(exe_launcher, "sweep_stale_session",
+                                      return_value=[]), \
+                    mock.patch.object(exe_launcher, "_wait_for_portable_processes",
+                                      return_value=0), \
+                    mock.patch.object(exe_launcher, "release_portable_folder",
+                                      return_value=[]), \
+                    mock.patch.object(exe_launcher, "_show_warning") as warning:
+                code = exe_launcher.run([])
+
+            self.assertEqual(code, 0)
+            self.assertEqual(Path(spawned[0][0]).name, "FalloutNV.exe")
+            self.assertFalse(warning.called)
+            self.assertTrue((portable.app / "Fallout.ini").is_file())
+            text = (portable.app / "Fallout.ini").read_text(encoding="utf-8")
+            self.assertIn("bUseMyGamesDirectory=0", text)
+            self.assertIn("SLocalSavePath=Saves\\", text)
 
 
 class BuiltPortableTests(unittest.TestCase):

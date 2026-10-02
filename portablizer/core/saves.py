@@ -111,7 +111,9 @@ GAME_PROFILES: Tuple[GameProfile, ...] = (
         id="gamebryo-falloutnv",
         title="Fallout: New Vegas",
         executables=("falloutnv.exe", "falloutnvlauncher.exe",
-                     "nvse_loader.exe", "fnv4gb.exe"),
+                     "nvse_loader.exe", "fnv4gb.exe", "falloutlauncher.exe",
+                     "launcher.exe", "falloutnvlauncher_en.exe",
+                     "falloutnvlauncher_gv.exe"),
         default_ini="Fallout_default.ini",
         user_inis=("Fallout.ini", "FalloutPrefs.ini", "FalloutCustom.ini"),
         my_games=("FalloutNV",),
@@ -120,7 +122,9 @@ GAME_PROFILES: Tuple[GameProfile, ...] = (
         id="gamebryo-fallout3",
         title="Fallout 3",
         executables=("fallout3.exe", "fallout3launcher.exe",
-                     "fose_loader.exe", "fallout3ng.exe"),
+                     "fose_loader.exe", "fallout3ng.exe",
+                     "falloutlauncher.exe", "falloutlaunchersteam.exe",
+                     "launcher.exe"),
         default_ini="Fallout_default.ini",
         user_inis=("Fallout.ini", "FalloutPrefs.ini", "FalloutCustom.ini"),
         my_games=("Fallout3",),
@@ -129,10 +133,29 @@ GAME_PROFILES: Tuple[GameProfile, ...] = (
         id="gamebryo-oblivion",
         title="The Elder Scrolls IV: Oblivion",
         executables=("oblivion.exe", "oblivionlauncher.exe",
-                     "obse_loader.exe"),
+                     "obse_loader.exe", "launcher.exe"),
         default_ini="Oblivion_default.ini",
-        user_inis=("Oblivion.ini",),
+        user_inis=("Oblivion.ini", "OblivionPrefs.ini"),
         my_games=("Oblivion",),
+    ),
+    GameProfile(
+        id="gamebryo-skyrim",
+        title="The Elder Scrolls V: Skyrim",
+        executables=("skyrim.exe", "skyrimlauncher.exe", "skse_loader.exe",
+                     "skyrimse.exe", "skyrimselauncher.exe",
+                     "skse64_loader.exe", "skyrimvr.exe", "launcher.exe"),
+        default_ini="Skyrim_default.ini",
+        user_inis=("Skyrim.ini", "SkyrimPrefs.ini", "SkyrimCustom.ini"),
+        my_games=("Skyrim", "Skyrim Special Edition", "Skyrim VR"),
+    ),
+    GameProfile(
+        id="gamebryo-fallout4",
+        title="Fallout 4",
+        executables=("fallout4.exe", "fallout4launcher.exe", "f4se_loader.exe",
+                     "fallout4vr.exe", "launcher.exe"),
+        default_ini="Fallout4_default.ini",
+        user_inis=("Fallout4.ini", "Fallout4Prefs.ini", "Fallout4Custom.ini"),
+        my_games=("Fallout4", "Fallout4VR"),
     ),
 )
 
@@ -658,6 +681,52 @@ def prepare_game_settings(store_dir: str, profile: GameProfile,
             if patch_ini_file(candidate, profile.ini_settings):
                 report.patched.append(name)
 
+    # Синхронизация и создание настроечных файлов в каталогах профиля
+    for directory in extra_dirs:
+        if not directory:
+            continue
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError:
+            continue
+        for name in profile.user_inis:
+            src = os.path.join(store_dir, name)
+            dst = os.path.join(directory, name)
+            if not os.path.isfile(src):
+                continue
+            if not os.path.isfile(dst):
+                try:
+                    shutil.copyfile(src, dst)
+                    _clear_readonly(dst)
+                    if patch and profile.ini_settings:
+                        patch_ini_file(dst, profile.ini_settings)
+                except OSError:
+                    pass
+            else:
+                try:
+                    src_stat = os.stat(src)
+                    dst_stat = os.stat(dst)
+                    if src_stat.st_mtime > dst_stat.st_mtime + MTIME_TOLERANCE:
+                        _clear_readonly(dst)
+                        shutil.copy2(src, dst)
+                        _clear_readonly(dst)
+                        if patch and profile.ini_settings:
+                            patch_ini_file(dst, profile.ini_settings)
+                    elif dst_stat.st_mtime > src_stat.st_mtime + MTIME_TOLERANCE:
+                        _clear_readonly(src)
+                        shutil.copy2(dst, src)
+                        _clear_readonly(src)
+                        if patch and profile.ini_settings:
+                            patch_ini_file(src, profile.ini_settings)
+                    else:
+                        _clear_readonly(dst)
+                        _clear_readonly(src)
+                        if patch and profile.ini_settings:
+                            patch_ini_file(dst, profile.ini_settings)
+                            patch_ini_file(src, profile.ini_settings)
+                except OSError:
+                    pass
+
     if unlock:
         report.unlocked = unlock_settings_files(store_dir)
         for directory in extra_dirs:
@@ -940,7 +1009,7 @@ def detect_game(app_dir: str, max_depth: int = 3) -> Optional[DetectedGame]:
                 title=f"{stem} (движок Gamebryo)",
                 executables=(),
                 default_ini=ini,
-                user_inis=(f"{stem}.ini", f"{stem}Prefs.ini"),
+                user_inis=(f"{stem}.ini", f"{stem}Prefs.ini", f"{stem}Custom.ini"),
                 my_games=(stem,),
             )
             return DetectedGame(profile, directory, path)

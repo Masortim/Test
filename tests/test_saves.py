@@ -339,6 +339,30 @@ class GameDetectionTests(unittest.TestCase):
             self.assertEqual(detected.profile.id, saves.GENERIC_GAMEBRYO_ID)
             self.assertEqual(detected.profile.my_games, ("Nehrim",))
 
+    def test_detects_skyrim(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            (app / "SkyrimSE.exe").write_bytes(b"MZ")
+            (app / "Skyrim_default.ini").write_bytes(
+                b"[General]\r\nsLanguage=ENGLISH\r\nSLocalSavePath=Saves\\\r\n")
+            detected = saves.detect_game(str(app))
+            self.assertIsNotNone(detected)
+            self.assertEqual(detected.profile.id, "gamebryo-skyrim")
+            self.assertIn("Skyrim.ini", detected.profile.user_inis)
+
+    def test_detects_fallout4(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            (app / "Fallout4.exe").write_bytes(b"MZ")
+            (app / "Fallout4_default.ini").write_bytes(
+                b"[General]\r\nsLanguage=en\r\nSLocalSavePath=Saves\\\r\n")
+            detected = saves.detect_game(str(app))
+            self.assertIsNotNone(detected)
+            self.assertEqual(detected.profile.id, "gamebryo-fallout4")
+            self.assertIn("Fallout4.ini", detected.profile.user_inis)
+
     def test_an_ordinary_program_is_not_mistaken_for_a_game(self):
         with tempfile.TemporaryDirectory() as temp:
             app = Path(temp, "App")
