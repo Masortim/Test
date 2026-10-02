@@ -12,13 +12,10 @@ import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
-import time
 import traceback
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence
 
@@ -679,514 +676,6 @@ def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
     return env
 
 
-# --- единый редактируемый INI Gamebryo --------------------------------------
-#
-# Fallout: New Vegas читает настройки по нескольким путям. Сама игра может
-# работать с Fallout.ini рядом с FalloutNV.exe, а официальный launcher иногда
-# открывает Documents\My Games\FalloutNV\Fallout.ini и сохраняет его целиком.
-# Если считать обе копии равноправными, один способ запуска перезаписывает
-# ручную правку другого. Здесь App\Fallout.ini является единственным
-# каноническим файлом: перед запуском он отдаётся профильной копии, а результат
-# настройки в launcher принимается только после этого сеанса.
-
-_INI_MTIME_TOLERANCE = 2.0
-
-
-def _safe_relative(root: Path, value: Any, *, filename: bool = False) -> Optional[Path]:
-    """Path below ``root`` or ``None`` for an unsafe config value."""
-    raw = str(value or "").strip().replace("\\", "/")
-    if not raw or raw.startswith("/") or ":" in raw:
-        return None
-    parts = [part for part in raw.split("/") if part]
-    if not parts or any(part in (".", "..") for part in parts):
-        return None
-    if filename and len(parts) != 1:
-        return None
-    candidate = root.joinpath(*parts)
-    try:
-        candidate.resolve().relative_to(root.resolve())
-    except (OSError, ValueError):
-        return None
-    return candidate
-
-
-def _clear_ini_readonly(path: Path) -> bool:
-    """Remove the read-only bit and report whether it had been set."""
-    try:
-        mode = path.stat().st_mode
-        if mode & stat.S_IWUSR:
-            return False
-        path.chmod(mode | stat.S_IWUSR)
-        return True
-    except OSError:
-        return False
-
-
-def _read_ini_text(path: Path) -> "tuple[str, str]":
-    raw = path.read_bytes()
-    if raw.startswith(b"\xef\xbb\xbf"):
-        return raw.decode("utf-8-sig"), "utf-8-sig"
-    try:
-        return raw.decode("utf-8"), "utf-8"
-    except UnicodeDecodeError:
-        # latin-1 is deliberately lossless: game INI files can still contain
-        # an old ANSI title/language value that must survive a key patch.
-        return raw.decode("latin-1"), "latin-1"
-
-
-def _patch_ini_text(text: str, settings: Sequence["tuple[str, str, str]"]
-                    ) -> "tuple[str, bool]":
-    """Set only portable keys without reformatting a Bethesda INI."""
-    newline = "\r\n" if "\r\n" in text else "\n"
-    had_final_newline = text.endswith(("\n", "\r"))
-    lines = text.splitlines()
-    changed = False
-    for section, key, value in settings:
-        section_l, key_l = section.casefold(), key.casefold()
-        current = ""
-        start = end = value_index = -1
-        for index, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
-                if current == section_l and end < 0:
-                    end = index
-                current = stripped[1:-1].strip().casefold()
-                if current == section_l and start < 0:
-                    start = index
-                continue
-            if current != section_l or value_index >= 0:
-                continue
-            if "=" not in stripped or stripped.startswith((";", "#")):
-                continue
-            if stripped.split("=", 1)[0].strip().casefold() == key_l:
-                value_index = index
-        replacement = f"{key}={value}"
-        if value_index >= 0:
-            if lines[value_index].strip() != replacement:
-                lines[value_index] = replacement
-                changed = True
-            continue
-        if start < 0:
-            if lines and lines[-1].strip():
-                lines.append("")
-            lines.extend((f"[{section}]", replacement))
-            changed = True
-            continue
-        insert_at = end if end >= 0 else len(lines)
-        while insert_at - 1 > start and not lines[insert_at - 1].strip():
-            insert_at -= 1
-        lines.insert(insert_at, replacement)
-        changed = True
-    if not changed:
-        return text, False
-    return newline.join(lines) + (newline if had_final_newline or lines else ""), True
-
-
-def _host_settings_directory(root: Path, value: Any,
-                             host_profile: Optional[Path] = None,
-                             host_documents: Optional[Path] = None
-                             ) -> Optional[Path]:
-    """Resolve a configured host-profile relative directory without writing it.
-
-    ``SharedSaveSession`` has already resolved the Windows Known Folder API
-    (including OneDrive Documents) before redirection.  Use that result when
-    available rather than guessing ``%USERPROFILE%\Documents`` again.
-    """
-    raw = str(value or "").strip().replace("\\", "/")
-    if not raw or raw.startswith("/") or ":" in raw:
-        return None
-    parts = [part for part in raw.split("/") if part]
-    if not parts or any(part in (".", "..") for part in parts):
-        return None
-    profile_text = os.environ.get("PORTABLE_HOST_PROFILE", "").strip() \
-        or os.environ.get("USERPROFILE", "").strip()
-    documents_text = os.environ.get("PORTABLE_HOST_DOCUMENTS", "").strip()
-    profile = host_profile or (Path(profile_text) if profile_text else None)
-    documents = host_documents or (Path(documents_text) if documents_text else None)
-    if parts[0].casefold() == "documents":
-        if documents is not None:
-            candidate = documents.joinpath(*parts[1:])
-        elif profile is not None:
-            candidate = profile.joinpath("Documents", *parts[1:])
-        else:
-            return None
-    elif profile is not None:
-        candidate = profile.joinpath(*parts)
-    else:
-        return None
-    try:
-        # A stale redirect must never make the portable folder its own host.
-        candidate.resolve().relative_to(root.resolve())
-        return None
-    except ValueError:
-        return candidate
-    except OSError:
-        return candidate
-
-
-def _fallback_game_settings(root: Path, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Derive the INI guard for a portable assembled before this feature.
-
-    ``shared_saves`` has carried enough information since the previous release
-    to identify Fallout NV/3/Oblivion. This makes ``--doctor`` and a refreshed
-    EXE launcher useful for an existing portable without forcing a rebuild.
-    """
-    explicit = cfg.get("game_settings")
-    if isinstance(explicit, dict):
-        # An explicit False is an opt-out, not an old missing section.
-        if explicit.get("enabled") is False:
-            return dict(explicit)
-        if explicit.get("enabled"):
-            return dict(explicit)
-
-    shared = cfg.get("shared_saves")
-    if not isinstance(shared, dict) or str(shared.get("mode", "")) != "inplace":
-        return {}
-    profile = str(shared.get("profile", "")).casefold()
-    known = {
-        "gamebryo-falloutnv": (
-            "Fallout: New Vegas", "Fallout_default.ini",
-            ["Fallout.ini", "FalloutPrefs.ini", "FalloutCustom.ini"]),
-        "gamebryo-fallout3": (
-            "Fallout 3", "Fallout_default.ini",
-            ["Fallout.ini", "FalloutPrefs.ini", "FalloutCustom.ini"]),
-        "gamebryo-oblivion": (
-            "The Elder Scrolls IV: Oblivion", "Oblivion_default.ini",
-            ["Oblivion.ini"]),
-    }
-    if profile not in known:
-        return {}
-    title, default_ini, user_inis = known[profile]
-    store = str(shared.get("store", "App")) or "App"
-    profile_dirs: list[str] = []
-    host_dirs: list[str] = []
-    entries = shared.get("entries")
-    if isinstance(entries, list):
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            directory = str(entry.get("portable", "")).replace("\\", "/").strip("/")
-            if directory and directory.casefold() not in {
-                    item.casefold() for item in profile_dirs}:
-                profile_dirs.append(directory)
-            host = str(entry.get("host", "")).replace("\\", "/").strip("/")
-            if host and host.casefold() not in {
-                    item.casefold() for item in host_dirs}:
-                host_dirs.append(host)
-    return {
-        "enabled": True,
-        "title": title,
-        "profile": profile,
-        "store": store,
-        "default_ini": default_ini,
-        "user_inis": user_inis,
-        "ini_settings": [
-            ["General", "bUseMyGamesDirectory", "0"],
-            ["General", "SLocalSavePath", "Saves\\"],
-        ],
-        "saves_dir": "Saves",
-        "profile_dirs": profile_dirs,
-        "host_dirs": host_dirs,
-    }
-
-
-class GameSettingsGuard:
-    """Keeps one writable, user-editable Fallout.ini across launch methods.
-
-    The canonical files live in the detected game ``store`` (normally App).
-    Profile copies exist only to satisfy Bethesda's launcher. They are never
-    allowed to replace App merely because they happen to exist: ``repair``
-    pushes a newer App edit out before start; ``adopt(since=...)`` imports a
-    copy that the launcher changed during the just-finished session.
-    """
-
-    def __init__(self, root: Path, cfg: Dict[str, Any], *,
-                 host_profile: Optional[Path] = None,
-                 host_documents: Optional[Path] = None) -> None:
-        self.root = Path(root)
-        self.host_profile = host_profile
-        self.host_documents = host_documents
-        self.raw = _fallback_game_settings(self.root, cfg)
-        self.blockers: list[str] = []
-        self.enabled = bool(self.raw.get("enabled"))
-        self.store_dir = _safe_relative(self.root, self.raw.get("store", "")) \
-            if self.enabled else None
-        default_name = str(self.raw.get("default_ini", ""))
-        self.default_ini = default_name if _safe_relative(
-            self.root, default_name, filename=True) is not None else ""
-        self.default_path = (self.store_dir / self.default_ini
-                             if self.store_dir is not None and self.default_ini
-                             else None)
-        self.user_inis: list[str] = []
-        raw_names = self.raw.get("user_inis")
-        if isinstance(raw_names, list):
-            for value in raw_names[:16]:
-                name = str(value)
-                if not name.casefold().endswith(".ini"):
-                    continue
-                if _safe_relative(self.root, name, filename=True) is None:
-                    continue
-                if name.casefold() not in {item.casefold() for item in self.user_inis}:
-                    self.user_inis.append(name)
-        self.ini_settings: list[tuple[str, str, str]] = []
-        raw_settings = self.raw.get("ini_settings")
-        if isinstance(raw_settings, list):
-            for item in raw_settings[:16]:
-                if not isinstance(item, (list, tuple)) or len(item) != 3:
-                    continue
-                section, key, value = (str(part) for part in item)
-                if section and key:
-                    self.ini_settings.append((section, key, value))
-        if not self.ini_settings:
-            self.ini_settings = [
-                ("General", "bUseMyGamesDirectory", "0"),
-                ("General", "SLocalSavePath", "Saves\\"),
-            ]
-        self.profile_dirs: list[Path] = []
-        raw_profiles = self.raw.get("profile_dirs")
-        if isinstance(raw_profiles, list):
-            for value in raw_profiles[:16]:
-                directory = _safe_relative(self.root, value)
-                if directory is None:
-                    continue
-                if str(directory).casefold() not in {
-                        str(item).casefold() for item in self.profile_dirs}:
-                    self.profile_dirs.append(directory)
-        # Unlike portable profile dirs these are read-only sources: direct
-        # App\launcher.exe may have just written a real Documents copy, but
-        # Portablizer must not create or overwrite files in the host profile.
-        self.host_profile_dirs: list[Path] = []
-        raw_host_dirs = self.raw.get("host_dirs")
-        if isinstance(raw_host_dirs, list):
-            for value in raw_host_dirs[:16]:
-                directory = _host_settings_directory(
-                    self.root, value, self.host_profile, self.host_documents)
-                if directory is None:
-                    continue
-                if str(directory).casefold() not in {
-                        str(item).casefold() for item in self.host_profile_dirs}:
-                    self.host_profile_dirs.append(directory)
-        self.enabled = bool(self.enabled and self.store_dir and self.default_ini
-                            and self.user_inis)
-
-    def _label(self, path: Path) -> str:
-        try:
-            return str(path.relative_to(self.root)).replace("/", "\\")
-        except ValueError:
-            return str(path)
-
-    def _block(self, path: Path, reason: str, lines: list[str]) -> None:
-        message = f"{self._label(path)} cannot be written ({reason})"
-        if message not in self.blockers:
-            self.blockers.append(message)
-        lines.append(message + "; the official launcher can enter a restart loop.")
-
-    def _make_writable(self, path: Path, lines: list[str]) -> bool:
-        if path.exists() and not path.is_file():
-            self._block(path, "it is not a file", lines)
-            return False
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            self._block(path, str(exc), lines)
-            return False
-        if path.exists() and _clear_ini_readonly(path):
-            lines.append(f"removed read-only flag from {self._label(path)}")
-        if not path.exists():
-            return True
-        try:
-            # Opening append-only changes no bytes and is a more truthful
-            # check than os.access on a UAC/ACL-protected Windows folder.
-            with path.open("ab"):
-                pass
-            return True
-        except OSError as exc:
-            self._block(path, str(exc), lines)
-            return False
-
-    def _copy(self, source: Path, destination: Path,
-              lines: list[str], description: str) -> bool:
-        if not source.is_file():
-            return False
-        if not self._make_writable(destination, lines):
-            return False
-        try:
-            shutil.copy2(source, destination)
-            _clear_ini_readonly(destination)
-            lines.append(f"{self._label(destination)} {description}")
-            return True
-        except OSError as exc:
-            self._block(destination, str(exc), lines)
-            return False
-
-    def _patch(self, path: Path, lines: list[str]) -> bool:
-        if not self._make_writable(path, lines):
-            return False
-        try:
-            text, encoding = _read_ini_text(path)
-        except OSError as exc:
-            self._block(path, str(exc), lines)
-            return False
-        patched, changed = _patch_ini_text(text, self.ini_settings)
-        if not changed:
-            return True
-        try:
-            path.write_bytes(patched.encode(encoding))
-            lines.append(f"confirmed portable settings in {self._label(path)}")
-            return True
-        except (OSError, UnicodeEncodeError) as exc:
-            self._block(path, str(exc), lines)
-            return False
-
-    def _create_from_template(self, destination: Path, lines: list[str]) -> bool:
-        if not self._make_writable(destination, lines):
-            return False
-        try:
-            if self.default_path is not None and self.default_path.is_file():
-                shutil.copy2(self.default_path, destination)
-            else:
-                destination.write_bytes(b"[General]\r\n")
-            _clear_ini_readonly(destination)
-            lines.append(
-                f"created the portable configuration: {self._label(destination)}")
-            return True
-        except OSError as exc:
-            self._block(destination, str(exc), lines)
-            return False
-
-    def _profiles_for(self, name: str) -> list[Path]:
-        """Copies in the redirected portable profile (safe to mirror into)."""
-        return [directory / name for directory in self.profile_dirs]
-
-    def _all_profiles_for(self, name: str) -> list[Path]:
-        """Portable copies plus read-only candidates from direct starts."""
-        return [*self._profiles_for(name),
-                *(directory / name for directory in self.host_profile_dirs)]
-
-    @staticmethod
-    def _mtime(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return -1.0
-
-    def repair(self) -> list[str]:
-        """Prepare writable files before every launch and mirror App outward."""
-        self.blockers = []
-        lines: list[str] = []
-        if not self.enabled or self.store_dir is None:
-            return lines
-        try:
-            self.store_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            self._block(self.store_dir, str(exc), lines)
-            return lines
-
-        if self.default_path is not None:
-            if not self.default_path.exists():
-                self._create_from_template(self.default_path, lines)
-            self._patch(self.default_path, lines)
-
-        for name in self.user_inis:
-            canonical = self.store_dir / name
-            # A direct official launcher can have updated a Documents copy
-            # while the EXE launcher was not running. Import it only when it is
-            # observably newer than App; a manual App edit remains authoritative.
-            newest = max((path for path in self._all_profiles_for(name)
-                          if path.is_file()), key=self._mtime, default=None)
-            if newest is not None and (not canonical.is_file() or
-                    self._mtime(newest) > self._mtime(canonical) + _INI_MTIME_TOLERANCE):
-                self._copy(newest, canonical, lines,
-                           "was updated from the newer launcher profile")
-            if not canonical.exists():
-                self._create_from_template(canonical, lines)
-            if not canonical.is_file():
-                self._block(canonical, "it is not a file", lines)
-                continue
-            if not self._patch(canonical, lines):
-                continue
-
-            # App is the editable source. Only replace a profile copy if it is
-            # missing or older; a newer one is accepted above/on adopt(), not
-            # silently discarded.
-            canonical_mtime = self._mtime(canonical)
-            for copy in self._profiles_for(name):
-                if (not copy.is_file() or canonical_mtime + _INI_MTIME_TOLERANCE
-                        >= self._mtime(copy)):
-                    self._copy(canonical, copy, lines,
-                               f"was updated from App\\{name}")
-                else:
-                    self._make_writable(copy, lines)
-        return lines
-
-    def adopt(self, since: float = 0.0) -> list[str]:
-        """Adopt settings a launcher changed after ``since`` into App.
-
-        A session timestamp turns profile copies into a deliberate return
-        channel rather than a second master. It is also what protects a manual
-        edit of App/Fallout.ini from an old leftover profile copy.
-        """
-        lines: list[str] = []
-        if not self.enabled or self.store_dir is None:
-            return lines
-        for name in self.user_inis:
-            candidates = [path for path in self._profiles_for(name)
-                          if path.is_file()
-                          and self._mtime(path) + _INI_MTIME_TOLERANCE >= since]
-            if not candidates:
-                continue
-            source = max(candidates, key=self._mtime)
-            canonical = self.store_dir / name
-            if self._copy(source, canonical, lines,
-                          "received settings chosen in the launcher"):
-                self._patch(canonical, lines)
-                # Keep every portable profile copy coherent with the adopted
-                # canonical file. This is intentionally after the copy so only
-                # the launcher result, not a stale file, fans out.
-                for copy in self._profiles_for(name):
-                    self._copy(canonical, copy, lines,
-                               f"was updated from App\\{name}")
-        return lines
-
-
-def doctor(root: Optional[Path] = None, quiet: bool = False) -> int:
-    """Check/repair portable game settings without starting the game."""
-    root = root or find_portable_root()
-    try:
-        with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
-            cfg: Dict[str, Any] = json.load(fh)
-    except (OSError, ValueError) as exc:
-        _run_log(root, f"--doctor: cannot read launcher configuration ({exc})")
-        if not quiet:
-            _show_error("Не удалось прочитать настройки портативного запуска.\n\n"
-                        f"{exc}")
-        return 1
-    # Resolve the actual Windows Documents folder just as a normal run does;
-    # it may be OneDrive rather than %USERPROFILE%\Documents.
-    host_session = SharedSaveSession(root, cfg)
-    guard = GameSettingsGuard(root, cfg, host_profile=host_session.host_profile,
-                              host_documents=host_session.host_documents)
-    lines = guard.repair()
-    for line in lines:
-        _run_log(root, "--doctor: " + line)
-    if guard.blockers:
-        _run_log(root, "--doctor: game settings are not writable")
-        if not quiet:
-            _show_error(
-                "Не удалось записать сквозной Fallout.ini.\n\n"
-                + "\n".join(guard.blockers)
-                + "\n\nИсправьте доступ к папке App и запустите проверку снова.")
-        return 1
-    message = ("Проверка портативных настроек завершена. "
-               "Сквозной INI рядом с игрой готов к редактированию.") \
-        if guard.enabled else \
-        "Проверка завершена: для этой программы нет Gamebryo-настроек."
-    _run_log(root, "--doctor: " + message)
-    if not quiet:
-        _show_warning(message)
-    return 0
-
-
 # --- сквозные сохранения ------------------------------------------------------
 #
 # Прямой запуск ``App\\Game.exe`` получает НАСТОЯЩИЙ профиль Windows, а запуск
@@ -1357,10 +846,6 @@ class SharedSaveSession:
         self.portable_profile = self.data_dir / "User"
         self.host_profile, self.host_documents = self._resolve_host()
         self.two_way = self._load_state()
-        # A GameSettingsGuard owns Fallout.ini. Generic save mirroring must
-        # not pull an older Documents copy over its canonical App version.
-        self.game_settings_enabled = bool(
-            _fallback_game_settings(root, cfg).get("enabled"))
         self.entries = self._configured_entries()
 
     # -- настоящий профиль пользователя ------------------------------------
@@ -1448,18 +933,13 @@ class SharedSaveSession:
                 store = str(item.get("store", "")).replace("\\", "/").strip("/")
                 if not store:
                     continue
-                raw_patterns = item.get("patterns", [])
-                patterns = [str(p) for p in raw_patterns] \
-                    if isinstance(raw_patterns, list) else []
-                if self.game_settings_enabled:
-                    patterns = [p for p in patterns
-                                if not p.casefold().endswith(".ini")]
                 entries.append({
                     "name": str(item.get("name", store)),
                     "store": store,
                     "host": str(item.get("host", "")),
                     "portable": str(item.get("portable", "")),
-                    "patterns": patterns,
+                    "patterns": [str(p) for p in item.get("patterns", [])
+                                 if isinstance(item.get("patterns", []), list)],
                     "direction": ("in" if str(item.get("direction", "both"))
                                   == "in" else "both"),
                 })
@@ -1850,11 +1330,6 @@ def _select_target(cfg: Dict[str, Any], arguments: Sequence[str]
         if lowered == "--elevated":
             index += 1
             continue
-        # A diagnostic escape hatch for a launcher the user explicitly wants
-        # to observe. It belongs to us, never to the game command line.
-        if lowered == "--no-loop-break":
-            index += 1
-            continue
         if lowered == "--machine-registry":
             selected_role = selected_role if selected_role != "main" else "auxiliary"
             index += 1
@@ -1878,192 +1353,6 @@ def _select_target(cfg: Dict[str, Any], arguments: Sequence[str]
         forwarded.append(arg)
         index += 1
     return target_rel, forwarded, selected_role != "main"
-
-
-def _loop_guard_settings(cfg: Dict[str, Any], arguments: Sequence[str]
-                         ) -> Dict[str, float | bool | int]:
-    """Read bounded launcher-loop protection settings from configuration."""
-    raw = cfg.get("loop_guard")
-    raw = raw if isinstance(raw, dict) else {}
-
-    def number(name: str, default: float, low: float, high: float) -> float:
-        try:
-            value = float(raw.get(name, default))
-        except (TypeError, ValueError):
-            value = default
-        return max(low, min(high, value))
-
-    disabled = any(str(arg).casefold() == "--no-loop-break"
-                   for arg in arguments)
-    return {
-        "enabled": bool(raw.get("enabled", True)) and not disabled,
-        "max_restarts": max(1, int(number("max_restarts", 3, 1, 20))),
-        "window": number("window", 120.0, 5.0, 3600.0),
-        "relaunch_grace": number("relaunch_grace", 10.0, 1.0, 120.0),
-        "poll_interval": number("poll_interval", 0.5, 0.1, 5.0),
-    }
-
-
-class LauncherRestartWatcher:
-    """Recognise a launcher that repeatedly closes and opens itself."""
-
-    def __init__(self, max_restarts: int = 3, window: float = 120.0,
-                 relaunch_grace: float = 10.0, clock=None) -> None:
-        self.max_restarts = max(1, int(max_restarts))
-        self.window = max(1.0, float(window))
-        self.relaunch_grace = max(0.1, float(relaunch_grace))
-        self.clock = clock or time.monotonic
-        self._open = False
-        self._last_closed: Optional[float] = None
-        self._restart_times: list[float] = []
-        self._game_started = False
-
-    def _trim(self, now: float) -> None:
-        self._restart_times = [item for item in self._restart_times
-                               if now - item <= self.window]
-
-    def opened(self) -> None:
-        if self._open:
-            return
-        now = float(self.clock())
-        if self._last_closed is not None:
-            if now - self._last_closed <= self.relaunch_grace:
-                self._restart_times.append(now)
-                self._trim(now)
-            else:
-                # A person reopened the launcher after reading/changing
-                # settings. It is a fresh interaction, not a carousel.
-                self._restart_times = []
-        self._open = True
-
-    def closed(self) -> None:
-        if not self._open:
-            return
-        self._open = False
-        self._last_closed = float(self.clock())
-
-    def note_game_started(self) -> None:
-        self._game_started = True
-
-    def restarts(self) -> int:
-        self._trim(float(self.clock()))
-        return len(self._restart_times)
-
-    def loop_detected(self) -> bool:
-        return not self._game_started and self.restarts() >= self.max_restarts
-
-
-@dataclass
-class LauncherSupervision:
-    code: int = 0
-    loop_broken: bool = False
-    game_started: bool = False
-    restarts: int = 0
-    notes: list[str] = field(default_factory=list)
-
-
-def _same_image(left: Any, right: Any) -> bool:
-    return str(left).replace("\\", "/").rstrip("/").casefold() == \
-        str(right).replace("\\", "/").rstrip("/").casefold()
-
-
-def _call_process_lister(lister, root: Optional[Path]):
-    """Use injectable listers with either historical signature in tests."""
-    try:
-        return list(lister(root))
-    except TypeError:
-        return list(lister())
-
-
-def _supervise_launcher(process, target: Path, main_target: Path,
-                         settings: Dict[str, Any], lister=None,
-                         clock=None, sleep=None, root: Optional[Path] = None
-                         ) -> LauncherSupervision:
-    """Watch an official game launcher long enough to catch its restart loop.
-
-    Seeing the game once is not enough: a broken launcher can flash the game
-    process for a fraction of a second and immediately open itself again. A
-    game is considered started only when it survives two process snapshots.
-    """
-    clock = clock or time.monotonic
-    sleep = sleep or time.sleep
-    lister = lister or _portable_process_list
-    if _same_image(target, main_target) or not settings.get("enabled", True):
-        return LauncherSupervision(code=int(process.wait()))
-
-    watcher = LauncherRestartWatcher(
-        max_restarts=int(settings.get("max_restarts", 3)),
-        window=float(settings.get("window", 120.0)),
-        relaunch_grace=float(settings.get("relaunch_grace", 10.0)),
-        clock=clock,
-    )
-    interval = max(0.1, float(settings.get("poll_interval", 0.5)))
-    started = float(clock())
-    # This is not a normal session watchdog; the outer launcher retains its
-    # regular shutdown logic. It merely bounds a silent launcher that never
-    # starts the game nor exits cleanly.
-    deadline = started + max(
-        float(settings.get("window", 120.0)),
-        float(settings.get("relaunch_grace", 10.0))
-        * (int(settings.get("max_restarts", 3)) + 2),
-    )
-    previous_launcher = False
-    game_seen = False
-    empty_since: Optional[float] = None
-
-    while True:
-        snapshot = _call_process_lister(lister, root)
-        launcher_running = any(_same_image(image, target)
-                               for _pid, image in snapshot)
-        game_running = any(_same_image(image, main_target)
-                           for _pid, image in snapshot)
-        now = float(clock())
-
-        if launcher_running and not previous_launcher:
-            watcher.opened()
-        elif previous_launcher and not launcher_running:
-            watcher.closed()
-        previous_launcher = launcher_running
-
-        if game_running:
-            if game_seen:
-                watcher.note_game_started()
-                return LauncherSupervision(
-                    code=int(process.poll() if process.poll() is not None else 0),
-                    game_started=True, restarts=watcher.restarts(),
-                    notes=[f"{main_target.name} started by {target.name}"],
-                )
-            game_seen = True
-        elif game_seen:
-            # A game that vanished before the next sample is not proof that
-            # the run succeeded; the following launcher appearance is counted.
-            game_seen = False
-
-        if watcher.loop_detected():
-            code = process.poll()
-            note = (f"{target.name} restarted {watcher.restarts()} time(s) "
-                    f"without {main_target.name} staying alive")
-            return LauncherSupervision(
-                code=int(code if code is not None else 0), loop_broken=True,
-                restarts=watcher.restarts(), notes=[note])
-
-        child_code = process.poll()
-        if not launcher_running and not game_running and child_code is not None:
-            if empty_since is None:
-                empty_since = now
-            elif now - empty_since >= float(settings.get("relaunch_grace", 10.0)):
-                return LauncherSupervision(code=int(child_code),
-                                           restarts=watcher.restarts())
-        else:
-            empty_since = None
-        if now >= deadline:
-            code = process.poll()
-            return LauncherSupervision(
-                code=int(code if code is not None else 0),
-                restarts=watcher.restarts(),
-                notes=[f"stopped observing {target.name} after the guard window"],
-            )
-        sleep(interval)
 
 
 def _machine_file_needs_admin(path: Path) -> bool:
@@ -3548,18 +2837,6 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             raise FileNotFoundError(
                 f"Исполняемый файл программы не найден:\n{target}")
 
-    # Canonical Fallout.ini is prepared before any target (including the
-    # official launcher) sees the redirected profile. This makes an editable
-    # App\Fallout.ini the source of truth for direct, EXE-launcher and BAT
-    # style starts alike.
-    game_settings = GameSettingsGuard(
-        root, cfg, host_profile=shared_saves.host_profile,
-        host_documents=shared_saves.host_documents)
-    for line in game_settings.repair():
-        _run_log(root, "game settings: " + line)
-    if game_settings.blockers:
-        _run_log(root, "game settings: a configuration file is not writable")
-
     # Предстартовая проверка распространяемых компонентов: лучше назвать
     # пакет, чем оставить пользователя наедине с окном Windows
     # «отсутствует MSVCR110.dll».
@@ -3594,53 +2871,12 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 *[str(arg) for arg in cfg.get("target_args", [])],
                 *forwarded,
             ]
-            main_target = _as_relative_path(root, str(cfg.get("target_exe_rel", "")))
-            if not main_target.is_file():
-                alternative_main = root / "App" / str(
-                    cfg.get("target_exe_rel", "")).replace("\\", os.sep)
-                if alternative_main.is_file():
-                    main_target = alternative_main
-            launcher_rel = str(cfg.get("launcher_target_rel", ""))
-            launcher_target = _as_relative_path(root, launcher_rel) \
-                if launcher_rel else None
-            is_official_launcher = bool(
-                launcher_target is not None and _same_image(target, launcher_target))
-            loop_guard = _loop_guard_settings(cfg, raw_arguments)
-            settings_session_started = time.time()
             _run_log(root, "start: " + subprocess.list2cmdline(command)
                      + f" (cwd={target.parent}, elevated={_is_elevated()}, "
                      + f"job={'yes' if job.handle else 'no'})")
             try:
-                child = _spawn_target(command, str(target.parent), env, job)
-                if is_official_launcher:
-                    outcome = _supervise_launcher(
-                        child, target=target, main_target=main_target,
-                        settings=loop_guard, lister=_portable_process_list,
-                        root=root)
-                    code = outcome.code
-                    for note in outcome.notes:
-                        _run_log(root, "launcher guard: " + note)
-                    if outcome.loop_broken:
-                        _run_log(root, "the launcher restart loop is detected; "
-                                 "breaking the loop and starting the game directly")
-                        for line in game_settings.repair():
-                            _run_log(root, "game settings: " + line)
-                        _show_warning(
-                            "Обнаружен цикл перезапуска игрового лаунчера.\n\n"
-                            "Сквозной Fallout.ini подготовлен заново; игра будет "
-                            "запущена напрямую, без зациклившегося launcher.exe.")
-                        if main_target.is_file():
-                            direct = [
-                                str(main_target),
-                                *[str(arg) for arg in cfg.get("target_args", [])],
-                                *forwarded,
-                            ]
-                            _run_log(root, "breaking the loop: direct start: "
-                                     + subprocess.list2cmdline(direct))
-                            code = _spawn_target(
-                                direct, str(main_target.parent), env, job).wait()
-                else:
-                    code = child.wait()
+                code = _spawn_target(
+                    command, str(target.parent), env, job).wait()
             except OSError as exc:
                 if getattr(exc, "winerror", None) != 14001:
                     raise
@@ -3681,12 +2917,6 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             if stopped:
                 _run_log(root, "stopped leftover processes from the portable "
                                "folder: " + ", ".join(sorted(set(stopped))))
-            # Accept an INI written by the official launcher during this
-            # session, then make App canonical again before the next start.
-            for line in game_settings.adopt(settings_session_started):
-                _run_log(root, "game settings: " + line)
-            for line in game_settings.repair():
-                _run_log(root, "game settings: " + line)
             return code
         finally:
             registry.save_and_restore()
@@ -3858,9 +3088,6 @@ def main() -> int:
         if any(str(arg).casefold() in ("--sync-saves", "/sync-saves")
                for arg in sys.argv[1:]):
             return sync_saves(root)
-        if any(str(arg).casefold() in ("--doctor", "/doctor")
-               for arg in sys.argv[1:]):
-            return doctor(root)
         return run()
     except Exception as exc:
         details = f"Не удалось запустить портативную программу.\n\n{exc}"

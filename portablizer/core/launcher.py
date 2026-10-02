@@ -42,7 +42,6 @@ cmd.exe читает .bat не построчно, а блоками, запом
 from __future__ import annotations
 
 import json
-import math
 import os
 import string
 from dataclasses import dataclass, field
@@ -153,19 +152,6 @@ class LauncherConfig:
     # собственные сохранения. Структура: {"enabled", "mode", "store",
     # "entries": [...], "discovery": {...}}.
     shared_saves: Dict[str, object] = field(default_factory=dict)
-    # --- единый редактируемый INI Gamebryo -----------------------------------
-    # Отдельная схема для Fallout.ini/FalloutPrefs.ini: официальный launcher
-    # Bethesda иногда пишет их в Documents, даже когда игра читает App. Поле
-    # описывает канонический файл и его портативные профильные копии.
-    game_settings: Dict[str, object] = field(default_factory=dict)
-    # --- защита от карусели официального launcher'а --------------------------
-    # Если launcher не может записать INI, он закрывается и запускает себя
-    # снова. EXE-лончер ловит это, лечит INI и запускает игру напрямую.
-    loop_guard_enabled: bool = True
-    loop_guard_max_restarts: int = 3
-    loop_guard_window: float = 120.0
-    loop_guard_relaunch_grace: float = 10.0
-    loop_guard_poll_interval: float = 0.5
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -679,115 +665,6 @@ def _bat_copy_lines(source: str, destination: str,
     return lines
 
 
-def _safe_game_settings(cfg: LauncherConfig) -> "tuple":
-    """Возвращает безопасные для CMD пути единого Gamebryo INI.
-
-    Конфиг портатива может редактироваться вручную, поэтому BAT не должен
-    подставлять из него ``..``/абсолютный путь или metacharacters. EXE-лончер
-    проводит такую же валидацию перед записью на диск.
-    """
-    raw = cfg.game_settings if isinstance(cfg.game_settings, dict) else {}
-    if not raw.get("enabled"):
-        return "", "", [], []
-
-    def relative(value: object) -> str:
-        item = str(value or "").replace("/", "\\").strip("\\")
-        if (not item or not is_ascii_safe(item) or ":" in item
-                or any(part in ("", ".", "..") for part in item.split("\\"))):
-            return ""
-        return item
-
-    store = relative(raw.get("store", ""))
-    default_ini = relative(raw.get("default_ini", ""))
-    # Names may only be direct children of the game directory.
-    if not store or not default_ini or "\\" in default_ini:
-        return "", "", [], []
-    names: List[str] = []
-    user_inis = raw.get("user_inis")
-    if isinstance(user_inis, list):
-        for value in user_inis[:12]:
-            name = relative(value)
-            if name and "\\" not in name and name.lower().endswith(".ini") \
-                    and name.lower() not in {n.lower() for n in names}:
-                names.append(name)
-    profiles: List[str] = []
-    raw_profiles = raw.get("profile_dirs")
-    if isinstance(raw_profiles, list):
-        for value in raw_profiles[:12]:
-            profile = relative(value)
-            if profile and profile.lower() not in {p.lower() for p in profiles}:
-                profiles.append(profile)
-    return store, default_ini, names, profiles
-
-
-def _settings_repair_block(cfg: LauncherConfig) -> str:
-    """BAT fallback: create writable profile-compatible copies of Fallout.ini."""
-    store, default_ini, names, profiles = _safe_game_settings(cfg)
-    if not store or not default_ini or not names:
-        return "goto :eof"
-    base = f"%PORTABLE_ROOT%\\{store}"
-    template = f"{base}\\{default_ini}"
-    lines = [
-        "rem Keep the canonical editable game INI next to the executable.",
-        "rem Bethesda launchers occasionally insist on a Documents copy; it is",
-        "rem prepared from App before start so it cannot reject a write or reset it.",
-        f'attrib -r "{template}" >nul 2>&1',
-    ]
-    for index, name in enumerate(names):
-        canonical = f"{base}\\{name}"
-        # Keep the seed branch flat. Apart from being easier to diagnose in a
-        # user-edited BAT, this also works in the deliberately small BAT
-        # interpreter used by the regression suite.
-        seed_done = f"portable_settings_seed_done_{index}"
-        lines += [
-            f'attrib -r "{canonical}" >nul 2>&1',
-            f'if exist "{canonical}" goto :{seed_done}',
-            f'if exist "{template}" copy /y "{template}" "{canonical}" >nul 2>&1',
-            f':{seed_done}',
-            f'attrib -r "{canonical}" >nul 2>&1',
-        ]
-        for profile in profiles:
-            satellite = f"%PORTABLE_ROOT%\\{profile}\\{name}"
-            directory = f"%PORTABLE_ROOT%\\{profile}"
-            lines += [
-                f'if not exist "{directory}\\" md "{directory}" >nul 2>&1',
-                f'attrib -r "{satellite}" >nul 2>&1',
-                # App is authoritative before the process starts. Do not use
-                # /D here: FAT/ZIP timestamp granularity can make a manual
-                # edit look equally old and leave the launcher with stale INI.
-                f'if exist "{canonical}" copy /y "{canonical}" "{satellite}" '
-                ">nul 2>&1",
-                f'attrib -r "{satellite}" >nul 2>&1',
-            ]
-    lines.append("goto :eof")
-    return "\n".join(lines)
-
-
-def _settings_adopt_block(cfg: LauncherConfig) -> str:
-    """BAT fallback: accept only a newer profile copy after official launcher."""
-    store, _default_ini, names, profiles = _safe_game_settings(cfg)
-    if not store or not names or not profiles:
-        return "goto :eof"
-    base = f"%PORTABLE_ROOT%\\{store}"
-    lines = [
-        "rem A settings dialog may have changed the portable Documents copy.",
-        "rem xcopy /D adopts it only when it is newer than the App original.",
-    ]
-    for name in names:
-        canonical_dir = base
-        canonical = f"{canonical_dir}\\{name}"
-        for profile in profiles:
-            satellite = f"%PORTABLE_ROOT%\\{profile}\\{name}"
-            lines += [
-                f'attrib -r "{canonical}" >nul 2>&1',
-                f'if exist "{satellite}" xcopy "{satellite}" "{canonical_dir}\\" '
-                "/D /Y /Q >nul 2>&1",
-                f'attrib -r "{canonical}" >nul 2>&1',
-            ]
-    lines.append("goto :eof")
-    return "\n".join(lines)
-
-
 def _saves_block(cfg: LauncherConfig, direction: str) -> str:
     """Сведение сохранений в запасном BAT-лончере.
 
@@ -815,11 +692,6 @@ def _saves_block(cfg: LauncherConfig, direction: str) -> str:
         patterns = entry.get("patterns")
         patterns = [str(p) for p in patterns] if isinstance(patterns, list) \
             else []
-        # Gamebryo INI has a dedicated one-writer guard. Treating it as a
-        # generic save here would let an old Documents copy overwrite a manual
-        # edit of App\Fallout.ini before the guard can arbitrate it.
-        if _safe_game_settings(cfg)[0]:
-            patterns = [p for p in patterns if not p.lower().endswith(".ini")]
         for satellite in satellites:
             source, destination = ((satellite, store) if direction == "in"
                                    else (store, satellite))
@@ -1085,7 +957,6 @@ rem as error 14001 at start. The check below names the package instead and
 rem silently repairs what it can.
 call :portable_check_runtime
 
-call :portable_settings_repair
 call :portable_saves_import
 call :portable_documents_load
 call :portable_registry_load
@@ -1105,8 +976,6 @@ call :portable_wait_children
 call :portable_registry_save
 call :portable_documents_restore
 call :portable_saves_export
-call :portable_settings_adopt
-call :portable_settings_repair
 
 rem Error 14001 deserves its own explanation: it is never about registry or
 rem rights, it is the missing Visual C++ runtime the program was built with.
@@ -1218,12 +1087,6 @@ rem services and keep the whole folder locked long after the program is gone.
 if exist "%PORTABLE_ROOT%\{data_dir}\Temp" rd /s /q "%PORTABLE_ROOT%\{data_dir}\Temp" >nul 2>&1
 if not exist "%PORTABLE_ROOT%\{data_dir}\Temp" md "%PORTABLE_ROOT%\{data_dir}\Temp" >nul 2>&1
 goto :eof
-
-:portable_settings_repair
-{settings_repair}
-
-:portable_settings_adopt
-{settings_adopt}
 
 :portable_saves_import
 {saves_import}
@@ -1398,8 +1261,6 @@ def render_bat(cfg: LauncherConfig) -> str:
         machine_elevation=_machine_elevation_block(cfg),
         saves_import=_saves_block(cfg, "in"),
         saves_export=_saves_block(cfg, "out"),
-        settings_repair=_settings_repair_block(cfg),
-        settings_adopt=_settings_adopt_block(cfg),
         documents_load=_documents_load_block(cfg),
         documents_restore=_documents_restore_block(cfg),
         runtime_check=_runtime_check_block(cfg),
@@ -1464,21 +1325,12 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
     registry = registry if isinstance(registry, dict) else {}
     shutdown = data.get("shutdown")
     shutdown = shutdown if isinstance(shutdown, dict) else {}
-    loop_guard = data.get("loop_guard")
-    loop_guard = loop_guard if isinstance(loop_guard, dict) else {}
-
-    def finite_number(value: object, default: float) -> float:
-        try:
-            number_value = float(value)
-        except (TypeError, ValueError):
-            return default
-        return number_value if math.isfinite(number_value) else default
 
     def number(key: str, default: float) -> float:
-        return finite_number(shutdown.get(key, default), default)
-
-    def loop_number(key: str, default: float) -> float:
-        return finite_number(loop_guard.get(key, default), default)
+        try:
+            return float(shutdown.get(key, default))
+        except (TypeError, ValueError):
+            return default
 
     targets: List[TargetInfo] = []
     raw_targets = data.get("targets")
@@ -1522,13 +1374,6 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         redirect_known_folders=bool(data.get("redirect_known_folders", False)),
         shared_saves=(data.get("shared_saves")
                       if isinstance(data.get("shared_saves"), dict) else {}),
-        game_settings=(data.get("game_settings")
-                       if isinstance(data.get("game_settings"), dict) else {}),
-        loop_guard_enabled=loop_guard.get("enabled", True) is not False,
-        loop_guard_max_restarts=max(1, int(loop_number("max_restarts", 3))),
-        loop_guard_window=loop_number("window", 120.0),
-        loop_guard_relaunch_grace=loop_number("relaunch_grace", 10.0),
-        loop_guard_poll_interval=loop_number("poll_interval", 0.5),
         targets=targets,
         launcher_target_rel=text("launcher_target_rel"),
         config_target_rel=text("config_target_rel"),
@@ -1964,17 +1809,6 @@ def render_config_json(cfg: LauncherConfig) -> str:
         # Сквозные сохранения: одно хранилище сейвов для прямого запуска
         # exe, лончера и комплектного launcher'а (см. core/saves.py).
         "shared_saves": cfg.shared_saves,
-        # Один канонический, записываемый Fallout.ini рядом с игрой. Копии,
-        # которые создаёт официальный launcher в PortableData, не могут
-        # молча затереть ручные изменения в App.
-        "game_settings": cfg.game_settings,
-        "loop_guard": {
-            "enabled": cfg.loop_guard_enabled,
-            "max_restarts": cfg.loop_guard_max_restarts,
-            "window": cfg.loop_guard_window,
-            "relaunch_grace": cfg.loop_guard_relaunch_grace,
-            "poll_interval": cfg.loop_guard_poll_interval,
-        },
         # Чего не хватает на чужом ПК: лончер проверяет этот список перед
         # стартом и называет пакет вместо системной ошибки про DLL.
         "runtime_requirements": cfg.runtime_requirements,

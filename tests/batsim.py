@@ -13,8 +13,8 @@
 * ``if``/``if not`` с ``==``, ``/i``, ``exist``, ``defined``, ``errorlevel N``;
 * многострочные блоки в скобках и ``else``;
 * ``for %%I in (...) do ...`` по списку значений;
-* ``mkdir``, ``del``, ``copy``, ``xcopy``, ``attrib``, ``pushd``/``popd``,
-  ``echo``, ``rem``, ``title``;
+* ``mkdir``, ``del``, ``copy``, ``xcopy``, ``pushd``/``popd``, ``echo``,
+  ``rem``, ``title``;
 * ``exit /b N`` и ``endlocal & exit /b N``;
 * запуск внешней программы (``"%TARGET%" args``) — фиксируется, не выполняется.
 
@@ -145,9 +145,6 @@ class Result:
     reg_commands: List[str] = field(default_factory=list)
     #: Выполненные xcopy: (источник, приёмник, что скопировано).
     copies: List[Tuple[str, str, List[str]]] = field(default_factory=list)
-    #: Calls to ``attrib``. The fake filesystem has no DOS attributes, but
-    #: recording them proves generated recovery scripts clear read-only INI.
-    attrib_calls: List[str] = field(default_factory=list)
     env: Dict[str, str] = field(default_factory=dict)
     paused: int = 0
 
@@ -468,10 +465,6 @@ class BatchInterpreter:
         if low.startswith("mkdir") or low.startswith("md "):
             self.fs.add_dir(self.expand(command.split(None, 1)[1]).strip('"'))
             return None
-        if low.startswith("attrib "):
-            self.result.attrib_calls.append(self.expand(command))
-            self.errorlevel = 0
-            return None
         if low.startswith("del "):
             for token in self._tokens(command[4:]):
                 if not token.startswith("/"):
@@ -481,8 +474,7 @@ class BatchInterpreter:
             tokens = [t for t in self._tokens(command[5:])
                       if not t.startswith("/")]
             if len(tokens) >= 2:
-                self.fs.copy(self.expand(tokens[0]).strip('"'),
-                             self.expand(tokens[1]).strip('"'))
+                self.fs.copy(self.expand(tokens[0]), self.expand(tokens[1]))
             return None
         if low.startswith("xcopy "):
             tokens = [t for t in self._tokens(command[6:])
