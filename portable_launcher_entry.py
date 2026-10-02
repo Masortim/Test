@@ -741,14 +741,21 @@ def _inside(path: Path, parent: Path) -> bool:
         return False
 
 
-def _clear_readonly(path: Path) -> None:
-    """Remove the Windows read-only flag from a user-owned settings file."""
+def _clear_readonly(path: Path) -> bool:
+    """Remove the Windows read-only flag from a user-owned settings file.
+
+    Returns True when the flag was actually removed: the caller reports it,
+    because a read-only settings file is what makes Bethesda's own launcher
+    loop forever ("closed - opened again - closed ...").
+    """
     try:
         mode = path.stat().st_mode
         if not mode & stat.S_IWRITE:
             path.chmod(mode | stat.S_IWRITE)
+            return True
     except OSError:
         pass
+    return False
 
 
 def _is_ini_pattern(pattern: object) -> bool:
@@ -774,29 +781,36 @@ def _runtime_save_patterns(entry: Dict[str, Any], mode: str) -> list[str]:
     return filtered or ["Saves"]
 
 
-def _make_ini_files_writable(directory: Path, recursive: bool = True) -> None:
+def _make_ini_files_writable(directory: Path,
+                             max_depth: "Optional[int]" = None) -> "list[str]":
     """Make portable user INIs editable, including files marked read-only by
     an installer or copied from a read-only source.
+
+    ``max_depth`` bounds the walk relative to ``directory`` (0 = its own
+    files only). A game folder can hold tens of thousands of files, so the
+    scan of the game directory itself is depth-limited, while small profile
+    trees are walked completely.
+
+    Returns the names of the files whose read-only flag was removed.
     """
+    repaired: "list[str]" = []
     try:
         if not directory.is_dir():
-            return
+            return repaired
     except OSError:
-        return
-    if recursive:
-        for root, dirs, files in os.walk(str(directory), followlinks=False):
-            dirs[:] = [name for name in dirs if not name.startswith((".", "$"))]
-            for name in files:
-                if name.casefold().endswith(".ini"):
-                    _clear_readonly(Path(root) / name)
-    else:
-        try:
-            files = list(directory.iterdir())
-        except OSError:
-            return
-        for path in files:
-            if path.is_file() and path.suffix.casefold() == ".ini":
-                _clear_readonly(path)
+        return repaired
+    for root, dirs, files in os.walk(str(directory), followlinks=False):
+        dirs[:] = [name for name in dirs if not name.startswith((".", "$"))]
+        if max_depth is not None:
+            relative = os.path.relpath(root, str(directory))
+            depth = 0 if relative == "." else relative.count(os.sep) + 1
+            if depth >= max_depth:
+                dirs[:] = []
+        for name in files:
+            if name.casefold().endswith(".ini"):
+                if _clear_readonly(Path(root) / name):
+                    repaired.append(name)
+    return repaired
 
 
 def merge_saves(source: Path, destination: Path,
@@ -1081,18 +1095,31 @@ class SharedSaveSession:
     def _runtime_patterns(self, entry: Dict[str, Any]) -> list[str]:
         return _runtime_save_patterns(entry, self.mode)
 
-    def prepare_settings(self) -> None:
-        """Ensure portable INI files can be edited by the current user."""
-        candidates: list[tuple[Path, bool]] = []
+    def prepare_settings(self) -> "list[str]":
+        """Ensure portable INI files can be edited by the current user.
+
+        Returns the names of the files that were still marked read-only and
+        had the flag removed. That is not cosmetics: the game's own launcher
+        rewrites its INI files on every press of "Play", and a file it cannot
+        write makes it loop forever (it closes and opens again, over and
+        over). A read-only INI usually arrives from the profile - Bethesda's
+        games mark their settings read-only when they exit - or from a manual
+        copy the user made by hand.
+        """
+        candidates: list[tuple[Path, "Optional[int]"]] = []
         for entry in self.entries:
             store = self.root.joinpath(*entry["store"].split("/"))
-            candidates.append((store, self.mode.casefold() != "inplace"))
+            inplace = self.mode.casefold() == "inplace"
+            # In inplace mode the store IS the game folder: it can be huge,
+            # so the walk is depth-limited (INI files live next to the exe,
+            # a repack may nest them one level deeper).
+            candidates.append((store, 2 if inplace else None))
             portable = str(entry.get("portable", "")).replace("\\", "/")
             if portable:
                 local_copy = self.root.joinpath(
                     *(part for part in portable.split("/") if part))
                 if _inside(local_copy, self.root):
-                    candidates.append((local_copy, True))
+                    candidates.append((local_copy, None))
 
         # Also cover portable Documents when synchronization is disabled and
         # there are no per-game directories in the config. With entries above,
@@ -1103,18 +1130,21 @@ class SharedSaveSession:
             local_root = self.portable_profile.joinpath(
                 *(part for part in relative.split("/") if part))
             if _inside(local_root, self.root):
-                candidates.append((local_root, True))
+                candidates.append((local_root, None))
 
-        seen: set[tuple[str, bool]] = set()
-        for directory, recursive in candidates:
+        seen: set[tuple[str, "Optional[int]"]] = set()
+        repaired: "list[str]" = []
+        for directory, max_depth in candidates:
             try:
-                key = (os.path.normcase(str(directory.resolve())), recursive)
+                key = (os.path.normcase(str(directory.resolve())), max_depth)
             except OSError:
-                key = (os.path.normcase(str(directory)), recursive)
+                key = (os.path.normcase(str(directory)), max_depth)
             if key in seen:
                 continue
             seen.add(key)
-            _make_ini_files_writable(directory, recursive=recursive)
+            repaired.extend(
+                _make_ini_files_writable(directory, max_depth=max_depth))
+        return repaired
 
     def _import_legacy_settings_once(self) -> "list[str]":
         """Import INIs once from old Gamebryo portables, then stop syncing them.
@@ -1184,11 +1214,29 @@ class SharedSaveSession:
                         f"to {satellite}")
         return report
 
-    def before(self) -> "list[str]":
-        self.prepare_settings()
-        if not self.enabled:
+    def _repair_report(self, repaired: "list[str]") -> "list[str]":
+        """Human-readable note about settings files that were read-only.
+
+        Bethesda launchers (Fallout 3/New Vegas, Oblivion) rewrite their INI
+        files every time "Play" is pressed. When such a file is read-only the
+        write fails and the launcher loops: it closes, opens again, closes
+        again... Removing the flag is therefore the cure for that exact
+        complaint, and the user deserves to know it happened.
+        """
+        if not repaired:
             return []
-        report = self._import_legacy_settings_once()
+        names = ", ".join(sorted(set(repaired)))
+        return [
+            f"settings files were read-only and are writable now ({names}): "
+            "otherwise the game's own launcher would close and reopen itself "
+            "in an endless loop"
+        ]
+
+    def before(self) -> "list[str]":
+        report = self._repair_report(self.prepare_settings())
+        if not self.enabled:
+            return report
+        report.extend(self._import_legacy_settings_once())
         report.extend(self.pull())
         return report
 
@@ -1201,10 +1249,13 @@ class SharedSaveSession:
         режим навсегда — иначе прямой запуск так и не увидел бы сейвы,
         сделанные через лончер.
         """
-        self.prepare_settings()
+        # Игра могла снова пометить свои INI «только для чтения» — так
+        # Bethesda'вские движки прощаются с настройками. Снимаем флаг сразу:
+        # иначе следующий запуск (в том числе прямой двойной клик по
+        # оригинальному exe) упрётся в недоступный для записи конфиг.
+        report = self._repair_report(self.prepare_settings())
         if not self.enabled:
-            return []
-        report: "list[str]" = []
+            return report
         changed = False
         for entry in self._all_entries():
             store = self.root.joinpath(*entry["store"].split("/"))
@@ -3220,7 +3271,8 @@ def sync_saves(root: Optional[Path] = None) -> int:
         cfg: Dict[str, Any] = json.load(fh)
     session = SharedSaveSession(root, cfg)
     if not session.enabled:
-        session.prepare_settings()
+        for line in session._repair_report(session.prepare_settings()):
+            _run_log(root, "shared saves: " + line)
         _run_log(root, "shared saves: disabled for this portable app")
         return 0
     report = [*session.before(), *session.push()]
