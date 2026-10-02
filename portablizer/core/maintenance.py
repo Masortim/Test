@@ -213,12 +213,24 @@ def refresh(folder: str, log: Optional[Logger] = None,
     # сейвов — одним для прямого запуска App\Game.exe, другим для лончера.
     if shared_saves:
         try:
+            old_cache_size = 4096
+            for item in cfg.game_settings.get("ini_settings", []):
+                if isinstance(item, (list, tuple)) and len(item) == 3 \
+                        and str(item[0]).casefold() == "audio" \
+                        and str(item[1]).casefold() == "iaudiocachesize":
+                    try:
+                        old_cache_size = int(item[2])
+                    except (TypeError, ValueError):
+                        old_cache_size = 4096
+                    break
             setup = saves_mod.plan(
                 folder, cfg.app_name,
                 [t.rel_path for t in cfg.targets] or [cfg.target_exe_rel],
-                data_dir_name=cfg.data_dir_name)
+                data_dir_name=cfg.data_dir_name,
+                fallout_audio_cache_size=old_cache_size)
             saves_mod.apply(folder, setup, log)
             cfg.shared_saves = setup.to_dict()
+            cfg.game_settings = dict(setup.game_settings)
             report.saves_mode = setup.mode
             report.saves_migrated = setup.migrated
             for line in saves_mod.describe(setup):
