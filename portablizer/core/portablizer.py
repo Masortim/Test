@@ -2656,6 +2656,8 @@ class Portablizer:
             ),
             shared_saves=(save_setup.to_dict()
                           if save_setup is not None else {}),
+            game_settings=(dict(save_setup.game_settings)
+                           if save_setup is not None else {}),
         )
         # Launch.bat — CRLF, чистый ASCII и без BOM. cmd.exe читает .bat по
         # байтовым смещениям: BOM, LF-концы строк или многобайтовый символ
@@ -2814,6 +2816,12 @@ class Portablizer:
                     "набор видят и прямой\n"
                     "    запуск exe из App, и LaunchPortable.exe, и "
                     "комплектный лаунчер;\n"
+                    "  • редактируйте App\\Fallout.ini (и FalloutPrefs.ini): "
+                    "это единственные\n"
+                    "    канонические настройки; launcher не перезапишет "
+                    "ручные изменения старой копией;\n"
+                    "  • проверить/восстановить записываемые INI: "
+                    "App\\LaunchPortable.exe --doctor;\n"
                     "  • в «Документы» этого компьютера ничего не пишется.\n"
                 )
             else:
@@ -2910,6 +2918,7 @@ _README = """{app_name} — портативная версия
   --keep-registry   оставить настройки в реестре после выхода
   --reset           забыть сохранённые настройки и стартовать «с нуля»
   --bat-fallback    принудительно использовать консольный BAT-лончер
+  --doctor          проверить и восстановить записываемые игровые INI
   --help            справка
   -- <аргументы>    передать аргументы самой программе
 
