@@ -152,6 +152,16 @@ class LauncherConfig:
     # собственные сохранения. Структура: {"enabled", "mode", "store",
     # "entries": [...], "discovery": {...}}.
     shared_saves: Dict[str, object] = field(default_factory=dict)
+    # Настройки Gamebryo INI. Копии Fallout.ini в App и PortableData
+    # синхронизирует автономный EXE-лончер перед запуском и после выхода.
+    game_settings: Dict[str, object] = field(default_factory=dict)
+    # Защита от Bethesda launcher, который иногда бесконечно перезапускает
+    # себя, если не смог сохранить настройки.
+    loop_guard_enabled: bool = True
+    loop_guard_max_restarts: int = 3
+    loop_guard_window: float = 120.0
+    loop_guard_relaunch_grace: float = 10.0
+    loop_guard_poll_interval: float = 0.5
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -705,6 +715,49 @@ def _saves_block(cfg: LauncherConfig, direction: str) -> str:
     return "\n".join([header, *lines, "goto :eof"])
 
 
+def _game_settings_repair_block(cfg: LauncherConfig) -> str:
+    """Prepare writable Bethesda INI copies in the console BAT fallback."""
+    settings = cfg.game_settings
+    if not isinstance(settings, dict) or not settings.get("enabled"):
+        return "goto :eof"
+    store = _win_rel(str(settings.get("store", "App")))
+    if not store or not is_ascii_safe(store):
+        return "goto :eof"
+    raw_inis = settings.get("user_inis", [])
+    if not isinstance(raw_inis, list):
+        return "goto :eof"
+    names = [str(name) for name in raw_inis
+             if str(name) and is_ascii_safe(str(name))
+             and "/" not in str(name) and "\\" not in str(name)]
+    raw_profiles = settings.get("profile_dirs", [])
+    profile_dirs = [_win_rel(str(path)) for path in raw_profiles
+                    if str(path) and is_ascii_safe(str(path))] \
+        if isinstance(raw_profiles, list) else []
+    default_name = str(settings.get("default_ini", ""))
+    if not is_ascii_safe(default_name) or "\\" in default_name \
+            or "/" in default_name:
+        default_name = ""
+
+    lines: List[str] = [
+        "rem Unlock and seed Bethesda INI files before the launcher opens.",
+    ]
+    for name in names:
+        app_file = f"%PORTABLE_ROOT%\\{store}\\{name}"
+        if default_name:
+            template = f"%PORTABLE_ROOT%\\{store}\\{default_name}"
+            lines.append(f'attrib -r "{app_file}" >nul 2>&1')
+            lines.append(f'if not exist "{app_file}" copy /y "{template}" "{app_file}" >nul 2>&1')
+        else:
+            lines.append(f'attrib -r "{app_file}" >nul 2>&1')
+        for directory in profile_dirs:
+            profile_dir = f"%PORTABLE_ROOT%\\{directory}"
+            profile_file = f"{profile_dir}\\{name}"
+            lines.append(f'if not exist "{profile_dir}\\" mkdir "{profile_dir}" >nul 2>&1')
+            lines.append(f'attrib -r "{profile_file}" >nul 2>&1')
+            lines.append(f'if exist "{app_file}" copy /y "{app_file}" "{profile_file}" >nul 2>&1')
+    return "\n".join([*lines, "goto :eof"])
+
+
 _BAT_TEMPLATE = r"""@echo off
 setlocal EnableExtensions DisableDelayedExpansion
 rem Prefer the windowed EXE launcher when it is available. Launch.bat remains
@@ -939,6 +992,8 @@ if not exist "%PORTABLE_TARGET%" (
 
 for %%I in ("%PORTABLE_TARGET%") do set "PORTABLE_TARGET_DIR=%%~dpI"
 
+call :portable_settings_repair
+
 rem --- Captured HKLM data: elevation FIRST, before anything that needs it ---
 rem Old games read their install folder from HKLM and quit silently when it is
 rem missing, and VirtualStore does not help manifest-aware programs. When the
@@ -1087,6 +1142,9 @@ rem services and keep the whole folder locked long after the program is gone.
 if exist "%PORTABLE_ROOT%\{data_dir}\Temp" rd /s /q "%PORTABLE_ROOT%\{data_dir}\Temp" >nul 2>&1
 if not exist "%PORTABLE_ROOT%\{data_dir}\Temp" md "%PORTABLE_ROOT%\{data_dir}\Temp" >nul 2>&1
 goto :eof
+
+:portable_settings_repair
+{settings_repair}
 
 :portable_saves_import
 {saves_import}
@@ -1261,6 +1319,7 @@ def render_bat(cfg: LauncherConfig) -> str:
         machine_elevation=_machine_elevation_block(cfg),
         saves_import=_saves_block(cfg, "in"),
         saves_export=_saves_block(cfg, "out"),
+        settings_repair=_game_settings_repair_block(cfg),
         documents_load=_documents_load_block(cfg),
         documents_restore=_documents_restore_block(cfg),
         runtime_check=_runtime_check_block(cfg),
@@ -1325,10 +1384,21 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
     registry = registry if isinstance(registry, dict) else {}
     shutdown = data.get("shutdown")
     shutdown = shutdown if isinstance(shutdown, dict) else {}
+    loop_guard = data.get("loop_guard")
+    loop_guard = loop_guard if isinstance(loop_guard, dict) else {}
+    raw_game_settings = data.get("game_settings")
+    game_settings = (dict(raw_game_settings)
+                     if isinstance(raw_game_settings, dict) else {})
 
     def number(key: str, default: float) -> float:
         try:
             return float(shutdown.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def guard_number(key: str, default: float) -> float:
+        try:
+            return float(loop_guard.get(key, default))
         except (TypeError, ValueError):
             return default
 
@@ -1374,6 +1444,16 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         redirect_known_folders=bool(data.get("redirect_known_folders", False)),
         shared_saves=(data.get("shared_saves")
                       if isinstance(data.get("shared_saves"), dict) else {}),
+        game_settings=game_settings,
+        loop_guard_enabled=loop_guard.get("enabled", True) is not False,
+        loop_guard_max_restarts=max(
+            1, min(20, int(guard_number("max_restarts", 3)))),
+        loop_guard_window=max(10.0, min(3600.0,
+                                       guard_number("window", 120.0))),
+        loop_guard_relaunch_grace=max(
+            1.0, min(120.0, guard_number("relaunch_grace", 10.0))),
+        loop_guard_poll_interval=max(
+            0.1, min(5.0, guard_number("poll_interval", 0.5))),
         targets=targets,
         launcher_target_rel=text("launcher_target_rel"),
         config_target_rel=text("config_target_rel"),
@@ -1809,6 +1889,18 @@ def render_config_json(cfg: LauncherConfig) -> str:
         # Сквозные сохранения: одно хранилище сейвов для прямого запуска
         # exe, лончера и комплектного launcher'а (см. core/saves.py).
         "shared_saves": cfg.shared_saves,
+        # Gamebryo/Bethesda INI: canonical-копия возле exe и копии в
+        # перенаправленном профиле. EXE-лончер делает их редактируемыми,
+        # принимает новые настройки из launcher-а и повторно применяет
+        # заданные здесь portable-ключи (например, New Vegas audio cache).
+        "game_settings": cfg.game_settings,
+        "loop_guard": {
+            "enabled": cfg.loop_guard_enabled,
+            "max_restarts": cfg.loop_guard_max_restarts,
+            "window": cfg.loop_guard_window,
+            "relaunch_grace": cfg.loop_guard_relaunch_grace,
+            "poll_interval": cfg.loop_guard_poll_interval,
+        },
         # Чего не хватает на чужом ПК: лончер проверяет этот список перед
         # стартом и называет пакет вместо системной ошибки про DLL.
         "runtime_requirements": cfg.runtime_requirements,
