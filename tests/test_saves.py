@@ -12,7 +12,6 @@ BAT) и лечение уже готовой папки без пересбор�
 """
 import json
 import os
-import stat
 import sys
 import tempfile
 import unittest
@@ -133,27 +132,6 @@ class SharedSavesForFalloutTests(unittest.TestCase):
             self.assertIn(b"iSize W=1024", text)
             self.assertIn(b"SStartingCell=", text)
 
-    def test_runtime_sync_rules_include_saves_but_not_game_inis(self):
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            setup = game.plan()
-
-            self.assertEqual(setup.entries[0].patterns, ["Saves"])
-            # Настройки всё ещё переносятся при сборке; правило runtime
-            # отвечает только за данные сохранений.
-            _write(game.host_game / "Fallout.ini", "[Audio]\niAudioCacheSize=8192\n")
-            game.apply(setup)
-            self.assertTrue((game.app / "Fallout.ini").is_file())
-
-    def test_result_explains_the_canonical_manual_ini_location(self):
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            description = "\n".join(saves.describe(game.apply()))
-
-            self.assertIn("редактируйте прямо в App", description)
-            self.assertIn("не является активной", description)
-            self.assertIn("не синхронизируются при каждом запуске", description)
-
     def test_read_only_default_ini_is_patched_too(self):
         """У установленной игры этот файл часто помечен «только чтение»."""
         with tempfile.TemporaryDirectory() as temp:
@@ -179,101 +157,6 @@ class SharedSavesForFalloutTests(unittest.TestCase):
             moved = (game.app / "Fallout.ini").read_text(encoding="utf-8")
             self.assertIn("SLanguage=russian", moved)
             self.assertIn("bUseMyGamesDirectory=0", moved)
-            self.assertIn("iSize W=1920",
-                          (game.app / "FalloutPrefs.ini").read_text(
-                              encoding="utf-8"))
-
-    def test_the_through_config_file_is_created_next_to_the_exe(self):
-        """Жалоба: «рядом с FalloutNV.exe в App не оказалось Fallout.ini».
-
-        Шаблон ``Fallout_default.ini`` — только значения по умолчанию: движок
-        читает пользовательские ``Fallout.ini``/``FalloutPrefs.ini``. Пока их
-        нет рядом с exe, сквозного конфигурационного файла не существует,
-        игра кладёт свой INI в профиль, а пользователь копирует его руками.
-        """
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            setup = game.apply()
-
-            self.assertEqual(setup.mode, "inplace")
-            for name in ("Fallout.ini", "FalloutPrefs.ini",
-                         "FalloutCustom.ini"):
-                config = game.app / name
-                self.assertTrue(config.is_file(), name)
-                text = config.read_text(encoding="utf-8")
-                # Созданный файл — не пустой шаблон: в нём уже включено
-                # хранение данных внутри портатива.
-                self.assertIn("bUseMyGamesDirectory=0", text, name)
-                self.assertIn("SLocalSavePath=Saves\\", text, name)
-                # Остальные настройки шаблона не потеряны.
-                self.assertIn("iSize W=1024", text, name)
-            self.assertTrue(any("создаётся рядом с exe" in note
-                                for note in saves.describe(setup)))
-
-    def test_the_created_config_file_stays_writable(self):
-        """Установщики игр помечают INI «только для чтения» — копия тоже.
-
-        Именно недоступный для записи конфиг заставляет лаунчер Bethesda
-        зацикливаться: закрылся — открылся — закрылся…
-        """
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            os.chmod(game.app / "Fallout_default.ini", 0o444)
-
-            game.apply()
-
-            for name in ("Fallout_default.ini", "Fallout.ini",
-                         "FalloutPrefs.ini", "FalloutCustom.ini"):
-                config = game.app / name
-                self.assertTrue(config.is_file(), name)
-                self.assertTrue(config.stat().st_mode & stat.S_IWUSR, name)
-
-    def test_a_read_only_ini_inside_the_game_folder_is_unlocked(self):
-        """INI, который сборка не трогала, тоже должен стать записываемым."""
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            nested = game.app / "Data" / "INI" / "Tweaks.ini"
-            _write(nested, "[Audio]\niAudioCacheSize=4096\n")
-            os.chmod(nested, 0o444)
-
-            game.apply()
-
-            self.assertTrue(nested.stat().st_mode & stat.S_IWUSR)
-
-    def test_read_only_inis_in_the_portable_profile_are_unlocked_too(self):
-        r"""Лаунчер Bethesda пишет свои настройки в перенаправленный профиль.
-
-        «Только для чтение» в PortableData\User\Documents\My Games даёт тот
-        же бесконечный цикл, что и в папке игры. Настоящий профиль этого ПК
-        при этом не трогаем.
-        """
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            game.apply()
-            copy = _write(game.portable_game / "Fallout.ini",
-                          "[General]\nSLanguage=russian\n")
-            os.chmod(copy, 0o444)
-
-            game.apply()
-
-            self.assertTrue(copy.stat().st_mode & stat.S_IWUSR)
-            # Файлы пользователя вне портатива не меняются.
-            self.assertFalse((game.host_game / "Fallout.ini").exists())
-
-    def test_user_settings_are_never_replaced_by_the_template(self):
-        """Если пользовательский INI уже есть — он остаётся собой."""
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            _write(game.app / "Fallout.ini",
-                   "[General]\nSLanguage=russian\n")
-            _write(game.app / "FalloutPrefs.ini",
-                   "[Display]\niSize W=1920\n")
-
-            game.apply()
-
-            self.assertIn("SLanguage=russian",
-                          (game.app / "Fallout.ini").read_text(
-                              encoding="utf-8"))
             self.assertIn("iSize W=1920",
                           (game.app / "FalloutPrefs.ini").read_text(
                               encoding="utf-8"))
@@ -339,30 +222,6 @@ class GameDetectionTests(unittest.TestCase):
             self.assertEqual(detected.profile.id, saves.GENERIC_GAMEBRYO_ID)
             self.assertEqual(detected.profile.my_games, ("Nehrim",))
 
-    def test_detects_skyrim(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app = Path(temp, "App")
-            app.mkdir()
-            (app / "SkyrimSE.exe").write_bytes(b"MZ")
-            (app / "Skyrim_default.ini").write_bytes(
-                b"[General]\r\nsLanguage=ENGLISH\r\nSLocalSavePath=Saves\\\r\n")
-            detected = saves.detect_game(str(app))
-            self.assertIsNotNone(detected)
-            self.assertEqual(detected.profile.id, "gamebryo-skyrim")
-            self.assertIn("Skyrim.ini", detected.profile.user_inis)
-
-    def test_detects_fallout4(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app = Path(temp, "App")
-            app.mkdir()
-            (app / "Fallout4.exe").write_bytes(b"MZ")
-            (app / "Fallout4_default.ini").write_bytes(
-                b"[General]\r\nsLanguage=en\r\nSLocalSavePath=Saves\\\r\n")
-            detected = saves.detect_game(str(app))
-            self.assertIsNotNone(detected)
-            self.assertEqual(detected.profile.id, "gamebryo-fallout4")
-            self.assertIn("Fallout4.ini", detected.profile.user_inis)
-
     def test_an_ordinary_program_is_not_mistaken_for_a_game(self):
         with tempfile.TemporaryDirectory() as temp:
             app = Path(temp, "App")
@@ -410,18 +269,6 @@ class IniPatchTests(unittest.TestCase):
         text, changed = saves.patch_ini_text(original, self.SETTINGS)
         self.assertFalse(changed)
         self.assertEqual(text, original)
-
-    def test_already_correct_readonly_ini_is_made_editable(self):
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp, "Fallout.ini")
-            path.write_text("[General]\nbUseMyGamesDirectory=0\n",
-                            encoding="utf-8")
-            os.chmod(path, 0o444)
-
-            changed = saves.patch_ini_file(str(path), self.SETTINGS)
-
-            self.assertFalse(changed)
-            self.assertTrue(path.stat().st_mode & stat.S_IWUSR)
 
     def test_comments_and_duplicates_survive(self):
         text, _ = saves.patch_ini_text(
@@ -477,20 +324,6 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(
                 (destination / "save.fos").read_text(encoding="utf-8"),
                 "новая")
-
-    def test_copied_readonly_settings_are_writable_in_the_portable_store(self):
-        with tempfile.TemporaryDirectory() as temp:
-            source, destination = Path(temp, "profile"), Path(temp, "App")
-            ini = _write(source / "Fallout.ini", "[Audio]\niAudioCacheSize=8192\n")
-            os.chmod(ini, 0o444)
-
-            self.assertEqual(saves.merge_tree(str(source), str(destination),
-                                              ["*.ini"]), 1)
-
-            copied = destination / "Fallout.ini"
-            self.assertEqual(copied.read_text(encoding="utf-8"),
-                             "[Audio]\niAudioCacheSize=8192\n")
-            self.assertTrue(copied.stat().st_mode & stat.S_IWUSR)
 
     def test_patterns_limit_what_is_merged(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -665,62 +498,6 @@ class RuntimeSyncTests(unittest.TestCase):
 
             self.assertFalse((game.host_saves / "Portable.fos").exists())
 
-    def test_game_ini_edits_are_not_overwritten_during_startup_sync(self):
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            game.apply()
-            active = _write(game.app / "Fallout.ini",
-                            "[Audio]\niAudioCacheSize=8192\n")
-            legacy = _write(game.portable_game / "Fallout.ini",
-                            "[Audio]\niAudioCacheSize=2048\n")
-            _touch(active, 20000)
-            _touch(legacy, 30000)  # even a newer duplicate must not win
-            os.chmod(legacy, 0o444)
-
-            session = self._session(game)
-            session.before()
-            session.after()
-
-            self.assertIn("iAudioCacheSize=8192",
-                          active.read_text(encoding="utf-8"))
-            self.assertTrue(active.stat().st_mode & stat.S_IWUSR)
-            self.assertTrue(legacy.stat().st_mode & stat.S_IWUSR)
-
-    def test_legacy_ini_mirror_is_imported_once_then_never_overwrites_edits(self):
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            game.apply()
-            legacy_setup = game.plan()
-            legacy_setup.entries[0].patterns = ["Saves", "*.ini"]
-            active = _write(game.app / "Fallout.ini",
-                            "[Audio]\niAudioCacheSize=1024\n")
-            legacy = _write(game.portable_game / "Fallout.ini",
-                            "[Audio]\niAudioCacheSize=8192\n")
-            _touch(active, 10000)
-            _touch(legacy, 20000)
-            os.chmod(legacy, 0o444)
-
-            first = self._session(game, legacy_setup)
-            report = first.before()
-
-            self.assertIn("iAudioCacheSize=8192",
-                          active.read_text(encoding="utf-8"))
-            self.assertTrue(any("imported 1 INI file(s) once" in line
-                                for line in report))
-            state = json.loads((game.root / "PortableData" / "SharedSaves" /
-                                "state.json").read_text(encoding="utf-8"))
-            self.assertTrue(state["settings_imported"])
-
-            _write(active, "[Audio]\niAudioCacheSize=16384\n")
-            _write(legacy, "[Audio]\niAudioCacheSize=2048\n")
-            _touch(active, 30000)
-            _touch(legacy, 40000)  # deliberately newer, but it is obsolete
-            second = self._session(game, legacy_setup)
-            second.before()
-
-            self.assertIn("iAudioCacheSize=16384",
-                          active.read_text(encoding="utf-8"))
-
     def test_a_program_that_ignores_the_ini_switches_to_two_way_sync(self):
         """Страховка: если игра всё равно пишет в My Games, сводим обе папки.
 
@@ -846,81 +623,6 @@ class RuntimeSyncTests(unittest.TestCase):
             self.assertEqual(session.before(), [])
 
 
-class ReadOnlySettingsTests(unittest.TestCase):
-    """Настроечный INI никогда не должен оставаться «только для чтения».
-
-    Лаунчеры Bethesda переписывают свои INI при каждом нажатии «Играть».
-    Если файл недоступен для записи, запись не удаётся — и лаунчер уходит в
-    бесконечный цикл: закрылся, открылся, закрылся… Флаг приходит откуда
-    угодно: от установщика, от самой игры (Bethesda'вские движки помечают
-    настройки «только для чтения» при выходе) или от копии, которую
-    пользователь сделал руками.
-    """
-
-    def _session(self, game: FalloutPortable, setup=None):
-        setup = setup or game.plan()
-        cfg = {"app_name": "Fallout New Vegas",
-               "target_exe_rel": "App/FalloutNV.exe",
-               "data_dir_name": "PortableData",
-               "shared_saves": setup.to_dict()}
-        with mock.patch.dict(os.environ, game.env):
-            return exe_launcher.SharedSaveSession(game.root, cfg)
-
-    def test_a_read_only_ini_is_unlocked_before_the_launch(self):
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            game.apply()
-            # Пользователь скопировал Fallout.ini из PortableData в App
-            # руками — копия принесла флаг «только для чтения».
-            config = _write(game.app / "Fallout.ini",
-                            "[General]\nbUseMyGamesDirectory=1\n")
-            os.chmod(config, 0o444)
-
-            report = self._session(game).before()
-
-            self.assertTrue(config.stat().st_mode & stat.S_IWUSR)
-            self.assertTrue(any("read-only" in line for line in report))
-            self.assertTrue(any("endless loop" in line for line in report))
-
-    def test_the_flag_the_game_left_behind_is_removed_after_the_session(self):
-        """Игра пометила настройки «только для чтения» при выходе.
-
-        Если не снять флаг сразу, следующий запуск — в том числе прямой
-        двойной клик по оригинальному ``FalloutNVLauncher.exe`` — упрётся в
-        недоступный для записи конфиг и зациклится.
-        """
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            game.apply()
-            config = game.app / "Fallout.ini"
-            os.chmod(config, 0o444)
-
-            report = self._session(game).after()
-
-            self.assertTrue(config.stat().st_mode & stat.S_IWUSR)
-            self.assertTrue(any("read-only" in line for line in report))
-
-    def test_a_read_only_ini_in_a_subfolder_is_unlocked_too(self):
-        """Репаки кладут INI не только в корень: обходим и вложенные папки."""
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            game.apply()
-            nested = _write(game.app / "Data" / "INI" / "Tweaks.ini",
-                            "[Audio]\niAudioCacheSize=4096\n")
-            os.chmod(nested, 0o444)
-
-            self._session(game).before()
-
-            self.assertTrue(nested.stat().st_mode & stat.S_IWUSR)
-
-    def test_nothing_is_reported_when_no_file_was_locked(self):
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            game.apply()
-            self.assertEqual(self._session(game).before(), [])
-            self.assertEqual(self._session(game).after(), [])
-
-
 class LauncherRunIntegrationTests(unittest.TestCase):
     """Сведение сейвов встроено в сам запуск, а не живёт отдельной кнопкой."""
 
@@ -996,16 +698,6 @@ class LaunchBatSavesTests(unittest.TestCase):
                                              rel_path="App/FalloutNV.exe")],
             shared_saves=setup.to_dict())
 
-    def test_legacy_inplace_config_does_not_resync_inis_in_bat(self):
-        with tempfile.TemporaryDirectory() as temp:
-            game = FalloutPortable(temp)
-            setup = game.plan()
-            setup.entries[0].patterns = ["Saves", "*.ini"]
-
-            bat = launcher_mod.render_bat(self._cfg(setup))
-
-            self.assertNotIn("*.ini", bat)
-
     def test_the_bat_remembers_the_real_profile_before_redirecting(self):
         with tempfile.TemporaryDirectory() as temp:
             game = FalloutPortable(temp)
@@ -1027,8 +719,6 @@ class LaunchBatSavesTests(unittest.TestCase):
             self.assertIn(launch, bat)
             self.assertIn("call :portable_saves_import", bat)
             self.assertIn("call :portable_saves_export", bat)
-            self.assertNotIn("*.ini", bat,
-                             "fallback launcher must not resync Gamebryo INIs")
             self.assertLess(bat.index("call :portable_saves_import"),
                             bat.index(launch),
                             "сейвы надо забрать ДО старта программы")
@@ -1037,31 +727,6 @@ class LaunchBatSavesTests(unittest.TestCase):
                                "вернуть их наружу можно только после выхода")
             body = bat.split("\n:portable_saves_import", 1)[1]
             self.assertIn("xcopy", body.split("goto :eof")[0])
-
-    def test_the_bat_clears_the_read_only_flag_before_copying(self):
-        """xcopy молча не переписывает файл «только для чтения».
-
-        В режиме mirror лончер сводит папки целиком, включая настроечные
-        INI. Игра при выходе снова помечает их «только для чтения» — без
-        attrib такие файлы навсегда остались бы в портативе устаревшими.
-        """
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp, "P")
-            (root / "App").mkdir(parents=True)
-            (root / "App" / "witcher2.exe").write_bytes(b"MZ")
-            profile = Path(temp, "Users", "Player")
-            _write(profile / "Documents" / "My Games" / "Witcher2" /
-                   "User.ini")
-            setup = saves.plan(str(root), "The Witcher 2",
-                               ["App/witcher2.exe"],
-                               profile_dir=str(profile),
-                               documents_dir=str(profile / "Documents"))
-            self.assertEqual(setup.mode, "mirror")
-
-            bat = launcher_mod.render_bat(self._cfg(setup))
-
-            self.assertIn("attrib -r", bat)
-            self.assertIn("*.ini", bat)
 
     def test_the_bat_actually_copies_the_saves_when_executed(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1167,31 +832,6 @@ class ExistingPortableSavesTests(unittest.TestCase):
             bat = (game.root / "Launch.bat").read_text(encoding="ascii")
             self.assertIn(":portable_saves_import", bat)
 
-    def test_refresh_creates_the_through_config_file_next_to_the_exe(self):
-        """Старый портатив лечится без пересборки — включая конфиг.
-
-        Жалоба: «рядом с FalloutNV.exe в App не оказалось Fallout.ini».
-        Обновление лончера создаёт его рядом с exe, и пользователю больше не
-        нужно копировать INI из PortableData руками.
-        """
-        with tempfile.TemporaryDirectory() as temp:
-            game = self._old_portable(temp)
-            self.assertFalse((game.app / "Fallout.ini").exists())
-
-            with mock.patch.dict(os.environ, game.env), \
-                    mock.patch.object(procutil, "release_folder",
-                                      return_value=[]):
-                report = maintenance.refresh(str(game.root), Logger(),
-                                             copy_exe=lambda f, rel: rel)
-
-            self.assertTrue(report.success)
-            self.assertTrue((game.app / "Fallout.ini").is_file())
-            self.assertTrue((game.app / "FalloutPrefs.ini").is_file())
-            text = (game.app / "Fallout.ini").read_text(encoding="utf-8")
-            self.assertIn("bUseMyGamesDirectory=0", text)
-            self.assertTrue((game.app / "Fallout.ini").stat().st_mode
-                            & stat.S_IWUSR)
-
     def test_refresh_can_leave_the_saves_alone_on_request(self):
         with tempfile.TemporaryDirectory() as temp:
             game = self._old_portable(temp)
@@ -1256,14 +896,6 @@ class BuildPipelineSavesTests(unittest.TestCase):
                            "Fallout_default.ini").read_bytes())
             # Исходная папка игрока осталась нетронутой.
             self.assertTrue((host_saves / "OldDirectStart.fos").is_file())
-            # Сквозной конфигурационный файл создаётся рядом с exe сразу:
-            # копировать Fallout.ini из PortableData вручную не нужно.
-            for name in ("Fallout.ini", "FalloutPrefs.ini"):
-                config = portable / "App" / name
-                self.assertTrue(config.is_file(), name)
-                self.assertIn("bUseMyGamesDirectory=0",
-                              config.read_text(encoding="utf-8"), name)
-                self.assertTrue(config.stat().st_mode & stat.S_IWUSR, name)
 
     def test_the_build_explains_the_shared_saves_in_the_readme(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1272,12 +904,6 @@ class BuildPipelineSavesTests(unittest.TestCase):
                 encoding="utf-8-sig")
             self.assertIn("Сохранения", readme)
             self.assertIn("App", readme)
-            self.assertIn("Fallout.ini", readme)
-            self.assertIn("Fallout_default.ini", readme)
-            self.assertIn("редактируйте прямо в App", readme)
-            self.assertIn("не синхронизируются", readme)
-            self.assertIn("уже создан рядом с exe", readme)
-            self.assertIn("бесконечный цикл", readme)
 
     def test_the_launcher_config_carries_the_setup(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1289,7 +915,6 @@ class BuildPipelineSavesTests(unittest.TestCase):
             self.assertTrue(setup.enabled)
             self.assertEqual(setup.mode, "inplace")
             self.assertEqual([e.name for e in setup.entries], ["FalloutNV"])
-            self.assertEqual(setup.entries[0].patterns, ["Saves"])
             bat = (portable / "Launch.bat").read_text(encoding="ascii")
             self.assertIn(":portable_saves_import", bat)
 

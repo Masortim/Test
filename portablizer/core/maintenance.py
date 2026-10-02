@@ -219,10 +219,6 @@ def refresh(folder: str, log: Optional[Logger] = None,
                 data_dir_name=cfg.data_dir_name)
             saves_mod.apply(folder, setup, log)
             cfg.shared_saves = setup.to_dict()
-            # Инструкция по настройкам игры (какие INI держать рядом с exe и
-            # что в них подтверждать) едет в конфиг вместе с сохранениями:
-            # по ней обновлённый лончер обслуживает Fallout.ini в runtime.
-            cfg.game_settings = setup.game_settings
             report.saves_mode = setup.mode
             report.saves_migrated = setup.migrated
             for line in saves_mod.describe(setup):

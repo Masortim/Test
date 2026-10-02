@@ -1276,27 +1276,6 @@ class RegistryPortabilityTests(unittest.TestCase):
         self.assertNotIn("Program Files", text)
         self.assertIn('"Language"="RU"', text)
 
-    def test_bethesda_installed_path_is_retargeted(self):
-        """Игры Bethesda ищут каталог установки в значении «Installed Path».
-
-        Его читает комплектный лаунчер: с чужим путём он считает игру
-        неустановленной и не запускает её кнопкой «Играть». Завершающий
-        обратный слэш сохранён — лаунчер склеивает путь без разделителя.
-        """
-        key = r"HKLM\Software\Wow6432Node\Bethesda Softworks\FalloutNV"
-        old = (r"C:\Program Files (x86)\Steam\steamapps\common"
-               r"\Fallout New Vegas")
-        snapshot = {key: {
-            "Installed Path": (registry.REG_SZ, repr(old + "\\")),
-        }}
-        moved = registry.retarget_install_paths(
-            snapshot, [key], r"E:\Portable\FNV_Portable\App")
-        text = registry.render_keys(moved, [key])
-        self.assertIn(
-            '"Installed Path"="E:\\\\Portable\\\\FNV_Portable\\\\App\\\\"',
-            text)
-        self.assertNotIn("Steam", text)
-
 
 class RegistryCaptureIntegrationTests(unittest.TestCase):
     """Захват реестра целиком: что уедет на флешку, а что вычистится."""

@@ -482,11 +482,6 @@ def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
     destination = os.path.normpath(app_dir)
     install_names = {
         "installdir", "installdirectory", "installfolder", "installlocation",
-        # Игры Bethesda (Fallout 3/NV, Oblivion, Skyrim) держат каталог
-        # установки в значении «Installed Path» — его читает комплектный
-        # лаунчер, и без правильного пути он не может запустить игру
-        # («Can't launch game from Launcher»).
-        "installed path", "installedpath",
     }
 
     for key in keys:

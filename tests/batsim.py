@@ -91,7 +91,6 @@ class FakeFS:
                       if d == norm or d.startswith(norm + "\\")}
 
     def copy(self, src: str, dst: str) -> None:
-        src, dst = src.strip('"'), dst.strip('"')
         src_norm = self._norm(src)
         if src_norm in self.files:
             self.add_file(dst, self.files[src_norm])
@@ -146,8 +145,6 @@ class Result:
     reg_commands: List[str] = field(default_factory=list)
     #: Выполненные xcopy: (источник, приёмник, что скопировано).
     copies: List[Tuple[str, str, List[str]]] = field(default_factory=list)
-    #: Выполненные attrib: снятие «только для чтения» с настроек игры.
-    attrib_calls: List[str] = field(default_factory=list)
     env: Dict[str, str] = field(default_factory=dict)
     paused: int = 0
 
@@ -478,13 +475,6 @@ class BatchInterpreter:
                       if not t.startswith("/")]
             if len(tokens) >= 2:
                 self.fs.copy(self.expand(tokens[0]), self.expand(tokens[1]))
-            return None
-        if low.startswith("attrib"):
-            # Атрибуты в симуляции не хранятся: команда важна как факт вызова.
-            # Именно ей лончер снимает «только для чтения» с настроек игры —
-            # без этого лаунчер Bethesda уходит в бесконечный цикл.
-            self.result.attrib_calls.append(self.expand(command))
-            self.errorlevel = 0
             return None
         if low.startswith("xcopy "):
             tokens = [t for t in self._tokens(command[6:])

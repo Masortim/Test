@@ -12,14 +12,12 @@ import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
-import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
 IS_WINDOWS = sys.platform.startswith("win")
@@ -742,614 +740,6 @@ def _inside(path: Path, parent: Path) -> bool:
         return False
 
 
-def _clear_readonly(path: Path) -> bool:
-    """Remove the Windows read-only flag from a user-owned settings file.
-
-    Returns True when the flag was actually removed: the caller reports it,
-    because a read-only settings file is what makes Bethesda's own launcher
-    loop forever ("closed - opened again - closed ...").
-    """
-    try:
-        mode = path.stat().st_mode
-        if not mode & stat.S_IWRITE:
-            path.chmod(mode | stat.S_IWRITE)
-            return True
-    except OSError:
-        pass
-    return False
-
-
-def _is_ini_pattern(pattern: object) -> bool:
-    """Whether a sync pattern selects INI files rather than a data folder."""
-    name = str(pattern).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-    return name.casefold().endswith(".ini")
-
-
-def _runtime_save_patterns(entry: Dict[str, Any], mode: str) -> list[str]:
-    """Keep Gamebryo configuration files out of recurring save syncs.
-
-    The game reads its active INIs beside the executable (``store``). They
-    are imported from old profile copies once, then must not be copied over
-    the user's edits on every launch. Save folders remain synchronized.
-    """
-    patterns = entry.get("patterns")
-    patterns = [str(p) for p in patterns] if isinstance(patterns, list) else []
-    if str(mode).casefold() != "inplace":
-        return patterns
-    filtered = [pattern for pattern in patterns if not _is_ini_pattern(pattern)]
-    # Old and hand-written configs sometimes had an empty pattern list, which
-    # means "copy everything". In inplace mode that would re-enable INI sync.
-    return filtered or ["Saves"]
-
-
-def _make_ini_files_writable(directory: Path,
-                             max_depth: "Optional[int]" = None) -> "list[str]":
-    """Make portable user INIs editable, including files marked read-only by
-    an installer or copied from a read-only source.
-
-    ``max_depth`` bounds the walk relative to ``directory`` (0 = its own
-    files only). A game folder can hold tens of thousands of files, so the
-    scan of the game directory itself is depth-limited, while small profile
-    trees are walked completely.
-
-    Returns the names of the files whose read-only flag was removed.
-    """
-    repaired: "list[str]" = []
-    try:
-        if not directory.is_dir():
-            return repaired
-    except OSError:
-        return repaired
-    for root, dirs, files in os.walk(str(directory), followlinks=False):
-        dirs[:] = [name for name in dirs if not name.startswith((".", "$"))]
-        if max_depth is not None:
-            relative = os.path.relpath(root, str(directory))
-            depth = 0 if relative == "." else relative.count(os.sep) + 1
-            if depth >= max_depth:
-                dirs[:] = []
-        for name in files:
-            if name.casefold().endswith(".ini"):
-                if _clear_readonly(Path(root) / name):
-                    repaired.append(name)
-    return repaired
-
-
-# --- настройки игры: проверка и ремонт перед запуском --------------------------
-
-#: Кроме ``*.ini`` лаунчеры Bethesda переписывают ``RendererInfo.txt`` (отчёт
-#: «Detecting Hardware»). «Только для чтения» в этом файле даёт ровно тот же
-#: бесконечный цикл «закрылся — открылся — закрылся…», поэтому он
-#: обслуживается вместе с INI.
-_SETTINGS_EXTRA_FILES = ("rendererinfo.txt",)
-
-#: Потолок обхода папки игры: в ней десятки тысяч файлов.
-_SETTINGS_MAX_FILES = 400
-
-#: Допуск по времени для FAT32 (та же причина, что и у сохранений).
-_SETTINGS_MTIME_TOLERANCE = 2.0
-
-
-def _is_settings_file(name: str) -> bool:
-    lowered = str(name).casefold()
-    return lowered.endswith(".ini") or lowered in _SETTINGS_EXTRA_FILES
-
-
-def _iter_settings_files(directory: Path,
-                         max_depth: "Optional[int]" = None) -> "list[Path]":
-    """Настроечные файлы каталога: ``*.ini`` и отчёт движка."""
-    found: "list[Path]" = []
-    try:
-        if not directory.is_dir():
-            return found
-    except OSError:
-        return found
-    for root, dirs, files in os.walk(str(directory), followlinks=False):
-        dirs[:] = [name for name in dirs if not name.startswith((".", "$"))]
-        if max_depth is not None:
-            relative = os.path.relpath(root, str(directory))
-            depth = 0 if relative == "." else relative.count(os.sep) + 1
-            if depth >= max_depth:
-                dirs[:] = []
-        for name in files:
-            if _is_settings_file(name):
-                found.append(Path(root) / name)
-                if len(found) >= _SETTINGS_MAX_FILES:
-                    return found
-    return found
-
-
-def _probe_writable(path: Path) -> str:
-    """Проверяет записываемость настроечного файла делом, а не атрибутом.
-
-    «Только для чтения» — не единственная причина, по которой лаунчер игры
-    не может сохранить настройки: файл может быть занят, лежать в каталоге с
-    запретом NTFS, а самого каталога может не быть. Для пользователя всё это
-    выглядит одинаково — бесконечным циклом лаунчера, — поэтому причина
-    отказа должна быть названа словами.
-    """
-    path_str = str(path)
-    if not path_str:
-        return ""
-    try:
-        if path.is_dir():
-            return (f"{path_str}: on the home of the settings file there is a "
-                    "folder - the file cannot be written")
-        if path.exists():
-            with path.open("r+b"):
-                pass
-            return ""
-        parent = path.parent
-        if not parent.is_dir():
-            return (f"{parent}: the settings folder does not exist and could "
-                    "not be created - the game launcher cannot save its "
-                    "configuration")
-        probe = parent / f".portablizer-write-probe-{os.getpid()}.tmp"
-        try:
-            with probe.open("w", encoding="ascii") as handle:
-                handle.write("probe")
-        finally:
-            try:
-                probe.unlink()
-            except OSError:
-                pass
-    except PermissionError:
-        return (f"{path_str}: the file cannot be opened for writing (the "
-                "read-only flag or NTFS permissions)")
-    except OSError as exc:
-        return f"{path_str}: writing is impossible ({exc})"
-    return ""
-
-
-def _patch_ini_text(text: str,
-                    settings: Sequence[Tuple[str, str, str]]
-                    ) -> "tuple[str, bool]":
-    """Выставляет ключи в INI, сохраняя всё остальное как было.
-
-    Правка построчная: в INI игр Bethesda встречаются повторы ключей, пустые
-    значения и комментарии, которые ``configparser`` перетасовал бы и
-    переписал файл целиком. Логика совпадает с ``core/saves.patch_ini_text``;
-    дублирование здесь намеренное — лончер собирается отдельно и не может
-    импортировать пакет Portablizer.
-    """
-    had_final_newline = text.endswith(("\n", "\r"))
-    newline = "\r\n" if "\r\n" in text else "\n"
-    lines = text.splitlines()
-    changed = False
-
-    for section, key, value in settings:
-        section_l = section.lower()
-        key_l = key.lower()
-        current = ""
-        section_start = -1
-        section_end = -1
-        value_index = -1
-
-        for index, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
-                if current == section_l and section_end < 0:
-                    section_end = index
-                current = stripped[1:-1].strip().lower()
-                if current == section_l and section_start < 0:
-                    section_start = index
-                continue
-            if current != section_l or value_index >= 0:
-                continue
-            if "=" not in stripped or stripped.startswith((";", "#")):
-                continue
-            if stripped.split("=", 1)[0].strip().lower() == key_l:
-                value_index = index
-
-        if value_index >= 0:
-            replacement = f"{key}={value}"
-            if lines[value_index].strip() != replacement:
-                lines[value_index] = replacement
-                changed = True
-            continue
-        if section_start < 0:
-            if lines and lines[-1].strip():
-                lines.append("")
-            lines.append(f"[{section}]")
-            lines.append(f"{key}={value}")
-            changed = True
-            continue
-        insert_at = section_end if section_end >= 0 else len(lines)
-        while insert_at - 1 > section_start and not lines[insert_at - 1].strip():
-            insert_at -= 1
-        lines.insert(insert_at, f"{key}={value}")
-        changed = True
-
-    if not changed:
-        return text, False
-    patched = newline.join(lines) + (newline if had_final_newline or lines
-                                     else "")
-    return patched, True
-
-
-def _patch_ini_file(path: Path,
-                    settings: Sequence[Tuple[str, str, str]]) -> bool:
-    """Правит INI на диске. Возвращает True, если файл изменён."""
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return False
-    if raw.startswith(b"\xef\xbb\xbf"):
-        text, encoding = raw.decode("utf-8-sig"), "utf-8-sig"
-    else:
-        try:
-            text, encoding = raw.decode("utf-8"), "utf-8"
-        except UnicodeDecodeError:
-            text, encoding = raw.decode("latin-1"), "latin-1"
-    patched, changed = _patch_ini_text(text, settings)
-    _clear_readonly(path)
-    if not changed:
-        return False
-    try:
-        path.write_bytes(patched.encode(encoding))
-    except (OSError, UnicodeEncodeError):
-        return False
-    return True
-
-
-#: Известные профили движка Gamebryo. Нужны только для портативов, собранных
-#: прежней версией: там секции ``game_settings`` в конфиге ещё нет, и лончер
-#: восстанавливает её сам.
-_GAMEBRYO_FALLBACKS: Dict[str, Dict[str, Any]] = {
-    "gamebryo-falloutnv": {
-        "title": "Fallout: New Vegas",
-        "default_ini": "Fallout_default.ini",
-        "user_inis": ["Fallout.ini", "FalloutPrefs.ini", "FalloutCustom.ini"],
-        "my_games": ["FalloutNV"],
-    },
-    "gamebryo-fallout3": {
-        "title": "Fallout 3",
-        "default_ini": "Fallout_default.ini",
-        "user_inis": ["Fallout.ini", "FalloutPrefs.ini", "FalloutCustom.ini"],
-        "my_games": ["Fallout3"],
-    },
-    "gamebryo-oblivion": {
-        "title": "The Elder Scrolls IV: Oblivion",
-        "default_ini": "Oblivion_default.ini",
-        "user_inis": ["Oblivion.ini", "OblivionPrefs.ini"],
-        "my_games": ["Oblivion"],
-    },
-    "gamebryo-skyrim": {
-        "title": "The Elder Scrolls V: Skyrim",
-        "default_ini": "Skyrim_default.ini",
-        "user_inis": ["Skyrim.ini", "SkyrimPrefs.ini", "SkyrimCustom.ini"],
-        "my_games": ["Skyrim", "Skyrim Special Edition", "Skyrim VR"],
-    },
-    "gamebryo-fallout4": {
-        "title": "Fallout 4",
-        "default_ini": "Fallout4_default.ini",
-        "user_inis": ["Fallout4.ini", "Fallout4Prefs.ini", "Fallout4Custom.ini"],
-        "my_games": ["Fallout4", "Fallout4VR"],
-    },
-}
-
-#: Что движок Gamebryo должен прочитать, чтобы держать данные в портативе.
-_GAMEBRYO_SETTINGS: "list[Tuple[str, str, str]]" = [
-    ("General", "bUseMyGamesDirectory", "0"),
-    ("General", "SLocalSavePath", "Saves\\"),
-]
-
-
-def _discover_gamebryo(store: Path) -> Optional[Dict[str, Any]]:
-    """Ищет шаблон ``*_default.ini`` рядом с exe (для старых портативов)."""
-    if not store.is_dir():
-        return None
-    for template in sorted(store.glob("*_default.ini")):
-        stem = template.name[: -len("_default.ini")]
-        if not stem:
-            continue
-        return {
-            "title": f"{stem} (Gamebryo)",
-            "default_ini": template.name,
-            "user_inis": [f"{stem}.ini", f"{stem}Prefs.ini", f"{stem}Custom.ini"],
-            "my_games": [stem],
-        }
-    return None
-
-
-class GameSettingsGuard:
-    """Держит настройки игры записываемыми — до, во время и после сеанса.
-
-    ``FalloutNVLauncher.exe`` переписывает ``Fallout.ini`` и
-    ``FalloutPrefs.ini`` при **каждом** нажатии «Играть». Если запись не
-    удаётся (файл «только для чтения», каталог запрещён для записи, INI негде
-    создать), лаунчер закрывается и открывается снова — и так до
-    бесконечности. Ровно эту жалобу и закрывает этот класс:
-
-    * перед запуском создаёт отсутствующие пользовательские INI, подтверждает
-      ``bUseMyGamesDirectory=0``/``SLocalSavePath=Saves\\``, снимает «только для
-      чтения» со всех настроечных файлов и проверяет запись делом;
-    * после выхода забирает в папку игры те INI, которые лаунчер переписал в
-      перенаправленном профиле (иначе выбранные в лаунчере разрешение и
-      качество графики до игры не доходят);
-    * возвращает человеческие строки для ``PortableData\\launcher-run.log``:
-      что сделано и что **мешает** записи.
-
-    Работает и на портативах, собранных прежней версией: если секции
-    ``game_settings`` в конфиге нет, параметры восстанавливаются по
-    ``shared_saves`` (режим ``inplace``) или по шаблону ``*_default.ini``.
-    """
-
-    def __init__(self, root: Path, cfg: Dict[str, Any]) -> None:
-        self.root = root
-        section = cfg.get("game_settings")
-        section = section if isinstance(section, dict) else {}
-        if not section.get("enabled"):
-            section = self._from_shared_saves(cfg) or {}
-        self.enabled = bool(section.get("enabled"))
-        self.title = str(section.get("title", ""))
-        self.profile = str(section.get("profile", ""))
-        self.default_ini = str(section.get("default_ini", ""))
-        user_inis = section.get("user_inis")
-        self.user_inis = [str(name) for name in user_inis] \
-            if isinstance(user_inis, list) else []
-        raw_settings = section.get("ini_settings")
-        self.ini_settings: "list[Tuple[str, str, str]]" = [
-            (str(item[0]), str(item[1]), str(item[2]))
-            for item in raw_settings
-            if isinstance(item, (list, tuple)) and len(item) == 3
-        ] if isinstance(raw_settings, list) else []
-        self.saves_dir = str(section.get("saves_dir", "Saves")) or "Saves"
-        self.store = str(section.get("store", ""))
-        dirs = section.get("profile_dirs")
-        self._profile_dirs = [str(item) for item in dirs] \
-            if isinstance(dirs, list) else []
-        self.blockers: "list[str]" = []
-
-    def _from_shared_saves(self, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Восстанавливает параметры для портатива прежней версии."""
-        data = cfg.get("shared_saves")
-        if not isinstance(data, dict) or not data.get("enabled"):
-            return None
-        if str(data.get("mode", "")).casefold() != "inplace":
-            return None
-        profile_id = str(data.get("profile", "")).casefold()
-        known = _GAMEBRYO_FALLBACKS.get(profile_id)
-        store = self.root.joinpath(*str(data.get("store", "")).split("/"))
-        if known is None:
-            known = _discover_gamebryo(store)
-            if known is None:
-                return None
-        raw_entries = data.get("entries")
-        profile_dirs = [
-            str(item.get("portable", ""))
-            for item in raw_entries if isinstance(item, dict)
-            and str(item.get("portable", ""))
-        ] if isinstance(raw_entries, list) else []
-        if not profile_dirs:
-            for name in known.get("my_games", []):
-                profile_dirs.append(
-                    f"{cfg.get('data_dir_name', 'PortableData')}"
-                    f"/User/Documents/My Games/{name}")
-        return {
-            "enabled": True,
-            "title": known.get("title", ""),
-            "profile": profile_id,
-            "default_ini": known.get("default_ini", ""),
-            "user_inis": list(known.get("user_inis", [])),
-            "ini_settings": [list(item) for item in _GAMEBRYO_SETTINGS],
-            "saves_dir": str(data.get("saves_dir", "Saves")) or "Saves",
-            "store": str(data.get("store", "")),
-            "profile_dirs": profile_dirs,
-        }
-
-    def store_dir(self) -> Optional[Path]:
-        if not self.enabled or not self.store:
-            return None
-        return self.root.joinpath(*self.store.split("/"))
-
-    def profile_dirs(self) -> "list[Path]":
-        result: "list[Path]" = []
-        for item in self._profile_dirs:
-            if not item:
-                continue
-            candidate = self.root.joinpath(*item.split("/"))
-            if candidate not in result:
-                result.append(candidate)
-        return result
-
-    def repair(self) -> "list[str]":
-        """Возвращает строки для журнала: что починено и что мешает."""
-        lines: "list[str]" = []
-        if not self.enabled:
-            return lines
-        store = self.store_dir()
-        if store is None or not store.is_dir():
-            return lines
-
-        created: "list[str]" = []
-        template = store / self.default_ini if self.default_ini else None
-        for name in self.user_inis:
-            candidate = store / name
-            if candidate.is_file():
-                continue
-            if template is None or not template.is_file():
-                continue
-            try:
-                # copyfile, а не copy2: копирование атрибутов принесло бы
-                # «только для чтения» с шаблона, который установщики игр любят
-                # помечать этим флагом.
-                shutil.copyfile(str(template), str(candidate))
-            except OSError:
-                continue
-            _clear_readonly(candidate)
-            created.append(name)
-        if created:
-            lines.append(
-                "created the portable configuration file(s) next to the exe ("
-                + ", ".join(created) + "): copy them from PortableData by hand "
-                "is not needed, and a hand copy brings the read-only flag that "
-                "makes the game launcher loop")
-
-        patched: "list[str]" = []
-        for name in [self.default_ini, *self.user_inis]:
-            if not name:
-                continue
-            candidate = store / name
-            if not candidate.is_file():
-                continue
-            _clear_readonly(candidate)
-            if self.ini_settings and _patch_ini_file(candidate,
-                                                     self.ini_settings):
-                patched.append(name)
-        if patched:
-            lines.append(
-                "the portable configuration is confirmed (bUseMyGamesDirectory"
-                "=0, SLocalSavePath=" + self.saves_dir + "\\): "
-                + ", ".join(patched))
-
-        repaired: "list[str]" = []
-        for candidate in _iter_settings_files(store, max_depth=2):
-            if _clear_readonly(candidate):
-                repaired.append(candidate.name)
-        for directory in self.profile_dirs():
-            for candidate in _iter_settings_files(directory):
-                if _clear_readonly(candidate):
-                    repaired.append(
-                        f"{directory.name}/{candidate.name}")
-        if repaired:
-            lines.append(
-                "settings files were read-only and are writable now ("
-                + ", ".join(sorted(set(repaired)))
-                + "): otherwise the game's own launcher would close and "
-                "reopen itself in an endless loop")
-
-        # Копии в перенаправленном профиле должны существовать и быть актуальными:
-        # лаунчер Bethesda пишет свои настройки именно туда. Если пользователь
-        # отредактировал сквозной INI в App, изменения сразу переносятся в профиль,
-        # а если профиль новее — переносятся в App.
-        profile_created: "list[str]" = []
-        for directory in self.profile_dirs():
-            try:
-                directory.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                continue
-            for name in self.user_inis:
-                candidate = directory / name
-                source = store / name
-                if not source.is_file():
-                    continue
-                if not candidate.is_file():
-                    try:
-                        shutil.copyfile(str(source), str(candidate))
-                    except OSError:
-                        continue
-                    _clear_readonly(candidate)
-                    if self.ini_settings:
-                        _patch_ini_file(candidate, self.ini_settings)
-                    profile_created.append(f"{directory.name}/{name}")
-                else:
-                    try:
-                        source_stat = source.stat()
-                        candidate_stat = candidate.stat()
-                        if source_stat.st_mtime > candidate_stat.st_mtime + _SETTINGS_MTIME_TOLERANCE:
-                            _clear_readonly(candidate)
-                            shutil.copy2(str(source), str(candidate))
-                            _clear_readonly(candidate)
-                            if self.ini_settings:
-                                _patch_ini_file(candidate, self.ini_settings)
-                            profile_created.append(f"{directory.name}/{name} (updated from App)")
-                        elif candidate_stat.st_mtime > source_stat.st_mtime + _SETTINGS_MTIME_TOLERANCE:
-                            _clear_readonly(source)
-                            shutil.copy2(str(candidate), str(source))
-                            _clear_readonly(source)
-                            if self.ini_settings:
-                                _patch_ini_file(source, self.ini_settings)
-                            profile_created.append(f"{name} (updated from profile)")
-                        else:
-                            _clear_readonly(candidate)
-                            _clear_readonly(source)
-                            if self.ini_settings:
-                                _patch_ini_file(candidate, self.ini_settings)
-                                _patch_ini_file(source, self.ini_settings)
-                    except OSError:
-                        pass
-        if profile_created:
-            lines.append(
-                "the game launcher keeps writing its settings to the profile "
-                "copy: it is prepared as well (" + ", ".join(profile_created)
-                + ")")
-
-        try:
-            (store / self.saves_dir).mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            lines.append(f"the saves folder could not be created ({exc})")
-
-        probes: "list[str]" = [str(store / name)
-                               for name in self.user_inis if name]
-        probes.extend(str(candidate)
-                      for candidate in _iter_settings_files(store, max_depth=2))
-        for directory in self.profile_dirs():
-            if self.user_inis:
-                probes.append(str(directory / self.user_inis[0]))
-        self.blockers = []
-        for candidate in probes:
-            reason = _probe_writable(Path(candidate))
-            if reason and reason not in self.blockers:
-                self.blockers.append(reason)
-        for blocker in self.blockers:
-            lines.append(
-                "the game settings cannot be written: " + blocker
-                + ". Until this is fixed the Bethesda launcher can loop on "
-                "the Play button")
-        return lines
-
-    def adopt(self, since: float) -> "list[str]":
-        """Забирает в папку игры INI, переписанные лаунчером в профиле.
-
-        ``since`` — время старта сеанса. Переносятся только файлы, изменённые
-        во время него: иначе устаревшая копия из профиля когда-нибудь
-        перезаписала бы ручные правки в ``App\\Fallout.ini``.
-        """
-        lines: "list[str]" = []
-        if not self.enabled:
-            return lines
-        store = self.store_dir()
-        if store is None or not store.is_dir():
-            return lines
-        adopted: "list[str]" = []
-        for directory in self.profile_dirs():
-            for name in self.user_inis:
-                source = directory / name
-                destination = store / name
-                try:
-                    source_stat = source.stat()
-                except OSError:
-                    continue
-                if source_stat.st_size == 0:
-                    continue
-                if source_stat.st_mtime + _SETTINGS_MTIME_TOLERANCE < since:
-                    continue
-                try:
-                    if destination.is_file():
-                        current = destination.stat()
-                        if current.st_size == source_stat.st_size \
-                                and current.st_mtime > source_stat.st_mtime:
-                            continue
-                except OSError:
-                    pass
-                try:
-                    _clear_readonly(destination)
-                    shutil.copy2(str(source), str(destination))
-                except OSError:
-                    continue
-                _clear_readonly(destination)
-                if self.ini_settings:
-                    _patch_ini_file(destination, self.ini_settings)
-                    _patch_ini_file(source, self.ini_settings)
-                adopted.append(name)
-        if adopted:
-            lines.append(
-                "the settings chosen in the launcher are moved next to the "
-                "exe (it writes them into the redirected profile): "
-                + ", ".join(sorted(set(adopted))))
-        return lines
-
-
 def merge_saves(source: Path, destination: Path,
                 patterns: Sequence[str] = ()) -> "list[str]":
     """Копирует то, чего в приёмнике нет или что там старее.
@@ -1394,12 +784,11 @@ def merge_saves(source: Path, destination: Path,
             try:
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
                 if dst_file.exists():
-                    _clear_readonly(dst_file)
+                    try:
+                        dst_file.chmod(dst_file.stat().st_mode | 0o200)
+                    except OSError:
+                        pass
                 shutil.copy2(str(src_file), str(dst_file))
-                # copy2 preserves the source's read-only flag. Clear it after
-                # the copy so a Fallout.ini copied from a locked profile stays
-                # editable in the portable store.
-                _clear_readonly(dst_file)
             except OSError:
                 continue
             copied.append(rel)
@@ -1457,14 +846,7 @@ class SharedSaveSession:
         self.portable_profile = self.data_dir / "User"
         self.host_profile, self.host_documents = self._resolve_host()
         self.two_way = self._load_state()
-        self.settings_imported = self._load_settings_imported()
         self.entries = self._configured_entries()
-        self.has_legacy_ini_sync = (
-            self.enabled and self.mode.casefold() == "inplace"
-            and any(_is_ini_pattern(pattern)
-                    for entry in self.entries
-                    for pattern in entry.get("patterns", []))
-        )
 
     # -- настоящий профиль пользователя ------------------------------------
     def _resolve_host(self) -> "tuple[Optional[Path], Optional[Path]]":
@@ -1530,21 +912,12 @@ class SharedSaveSession:
         except (OSError, ValueError, AttributeError):
             return set()
 
-    def _load_settings_imported(self) -> bool:
-        try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-            return bool(data.get("settings_imported", False))
-        except (OSError, ValueError, AttributeError):
-            return False
-
     def _save_state(self) -> None:
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             self.state_file.write_text(
-                json.dumps({
-                    "two_way": sorted(self.two_way),
-                    "settings_imported": self.settings_imported,
-                }, ensure_ascii=False),
+                json.dumps({"two_way": sorted(self.two_way)},
+                           ensure_ascii=False),
                 encoding="utf-8")
         except OSError:
             pass
@@ -1629,89 +1002,6 @@ class SharedSaveSession:
     def _two_way(self, entry: Dict[str, Any]) -> bool:
         return entry["direction"] == "both" or entry["name"] in self.two_way
 
-    def _runtime_patterns(self, entry: Dict[str, Any]) -> list[str]:
-        return _runtime_save_patterns(entry, self.mode)
-
-    def prepare_settings(self) -> "list[str]":
-        """Ensure portable INI files can be edited by the current user.
-
-        Returns the names of the files that were still marked read-only and
-        had the flag removed. That is not cosmetics: the game's own launcher
-        rewrites its INI files on every press of "Play", and a file it cannot
-        write makes it loop forever (it closes and opens again, over and
-        over). A read-only INI usually arrives from the profile - Bethesda's
-        games mark their settings read-only when they exit - or from a manual
-        copy the user made by hand.
-        """
-        candidates: list[tuple[Path, "Optional[int]"]] = []
-        for entry in self.entries:
-            store = self.root.joinpath(*entry["store"].split("/"))
-            inplace = self.mode.casefold() == "inplace"
-            # In inplace mode the store IS the game folder: it can be huge,
-            # so the walk is depth-limited (INI files live next to the exe,
-            # a repack may nest them one level deeper).
-            candidates.append((store, 2 if inplace else None))
-            portable = str(entry.get("portable", "")).replace("\\", "/")
-            if portable:
-                local_copy = self.root.joinpath(
-                    *(part for part in portable.split("/") if part))
-                if _inside(local_copy, self.root):
-                    candidates.append((local_copy, None))
-
-        # Also cover portable Documents when synchronization is disabled and
-        # there are no per-game directories in the config. With entries above,
-        # scanning all of My Games on every launch is unnecessary.
-        roots = (self.roots or list(_SAVE_ROOTS)) if not self.entries else []
-        for root in roots:
-            relative = str(root).replace("\\", "/").strip("/")
-            local_root = self.portable_profile.joinpath(
-                *(part for part in relative.split("/") if part))
-            if _inside(local_root, self.root):
-                candidates.append((local_root, None))
-
-        seen: set[tuple[str, "Optional[int]"]] = set()
-        repaired: "list[str]" = []
-        for directory, max_depth in candidates:
-            try:
-                key = (os.path.normcase(str(directory.resolve())), max_depth)
-            except OSError:
-                key = (os.path.normcase(str(directory)), max_depth)
-            if key in seen:
-                continue
-            seen.add(key)
-            repaired.extend(
-                _make_ini_files_writable(directory, max_depth=max_depth))
-        return repaired
-
-    def _import_legacy_settings_once(self) -> "list[str]":
-        """Import INIs once from old Gamebryo portables, then stop syncing them.
-
-        Previous configs included ``*.ini`` in their save-sync rules. Keep their
-        existing hand-edited profile files useful on upgrade, but record the
-        migration so an older duplicate can never overwrite future edits.
-        """
-        if not self.has_legacy_ini_sync or self.settings_imported:
-            return []
-        report: "list[str]" = []
-        for entry in self.entries:
-            patterns = [str(pattern) for pattern in entry.get("patterns", [])
-                        if _is_ini_pattern(pattern)]
-            if not patterns:
-                continue
-            store = self.root.joinpath(*entry["store"].split("/"))
-            for satellite in self._satellites(entry):
-                copied = merge_saves(satellite, store, patterns)
-                if copied:
-                    report.append(
-                        f"{entry['name']}: imported {len(copied)} INI file(s) "
-                        f"once from {satellite}; future launches keep the "
-                        "game-folder settings unchanged")
-        # Mark even an empty first pass: from now on only the canonical INIs
-        # beside the game executable are authoritative.
-        self.settings_imported = True
-        self._save_state()
-        return report
-
     # -- синхронизация ------------------------------------------------------
     def pull(self) -> "list[str]":
         """Забрать в портатив всё, что новее, из папок профиля."""
@@ -1721,8 +1011,7 @@ class SharedSaveSession:
         for entry in self._all_entries():
             store = self.root.joinpath(*entry["store"].split("/"))
             for satellite in self._satellites(entry):
-                copied = merge_saves(satellite, store,
-                                     self._runtime_patterns(entry))
+                copied = merge_saves(satellite, store, entry["patterns"])
                 if copied:
                     report.append(
                         f"{entry['name']}: {len(copied)} file(s) taken into "
@@ -1743,39 +1032,15 @@ class SharedSaveSession:
             for satellite in self._satellites(entry):
                 # Чужой профиль не трогаем, пока отдавать нечего: пустая
                 # папка в чужом Documents - это след, которого быть не должно.
-                copied = merge_saves(store, satellite,
-                                     self._runtime_patterns(entry))
+                copied = merge_saves(store, satellite, entry["patterns"])
                 if copied:
                     report.append(
                         f"{entry['name']}: {len(copied)} file(s) written back "
                         f"to {satellite}")
         return report
 
-    def _repair_report(self, repaired: "list[str]") -> "list[str]":
-        """Human-readable note about settings files that were read-only.
-
-        Bethesda launchers (Fallout 3/New Vegas, Oblivion) rewrite their INI
-        files every time "Play" is pressed. When such a file is read-only the
-        write fails and the launcher loops: it closes, opens again, closes
-        again... Removing the flag is therefore the cure for that exact
-        complaint, and the user deserves to know it happened.
-        """
-        if not repaired:
-            return []
-        names = ", ".join(sorted(set(repaired)))
-        return [
-            f"settings files were read-only and are writable now ({names}): "
-            "otherwise the game's own launcher would close and reopen itself "
-            "in an endless loop"
-        ]
-
     def before(self) -> "list[str]":
-        report = self._repair_report(self.prepare_settings())
-        if not self.enabled:
-            return report
-        report.extend(self._import_legacy_settings_once())
-        report.extend(self.pull())
-        return report
+        return self.pull()
 
     def after(self) -> "list[str]":
         """После выхода: забрать новое и, если нужно, отдать обратно.
@@ -1786,19 +1051,14 @@ class SharedSaveSession:
         режим навсегда — иначе прямой запуск так и не увидел бы сейвы,
         сделанные через лончер.
         """
-        # Игра могла снова пометить свои INI «только для чтения» — так
-        # Bethesda'вские движки прощаются с настройками. Снимаем флаг сразу:
-        # иначе следующий запуск (в том числе прямой двойной клик по
-        # оригинальному exe) упрётся в недоступный для записи конфиг.
-        report = self._repair_report(self.prepare_settings())
         if not self.enabled:
-            return report
+            return []
+        report: "list[str]" = []
         changed = False
         for entry in self._all_entries():
             store = self.root.joinpath(*entry["store"].split("/"))
             for satellite in self._satellites(entry):
-                copied = merge_saves(satellite, store,
-                                     self._runtime_patterns(entry))
+                copied = merge_saves(satellite, store, entry["patterns"])
                 if not copied:
                     continue
                 report.append(
@@ -2068,11 +1328,6 @@ def _select_target(cfg: Dict[str, Any], arguments: Sequence[str]
         arg = str(arguments[index])
         lowered = arg.casefold()
         if lowered == "--elevated":
-            index += 1
-            continue
-        if lowered in ("--no-loop-break", "--quiet", "/quiet", "-q"):
-            # Ключи самого портативного лончера: программе они не нужны и
-            # передавать их ей нельзя.
             index += 1
             continue
         if lowered == "--machine-registry":
@@ -3513,217 +2768,6 @@ def sweep_stale_session(root: Path, cfg: "Dict[str, Any]") -> "list[str]":
     return done
 
 
-class LauncherRestartWatcher:
-    """Считает перезапуски лаунчера игры и распознаёт «карусель».
-
-    Признак настоящего цикла: лаунчер закрывается и **сам** запускается
-    снова, то есть новый экземпляр появляется почти сразу после исчезновения
-    предыдущего (включая паузы на диалоговые окна русификации или выбора DLC).
-    Если пользователь просто открывает лончер повторно вручную,
-    между экземплярами проходит заметно больше времени — такие запуски в
-    счёт не идут, и лончер портатива не вмешивается в ручную работу с
-    настройками игры.
-    """
-
-    def __init__(self, *, max_restarts: int = 3, window: float = 120.0,
-                 relaunch_grace: float = 30.0,
-                 clock=time.monotonic) -> None:
-        self.max_restarts = max(1, int(max_restarts))
-        self.window = max(1.0, float(window))
-        self.relaunch_grace = max(0.5, float(relaunch_grace))
-        self.clock = clock
-        self.starts: "list[float]" = []
-        self.quick: "list[float]" = []
-        self.last_closed: Optional[float] = None
-        self.game_running = False
-
-    def opened(self, when: Optional[float] = None) -> None:
-        """Экземпляр лаунчера появился."""
-        now = self.clock() if when is None else when
-        self.starts.append(now)
-        if self.last_closed is not None \
-                and now - self.last_closed <= self.relaunch_grace:
-            self.quick.append(now)
-        self.last_closed = None
-
-    def closed(self, when: Optional[float] = None) -> None:
-        """Экземпляр лаунчера исчез."""
-        self.last_closed = self.clock() if when is None else when
-
-    def set_game_running(self, running: bool) -> None:
-        """Настоящая игра в данный момент активна."""
-        self.game_running = running
-
-    def note_game_started(self) -> None:
-        """Настоящая игра пошла: лаунчер сделал своё дело."""
-        self.game_running = True
-
-    @property
-    def game_started(self) -> bool:
-        return self.game_running
-
-    def restarts(self, when: Optional[float] = None) -> int:
-        """Сколько самопроизвольных перезапусков уложилось в окно.
-
-        Основной признак — закрытие и почти мгновенное появление нового
-        экземпляра. Дополнительный — несколько запусков подряд с интервалом
-        меньше ``relaunch_grace``: так выглядит цикл, в котором новый
-        экземпляр успевает подняться раньше, чем исчезнет предыдущий, и
-        момента «закрылся» наблюдатель не видит. Ручное открытие лончера
-        повторно сюда не попадает: человек делает паузу заметно дольше.
-        """
-        now = self.clock() if when is None else when
-        self.starts = [moment for moment in self.starts
-                       if now - moment <= self.window]
-        self.quick = [moment for moment in self.quick
-                      if now - moment <= self.window]
-        if self.quick:
-            return len(self.quick)
-        if len(self.starts) >= 2 and all(
-                second - first <= self.relaunch_grace
-                for first, second in zip(self.starts, self.starts[1:])):
-            return len(self.starts) - 1
-        return 0
-
-    def loop_detected(self, when: Optional[float] = None) -> bool:
-        return not self.game_running and self.restarts(when) >= self.max_restarts
-
-
-class _SessionOutcome:
-    """Итог наблюдения за запущенной целью."""
-
-    def __init__(self, code: int = 0) -> None:
-        self.code = code
-        self.restarts = 0
-        self.loop_broken = False
-        self.game_started = False
-        self.notes: "list[str]" = []
-
-
-def _same_image_path(left: Path, right: Path) -> bool:
-    return os.path.normcase(str(left)) == os.path.normcase(str(right))
-
-
-def _process_code(process) -> int:
-    """Код возврата завершившегося процесса.
-
-    Терпимо к тестовым двойникам: у них ``poll()`` может быть заглушкой, а
-    ``returncode`` — не числом. Реальный процесс всегда отдаёт целое.
-    """
-    code = getattr(process, "returncode", 0)
-    return code if isinstance(code, int) else 0
-
-
-def _supervise_launcher(process, *, target: Path, main_target: Optional[Path],
-                        settings: Dict[str, Any], lister,
-                        clock=time.monotonic,
-                        sleep=time.sleep) -> _SessionOutcome:
-    """Ведёт сеанс лаунчера игры и замечает бесконечную «карусель».
-
-    Обычный сеанс заканчивается тогда, когда закрылся запущенный процесс (а
-    если он перед этим передал управление игре — дождаться её должен
-    вызывающий код, как и раньше). Наблюдатель добавляет к этому один
-    сценарий: лаунчер закрывается и **сам** запускается снова, раз за разом,
-    так и не доведя дело до игры. В этом случае сеанс заканчивается с
-    ``loop_broken=True``, и лончер портатива лечит настройки, а игру запускает
-    напрямую — посредник, который зациклился, больше не нужен.
-    """
-    outcome = _SessionOutcome()
-    enabled = bool(settings.get("enabled", True))
-    if main_target is None or _same_image_path(main_target, target):
-        # Лончер не участвует: зацикливаться нечему.
-        enabled = False
-    if not enabled:
-        outcome.code = process.wait()
-        return outcome
-
-    poll = max(0.1, float(settings.get("poll_interval", 0.5) or 0.5))
-    watcher = LauncherRestartWatcher(
-        max_restarts=int(settings.get("max_restarts", 3) or 3),
-        window=float(settings.get("window", 120.0) or 120.0),
-        relaunch_grace=float(settings.get("relaunch_grace", 30.0) or 30.0),
-        clock=clock,
-    )
-    target_key = os.path.normcase(str(target))
-    main_key = os.path.normcase(str(main_target))
-    known: "set[int]" = set()
-
-    while True:
-        try:
-            images = [(int(pid), os.path.normcase(str(image)))
-                      for pid, image in lister()]
-        except Exception:  # noqa: BLE001 - наблюдение не должно мешать запуску
-            images = []
-        target_pids = {pid for pid, key in images if key == target_key}
-        main_running = any(key == main_key for _, key in images)
-
-        watcher.set_game_running(main_running)
-        if main_running:
-            outcome.game_started = True
-
-        # Считаются именно НОВЫЕ экземпляры: цикл лаунчера — это появление
-        # его копии после того, как предыдущая закрылась.
-        for _pid in sorted(target_pids - known):
-            watcher.opened()
-        if not target_pids and known:
-            watcher.closed()
-        known = target_pids
-
-        if watcher.loop_detected():
-            outcome.loop_broken = True
-            outcome.restarts = watcher.restarts()
-            outcome.notes.append(
-                f"{target.name} restarted {outcome.restarts} time(s) in a row "
-                f"without {main_target.name} ever starting")
-            code = process.poll()
-            outcome.code = 0 if code is None else _process_code(process)
-            return outcome
-
-        if process.poll() is not None:
-            # Запущенный процесс закрылся. Если игра, которой он передал
-            # управление, ещё работает, её дождётся вызывающий код — как и
-            # раньше, до появления наблюдателя.
-            outcome.code = _process_code(process)
-            outcome.restarts = watcher.restarts()
-            outcome.game_started = watcher.game_running or outcome.game_started
-            if outcome.restarts:
-                outcome.notes.append(
-                    f"the launcher was restarted {outcome.restarts} time(s) "
-                    "but the game did start")
-            return outcome
-        sleep(poll)
-
-
-def _loop_guard_settings(cfg: Dict[str, Any], arguments: Sequence[str]
-                         ) -> Dict[str, Any]:
-    """Настройки наблюдателя за циклом лаунчера.
-
-    Выключается ключом ``--no-loop-break`` и переменной окружения
-    ``PORTABLE_NO_LOOP_BREAK=1``: если пользователь сознательно работает с
-    лаунчером (например, подбирает графику и нажимает «Играть» много раз),
-    вмешательство ему не нужно.
-    """
-    section = cfg.get("loop_guard")
-    settings = dict(section) if isinstance(section, dict) else {}
-    disabled = any(str(arg).casefold() in ("--no-loop-break",)
-                   for arg in arguments)
-    if os.environ.get("PORTABLE_NO_LOOP_BREAK", "").strip() in ("1", "true",
-                                                                "yes"):
-        disabled = True
-    if disabled:
-        settings["enabled"] = False
-    settings.setdefault("enabled", True)
-    settings.setdefault("relaunch_grace", 30.0)
-    return settings
-
-
-def _is_quiet(arguments: Sequence[str]) -> bool:
-    if any(str(arg).casefold() in ("--quiet", "/quiet", "-q")
-           for arg in arguments):
-        return True
-    return os.environ.get("PORTABLE_QUIET", "").strip() in ("1", "true", "yes")
-
-
 def run(argv: Optional[Sequence[str]] = None) -> int:
     root = find_portable_root()
     with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
@@ -3815,13 +2859,6 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     shell_folders = ShellFolderSession(root, cfg)
     registry = RegistrySession(root, cfg)
     shutdown = shutdown_settings(cfg)
-    # Настройки игры (Fallout.ini и его родня) — наше слабое место: лаунчер
-    # Bethesda переписывает их при каждом нажатии «Играть» и уходит в
-    # бесконечный цикл, когда это не удаётся. Проверяем и лечим их до старта,
-    # а не после того, как пользователь соберёт полсотни перезапусков.
-    game_settings = GameSettingsGuard(root, cfg)
-    quiet = _is_quiet(raw_arguments)
-    session_started = time.time()
     # Kill-on-close job: nothing started from the portable folder may outlive
     # this launcher, otherwise the user cannot delete the folder afterwards.
     job = _JobObject()
@@ -3834,27 +2871,12 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 *[str(arg) for arg in cfg.get("target_args", [])],
                 *forwarded,
             ]
-            for line in game_settings.repair():
-                _run_log(root, "game settings: " + line)
-            main_target = _as_relative_path(root, str(cfg.get(
-                "target_exe_rel", ""))) if cfg.get("target_exe_rel") else None
-            guard = _loop_guard_settings(cfg, raw_arguments)
-            if guard.get("enabled", True) and main_target is not None \
-                    and not _same_image_path(main_target, target):
-                _run_log(root, "watching " + target.name
-                         + " for an endless restart loop (the game "
-                           "executable is the way out: "
-                         + main_target.name + ")")
             _run_log(root, "start: " + subprocess.list2cmdline(command)
                      + f" (cwd={target.parent}, elevated={_is_elevated()}, "
                      + f"job={'yes' if job.handle else 'no'})")
             try:
-                process = _spawn_target(command, str(target.parent), env, job)
-                outcome = _supervise_launcher(
-                    process, target=target, main_target=main_target,
-                    settings=guard,
-                    lister=lambda: _portable_process_list(root))
-                code = outcome.code
+                code = _spawn_target(
+                    command, str(target.parent), env, job).wait()
             except OSError as exc:
                 if getattr(exc, "winerror", None) != 14001:
                     raise
@@ -3878,68 +2900,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                     "с одним UAC-запросом. Подробности и ссылки — в файле "
                     "redistributables.txt.")
                 return 14001
-
-            if outcome.loop_broken and main_target is not None \
-                    and not main_target.is_file():
-                # Игру запустить напрямую не из чего: вместо вмешательства
-                # честно называем это в журнале и оставляем пользователю его
-                # лаунчер.
-                _run_log(root, "the launcher restarts in a loop, but "
-                               + str(main_target) + " is missing - cannot "
-                               "start the game directly")
-                outcome.loop_broken = False
-            if outcome.loop_broken and main_target is not None:
-                # «Карусель» лаунчера: он закрывается и открывается снова,
-                # так и не доведя дело до игры. Бесконечности здесь больше
-                # нет — лончер портатива называет причину, лечит настройки и
-                # запускает игру напрямую.
-                _run_log(root, "the launcher restart loop is detected: "
-                               + "; ".join(outcome.notes))
-                for line in game_settings.repair():
-                    _run_log(root, "game settings: " + line)
-                _run_log(root, "breaking the loop: starting "
-                               + main_target.name + " directly")
-                if not quiet:
-                    reason = ("\n".join("• " + item
-                                        for item in game_settings.blockers[:4])
-                              or "настройки игры не удалось сохранить — "
-                                 "лаунчер не смог их переписать")
-                    _show_warning(
-                        f"{target.name} закрывается и запускается заново, не "
-                        "доводя дело до игры: это цикл лаунчера, а не "
-                        "проблема портатива.\n\n"
-                        f"Причина: {reason}.\n\n"
-                        "Портативный лончер уже прервал цикл и запускает игру "
-                        "напрямую, без посредника.\n"
-                        "Подробности — в PortableData\\launcher-run.log; "
-                        "проверить и починить настройки можно командой:\n"
-                        f"    {Path(sys.executable).name if getattr(sys, 'frozen', False) else 'LaunchPortable.exe'} --doctor")
-                direct = [str(main_target),
-                          *[str(arg) for arg in cfg.get("target_args", [])]]
-                direct.extend(arg for arg in forwarded
-                              if str(arg).casefold() not in
-                              ("--launcher", "--machine-registry"))
-                try:
-                    _run_log(root, "start: " + subprocess.list2cmdline(direct)
-                             + f" (direct, cwd={main_target.parent})")
-                    direct_process = _spawn_target(
-                        direct, str(main_target.parent), env, job)
-                    code = direct_process.wait()
-                except OSError as exc:
-                    _run_log(root, "could not start " + main_target.name
-                                   + f" directly ({exc})")
-                    code = 1
-                else:
-                    _run_log(root, f"{main_target.name} exited with code "
-                                   f"{code}")
-                loop_broken = True
-            else:
-                for note in outcome.notes:
-                    _run_log(root, note)
-                loop_broken = False
-
-            if not loop_broken:
-                _run_log(root, f"{target.name} exited with code {code}")
+            _run_log(root, f"{target.name} exited with code {code}")
             # The official launcher usually starts the game and exits at once.
             # Restoring the registry right now would pull the install keys out
             # from under the game that is just starting, so wait for it.
@@ -3975,22 +2936,6 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 _run_log(root, "shared saves: " + line)
         except OSError as exc:
             _run_log(root, f"shared saves: synchronisation failed ({exc})")
-        # Лаунчер Bethesda пишет выбранные настройки в профиль, а движок
-        # читает INI рядом с exe. Переносим только то, что переписано в этом
-        # сеансе, чтобы настройки, выбранные в лаунчере, дошли до игры.
-        try:
-            for line in game_settings.adopt(session_started):
-                _run_log(root, "game settings: " + line)
-        except OSError as exc:
-            _run_log(root, f"game settings: adoption failed ({exc})")
-        # Игра при выходе снова помечает свои INI «только для чтения» —
-        # снимаем флаг сразу, иначе следующий запуск (в том числе прямой
-        # двойной клик по exe) упрётся в недоступный для записи конфиг.
-        try:
-            for line in game_settings.repair():
-                _run_log(root, "game settings: " + line)
-        except OSError as exc:
-            _run_log(root, f"game settings: repair failed ({exc})")
         # Временная папка портатива не должна пережить сеанс: именно
         # распакованные в неё файлы (шрифты установщика, DLL «помощников»)
         # потом подхватывает система и держит их месяцами.
@@ -4111,55 +3056,6 @@ def _retry_stop_elevated(root: Path, reason: str) -> int:
     return 1
 
 
-def doctor(root: Optional[Path] = None, quiet: bool = False) -> int:
-    """``LaunchPortable.exe --doctor``: проверить и починить настройки игры.
-
-    Отдельный режим нужен ровно для одной ситуации: лаунчер игры зациклился
-    (закрывается и открывается), а пересобирать портатив не хочется. Команда
-    создаёт отсутствующие INI рядом с exe, подтверждает
-    ``bUseMyGamesDirectory=0``/``SLocalSavePath``, снимает «только для чтения»
-    с настроечных файлов и копий в перенаправленном профиле и проверяет запись
-    делом. Итог — в ``PortableData\\launcher-run.log`` и, если что-то лечить
-    нечем, в окне сообщения.
-    """
-    root = root or find_portable_root()
-    with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
-        cfg: Dict[str, Any] = json.load(fh)
-    guard = GameSettingsGuard(root, cfg)
-    if not guard.enabled:
-        _run_log(root, "--doctor: у этого портатива нет отдельного файла "
-                       "настроек игры — проверять нечего")
-        return 0
-    lines = guard.repair()
-    for line in lines:
-        _run_log(root, "game settings: " + line)
-    if not lines:
-        _run_log(root, "game settings: settings are already writable, "
-                       "nothing to fix")
-    if guard.blockers:
-        _run_log(root, "--doctor: настройки записать нельзя: "
-                       + "; ".join(guard.blockers))
-        if not quiet:
-            _show_error(
-                "Настройки игры всё ещё нельзя записать:\n\n"
-                + "\n".join("• " + item for item in guard.blockers[:6])
-                + "\n\nПока это не исправлено, лаунчер игры может "
-                  "зацикливаться на кнопке «Играть». Подробности — в "
-                  "PortableData\\launcher-run.log.")
-        return 1
-    _run_log(root, "--doctor: game settings are ready ("
-                   + (guard.title or "Gamebryo")
-                   + "); the game launcher can save its configuration")
-    if not quiet:
-        _show_warning(
-            "Настройки игры в порядке: файлы рядом с exe созданы, доступны "
-            "для записи и указывают внутрь портатива.\n\n"
-            "Лаунчер игры больше не должен зацикливаться. Если цикл "
-            "повторится, посмотрите PortableData\\launcher-run.log: там "
-            "будет названа причина.")
-    return 0
-
-
 def sync_saves(root: Optional[Path] = None) -> int:
     """``LaunchPortable.exe --sync-saves``: свести сохранения вручную.
 
@@ -4172,11 +3068,9 @@ def sync_saves(root: Optional[Path] = None) -> int:
         cfg: Dict[str, Any] = json.load(fh)
     session = SharedSaveSession(root, cfg)
     if not session.enabled:
-        for line in session._repair_report(session.prepare_settings()):
-            _run_log(root, "shared saves: " + line)
         _run_log(root, "shared saves: disabled for this portable app")
         return 0
-    report = [*session.before(), *session.push()]
+    report = [*session.pull(), *session.push()]
     for line in report:
         _run_log(root, "shared saves: " + line)
     if not report:
@@ -4194,9 +3088,6 @@ def main() -> int:
         if any(str(arg).casefold() in ("--sync-saves", "/sync-saves")
                for arg in sys.argv[1:]):
             return sync_saves(root)
-        if any(str(arg).casefold() in ("--doctor", "/doctor")
-               for arg in sys.argv[1:]):
-            return doctor(root, quiet=_is_quiet(sys.argv[1:]))
         return run()
     except Exception as exc:
         details = f"Не удалось запустить портативную программу.\n\n{exc}"

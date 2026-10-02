@@ -111,9 +111,7 @@ GAME_PROFILES: Tuple[GameProfile, ...] = (
         id="gamebryo-falloutnv",
         title="Fallout: New Vegas",
         executables=("falloutnv.exe", "falloutnvlauncher.exe",
-                     "nvse_loader.exe", "fnv4gb.exe", "falloutlauncher.exe",
-                     "launcher.exe", "falloutnvlauncher_en.exe",
-                     "falloutnvlauncher_gv.exe"),
+                     "nvse_loader.exe", "fnv4gb.exe"),
         default_ini="Fallout_default.ini",
         user_inis=("Fallout.ini", "FalloutPrefs.ini", "FalloutCustom.ini"),
         my_games=("FalloutNV",),
@@ -122,9 +120,7 @@ GAME_PROFILES: Tuple[GameProfile, ...] = (
         id="gamebryo-fallout3",
         title="Fallout 3",
         executables=("fallout3.exe", "fallout3launcher.exe",
-                     "fose_loader.exe", "fallout3ng.exe",
-                     "falloutlauncher.exe", "falloutlaunchersteam.exe",
-                     "launcher.exe"),
+                     "fose_loader.exe", "fallout3ng.exe"),
         default_ini="Fallout_default.ini",
         user_inis=("Fallout.ini", "FalloutPrefs.ini", "FalloutCustom.ini"),
         my_games=("Fallout3",),
@@ -133,29 +129,10 @@ GAME_PROFILES: Tuple[GameProfile, ...] = (
         id="gamebryo-oblivion",
         title="The Elder Scrolls IV: Oblivion",
         executables=("oblivion.exe", "oblivionlauncher.exe",
-                     "obse_loader.exe", "launcher.exe"),
+                     "obse_loader.exe"),
         default_ini="Oblivion_default.ini",
-        user_inis=("Oblivion.ini", "OblivionPrefs.ini"),
+        user_inis=("Oblivion.ini",),
         my_games=("Oblivion",),
-    ),
-    GameProfile(
-        id="gamebryo-skyrim",
-        title="The Elder Scrolls V: Skyrim",
-        executables=("skyrim.exe", "skyrimlauncher.exe", "skse_loader.exe",
-                     "skyrimse.exe", "skyrimselauncher.exe",
-                     "skse64_loader.exe", "skyrimvr.exe", "launcher.exe"),
-        default_ini="Skyrim_default.ini",
-        user_inis=("Skyrim.ini", "SkyrimPrefs.ini", "SkyrimCustom.ini"),
-        my_games=("Skyrim", "Skyrim Special Edition", "Skyrim VR"),
-    ),
-    GameProfile(
-        id="gamebryo-fallout4",
-        title="Fallout 4",
-        executables=("fallout4.exe", "fallout4launcher.exe", "f4se_loader.exe",
-                     "fallout4vr.exe", "launcher.exe"),
-        default_ini="Fallout4_default.ini",
-        user_inis=("Fallout4.ini", "Fallout4Prefs.ini", "Fallout4Custom.ini"),
-        my_games=("Fallout4", "Fallout4VR"),
     ),
 )
 
@@ -246,11 +223,6 @@ class SaveSetup:
     patched: List[str] = field(default_factory=list)
     #: Сколько файлов перенесено в общее хранилище при сборке.
     migrated: int = 0
-    #: Готовая секция ``game_settings`` для ``launcher_config.json``: по ней
-    #: лончер в runtime создаёт сквозные INI, подтверждает portable-ключи и
-    #: проверяет, что настройки вообще можно записать (см. ``runtime_settings``
-    #: и ``prepare_game_settings``).
-    game_settings: Dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -260,7 +232,6 @@ class SaveSetup:
             "title": self.title,
             "store": _posix(self.store),
             "entries": [e.to_dict() for e in self.entries],
-            "game_settings": self.game_settings,
             "discovery": {
                 "enabled": self.discovery,
                 "tokens": list(self.tokens),
@@ -287,45 +258,11 @@ class SaveSetup:
             title=str(data.get("title", "")),
             store=_posix(str(data.get("store", ""))),
             entries=entries,
-            game_settings=(data.get("game_settings")
-                           if isinstance(data.get("game_settings"), dict)
-                           else {}),
             tokens=[str(t) for t in tokens] if isinstance(tokens, list) else [],
             roots=[str(r) for r in roots] if isinstance(roots, list)
             else list(WATCHED_ROOTS),
             discovery=bool(discovery.get("enabled", True)),
         )
-
-
-def runtime_settings(setup: SaveSetup,
-                     profile: Optional[GameProfile]) -> Dict[str, object]:
-    """Секция ``game_settings`` для ``launcher_config.json``.
-
-    Лончер не должен знать таблицу игр: он получает готовый список INI,
-    ключей и каталогов профиля. Благодаря этому проверка и ремонт настроек
-    работают в runtime — перед каждым запуском и после него, — а не только в
-    момент сборки. Именно runtime-ремонт закрывает исходную жалобу: лаунчер
-    Bethesda переписывает INI при каждом нажатии «Играть», и файл, который
-    нельзя перезаписать, заставляет его закрываться и открываться снова.
-    """
-    if not setup.enabled or setup.mode != "inplace" or profile is None:
-        return {"enabled": False}
-    profile_dirs: List[str] = []
-    for entry in setup.entries:
-        if entry.portable and entry.portable not in profile_dirs:
-            profile_dirs.append(_posix(entry.portable))
-    return {
-        "enabled": True,
-        "title": profile.title,
-        "profile": profile.id,
-        "store": _posix(setup.store),
-        "default_ini": profile.default_ini,
-        "user_inis": list(profile.user_inis),
-        "ini_settings": [[section, key, value]
-                         for section, key, value in profile.ini_settings],
-        "saves_dir": profile.saves_dir,
-        "profile_dirs": profile_dirs,
-    }
 
 
 # --- вспомогательное ----------------------------------------------------------
@@ -441,335 +378,14 @@ def path_allowed(rel_path: str, compiled: Sequence[re.Pattern]) -> bool:
     return any(rule.match(text) for rule in compiled)
 
 
-def _clear_readonly(path: str) -> bool:
-    """Fallout.ini часто помечен «только для чтения» — снимаем флаг.
-
-    Возвращает True, если флаг действительно был снят: вызывающий код
-    сообщает об этом пользователю, потому что «только для чтения» в
-    настроечном файле — причина бесконечного цикла лаунчеров Bethesda
-    (закрылся — открылся — закрылся…).
-    """
+def _clear_readonly(path: str) -> None:
+    """Fallout.ini часто помечен «только для чтения» — снимаем флаг."""
     try:
         mode = os.stat(path).st_mode
         if not mode & stat.S_IWRITE:
             os.chmod(path, mode | stat.S_IWRITE)
-            return True
     except OSError:
         pass
-    return False
-
-
-def create_missing_user_inis(store_dir: str, profile: GameProfile) -> List[str]:
-    """Создаёт рядом с exe пользовательские INI, которых там ещё нет.
-
-    У игр движка Gamebryo (Fallout 3/New Vegas, Oblivion) шаблон
-    ``<Игра>_default.ini`` — только источник значений по умолчанию: движок
-    создаёт из него пользовательские ``<Игра>.ini`` и ``<Игра>Prefs.ini`` и
-    дальше читает уже их. Пока этих файлов нет рядом с exe, сквозного
-    конфигурационного файла не существует: игра кладёт свой INI в профиль
-    (в портативе — в перенаправленные ``PortableData\\User\\Documents\\My
-    Games\\...``), и настройки перестают быть общими для всех способов
-    запуска. Пользователь видит пустую папку ``App`` и начинает копировать
-    INI руками — а копия приносит флаг «только для чтения», и лаунчер игры
-    уходит в бесконечный цикл.
-
-    Поэтому отсутствующие пользовательские INI создаются из шаблона сразу
-    при сборке — ровно то, что игра сделала бы при первом запуске, но рядом
-    с exe и с уже включённым хранением данных внутри портатива.
-
-    Возвращает имена созданных файлов (без пути).
-    """
-    created: List[str] = []
-    default_path = os.path.join(store_dir, profile.default_ini)
-    if not os.path.isfile(default_path):
-        return created
-    for name in profile.user_inis:
-        candidate = os.path.join(store_dir, name)
-        if os.path.isfile(candidate):
-            continue
-        try:
-            # copyfile, а не copy2: копирование атрибутов принесло бы флаг
-            # «только для чтения» с шаблона, который установщики игр любят
-            # помечать только для чтения.
-            shutil.copyfile(default_path, candidate)
-        except OSError:
-            continue
-        _clear_readonly(candidate)
-        created.append(name)
-    return created
-
-
-def make_inis_writable(store_dir: str, max_depth: int = 2) -> List[str]:
-    """Снимает «только для чтения» со всех INI в папке игры.
-
-    Установщики нередко оставляют настроечные файлы «только для чтения»
-    (``Fallout_default.ini`` приходит таким от Bethesda). Для файлов, которые
-    правит сам Portablizer, флаг снимается точечно, но INI, лежащие глубже
-    или не тронутые сборкой, оставались недоступны для записи — а лаунчер
-    игры переписывает свои настройки при каждом нажатии «Играть».
-
-    Возвращает имена файлов, с которых флаг был снят.
-    """
-    repaired: List[str] = []
-    if not os.path.isdir(store_dir):
-        return repaired
-    for root, dirs, files in os.walk(store_dir, followlinks=False):
-        dirs[:] = [name for name in dirs
-                   if not name.startswith((".git", "$"))]
-        relative = os.path.relpath(root, store_dir)
-        depth = 0 if relative == "." else relative.count(os.sep) + 1
-        if depth >= max_depth:
-            dirs[:] = []
-        for name in files:
-            if not name.casefold().endswith(".ini"):
-                continue
-            if _clear_readonly(os.path.join(root, name)):
-                repaired.append(_posix(os.path.relpath(os.path.join(root,
-                                                                    name),
-                                                        store_dir)))
-    return repaired
-
-
-#: Кроме ``*.ini`` лаунчеры Bethesda переписывают рядом с настройками ещё и
-#: ``RendererInfo.txt`` (отчёт «Detecting Hardware»). Файл «только для чтения»
-#: в этом месте даёт ровно тот же бесконечный цикл «закрылся — открылся…»,
-#: поэтому он обслуживается вместе с INI.
-SETTINGS_EXTRA_FILES: Tuple[str, ...] = ("rendererinfo.txt",)
-
-#: Потолок числа файлов в отчёте о настройках: папка игры может содержать
-#: десятки тысяч файлов, а пользователю нужен короткий вердикт.
-MAX_SETTINGS_FILES = 400
-
-
-def is_settings_file(name: str) -> bool:
-    """Настроечный ли это файл: ``*.ini`` или отчёт движка."""
-    lowered = str(name).casefold()
-    return lowered.endswith(".ini") or lowered in SETTINGS_EXTRA_FILES
-
-
-def iter_settings_files(directory: str,
-                        max_depth: Optional[int] = None) -> List[str]:
-    """Абсолютные пути настроечных файлов в каталоге (``*.ini`` + отчёт).
-
-    ``max_depth`` ограничивает обход относительно ``directory`` (0 — только
-    собственные файлы каталога): в папке игры десятки тысяч файлов, и обходить
-    её целиком на каждом запуске нельзя.
-    """
-    found: List[str] = []
-    if not directory or not os.path.isdir(directory):
-        return found
-    for root, dirs, files in os.walk(directory, followlinks=False):
-        dirs[:] = [name for name in dirs
-                   if not name.startswith((".", "$"))]
-        if max_depth is not None:
-            relative = os.path.relpath(root, directory)
-            depth = 0 if relative == "." else relative.count(os.sep) + 1
-            if depth >= max_depth:
-                dirs[:] = []
-        for name in files:
-            if is_settings_file(name):
-                found.append(os.path.join(root, name))
-                if len(found) >= MAX_SETTINGS_FILES:
-                    return found
-    return found
-
-
-def write_probe(path: str) -> str:
-    """Проверяет записываемость настроечного файла делом, а не атрибутом.
-
-    Атрибут «только для чтения» — не единственная причина, по которой лаунчер
-    игры не может сохранить свои настройки: файл может быть занят, лежать в
-    каталоге с запретом NTFS, а самого каталога может не быть. Все эти случаи
-    выглядят для пользователя одинаково — бесконечный цикл лаунчера, — и все
-    они должны быть названы в журнале.
-
-    Возвращает пустую строку, когда запись возможна, иначе — человеческую
-    причину отказа.
-    """
-    if not path:
-        return ""
-    if os.path.isdir(path):
-        return (f"{path}: на месте файла папка — запись невозможна, "
-                "переименуйте папку и создайте файл заново")
-    parent = os.path.dirname(path) or "."
-    if os.path.exists(path):
-        try:
-            with open(path, "r+b"):
-                pass
-        except PermissionError:
-            return (f"{path}: файл нельзя открыть на запись (атрибут «только "
-                    "для чтения» или запрет прав NTFS)")
-        except OSError as exc:
-            return f"{path}: запись невозможна ({exc})"
-        return ""
-    if not os.path.isdir(parent):
-        return (f"{parent}: папки настроек нет, и создать её не удалось — "
-                "лаунчер игры не сможет сохранить конфигурацию")
-    probe = os.path.join(parent, f".portablizer-write-probe-{os.getpid()}.tmp")
-    try:
-        with open(probe, "w", encoding="ascii") as handle:
-            handle.write("probe")
-        os.remove(probe)
-    except OSError as exc:
-        return (f"{parent}: в папке нельзя создавать файлы ({exc}) — "
-                "конфигурацию сохранить некуда")
-    return ""
-
-
-@dataclass
-class GameSettingsReport:
-    """Итог проверки и ремонта настроечных файлов.
-
-    ``created``   — пользовательские INI, созданные из шаблона;
-    ``patched``   — файлы, которым выставили portable-ключи (относительно
-                    каталога настроек);
-    ``unlocked``  — файлы, у которых сняли «только для чтения»;
-    ``blockers``  — причины, по которым запись всё ещё невозможна: именно они
-                    превращают нажатие «Играть» в бесконечный цикл лаунчера;
-    ``writable``  — можно ли считать (после ремонта) запись рабочей.
-    """
-
-    created: List[str] = field(default_factory=list)
-    patched: List[str] = field(default_factory=list)
-    unlocked: List[str] = field(default_factory=list)
-    blockers: List[str] = field(default_factory=list)
-    checked: int = 0
-    writable: bool = True
-
-def prepare_game_settings(store_dir: str, profile: GameProfile,
-                          extra_dirs: Sequence[str] = (),
-                          create: bool = True, patch: bool = True,
-                          unlock: bool = True,
-                          probe: bool = True) -> GameSettingsReport:
-    """Приводит настройки игры в рабочее состояние и проверяет запись.
-
-    Одна операция на все случаи жизни — сборка, «Обновить лончер», запуск и
-    ремонт по кнопке:
-
-    1. отсутствующие пользовательские INI создаются из шаблона
-       (``create_missing_user_inis``);
-    2. в них (и в шаблоне) выставляются portable-ключи
-       ``bUseMyGamesDirectory=0`` и ``SLocalSavePath=Saves\\``;
-    3. с настроечных файлов и их копий в перенаправленном профиле снимается
-       «только для чтения» — включая ``RendererInfo.txt``;
-    4. запись проверяется делом (``write_probe``), и причина отказа
-       возвращается в ``blockers``.
-
-    Именно (3) и (4) закрывают исходную жалобу: лаунчер Fallout: New Vegas
-    переписывает свои INI при каждом нажатии «Играть», и файл, который нельзя
-    перезаписать, заставляет его закрываться и открываться снова.
-
-    ``extra_dirs`` — дополнительные каталоги настроек (копии в
-    перенаправленном профиле портатива), которые тоже должны быть записываемы.
-    """
-    report = GameSettingsReport()
-    if not store_dir or not os.path.isdir(store_dir):
-        report.writable = False
-        report.blockers.append(
-            f"{store_dir or 'папка игры'}: каталога нет — настройки сохранить "
-            "некуда")
-        return report
-
-    if create:
-        report.created = create_missing_user_inis(store_dir, profile)
-
-    if patch:
-        for name in (profile.default_ini, *profile.user_inis):
-            candidate = os.path.join(store_dir, name)
-            if not os.path.isfile(candidate):
-                continue
-            if patch_ini_file(candidate, profile.ini_settings):
-                report.patched.append(name)
-
-    # Синхронизация и создание настроечных файлов в каталогах профиля
-    for directory in extra_dirs:
-        if not directory:
-            continue
-        try:
-            os.makedirs(directory, exist_ok=True)
-        except OSError:
-            continue
-        for name in profile.user_inis:
-            src = os.path.join(store_dir, name)
-            dst = os.path.join(directory, name)
-            if not os.path.isfile(src):
-                continue
-            if not os.path.isfile(dst):
-                try:
-                    shutil.copyfile(src, dst)
-                    _clear_readonly(dst)
-                    if patch and profile.ini_settings:
-                        patch_ini_file(dst, profile.ini_settings)
-                except OSError:
-                    pass
-            else:
-                try:
-                    src_stat = os.stat(src)
-                    dst_stat = os.stat(dst)
-                    if src_stat.st_mtime > dst_stat.st_mtime + MTIME_TOLERANCE:
-                        _clear_readonly(dst)
-                        shutil.copy2(src, dst)
-                        _clear_readonly(dst)
-                        if patch and profile.ini_settings:
-                            patch_ini_file(dst, profile.ini_settings)
-                    elif dst_stat.st_mtime > src_stat.st_mtime + MTIME_TOLERANCE:
-                        _clear_readonly(src)
-                        shutil.copy2(dst, src)
-                        _clear_readonly(src)
-                        if patch and profile.ini_settings:
-                            patch_ini_file(src, profile.ini_settings)
-                    else:
-                        _clear_readonly(dst)
-                        _clear_readonly(src)
-                        if patch and profile.ini_settings:
-                            patch_ini_file(dst, profile.ini_settings)
-                            patch_ini_file(src, profile.ini_settings)
-                except OSError:
-                    pass
-
-    if unlock:
-        report.unlocked = unlock_settings_files(store_dir)
-        for directory in extra_dirs:
-            if not directory:
-                continue
-            for relative in unlock_settings_files(directory):
-                report.unlocked.append(
-                    _posix(os.path.join(os.path.basename(directory),
-                                        relative)))
-
-    try:
-        os.makedirs(os.path.join(store_dir, profile.saves_dir), exist_ok=True)
-    except OSError as exc:
-        report.blockers.append(
-            f"{os.path.join(store_dir, profile.saves_dir)}: папку сохранений "
-            f"создать не удалось ({exc})")
-
-    if probe:
-        targets: List[str] = []
-        for directory in (store_dir, *extra_dirs):
-            if directory and os.path.isdir(directory):
-                targets.append(os.path.join(directory, profile.user_inis[0]))
-        targets.extend(iter_settings_files(store_dir, max_depth=2))
-        for target in targets:
-            report.checked += 1
-            reason = write_probe(target)
-            if reason and reason not in report.blockers:
-                report.blockers.append(reason)
-        report.writable = not report.blockers
-    return report
-
-
-def unlock_settings_files(directory: str,
-                          max_depth: Optional[int] = None) -> List[str]:
-    """Снимает «только для чтения» со всех настроечных файлов каталога.
-
-    Возвращает пути, относительно ``directory`` (posix-разделители).
-    """
-    repaired: List[str] = []
-    for path in iter_settings_files(directory, max_depth=max_depth):
-        if _clear_readonly(path):
-            repaired.append(_posix(os.path.relpath(path, directory)))
-    return repaired
 
 
 def read_ini(path: str) -> Tuple[str, str]:
@@ -865,13 +481,9 @@ def patch_ini_file(path: str,
     except OSError:
         return False
     patched, changed = patch_ini_text(text, settings)
-    # Настроечные INI должны оставаться доступными пользователю даже тогда,
-    # когда их содержимое уже совпадает с шаблоном. Раньше флаг снимался лишь
-    # при фактической правке bUseMyGamesDirectory, а исходные Fallout.ini и
-    # FalloutPrefs.ini могли остаться read-only.
-    _clear_readonly(path)
     if not changed:
         return False
+    _clear_readonly(path)
     try:
         with open(path, "wb") as handle:
             handle.write(patched.encode(encoding))
@@ -928,10 +540,6 @@ def merge_tree(source: str, destination: str,
                 os.makedirs(os.path.dirname(dst_file), exist_ok=True)
                 _clear_readonly(dst_file)
                 shutil.copy2(src_file, dst_file)
-                # copy2 сохраняет и атрибут «только для чтения» источника.
-                # Снимаем его ПОСЛЕ копирования, иначе пользовательские INI
-                # снова становятся недоступны для ручного редактирования.
-                _clear_readonly(dst_file)
             except OSError:
                 continue
             count += 1
@@ -1009,7 +617,7 @@ def detect_game(app_dir: str, max_depth: int = 3) -> Optional[DetectedGame]:
                 title=f"{stem} (движок Gamebryo)",
                 executables=(),
                 default_ini=ini,
-                user_inis=(f"{stem}.ini", f"{stem}Prefs.ini", f"{stem}Custom.ini"),
+                user_inis=(f"{stem}.ini", f"{stem}Prefs.ini"),
                 my_games=(stem,),
             )
             return DetectedGame(profile, directory, path)
@@ -1149,11 +757,7 @@ def plan(portable_dir: str, app_name: str,
         setup.profile = detected.profile.id
         setup.title = detected.profile.title
         setup.store = store_rel
-        # INI-файлы переносятся в store один раз при сборке/обновлении
-        # портатива ниже. В runtime entries обслуживают только сейвы: если
-        # синхронизировать *.ini перед каждым запуском, устаревшая копия из
-        # Documents\My Games может перезаписать ручные правки пользователя.
-        patterns = [detected.profile.saves_dir]
+        patterns = [detected.profile.saves_dir, "*.ini"]
         for root, name in unique:
             setup.entries.append(SaveEntry(
                 name=name,
@@ -1256,62 +860,12 @@ def apply(portable_dir: str, setup: SaveSetup,
                     and patch_ini_file(candidate, profile.ini_settings):
                 setup.patched.append(
                     _posix(os.path.relpath(candidate, portable_dir)))
-
-        # 3. Сквозной конфигурационный файл рядом с exe. Шаблон
-        #    ``*_default.ini`` задаёт только значения по умолчанию: движок
-        #    читает пользовательские ``<Игра>.ini``/``<Игра>Prefs.ini``. Пока
-        #    их нет рядом с exe, «сквозного» конфига не существует — игра
-        #    кладёт свой INI в профиль, а пользователь копирует файл руками и
-        #    получает взамен бесконечный цикл лаунчера (см. docstring
-        #    ``create_missing_user_inis``).
-        created = create_missing_user_inis(store_dir, profile)
-        for name in created:
-            candidate = os.path.join(store_dir, name)
-            # Страховка: даже если шаблон по какой-то причине не удалось
-            # править, пользовательский INI получает нужные ключи напрямую.
-            patch_ini_file(candidate, profile.ini_settings)
-            setup.patched.append(
-                _posix(os.path.relpath(candidate, portable_dir)))
         if setup.patched:
             log.ok(f"{profile.default_ini}: включено хранение сохранений и "
                    "настроек внутри портатива (bUseMyGamesDirectory=0, "
                    f"SLocalSavePath={profile.saves_dir}\\).")
-        if created:
-            log.ok("Рядом с exe создан сквозной конфигурационный файл: "
-                   + ", ".join(created)
-                   + ". Его видят прямой запуск, лончер и комплектный "
-                     "лаунчер — копировать INI из PortableData вручную не "
-                     "нужно.")
 
-        # 4. Настроечные файлы приводятся в рабочее состояние одной
-        #    операцией: снимается «только для чтения» (в том числе с копий в
-        #    перенаправленном профиле — лаунчер Bethesda пишет свои настройки
-        #    именно туда), подтверждаются portable-ключи, а запись проверяется
-        #    делом. Недоступный для записи INI — и есть причина бесконечного
-        #    цикла «закрылся — открылся — закрылся…»; если записать файл всё
-        #    равно нельзя, это должно быть названо в журнале, а не выясняться
-        #    перезапусками лаунчера. Настоящий профиль этого ПК не трогаем:
-        #    меняются только файлы внутри портатива.
-        portable_copies = [source for source in sources
-                           if _is_inside(source, portable_dir)]
-        state = prepare_game_settings(store_dir, profile,
-                                      extra_dirs=portable_copies)
-        if state.unlocked:
-            log.ok("Снят флаг «только для чтения» с настроечных файлов ("
-                   + ", ".join(state.unlocked)
-                   + "): иначе лаунчер игры не смог бы их переписать и "
-                     "уходил бы в бесконечный цикл.")
-        for blocker in state.blockers:
-            log.warn("Настройки игры записать нельзя: " + blocker
-                     + ". Пока это не исправлено, лаунчер Bethesda может "
-                       "зацикливаться на кнопке «Играть».")
-
-        # 5. Описание для runtime: по нему LaunchPortable.exe обслуживает
-        #    настройки перед каждым запуском и после него (см. launcher_config
-        #    .json, секция game_settings).
-        setup.game_settings = runtime_settings(setup, profile)
-
-        # 6. Переносим сейвы, уже накопленные обоими способами запуска.
+        # 3. Переносим сейвы, уже накопленные обоими способами запуска.
         saves_target = os.path.join(store_dir, profile.saves_dir)
         for source in sources:
             moved = merge_tree(os.path.join(source, profile.saves_dir),
@@ -1324,7 +878,6 @@ def apply(portable_dir: str, setup: SaveSetup,
         return setup
 
     if setup.mode == "mirror":
-        setup.game_settings = {"enabled": False}
         for entry in setup.entries:
             store_dir = os.path.join(portable_dir, *entry.store.split("/"))
             for source in _entry_sources(portable_dir, entry, profile_dir,
@@ -1335,13 +888,6 @@ def apply(portable_dir: str, setup: SaveSetup,
                     log.ok(f"Сохранения «{entry.name}» перенесены в портатив: "
                            f"{moved} файлов.")
             os.makedirs(store_dir, exist_ok=True)
-            # Настроечные файлы в портативном хранилище не должны остаться
-            # «только для чтения»: xcopy и сама программа не переписывают
-            # такой файл, и настройки навсегда остались бы устаревшими.
-            unlocked = make_inis_writable(store_dir)
-            if unlocked:
-                log.ok("Снят флаг «только для чтения» с настроек «"
-                       + entry.name + "» (" + ", ".join(unlocked) + ").")
     return setup
 
 
@@ -1370,23 +916,6 @@ def describe(setup: SaveSetup) -> List[str]:
             f"Сквозные сохранения: {setup.title or 'программа'} хранит сейвы "
             f"и настройки в {store} — одинаково при запуске "
             f"{store}\\<exe>, LaunchPortable.exe и комплектного лаунчера.")
-        lines.append(
-            f"  • Настроечные INI редактируйте прямо в {store} — рядом с exe. "
-            "Копия в PortableData\\User\\Documents\\My Games не является "
-            "активной.")
-        lines.append(
-            "    Сквозной конфигурационный файл создаётся рядом с exe сам: "
-            "копировать INI из PortableData вручную не нужно — копия приносит "
-            "флаг «только для чтения», от которого лончер игры уходит в "
-            "бесконечный цикл.")
-        lines.append(
-            "    INI не синхронизируются при каждом запуске, поэтому ручные "
-            "изменения не заменяются старыми копиями.")
-        lines.append(
-            "    Если комплектный лаунчер всё же зациклится (закрывается и "
-            "открывается снова), лончер портатива заметит это, прервёт цикл и "
-            "запустит игру напрямую; проверить настройки вручную: "
-            "App\\LaunchPortable.exe --doctor.")
     else:
         lines.append(
             "Сквозные сохранения: папки сейвов сводятся между портативом и "
