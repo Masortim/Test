@@ -25,10 +25,34 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..core import elevate
+from ..core import redist as redist_mod
 from ..core.detect import detect_installer
-from ..core.portablizer import PortableOptions, PortableResult
+from ..core.portablizer import (
+    INSTALL_HARD_LIMIT, INSTALL_IDLE_LIMIT, STALL_CANCEL, STALL_STOP,
+    STALL_WAIT, InstallStall, PortableOptions, PortableResult,
+)
 from . import style
 from .worker import MaintenanceWorker, PortableWorker
+
+#: Режимы ожидания долгой установки: подпись, предел ПАУЗЫ в работе
+#: установщика (секунды), потолок всей попытки (0 — без потолка) и пояснение.
+#: Пока установщик пишет файлы, ждать можно сколько угодно: предел относится
+#: именно к тишине (см. core/portablizer.py, _InstallWatchdog).
+LONG_INSTALL_MODES = (
+    ("Ждать, пока идёт работа (до 6 ч)", INSTALL_IDLE_LIMIT,
+     INSTALL_HARD_LIMIT,
+     "Рекомендуется для больших игр: пока установщик распаковывает файлы, "
+     f"ждать можно сколько нужно; вопрос возникает, только если он замолчал "
+     f"на {redist_mod.human_duration(INSTALL_IDLE_LIMIT)}. Вся попытка "
+     "ограничена шестью часами — этого хватает даже очень крупным играм."),
+    ("Ждать, пока идёт работа, без предела", INSTALL_IDLE_LIMIT, 0,
+     "То же самое, но без общего потолка времени: попытка идёт, пока "
+     "установщик подаёт признаки работы. Для очень больших игр на медленном "
+     "диске, где и шесть часов могут оказаться мало."),
+    ("Строго: не дольше 30 минут", 300, 1800,
+     "Прежнее поведение — жёсткий потолок на попытку. Подходит мелким "
+     "программам, но может прервать установку большой игры."),
+)
 
 
 def _resource(rel: str) -> str:
@@ -113,6 +137,14 @@ class MainWindow(QMainWindow):
         remembered = str(self.settings.value("output_dir", "") or "")
         if remembered and os.path.isdir(remembered):
             self.output_edit.setText(remembered)
+        # Режим ожидания долгой установки тоже запоминается: для коллекции
+        # больших игр его выставляют один раз, а не при каждой сборке.
+        try:
+            mode = int(self.settings.value("long_install_mode", 0) or 0)
+        except (TypeError, ValueError):
+            mode = 0
+        if 0 <= mode < self.long_install_combo.count():
+            self.long_install_combo.setCurrentIndex(mode)
 
     # -- шапка ----------------------------------------------------------------
     def _build_header(self) -> QWidget:
@@ -191,6 +223,26 @@ class MainWindow(QMainWindow):
         self.env_edit = QLineEdit()
         self.env_edit.setPlaceholderText("KEY1=VAL1; KEY2=VAL2 (добавятся в лончер)")
         grid.addWidget(self.env_edit, 3, 1, 1, 2)
+
+        # Долгие установки: у больших игр (BioShock Infinite — десятки
+        # гигабайт) установка идёт часами, и общий потолок по времени её
+        # обрывал. Предел относится к паузе в работе установщика, поэтому
+        # «сколько ждать тишины» — единственный настоящий выбор пользователя.
+        grid.addWidget(QLabel("Долгие установки:"), 4, 0)
+        self.long_install_combo = QComboBox()
+        self.long_install_combo.setToolTip(
+            "Сколько ждать установщик, если он перестал подавать признаки "
+            "работы: не пишет файлы в папку App, не читает диск, не тратит "
+            "процессор и не дописывает свой журнал.\n\n"
+            "Пока работа идёт, ожидание не ограничено — установка большой "
+            "игры в 40 ГБ может идти сколько нужно. Предел срабатывает "
+            "только на тишине, и тогда Portablizer спросит, ждать ли ещё.")
+        for title, _idle, _deadline, note in LONG_INSTALL_MODES:
+            self.long_install_combo.addItem(title)
+            self.long_install_combo.setItemData(
+                self.long_install_combo.count() - 1, note,
+                Qt.ToolTipRole)
+        grid.addWidget(self.long_install_combo, 4, 1, 1, 2)
         grid.setColumnStretch(1, 1)
         lay.addLayout(grid)
 
@@ -616,6 +668,7 @@ class MainWindow(QMainWindow):
             return None
         os.makedirs(output, exist_ok=True)
         args = self._parse_install_args(self.args_edit.text())
+        idle_limit, deadline = self._long_install_limits()
         return PortableOptions(
             installer_path=installer,
             output_dir=output,
@@ -636,7 +689,17 @@ class MainWindow(QMainWindow):
             shared_saves=self.cb_shared_saves.isChecked(),
             extra_install_args=args,
             extra_env=self._parse_env(),
+            install_timeout=idle_limit,
+            install_deadline=deadline,
         )
+
+    def _long_install_limits(self) -> "tuple[int, int]":
+        """Предел паузы и потолок попытки для выбранного режима ожидания."""
+        index = self.long_install_combo.currentIndex()
+        if index < 0 or index >= len(LONG_INSTALL_MODES):
+            index = 0
+        _title, idle_limit, deadline, _note = LONG_INSTALL_MODES[index]
+        return int(idle_limit), int(deadline)
 
     def _start(self) -> None:
         opts = self._collect_options()
@@ -647,10 +710,13 @@ class MainWindow(QMainWindow):
         self._on_detail(0, "")
         self._set_running(True)
 
+        self.settings.setValue("long_install_mode",
+                               self.long_install_combo.currentIndex())
         self.worker = PortableWorker(opts)
         self.worker.log_line.connect(self._on_log)
         self.worker.progress.connect(self._on_progress)
         self.worker.detail.connect(self._on_detail)
+        self.worker.stall.connect(self._on_stall)
         self.worker.finished_result.connect(self._on_finished)
         self.worker.start()
 
@@ -658,6 +724,53 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.status_label.setText("Отмена…")
+
+    def _on_stall(self, stall: InstallStall) -> None:
+        """Установка замолчала — спрашиваем человека, ждать ли ещё.
+
+        Молчание установщика не всегда означает зависание: он мог остановиться
+        на модальном окне, а мог «задуматься» над одним огромным файлом.
+        Поэтому решение принимает человек, а не таймер, — и решение это
+        осознанное: в вопросе видны и время тишины, и объём уже
+        распакованного. Ответ уходит в рабочий поток, который ждёт его здесь.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Portablizer — установка замолчала")
+        box.setText(stall.message())
+        box.setInformativeText(
+            "Установщик не пишет файлы в папку App, не читает диск, не тратит "
+            "процессор и не дописывает свой журнал.\n\n"
+            "Если он показывает окно с кнопкой или вы знаете, что он ещё "
+            "работает (например, идёт проверка на антивирусе), его можно "
+            "подождать ещё. Если он действительно завис — прекращайте: "
+            "Portablizer снимает зависший установщик вместе с дочерними "
+            "процессами и продолжает сборку с тем, что уже распаковано.\n\n"
+            + (f"Процессов установщика: {stall.processes}. "
+               if stall.processes else "")
+            + "Следующий вопрос — ещё через "
+            + redist_mod.human_duration(stall.idle_limit) + " тишины."
+        )
+        wait_btn = box.addButton(
+            "Подождать ещё " + redist_mod.human_duration(stall.idle_limit),
+            QMessageBox.AcceptRole)
+        stop_btn = box.addButton("Прекратить установку",
+                                 QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("Отменить сборку", QMessageBox.RejectRole)
+        box.setDefaultButton(wait_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is stop_btn:
+            verdict = STALL_STOP
+        elif clicked is cancel_btn:
+            verdict = STALL_CANCEL
+        elif clicked is wait_btn:
+            verdict = STALL_WAIT
+        else:
+            # Диалог закрыт крестиком: ждать дальше вслепую нельзя.
+            verdict = STALL_STOP
+        if self.worker:
+            self.worker.answer_stall(verdict)
 
     def _on_log(self, level: str, message: str) -> None:
         color = style.LEVEL_COLORS.get(level, style.TEXT)

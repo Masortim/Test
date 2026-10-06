@@ -11,7 +11,10 @@
                        вариантов от самого точного к самому общему).
   3. snapshot(before)— снять состояние реестра (Windows).
   4. install         — выполнять попытки по очереди, пока в App не появятся
-                       файлы программы.
+                       файлы программы. Долгая установка при этом не
+                       прерывается: предел ожидания относится к паузе в
+                       работе установщика, а не ко времени установки (см.
+                       _InstallWatchdog).
   5. snapshot(after) — снять состояние реестра и сохранить diff в portable.reg.
   6. detect_main_exe — найти главный exe установленной программы.
   7. gather_deps     — эвристически собрать/скопировать зависимости (VC++ и т.п.).
@@ -59,8 +62,45 @@ ProgressCB = Callable[[int, str], None]
 #: величину заранее узнать нельзя (сервер не сообщил размер файла и т. п.) —
 #: интерфейс показывает «бегущую» полосу вместо замершего числа.
 DetailCB = Callable[[int, str], None]
+#: Вопрос к человеку, когда установка замолчала: ждать ещё или прекращать.
+#: Возвращает :data:`STALL_WAIT`, :data:`STALL_STOP` или :data:`STALL_CANCEL`.
+StallCB = Callable[["InstallStall"], str]
+
+#: Вердикты на доклад о затишье в установке.
+STALL_WAIT = "wait"        # «установщик всё ещё может работать — ждём ещё»
+STALL_STOP = "stop"        # «хватит ждать»: снять установщик и идти дальше
+STALL_CANCEL = "cancel"    # «отменить всю сборку»
 
 IS_WINDOWS = sys.platform.startswith("win")
+
+#: Сколько терпеть установку БЕЗ ПРИЗНАКОВ РАБОТЫ (секунды).
+#:
+#: Это не предел времени установки: пока установщик пишет файлы, читает диск,
+#: тратит процессор или дописывает свой журнал, ждать можно сколько угодно.
+#: Предел относится к ПАУЗЕ. Раньше здесь был общий потолок на попытку в
+#: 30 минут: BioShock Infinite (десятки гигабайт, сотни тысяч файлов) ставится
+#: дольше, и сборка обрывалась с «Превышено время ожидания установки», хотя
+#: установщик в этот момент исправно работал.
+INSTALL_IDLE_LIMIT = 900
+
+#: Абсолютный потолок на одну попытку (секунды). Ноль — без потолка.
+#: Нужен только как страховка от бесконечно долгой работы: обычные установки до
+#: него не доживают, а зависшая распознаётся по паузе (см. выше) гораздо раньше.
+INSTALL_HARD_LIMIT = 6 * 3600
+
+#: Как часто опрашивать признаки работы (секунды). Дешёвые счётчики процессов
+#: опрашиваются с этой частотой, обход целевой папки — реже (см. ниже).
+INSTALL_PROBE_SECONDS = 5.0
+
+#: Как часто пересчитывать размер и число файлов в целевой папке: обход сотен
+#: тысяч файлов заметно дороже опроса счётчиков, а для вывода «работа идёт или
+#: нет» такая точность не нужна.
+INSTALL_DIR_SCAN_SECONDS = 20.0
+
+#: Меньше этого предел ожидания не ставится, даже если его задали крошечным:
+#: вопрос «ждать ещё?» не должен всплывать каждые несколько секунд. Тесты и
+#: внешние сценарии переопределяют это значение, а не обходят его.
+INSTALL_IDLE_FLOOR = 30.0
 
 # Имя готового EXE-лончера внутри App/. Сам бинарник собирается из
 # portable_launcher_entry.py, встраивается в Portablizer.exe как ресурс и не
@@ -82,6 +122,10 @@ def bundled_exe_launcher_path() -> str:
 _EXIT_CODE_HINTS: Dict[int, str] = {
     2: "файл не найден",
     5: "отказано в доступе (нужны права администратора)",
+    # WAIT_TIMEOUT: наша собственная метка «установщик перестал подавать
+    # признаки работы и был снят», а не код, который вернул сам движок.
+    0x102: "установщик молчал дольше отведённого времени и был снят вместе "
+           "с дочерними процессами — смотрите предел ожидания установки",
     1223: "пользователь отменил операцию (например, отклонил UAC-запрос)",
     740: "запрашиваются права администратора — запустите Portablizer от "
          "имени администратора",
@@ -291,7 +335,15 @@ class PortableOptions:
     include_shell_integration: bool = False
     extra_install_args: List[str] = field(default_factory=list)
     extra_env: Dict[str, str] = field(default_factory=dict)
-    install_timeout: int = 1800        # сек
+    # Предел ожидания установки. Считается НЕ от запуска, а от последнего
+    # признака работы (запись в целевую папку, ввод-вывод и процессорное время
+    # дерева процессов установщика, рост журнала установщика). Поэтому долгая
+    # установка большой игры не прерывается: 40 ГБ, которые пишутся два часа,
+    # — это «идёт работа», а не «зависло». Прерывается только молчание.
+    install_timeout: int = INSTALL_IDLE_LIMIT          # сек без работы
+    # Абсолютный потолок на одну попытку, сек. 0 — без потолка. Страховка от
+    # бесконечной работы (например, установщик зациклился и пишет по кругу).
+    install_deadline: int = INSTALL_HARD_LIMIT
     # Разрешить сценарий с видимым окном мастера. Нужен старым InstallShield
     # InstallScript: тихий режим у них работает только по файлу ответов
     # setup.iss, а записать его может лишь человек, прошедший мастер.
@@ -407,11 +459,237 @@ class PortableResult:
     saves_notes: List[str] = field(default_factory=list)
 
 
+# -- «установка долго идёт» и «установка зависла» — это разные вещи -----------
+#
+# Раньше у тихой установки был один общий потолок на попытку (30 минут), и
+# большая игра его не переживала: BioShock Infinite — десятки гигабайт и сотни
+# тысяч файлов, установка идёт дольше, и сборка обрывалась сообщением
+# «Превышено время ожидания установки», хотя установщик в этот момент
+# добросовестно распаковывал файлы. Отличить одно от другого можно только по
+# признакам работы, поэтому ниже ведутся три независимых наблюдения:
+#   1) ввод-вывод и процессорное время дерева процессов установщика
+#      (``procutil.process_activity``) — работает даже внутри одного большого
+#      файла, который дописывается часами;
+#   2) размер и число файлов в целевой папке (и в перенаправленном профиле:
+#      движки вроде InstallScript ставят не туда, куда просили);
+#   3) журналы, которые пишет сам установщик (Inno ``/LOG``, Burn ``/log``,
+#      msiexec ``/L*v``, InstallShield ``/f2``).
+# Пока растёт хоть что-то — установка живёт, и ждать можно сколько угодно.
+# Замолчало всё сразу — вот это и есть зависание: его видно за минуты, а не
+# через полчаса ожидания «на всякий случай».
+
+
+@dataclass
+class InstallStall:
+    """Доклад о затишье: по нему человек решает, ждать ли ещё.
+
+    Идёт в интерфейс (окно с вопросом), в журнал и в итоговые подсказки.
+    Показывать одни секунды бесполезно — рядом должны стоять размеры уже
+    распакованного, иначе «завис» и «медленно пишет» выглядят одинаково.
+    """
+
+    attempt: str = ""
+    elapsed: float = 0.0        # сколько идёт попытка, секунд
+    idle: float = 0.0           # сколько нет признаков работы, секунд
+    idle_limit: float = 0.0     # сколько их терпят по настройкам
+    deadline: float = 0.0       # абсолютный потолок (0 — без потолка)
+    written: int = 0            # сколько байт уже лежит в целевой папке
+    files: int = 0              # сколько файлов появилось
+    processes: int = 0          # сколько процессов в дереве установщика
+    logs: List[str] = field(default_factory=list)
+    io_bytes: int = 0
+    cpu_seconds: float = 0.0
+
+    def message(self) -> str:
+        """Готовая фраза для журнала и окна с вопросом."""
+        parts = [f"Установка идёт {redist_mod.human_duration(self.elapsed)}"]
+        if self.files or self.written:
+            parts.append(
+                f"уже распаковано {redist_mod.format_size(self.written)} "
+                f"в {self.files} файлах")
+        parts.append(
+            f"но последние {redist_mod.human_duration(self.idle)} нет "
+            "признаков работы "
+            f"(предел {redist_mod.human_duration(self.idle_limit)})")
+        return ", ".join(parts) + "."
+
+
+def _stall_verdict(answer: object) -> str:
+    """Приводит ответ колбэка к одному из :data:`STALL_WAIT`/``STOP``/``CANCEL``.
+
+    Разные вызывающие коды отвечают по-разному (строка, флаг, ничего), поэтому
+    незнакомый ответ считается решением «больше не ждать»: молчание не должно
+    превращаться в бесконечное ожидание.
+    """
+    if answer is True:
+        return STALL_WAIT
+    if answer is False or answer is None:
+        return STALL_STOP
+    text = str(answer).strip().casefold()
+    if text.startswith(("wait", "more", "ждать", "подожд", "ещё", "еще",
+                        "продолж")):
+        return STALL_WAIT
+    if text.startswith(("cancel", "abort", "отмен", "прерв")):
+        return STALL_CANCEL
+    return STALL_STOP
+
+
+def _tree_usage(root: str, budget: float = 3.0) -> Tuple[int, int]:
+    """``(файлов, байт)`` внутри ``root`` за отведённое время.
+
+    Обход намеренно ограничен по времени: целевая папка установщика большой
+    игры — сотни тысяч файлов, и полный пересчёт на каждом опросе стоил бы
+    дороже самой установки. Частичный результат для наблюдения за ходом работ
+    ничем не хуже полного: важно, что число меняется, а не его абсолютное
+    значение. Ошибки доступа не прерывают обход (установщик может держать
+    файлы открытыми), а просто пропускают недоступное.
+    """
+    files = 0
+    total = 0
+    if not root:
+        return files, total
+    limit = time.monotonic() + max(0.1, budget)
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            files += 1
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+        if time.monotonic() > limit:
+            break
+    return files, total
+
+
+class _InstallWatchdog:
+    """Отличает долгую установку от зависшей по признакам работы.
+
+    Опрашивает дерево процессов установщика (ввод-вывод, процессор), целевую
+    папку и журналы установщика. ``poll()`` возвращает ``True``, когда с
+    прошлого опроса появились изменения — то есть установщик работает.
+    """
+
+    def __init__(self, pid: int, roots: Sequence[str] = (),
+                 logs: Sequence[str] = (),
+                 probe_seconds: Optional[float] = None,
+                 dir_seconds: Optional[float] = None,
+                 scan_budget: float = 3.0) -> None:
+        # Частоты опроса берутся из модульных констант в момент ВЫЗОВА, а не
+        # при определении класса: их переопределяют тесты и внешние сценарии.
+        self.pid = int(pid)
+        self.roots = [str(path) for path in roots if path]
+        self.logs = [str(path) for path in dict.fromkeys(logs) if path]
+        self.probe_seconds = max(0.01, float(
+            INSTALL_PROBE_SECONDS if probe_seconds is None else probe_seconds))
+        self.dir_seconds = max(self.probe_seconds, float(
+            INSTALL_DIR_SCAN_SECONDS if dir_seconds is None else dir_seconds))
+        self.scan_budget = max(0.1, float(scan_budget))
+        self._next_probe = 0.0
+        self._next_dir_scan = 0.0
+        self._fingerprint: Tuple = ()
+        self.samples = 0
+        self.io_bytes = 0
+        self.cpu_seconds = 0.0
+        self.processes = 0
+        self.files = 0
+        self.bytes = 0
+        self.log_bytes = 0
+
+    # -- наблюдения -----------------------------------------------------------
+    def _log_bytes(self) -> int:
+        total = 0
+        for path in self.logs:
+            try:
+                total += os.path.getsize(path)
+            except OSError:
+                continue
+        return total
+
+    def _sample_now(self, now: float) -> None:
+        """Снимает все наблюдения, которые пора снять."""
+        activity = procutil.process_activity(self.pid)
+        if activity is not None:
+            self.io_bytes = int(activity.io_bytes)
+            self.cpu_seconds = float(activity.cpu_seconds)
+            self.processes = len(activity.pids)
+        if now >= self._next_dir_scan:
+            # Целевую папку считаем реже процессов, но обязательно вместе с
+            # журналами: журнал растёт построчно, папка — целыми файлами.
+            self._next_dir_scan = now + self.dir_seconds
+            files = 0
+            total = 0
+            for root in self.roots:
+                found_files, found_bytes = _tree_usage(root, self.scan_budget)
+                files += found_files
+                total += found_bytes
+            self.files, self.bytes = files, total
+        self.log_bytes = self._log_bytes()
+
+    def _fingerprint_now(self) -> Tuple:
+        return (self.processes, self.io_bytes, int(self.cpu_seconds * 10),
+                self.files, self.bytes, self.log_bytes)
+
+    def poll(self, now: Optional[float] = None) -> bool:
+        """``True``, если установщик подал признаки работы с прошлого опроса.
+
+        Первый опрос всегда считается работой: установщик только что
+        запустился, и ждать от него счётчиков раньше времени нечего.
+        """
+        now = time.monotonic() if now is None else float(now)
+        if self.samples and now < self._next_probe:
+            return False
+        self._next_probe = now + self.probe_seconds
+        self._sample_now(now)
+        current = self._fingerprint_now()
+        changed = self.samples == 0 or current != self._fingerprint
+        self._fingerprint = current
+        self.samples += 1
+        return changed
+
+    # -- отчёт ---------------------------------------------------------------
+    def summary(self) -> str:
+        """Что видно про работу установщика (для журнала и подробной строки)."""
+        parts: List[str] = []
+        if self.bytes or self.files:
+            parts.append(f"распаковано {redist_mod.format_size(self.bytes)} "
+                         f"в {self.files} файлах")
+        if self.io_bytes:
+            parts.append(f"диск: {redist_mod.format_size(self.io_bytes)}")
+        if self.cpu_seconds:
+            parts.append(f"процессор: "
+                         f"{redist_mod.format_duration(self.cpu_seconds)}")
+        if self.log_bytes:
+            parts.append("журнал установщика растёт")
+        if not parts:
+            parts.append("процессы установщика живы")
+        return ", ".join(parts)
+
+    def report(self, attempt: str, elapsed: float, idle: float,
+               idle_limit: float, deadline: float) -> InstallStall:
+        """Доклад о затишье для интерфейса, журнала и подсказок."""
+        return InstallStall(
+            attempt=attempt, elapsed=elapsed, idle=idle,
+            idle_limit=idle_limit, deadline=deadline,
+            written=self.bytes, files=self.files, processes=self.processes,
+            logs=list(self.logs), io_bytes=self.io_bytes,
+            cpu_seconds=self.cpu_seconds)
+
+
 class Portablizer:
     def __init__(self, logger: Logger,
                  progress: Optional[ProgressCB] = None,
                  cancel_event: Optional[threading.Event] = None,
-                 detail: Optional[DetailCB] = None) -> None:
+                 detail: Optional[DetailCB] = None,
+                 on_stall: Optional[StallCB] = None) -> None:
         self.log = logger
         #: Колбэк общего хода сборки, как его передал вызывающий код.
         self._progress_cb: ProgressCB = progress or (lambda p, s: None)
@@ -426,6 +704,12 @@ class Portablizer:
         self._attempt_history: List[Tuple[str, Optional[int]]] = []
         #: Последний ResultCode из setup.log классического InstallShield.
         self._installshield_result: Optional[int] = None
+        #: Вопрос «установка замолчала — ждать ещё?» (см. ``StallCB``).
+        self.on_stall: Optional[StallCB] = on_stall
+        #: Попытка была снята по пределу ожидания (для итоговой диагностики).
+        self._install_stalled = False
+        #: Доклад о последнем затишье: по нему строятся подсказки.
+        self._install_stall: Optional[InstallStall] = None
 
     # -- вспомогательное ------------------------------------------------------
     def progress(self, percent: int, stage: str) -> None:
@@ -686,6 +970,8 @@ class Portablizer:
             self._attempts_made = 0
             self._attempt_history = []
             self._installshield_result = None
+            self._install_stalled = False
+            self._install_stall = None
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
                 raise FileNotFoundError(f"Установщик не найден: {opts.installer_path}")
@@ -1065,6 +1351,9 @@ class Portablizer:
         """
         hints: List[str] = []
 
+        if self._install_stalled:
+            hints.extend(self._stall_hints())
+
         needs_admin = det.requires_admin or (
             rc is not None and rc in _BAD_COMMAND_LINE_CODES)
         if IS_WINDOWS and needs_admin and not is_elevated():
@@ -1113,6 +1402,42 @@ class Portablizer:
             "Некоторые установщики требуют входа в аккаунт или активной "
             "лицензии и в тихом режиме не работают в принципе — такую "
             "программу портативной сделать нельзя."
+        )
+        return hints
+
+    def _stall_hints(self) -> List[str]:
+        """Подсказки, когда установка была снята по пределу ожидания.
+
+        Пользователю важно понять две вещи: что установщик не «сломался», а
+        замолчал, и что ожидание можно продлить — для больших игр это штатный
+        сценарий, а не ошибка.
+        """
+        stall = self._install_stall
+        hints: List[str] = []
+        if stall is not None:
+            hints.append(
+                f"Установка остановлена по пределу ожидания: сценарий "
+                f"«{stall.attempt}» шёл "
+                f"{redist_mod.human_duration(stall.elapsed)}, из них "
+                f"{redist_mod.human_duration(stall.idle)} — без признаков "
+                "работы (записи в App, ввода-вывода установщика, роста его "
+                "журнала)."
+                + (f" Успело распаковаться: "
+                   f"{redist_mod.format_size(stall.written)} "
+                   f"в {stall.files} файлах." if stall.files else "")
+            )
+        hints.append(
+            "Если установщик ещё работал (у больших игр вроде BioShock "
+            "Infinite установка идёт часами), повторите сборку с более щедрым "
+            "ожиданием: поле «Долгие установки» → «Ждать, пока идёт работа, "
+            "без предела». Предел относится к паузе без работы, поэтому долгая "
+            "установка сама по себе сборку больше не прерывает."
+        )
+        hints.append(
+            "Если пауза в самом деле была зависанием, посмотрите "
+            "installer-output.log и журнал установщика (install.log): чаще "
+            "всего движок показал модальное окно (не тот ключ тишины, "
+            "требование перезагрузки, нехватка места) и ждал нажатия кнопки."
         )
         return hints
 
@@ -1187,6 +1512,9 @@ class Portablizer:
                     verdict = "не запускалась"
                 elif outcome in (0, 3010):
                     verdict = f"код {outcome}, но файлов в App не появилось"
+                elif outcome == redist_mod.TIMEOUT_EXIT_CODE:
+                    verdict = ("снят по пределу ожидания — установщик "
+                               "перестал подавать признаки работы")
                 else:
                     verdict = f"код {_format_exit_code(outcome)}"
                 lines.append(f"\n  • «{label}» — {verdict}")
@@ -1204,9 +1532,17 @@ class Portablizer:
                                    "(stdout/stderr) — в installer-output.log.")
             except OSError:
                 pass
+        kept_text = ""
+        if self._install_stalled and self._app_has_payload(
+                os.path.join(result.portable_dir, "App")):
+            # Неполная установка — не мусор: по ней видно, что именно движок
+            # успел распаковать, и с ней же можно запустить проверку вручную.
+            kept_text = ("\n\nРаспакованные файлы оставлены в папке App: по "
+                         "ним видно, что установщик успел сделать.")
         return (
             "Установщик завершился, но в папке App не найден ни один "
             f"исполняемый файл{rc_hint}.{attempts_text} Портатив не создан."
+            + kept_text
             + outcomes_text
             + (f"\n\nЧто можно сделать:{advice}" if advice else "")
             + "\n\nПодробности — в portablizer.log рядом с папкой портатива."
@@ -1606,8 +1942,14 @@ class Portablizer:
         # Интерактивный план (запись ответов InstallScript) обязан показать
         # окно: пользователь должен пройти мастер, иначе записывать нечего.
         creationflags = 0 if plan.interactive else 0x08000000  # CREATE_NO_WINDOW
-        timeout = (max(opts.install_timeout, opts.assisted_timeout)
-                   if plan.interactive else opts.install_timeout)
+        # Предел ожидания относится к ПАУЗЕ в работе установщика, а не ко всему
+        # времени установки (см. _InstallWatchdog). У мастера с человеком за
+        # клавиатурой пауза своя: думать над окном можно долго.
+        idle_limit = max(INSTALL_IDLE_FLOOR, float(
+            max(opts.install_timeout, opts.assisted_timeout)
+            if plan.interactive else opts.install_timeout))
+        deadline = 0.0 if plan.interactive else max(
+            0.0, float(opts.install_deadline))
         if plan.interactive:
             self.log.info("Запуск установщика с окном мастера (изолированно)...")
             for line in plan.instructions:
@@ -1638,31 +1980,12 @@ class Portablizer:
                 raise RuntimeError(
                     f"Не удалось запустить установщик: {exc}") from exc
 
-            start = time.time()
-            while proc.poll() is None:
-                if self.cancel.is_set():
-                    proc.terminate()
-                    raise RuntimeError("Установка отменена пользователем.")
-                if time.time() - start > timeout:
-                    proc.terminate()
-                    raise RuntimeError("Превышено время ожидания установки.")
-                # плавный прогресс во время установки: progress_from -> progress_to
-                elapsed = time.time() - start
-                frac = min(1.0, elapsed / 60.0)
-                span = max(1, progress_to - progress_from)
-                title = ("Установка в окне мастера..." if plan.interactive
-                         else "Тихая установка...")
-                self._emit_progress(progress_from + int(span * frac), title)
-                # Установщик о себе процентов не сообщает, поэтому подробная
-                # строка показывает прошедшее время и предел ожидания —
-                # видно, что процесс жив, и сколько он ещё может идти.
-                self._detail(
-                    min(99, int(elapsed * 100 / max(1, timeout))),
-                    f"{title} идёт "
-                    f"{redist_mod.format_duration(elapsed)} "
-                    f"(предел {redist_mod.format_duration(timeout)})")
-                time.sleep(0.5)
-            rc = proc.returncode
+            rc = self._wait_for_install(proc, plan, app_dir, data_dir,
+                                        idle_limit=idle_limit,
+                                        deadline=deadline,
+                                        progress_from=progress_from,
+                                        progress_to=progress_to,
+                                        console_log=console_log)
         finally:
             if console_handle is not None:
                 try:
@@ -1675,7 +1998,14 @@ class Portablizer:
                 except OSError:
                     pass
 
-        if rc not in (0, 3010):  # 3010 = успех, требуется перезагрузка
+        if rc == redist_mod.TIMEOUT_EXIT_CODE:
+            # Это наша метка, а не код движка: подробности уже сказаны выше
+            # (см. _note_stall), здесь важно лишь подвести итог попытки.
+            self.log.warn(
+                "Установщик был снят по пределу ожидания (это не код движка, "
+                "а решение Portablizer). Проверяю, что он успел установить."
+            )
+        elif rc not in (0, 3010):  # 3010 = успех, требуется перезагрузка
             hint = _exit_code_hint(rc)
             self.log.warn(
                 f"Установщик вернул код {_format_exit_code(rc)}."
@@ -1703,6 +2033,163 @@ class Portablizer:
                     "проверяю перенаправленный профиль и системные каталоги установки."
                 )
         return rc
+
+    # -- ожидание установщика: долго ≠ зависло --------------------------------
+    def _install_watch_roots(self, plan: SilentPlan, app_dir: str,
+                             data_dir: str) -> List[str]:
+        """Где искать признаки работы установщика.
+
+        Целевая папка — очевидное место, но не единственное: движки, не
+        принимающие папку в командной строке (InstallScript), и установщики,
+        игнорирующие её, пишут в перенаправленный профиль (``data_dir``), а
+        распаковка бандла ``/layout`` — в свою временную папку.
+        """
+        roots = [app_dir, data_dir]
+        if plan.output_dir:
+            roots.append(plan.output_dir)
+        return list(dict.fromkeys(path for path in roots if path))
+
+    def _install_watch_logs(self, plan: SilentPlan, data_dir: str,
+                            console_log: Optional[str]) -> List[str]:
+        """Журналы установщика, по которым видно, что он продолжает работу.
+
+        Помимо явных ключей (Inno ``/LOG``, Burn ``/log``, msiexec ``/L*v``,
+        InstallShield ``/f2``) смотрим свежие ``*.log`` в перенаправленном
+        TEMP: Burn и многие бутстрапперы пишут туда, даже когда ключ журнала
+        не поддержан.
+        """
+        logs: List[str] = []
+        for path in (console_log, plan.result_log, *plan.progress_logs):
+            if path:
+                logs.append(path)
+        if data_dir:
+            temp = os.path.join(data_dir, "Temp")
+            try:
+                for name in os.listdir(temp):
+                    if name.lower().endswith(".log"):
+                        logs.append(os.path.join(temp, name))
+            except OSError:
+                pass
+        return list(dict.fromkeys(logs))
+
+    def _wait_for_install(self, proc: "subprocess.Popen", plan: SilentPlan,
+                          app_dir: str, data_dir: str,
+                          idle_limit: float, deadline: float,
+                          progress_from: int, progress_to: int,
+                          console_log: Optional[str] = None) -> Optional[int]:
+        """Ждёт установщик, пока он подаёт признаки работы.
+
+        Возвращает код возврата процесса или :data:`TIMEOUT_EXIT_CODE`, если
+        установщик замолчал и был снят (``redist_mod.TIMEOUT_EXIT_CODE``).
+        Исключение — только отмена пользователем: обычный тайм-аут больше не
+        обрывает сборку, потому что «долго» и «зависло» — разные вещи.
+        """
+        watchdog = _InstallWatchdog(
+            proc.pid,
+            roots=self._install_watch_roots(plan, app_dir, data_dir),
+            logs=self._install_watch_logs(plan, data_dir, console_log))
+        started = time.monotonic()
+        last_work = started
+        last_report = -1
+        while proc.poll() is None:
+            now = time.monotonic()
+            if self.cancel.is_set():
+                self._stop_installer(proc)
+                raise RuntimeError("Установка отменена пользователем.")
+            if watchdog.poll(now):
+                last_work = now
+            elapsed = now - started
+            idle = now - last_work
+            # Плавный прогресс во время установки: progress_from -> progress_to.
+            frac = min(1.0, elapsed / 60.0)
+            span = max(1, progress_to - progress_from)
+            title = ("Установка в окне мастера..." if plan.interactive
+                     else "Тихая установка...")
+            self._emit_progress(progress_from + int(span * frac), title)
+            # Установщик о себе процентов не сообщает, поэтому подробная
+            # строка показывает и время работы, и её видимый результат: так
+            # «медленно пишет 40 ГБ» не выглядит как «зависло».
+            self._detail(
+                min(99, int(idle * 100 / max(1.0, idle_limit))),
+                f"{title} идёт {redist_mod.format_duration(elapsed)}; "
+                f"{watchdog.summary()}; пауза без признаков работы "
+                f"{redist_mod.format_duration(idle)} из "
+                f"{redist_mod.format_duration(idle_limit)}")
+            # Абсолютный потолок проверяется первым: он не обсуждается и не
+            # продлевается вопросом — это страховка от вечной работы.
+            if deadline and elapsed > deadline:
+                self._note_stall(watchdog, plan, elapsed, idle, idle_limit,
+                                 deadline, reason="достигнут предел времени")
+                self._stop_installer(proc)
+                return redist_mod.TIMEOUT_EXIT_CODE
+            if idle >= idle_limit:
+                verdict = self._ask_about_stall(
+                    watchdog.report(plan.label, elapsed, idle, idle_limit,
+                                    deadline))
+                if verdict == STALL_WAIT:
+                    last_work = time.monotonic()
+                    continue
+                if verdict == STALL_CANCEL:
+                    self._stop_installer(proc)
+                    raise RuntimeError("Операция отменена пользователем.")
+                self._note_stall(watchdog, plan, elapsed, idle, idle_limit,
+                                 deadline, reason="установщик замолчал")
+                self._stop_installer(proc)
+                return redist_mod.TIMEOUT_EXIT_CODE
+            # Строка отчёта в журнал — раз в минуту: часы установки не должны
+            # превращать журнал в лестницу из одинаковых строк.
+            minute = int(elapsed // 60)
+            if minute != last_report:
+                last_report = minute
+                self.log.info(
+                    f"  {title} идёт {redist_mod.format_duration(elapsed)}; "
+                    f"{watchdog.summary()}")
+            time.sleep(0.5)
+        return proc.returncode
+
+    def _ask_about_stall(self, stall: InstallStall) -> str:
+        """Спрашивает человека, ждать ли ещё (если спросить есть кому).
+
+        Без колбэка (CLI, тесты, сборка без интерфейса) решение принимается
+        самим: затишье — это зависание, и ждать дальше нечего.
+        """
+        self.log.warn(stall.message())
+        if self.on_stall is None:
+            return STALL_STOP
+        try:
+            answer = self.on_stall(stall)
+        except Exception as exc:  # noqa: BLE001 - интерфейс не вправе ронять сборку
+            self.log.debug(f"  • вопрос о продолжении ожидания не удался: {exc}")
+            return STALL_STOP
+        verdict = _stall_verdict(answer)
+        if verdict == STALL_WAIT:
+            self.log.info(
+                "По вашему решению жду ещё: следующий вопрос — ещё через "
+                f"{redist_mod.human_duration(stall.idle_limit)} тишины.")
+        return verdict
+
+    def _note_stall(self, watchdog: _InstallWatchdog, plan: SilentPlan,
+                    elapsed: float, idle: float, idle_limit: float,
+                    deadline: float, reason: str) -> None:
+        """Запоминает затишье: из него потом строятся итоговые подсказки."""
+        stall = watchdog.report(plan.label, elapsed, idle, idle_limit, deadline)
+        self._install_stalled = True
+        self._install_stall = stall
+        self.log.warn(
+            f"{reason.capitalize()}: {stall.message()} Установщик снят вместе "
+            "с дочерними процессами — сборка продолжается с тем, что уже "
+            "лежит в папке App.")
+
+    @staticmethod
+    def _stop_installer(proc: "subprocess.Popen") -> None:
+        """Снимает установщик вместе со всеми его дочерними процессами.
+
+        ``Popen.terminate()`` снимает только обёртку, а файлы пишет ребёнок
+        (``setup.tmp``, ``msiexec``, ``ikernel.exe``). Переживший сборку
+        процесс продолжал бы занимать папку результата и показывать модальное
+        окно уже после того, как сборка признала попытку неудачной.
+        """
+        procutil.kill_tree(getattr(proc, "pid", 0), proc)
 
     # -- лестница попыток установки ------------------------------------------
     def _run_attempts(self, attempts: Sequence[SilentPlan],
@@ -1784,6 +2271,20 @@ class Portablizer:
                         f"перенесена в App. Сработал сценарий: {plan.label}"
                     )
                     return rc, plan
+
+            # Установщик замолчал, но уже успел распаковать часть данных.
+            # Запускать поверх них следующий сценарий бессмысленно и вредно:
+            # это те же гигабайты заново, только ещё и с риском получить
+            # «кашу» из двух неполных установок. Останавливаем лестницу и
+            # честно объясняем, что произошло (подсказки — _failure_hints).
+            if rc == redist_mod.TIMEOUT_EXIT_CODE and self._app_has_payload(app_dir):
+                self.log.warn(
+                    "Повторять установку другими ключами не буду: в папке App "
+                    "уже лежат распакованные файлы, а поверх неполной установки "
+                    "новая только займёт место и время. Что успело "
+                    "установиться — оставлено на месте для проверки."
+                )
+                break
 
             if index + 1 < total:
                 self.log.warn(
@@ -2315,6 +2816,20 @@ class Portablizer:
         # Главный exe первым, затем лаунчеры, конфигураторы и утилиты
         targets.sort(key=lambda t: 0 if t.role == "main" else (1 if t.role == "launcher" else (2 if t.role == "config" else 3)))
         return main_exe, targets
+
+    @staticmethod
+    def _app_has_payload(app_dir: str) -> bool:
+        """Есть ли в ``App`` хоть один файл (неполная установка).
+
+        Нужно, чтобы отличить два разных исхода тайм-аута: «движок не понял
+        ключи и не сделал ничего» (тогда перебор сценариев продолжается) и
+        «установка шла, но не дошла до конца» (тогда повторять её поверх
+        недописанных гигабайтов нельзя).
+        """
+        for _current, _dirs, files in os.walk(app_dir):
+            if files:
+                return True
+        return False
 
     def _find_main_exe(self, app_dir: str, name: str) -> Optional[str]:
         main_exe, _ = self._discover_app_executables(app_dir, name)

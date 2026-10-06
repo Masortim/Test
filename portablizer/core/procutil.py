@@ -20,9 +20,12 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
-from typing import Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple,
+)
 
 IS_WINDOWS = sys.platform.startswith("win")
 
@@ -157,6 +160,207 @@ def processes_in(root: str,
     """Процессы, чей exe лежит внутри ``root``."""
     items = _snapshot() if snapshot is None else list(snapshot)
     return [(pid, image) for pid, image in items if is_inside(image, root)]
+
+
+# --- признаки работы процесса: «долго» и «завис» — не одно и то же ------------
+#
+# Установка большой игры (BioShock Infinite — десятки гигабайт и сотни тысяч
+# файлов) идёт часами, и время здесь ничего не доказывает. Доказательство —
+# работа: пока дерево процессов установщика читает и пишет диск или тратит
+# процессорное время, его нельзя считать зависшим, сколько бы это ни длилось.
+# Обратная ситуация тоже важна: модальное окно «вставьте диск 2» не пишет
+# ничего и не тратит CPU, поэтому его видно сразу, а не через полчаса.
+
+
+class ProcessActivity(NamedTuple):
+    """Сколько работы сделало дерево процессов к этому моменту.
+
+    Счётчики монотонные (в пределах жизни процесса), поэтому вызывающий код
+    сравнивает два снимка: изменилось — установщик работает, нет — молчит.
+    """
+
+    pids: Tuple[int, ...] = ()
+    io_bytes: int = 0            # прочитано + записано, байт
+    cpu_seconds: float = 0.0     # пользовательское + системное время, секунд
+
+    @property
+    def fingerprint(self) -> Tuple[int, int, int]:
+        """Отпечаток «объёма сделанной работы»: меняется — процесс живёт."""
+        return (len(self.pids), self.io_bytes, int(self.cpu_seconds * 1000))
+
+
+def _parent_pids() -> List[Tuple[int, int]]:
+    """Все процессы системы как ``(pid, pid родителя)``. Вне Windows — пусто."""
+    if not IS_WINDOWS:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap in (0, -1, None):
+            return []
+        found: List[Tuple[int, int]] = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            more = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while more:
+                found.append((int(entry.th32ProcessID),
+                              int(entry.th32ParentProcessID)))
+                more = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+        return found
+    except Exception:  # noqa: BLE001 - диагностика не вправе ронять сборку
+        return []
+
+
+def process_tree(root_pid: int) -> List[int]:
+    """Сам процесс и все его потомки (дети, внуки…). Вне Windows — только он.
+
+    Установщик почти всегда работает не сам: ``setup.exe`` распаковывает
+    ``setup.tmp``, тот запускает ``msiexec``, а рядом живёт снимающий окна
+    помощник. Считать «работой установщика» только счётчики одного процесса
+    значило бы объявить зависшей установку, где пишет как раз ребёнок.
+    """
+    root = int(root_pid)
+    if not IS_WINDOWS:
+        return [root]
+    parents = _parent_pids()
+    if not parents:
+        return [root]
+    children: Dict[int, List[int]] = {}
+    for pid, parent in parents:
+        children.setdefault(parent, []).append(pid)
+    result: List[int] = []
+    queue: List[int] = [root]
+    seen: Set[int] = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        result.append(pid)
+        queue.extend(children.get(pid, ()))
+    return result
+
+
+def _filetime_seconds(value) -> float:  # noqa: ANN001 - wintypes.FILETIME
+    """FILETIME (100-нс единицы с 1601 года) → секунды."""
+    ticks = (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+    return ticks / 10_000_000.0
+
+
+def process_activity(root_pid: int) -> Optional[ProcessActivity]:
+    """Работа дерева процессов: прочитанные/записанные байты и время CPU.
+
+    Возвращает ``None``, если опросить не удалось (не Windows, процессы уже
+    завершились, счётчики недоступны) — вызывающий код в этом случае
+    опирается на рост целевой папки и журналов установщика.
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                        ("WriteOperationCount", ctypes.c_ulonglong),
+                        ("OtherOperationCount", ctypes.c_ulonglong),
+                        ("ReadTransferCount", ctypes.c_ulonglong),
+                        ("WriteTransferCount", ctypes.c_ulonglong),
+                        ("OtherTransferCount", ctypes.c_ulonglong)]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        seen: List[int] = []
+        io_bytes = 0
+        cpu_seconds = 0.0
+        for pid in process_tree(root_pid):
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not handle:
+                continue
+            try:
+                counters = IO_COUNTERS()
+                if kernel32.GetProcessIoCounters(handle, ctypes.byref(counters)):
+                    io_bytes += (int(counters.ReadTransferCount)
+                                 + int(counters.WriteTransferCount))
+                created, exited = wintypes.FILETIME(), wintypes.FILETIME()
+                kernel, user = wintypes.FILETIME(), wintypes.FILETIME()
+                if kernel32.GetProcessTimes(
+                        handle, ctypes.byref(created), ctypes.byref(exited),
+                        ctypes.byref(kernel), ctypes.byref(user)):
+                    cpu_seconds += _filetime_seconds(kernel) \
+                        + _filetime_seconds(user)
+                seen.append(int(pid))
+            finally:
+                kernel32.CloseHandle(handle)
+        if not seen:
+            return None
+        return ProcessActivity(tuple(seen), io_bytes, cpu_seconds)
+    except Exception:  # noqa: BLE001 - диагностика не вправе ронять сборку
+        return None
+
+
+def kill_tree(pid: int, process: Optional[object] = None,
+              wait: float = 15.0, rounds: int = 3) -> None:
+    """Снимает процесс вместе со всеми потомками (без внешних утилит).
+
+    ``Popen.terminate()``/``kill()`` снимает только саму обёртку установщика,
+    а работу обычно делает ребёнок (``setup.tmp``, ``msiexec``, ``DXSETUP``,
+    распакованный ``setup.exe``). Пережившая сборку пара «обёртка + ребёнок»
+    продолжала бы писать в папку результата и держать модальное окно, поэтому
+    потомки находятся заранее и завершаются принудительно. Раундов несколько:
+    пока жив родитель, он может успеть породить новых детей.
+
+    Функция ничего не возвращает и молчит на любых ошибках: снятие зависшей
+    установки — не то место, где сборке позволено упасть.
+    """
+    if process is not None:
+        pid = getattr(process, "pid", pid)
+    if IS_WINDOWS:
+        try:
+            root = int(pid)
+        except (TypeError, ValueError):
+            root = 0
+        if root:
+            for _ in range(max(1, rounds)):
+                victims = sorted(set(process_tree(root) or [root]),
+                                 key=lambda item: (item != root, item))
+                if not _terminate(victims):
+                    break
+                time.sleep(0.2)
+    if process is None:
+        return
+    try:
+        process.kill()  # type: ignore[attr-defined]
+    except (OSError, AttributeError, TypeError):
+        pass
+    try:
+        process.wait(timeout=wait)  # type: ignore[attr-defined]
+    except (OSError, AttributeError, TypeError, subprocess.SubprocessError):
+        pass
 
 
 def _post_close(pids: Iterable[int]) -> int:

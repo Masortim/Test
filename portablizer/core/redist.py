@@ -1230,6 +1230,23 @@ def format_duration(seconds: float) -> str:
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
+def human_duration(seconds: float) -> str:
+    """Длительность словами: «45 с», «12 мин», «1 ч 20 мин».
+
+    Форма ``format_duration`` (``12:00``) хороша для полос прогресса, но в
+    фразах вроде «последние 15:00 нет признаков работы» читается как время
+    суток. Для текста — эта функция.
+    """
+    total = int(max(0.0, seconds) + 0.5)
+    if total < 60:
+        return f"{total} с"
+    minutes = total // 60
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} ч {rest:02d} мин" if rest else f"{hours} ч"
+
+
 def describe_download(done: int, total: int, elapsed: float) -> Tuple[int, str]:
     """Процент и человеческое описание хода загрузки.
 
