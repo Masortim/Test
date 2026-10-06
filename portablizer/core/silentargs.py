@@ -60,6 +60,11 @@ class SilentPlan:
     interactive: bool = False
     #: Движок сам пишет сюда итог (InstallShield: setup.log с ResultCode).
     result_log: str = ""
+    #: Журналы, которые установщик ведёт ПО ХОДУ работы. Их рост — самое
+    #: честное доказательство, что долгая установка жива (см.
+    #: ``portablizer.core.portablizer._InstallWatchdog``): по журналу видно,
+    #: что движок продолжает распаковывать файлы, а не ждёт мышку.
+    progress_logs: List[str] = field(default_factory=list)
     #: Движок физически не умеет принимать целевую папку в командной строке:
     #: файлы окажутся в его каталоге по умолчанию, и их придётся переносить.
     ignores_target_dir: bool = False
@@ -146,7 +151,8 @@ def build_silent_plan(
         notes.append("MSI распаковывается через административную установку /a в TARGETDIR.")
         return SilentPlan(program="msiexec.exe", args=args, notes=notes,
                           label="MSI: административная распаковка",
-                          output_dir=native_target, extracts_only=True)
+                          output_dir=native_target, extracts_only=True,
+                          progress_logs=[log_file] if log_file else [])
 
     if installer_type == InstallerType.INNO:
         args = [
@@ -162,7 +168,8 @@ def build_silent_plan(
         notes.append("Inno Setup: /VERYSILENT /DIR=<папка>.")
         return SilentPlan(program=installer_path, args=args, notes=notes,
                           label="Inno Setup: /VERYSILENT /DIR",
-                          output_dir=native_target)
+                          output_dir=native_target,
+                          progress_logs=[log_file] if log_file else [])
 
     if installer_type == InstallerType.NSIS:
         # У NSIS /D должен быть ПОСЛЕДНИМ и БЕЗ кавычек.
@@ -203,7 +210,8 @@ def build_silent_plan(
         label = ("WiX Burn: /quiet /install + InstallFolder"
                  if override_install_folder else "WiX Burn: /quiet /install")
         return SilentPlan(program=installer_path, args=args, notes=notes,
-                          label=label, output_dir=native_target, needs_admin=True)
+                          label=label, output_dir=native_target, needs_admin=True,
+                          progress_logs=[log_file] if log_file else [])
 
     if installer_type == InstallerType.INSTALLAWARE:
         args = ["/s", f'/D={target_dir}'] + extra_args
@@ -238,7 +246,8 @@ def build_silent_plan(
         notes.append("Advanced Installer: /exenoui /qn APPDIR=<папка>.")
         return SilentPlan(program=installer_path, args=args, notes=notes,
                           label="Advanced Installer: /exenoui /qn",
-                          output_dir=native_target)
+                          output_dir=native_target,
+                          progress_logs=[log_file] if log_file else [])
 
     if installer_type == InstallerType.CUSTOM_CLI:
         return build_custom_cli_plan(installer_path, target_dir,
@@ -335,6 +344,7 @@ def build_installscript_plan(
         output_dir=native_target,
         interactive=record,
         result_log=native_log,
+        progress_logs=[native_log] if native_log else [],
         response_file=native_response,
         ignores_target_dir=True,
         instructions=[
@@ -510,6 +520,7 @@ def build_burn_layout_plan(
         label="WiX Burn: распаковка /layout",
         output_dir=native_layout,
         extracts_only=True,
+        progress_logs=[log_file] if log_file else [],
     )
 
 
