@@ -45,7 +45,7 @@ import json
 import os
 import string
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .. import __version__
 from .redist import REDIST_DIR_NAME, SILENT_SCRIPT_NAME as REDIST_SCRIPT_NAME
@@ -1781,6 +1781,26 @@ def render_py_launcher(cfg: LauncherConfig) -> str:
     return _PY_LAUNCHER
 
 
+#: Программы, которые входят в аккаунт ключом из профиля пользователя.
+#: Ключ переносится в портатив только для них — копировать закрытый ключ
+#: произвольной программы без её ведома незачем. Маркер ищется в имени
+#: программы и путях её исполняемых файлов (без учёта регистра).
+IDENTITY_PROFILES = (
+    ("ollama", (".ollama/id_ed25519", ".ollama/id_ed25519.pub")),
+)
+
+
+def identity_settings(cfg: "LauncherConfig") -> Optional[Dict[str, object]]:
+    """Блок ``identity`` для launcher_config.json, если программе нужен ключ."""
+    names = [cfg.app_name, cfg.target_exe_rel, cfg.launcher_target_rel]
+    names.extend(f"{t.name} {t.rel_path}" for t in cfg.targets)
+    haystack = " ".join(str(n) for n in names).casefold()
+    for marker, files in IDENTITY_PROFILES:
+        if marker in haystack:
+            return {"import_from_host": True, "files": list(files)}
+    return None
+
+
 def render_config_json(cfg: LauncherConfig) -> str:
     targets_data = [
         {
@@ -1793,7 +1813,7 @@ def render_config_json(cfg: LauncherConfig) -> str:
         }
         for t in cfg.targets
     ]
-    return json.dumps({
+    payload = {
         "generated_by": f"Portablizer {__version__}",
         "app_name": cfg.app_name,
         "target_exe_rel": cfg.target_exe_rel,
@@ -1839,4 +1859,9 @@ def render_config_json(cfg: LauncherConfig) -> str:
             "keys": consolidate_root_keys(cfg.registry_keys),
             "created_keys": consolidate_root_keys(cfg.registry_created_keys),
         },
-    }, ensure_ascii=False, indent=2)
+    }
+    # Ключ входа переносится только для программ из IDENTITY_PROFILES.
+    identity = identity_settings(cfg)
+    if identity is not None:
+        payload["identity"] = identity
+    return json.dumps(payload, ensure_ascii=False, indent=2)

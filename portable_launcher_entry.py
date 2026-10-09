@@ -8,10 +8,13 @@ portable app is started.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1275,6 +1278,211 @@ class RegistrySession:
             self.runtime.rmdir()
         except OSError:
             pass
+
+
+# --- ключ входа в аккаунт -----------------------------------------------------
+#
+# Ollama (и подобные программы) входит в аккаунт не паролем, а ключом в профиле
+# пользователя: ~/.ollama/id_ed25519. Сервер признаёт запросы по публичной
+# части, привязанной к аккаунту на сайте. Если вход выполнен одним ключом, а
+# портатив при следующем запуске берёт другой (или вообще пустой профиль),
+# окно входа крутится бесконечно: ключ «не тот».
+#
+# Поэтому лончер, но только для программ, у которых в launcher_config.json
+# есть блок ``identity``: (1) переносит ключ из профиля Windows в портатив,
+# если в портативе ключа ещё нет (существующий ключ портатива не трогает);
+# (2) пишет в журнал отпечаток ключа, чтобы было видно, совпадает ли он с
+# тем, что привязан к аккаунту, и почему вход не проходит.
+
+#: Файлы ключа по умолчанию (относительно профиля), если блок не задаёт свои.
+DEFAULT_IDENTITY_FILES = (".ollama/id_ed25519", ".ollama/id_ed25519.pub")
+
+_OPENSSH_MAGIC = b"openssh-key-v1\x00"
+_OPENSSH_BEGIN = b"-----BEGIN OPENSSH PRIVATE KEY-----"
+
+
+def _public_blob_from_pub(data: bytes) -> Optional[bytes]:
+    """Публичный ключ из строки ``ssh-ed25519 AAAA… комментарий``."""
+    parts = data.decode("ascii", "replace").split()
+    if len(parts) < 2:
+        return None
+    try:
+        return base64.b64decode(parts[1], validate=True)
+    except ValueError:
+        return None
+
+
+def _public_blob_from_private(data: bytes) -> Optional[bytes]:
+    """Публичная часть закрытого ключа OpenSSH без пароля.
+
+    Формат: base64 внутри PEM-обёртки, затем ``openssh-key-v1``, три строки
+    (шифр, KDF, параметры KDF), число ключей и публичный блок. Расшифровывать
+    ничего не нужно, поэтому пароль не требуется и секрет не раскрывается.
+    """
+    stripped = data.strip()
+    if not stripped.startswith(_OPENSSH_BEGIN):
+        return None
+    body = b"".join(
+        line.strip() for line in stripped.splitlines()
+        if line.strip() and not line.strip().startswith(b"-----"))
+    try:
+        raw = base64.b64decode(body, validate=True)
+    except ValueError:
+        return None
+    if not raw.startswith(_OPENSSH_MAGIC):
+        return None
+
+    def read_string(position: int) -> "tuple[bytes, int]":
+        if position + 4 > len(raw):
+            raise ValueError("truncated")
+        size = struct.unpack(">I", raw[position:position + 4])[0]
+        position += 4
+        if position + size > len(raw):
+            raise ValueError("truncated")
+        return raw[position:position + size], position + size
+
+    position = len(_OPENSSH_MAGIC)
+    try:
+        for _ in range(3):  # шифр, KDF, параметры KDF
+            _, position = read_string(position)
+        position += 4  # число ключей (uint32)
+        blob, _ = read_string(position)
+        return blob
+    except ValueError:
+        return None
+
+
+def _identity_blob(path: Path) -> Optional[bytes]:
+    """Публичный блок ключа из файла ``.pub`` или закрытого ключа."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if path.name.endswith(".pub"):
+        return _public_blob_from_pub(data)
+    return _public_blob_from_private(data)
+
+
+def _fingerprint(blob: bytes) -> str:
+    """Отпечаток в том же виде, что печатает ``ssh-keygen -lf``."""
+    digest = hashlib.sha256(blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _first_identity_blob(profile: Path, files: Sequence[str]) -> Optional[bytes]:
+    for rel in files:
+        path = _as_relative_path(profile, rel)
+        if path.is_file():
+            blob = _identity_blob(path)
+            if blob is not None:
+                return blob
+    return None
+
+
+def identity_settings(cfg: Dict[str, Any]) -> "Optional[tuple[list[str], bool]]":
+    """Есть ли у программы ключ входа, и какие файлы его составляют.
+
+    Возвращает ``(файлы, можно_ли_переносить_из_профиля_Windows)`` или
+    ``None``, если блока ``identity`` в конфиге нет (тогда лончер ничего не
+    трогает — для обычных программ так и должно быть).
+    """
+    block = cfg.get("identity")
+    if not isinstance(block, dict):
+        return None
+    raw_files = block.get("files")
+    files = [str(item) for item in raw_files
+             if str(item).strip()] if isinstance(raw_files, list) else []
+    if not files:
+        files = list(DEFAULT_IDENTITY_FILES)
+    return files, bool(block.get("import_from_host", True))
+
+
+def identity_report(root: Path, cfg: Dict[str, Any], host_profile: str = "",
+                    import_from_host: bool = False) -> "list[str]":
+    """Сверяет ключ входа в портативе с профилем Windows.
+
+    При ``import_from_host=True`` и отсутствии ключа в портативе копирует
+    ключ из профиля Windows (не перезаписывая ничего). При ``False`` только
+    читает — так работает проверка ``--check-identity``. Возвращает строки
+    отчёта; пустой список означает, что у программы ключа входа нет.
+    """
+    settings = identity_settings(cfg)
+    if settings is None:
+        return []
+    files, allow_import = settings
+    data = root / str(cfg.get("data_dir_name", "PortableData"))
+    portable = data / "User"
+    host: Optional[Path] = Path(host_profile) if host_profile else None
+    if host is not None:
+        try:
+            if os.path.normcase(str(host.resolve())) == os.path.normcase(
+                    str(portable.resolve())):
+                host = None  # профиль уже перенаправлен внутрь портатива
+        except OSError:
+            host = None
+
+    lines: list[str] = []
+    portable_has_key = any(_as_relative_path(portable, rel).is_file()
+                           for rel in files)
+    host_has_key = host is not None and any(
+        _as_relative_path(host, rel).is_file() for rel in files)
+
+    if not portable_has_key and host_has_key:
+        if import_from_host and allow_import:
+            copied = []
+            for rel in files:
+                source = _as_relative_path(host, rel)
+                if source.is_file():
+                    target = _as_relative_path(portable, rel)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+                    copied.append(rel)
+            lines.append("ключ перенесён из профиля Windows в портатив: "
+                         + ", ".join(copied))
+            portable_has_key = True
+        elif not allow_import:
+            lines.append("в профиле Windows есть ключ, но перенос отключён "
+                         "(identity.import_from_host = false)")
+        else:
+            lines.append("в профиле Windows есть ключ; проверка не переносит "
+                         "его сама — запустите программу через лончер")
+
+    portable_blob = _first_identity_blob(portable, files)
+    if portable_blob is None:
+        lines.append("ключа входа в портативе нет: при входе программа создаст "
+                     "новый ключ, и его придётся привязать к аккаунту заново")
+    else:
+        lines.append("ключ портатива: " + _fingerprint(portable_blob))
+
+    if host is not None and host_has_key:
+        host_blob = _first_identity_blob(host, files)
+        if host_blob is not None and portable_blob is not None:
+            if host_blob == portable_blob:
+                lines.append("профиль Windows: тот же ключ, что в портативе")
+            else:
+                lines.append(
+                    "ВНИМАНИЕ: в профиле Windows другой ключ ("
+                    + _fingerprint(host_blob) + "). Вход, выполненный с ним, "
+                    "в портативе не сработает — привяжите ключ портатива к "
+                    "аккаунту на сайте программы.")
+    return lines
+
+
+def check_identity(root: Optional[Path] = None) -> int:
+    """``LaunchPortable.exe --check-identity``: показать состояние ключа."""
+    root = root or find_portable_root()
+    with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
+        cfg: Dict[str, Any] = json.load(fh)
+    lines = identity_report(root, cfg, os.environ.get("USERPROFILE", ""),
+                            import_from_host=False)
+    if not lines:
+        text = "Для этой программы проверка ключа входа не предусмотрена."
+    else:
+        text = "\n".join(lines)
+    for line in lines:
+        _run_log(root, "identity check: " + line)
+    _show_warning(text)
+    return 0
 
 
 def _arguments_with_executable_alias(
@@ -2796,6 +3004,18 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     machine_path = root / machine_name if machine_name else None
     machine_available = bool(machine_path and machine_path.is_file())
 
+    # Ключ входа (Ollama и т.п.) сверяется ДО UAC-перезапуска: родительский
+    # процесс видит настоящий профиль пользователя, а повышенный экземпляр
+    # может работать от другой учётной записи администратора и не должен
+    # переносить чужой ключ.
+    try:
+        for line in identity_report(
+                root, cfg, os.environ.get("USERPROFILE", ""),
+                import_from_host=not already_elevated):
+            _run_log(root, "identity: " + line)
+    except Exception as exc:  # noqa: BLE001 - ключ не должен срывать запуск
+        _run_log(root, f"identity: check failed ({exc})")
+
     # Not only launchers and configurators need the captured HKLM data: old
     # games (The Witcher and other GOG re-releases) read their install path
     # from HKLM themselves and quit with exit code 1 when it is not there.
@@ -3088,6 +3308,9 @@ def main() -> int:
         if any(str(arg).casefold() in ("--sync-saves", "/sync-saves")
                for arg in sys.argv[1:]):
             return sync_saves(root)
+        if any(str(arg).casefold() in ("--check-identity", "/check-identity")
+               for arg in sys.argv[1:]):
+            return check_identity(root)
         return run()
     except Exception as exc:
         details = f"Не удалось запустить портативную программу.\n\n{exc}"
