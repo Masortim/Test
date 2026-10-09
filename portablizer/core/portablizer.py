@@ -919,7 +919,8 @@ class Portablizer:
             "install-retry.log", "install-layout.log", "installer-engine.log",
             "installer-output.log", "portablizer.log", "_bundle_layout",
             "setup-installshield.log", redist_mod.REPORT_NAME, "_redist_cache",
-            launcher_mod.STOP_SCRIPT_NAME,
+            launcher_mod.STOP_SCRIPT_NAME, launcher_mod.UPDATE_SCRIPT_NAME,
+            "Updates",
         ):
             path = os.path.join(portable_dir, filename)
             try:
@@ -3191,8 +3192,16 @@ class Portablizer:
             launcher_mod.render_stop_cmd(cfg, APP_EXE_LAUNCHER_NAME),
             encoding="ascii")
 
+        # Обновление программы внутри портатива: перетащить новый установщик
+        # на этот файл (или запустить без аргументов - он скачает сам).
+        self._write_text(
+            os.path.join(portable_dir, launcher_mod.UPDATE_SCRIPT_NAME),
+            launcher_mod.render_update_cmd(cfg, APP_EXE_LAUNCHER_NAME),
+            encoding="ascii")
+
         created_launchers: List[str] = ["Launch.bat", "LaunchHidden.vbs",
-                                        launcher_mod.STOP_SCRIPT_NAME]
+                                        launcher_mod.STOP_SCRIPT_NAME,
+                                        launcher_mod.UPDATE_SCRIPT_NAME]
 
         # Отдельные файлы нужны только для двух частых действий: официальный
         # launcher и окно настроек. Раньше BAT+VBS создавались для каждого
@@ -3414,6 +3423,7 @@ _README = """{app_name} — портативная версия
   Launch.bat            — запуск через EXE-лончер; --bat-fallback для консоли
   LaunchHidden.vbs      — запуск без окна консоли
   StopPortable.cmd      — освободить папку, если что-то из неё осталось в фоне
+  UpdatePortable.cmd    — обновить программу ВНУТРИ портатива (см. ниже)
 {companion_files_list}  launcher_config.json  — параметры лончера
 {registry_note}{runtime_note}  install.log           — подробный журнал установщика (если он поддерживается)
   portablizer.log       — журнал создания и диагностики портатива
@@ -3451,6 +3461,20 @@ _README = """{app_name} — портативная версия
 
 Полной виртуализации Windows лончер не выполняет: отдельные программы могут
 обращаться к системным каталогам напрямую.
+
+Обновление программы (новая версия вышла):
+  • кнопка «перезапустить для обновления» внутри самой программы на портативе
+    не нужна: лончер перехватывает её и сам ставит новую версию в App\\ —
+    данные в PortableData не затрагиваются;
+  • то же самое вручную: перетащите новый установщик на UpdatePortable.cmd
+    (или запустите его без аргументов — он скачает актуальную версию сам);
+  • новая версия сначала ставится во временную папку Updates\\stage и только
+    после проверки подменяет файлы в App\\. Прежняя версия остаётся в
+    Updates\\backup: «UpdatePortable.cmd --rollback» вернёт её, а саму папку
+    можно удалить, чтобы освободить место на флешке;
+  • если обновление прервали (зависло, закрыли через диспетчер задач),
+    при следующем запуске лончер сам вернёт прежнюю версию или предложит
+    доустановить новую. Ход работы — PortableData\\launcher-update.log.
 
 Если папка не удаляется («файл открыт в другой программе»):
   • обычно этого не бывает: после выхода лончер сам закрывает всё, что было

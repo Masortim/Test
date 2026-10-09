@@ -431,7 +431,13 @@ class MainWindow(QMainWindow):
             "за собой фоновые процессы. Заодно включаются сквозные "
             "сохранения: сейвы прямого запуска exe и запуска через лончер "
             "сводятся в одно хранилище внутри портатива. Настройки "
-            "портатива сохраняются, пересобирать его не нужно.")
+            "портатива сохраняются, пересобирать его не нужно.\n"
+            "«Обновить программу» ставит новую версию (например, Ollama) "
+            "ВНУТРЬ портатива: из файла установщика или из загруженного "
+            "программой. Файлы App подменяются только после проверки, "
+            "прежняя версия остаётся для отката, данные PortableData не "
+            "затрагиваются. Нужен свежий лончер — сначала «Обновить "
+            "лончер».")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -452,8 +458,12 @@ class MainWindow(QMainWindow):
         self.refresh_btn = QPushButton("Обновить лончер")
         self.refresh_btn.setObjectName("Ghost")
         self.refresh_btn.clicked.connect(lambda: self._maintenance("refresh"))
+        self.update_btn = QPushButton("Обновить программу")
+        self.update_btn.setObjectName("Ghost")
+        self.update_btn.clicked.connect(self._update_program)
         buttons.addWidget(self.release_btn)
         buttons.addWidget(self.refresh_btn)
+        buttons.addWidget(self.update_btn)
         buttons.addStretch(1)
         self.maintenance_status = QLabel("")
         self.maintenance_status.setObjectName("Hint")
@@ -469,7 +479,35 @@ class MainWindow(QMainWindow):
         if path:
             self.maintenance_edit.setText(path)
 
-    def _maintenance(self, action: str) -> None:
+    def _update_program(self) -> None:
+        """Обновление программы внутри портатива: файл установщика или авто."""
+        folder = self.maintenance_edit.text().strip()
+        box = QMessageBox(self)
+        box.setWindowTitle("Portablizer")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(
+            "Откуда взять новую версию программы?\n\n"
+            "• «Выбрать установщик» — файл, который вы скачали сами;\n"
+            "• «Автоматически» — тот, что программа уже скачала сама, а если "
+            "его нет — актуальный по адресу из настроек портатива "
+            "(для Ollama — ollama.com).")
+        pick = box.addButton("Выбрать установщик…", QMessageBox.ButtonRole.AcceptRole)
+        auto = box.addButton("Автоматически", QMessageBox.ButtonRole.YesRole)
+        box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        installer = ""
+        if clicked is pick:
+            installer, _ = QFileDialog.getOpenFileName(
+                self, "Установщик новой версии", folder,
+                "Установщики (*.exe *.msi);;Все файлы (*.*)")
+            if not installer:
+                return
+        elif clicked is not auto:
+            return
+        self._maintenance("update", installer)
+
+    def _maintenance(self, action: str, installer: str = "") -> None:
         folder = self.maintenance_edit.text().strip()
         if not folder and self.last_result:
             folder = self.last_result.portable_dir
@@ -482,9 +520,11 @@ class MainWindow(QMainWindow):
             return
         self.release_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
+        self.update_btn.setEnabled(False)
         self.maintenance_status.setText(
-            "Освобождаю папку…" if action == "release" else "Обновляю…")
-        self.maintenance_worker = MaintenanceWorker(folder, action)
+            {"release": "Освобождаю папку…",
+             "update": "Обновляю программу…"}.get(action, "Обновляю…"))
+        self.maintenance_worker = MaintenanceWorker(folder, action, installer)
         self.maintenance_worker.log_line.connect(self._on_log)
         self.maintenance_worker.finished_report.connect(
             self._on_maintenance_done)
@@ -493,6 +533,7 @@ class MainWindow(QMainWindow):
     def _on_maintenance_done(self, report) -> None:
         self.release_btn.setEnabled(True)
         self.refresh_btn.setEnabled(True)
+        self.update_btn.setEnabled(True)
         text = "\n".join(report.messages) or "Готово."
         if report.success:
             self.maintenance_status.setText("✔ Готово")
@@ -753,10 +794,10 @@ class MainWindow(QMainWindow):
         )
         wait_btn = box.addButton(
             "Подождать ещё " + redist_mod.human_duration(stall.idle_limit),
-            QMessageBox.AcceptRole)
+            QMessageBox.ButtonRole.AcceptRole)
         stop_btn = box.addButton("Прекратить установку",
                                  QMessageBox.DestructiveRole)
-        cancel_btn = box.addButton("Отменить сборку", QMessageBox.RejectRole)
+        cancel_btn = box.addButton("Отменить сборку", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(wait_btn)
         box.exec()
         clicked = box.clickedButton()

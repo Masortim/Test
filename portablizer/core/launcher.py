@@ -152,6 +152,11 @@ class LauncherConfig:
     # собственные сохранения. Структура: {"enabled", "mode", "store",
     # "entries": [...], "discovery": {...}}.
     shared_saves: Dict[str, object] = field(default_factory=dict)
+    # --- обновление программы внутри портатива -------------------------------
+    # Блок ``update`` из launcher_config.json: адрес актуального установщика,
+    # следы родного апдейтера, ключи тихой установки (см. UPDATE_PROFILES).
+    # Пустой словарь - значит «взять профиль программы, если он есть».
+    update: Dict[str, object] = field(default_factory=dict)
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -1374,6 +1379,8 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         redirect_known_folders=bool(data.get("redirect_known_folders", False)),
         shared_saves=(data.get("shared_saves")
                       if isinstance(data.get("shared_saves"), dict) else {}),
+        update=(dict(data["update"])
+                if isinstance(data.get("update"), dict) else {}),
         targets=targets,
         launcher_target_rel=text("launcher_target_rel"),
         config_target_rel=text("config_target_rel"),
@@ -1506,6 +1513,97 @@ def render_stop_cmd(cfg: LauncherConfig,
         exe_launcher=exe_launcher_name,
         powershell=_STOP_PS_FALLBACK.format(),
     ))
+
+
+# --- UpdatePortable.cmd (обновление программы внутри портатива) ---------------
+
+#: Имя скрипта обновления в корне портатива.
+UPDATE_SCRIPT_NAME = "UpdatePortable.cmd"
+
+_UPDATE_TEMPLATE = r"""@echo off
+rem ============================================================================
+rem  {title} - update the program INSIDE this portable folder
+rem
+rem  Usage:
+rem    UpdatePortable.cmd                  use the update the program already
+rem                                        downloaded, or download the latest one
+rem    UpdatePortable.cmd Setup.exe        install from this installer
+rem                                        (or drag the installer onto this file)
+rem    UpdatePortable.cmd https://...      download the installer from this URL
+rem    UpdatePortable.cmd --rollback       bring back the previous version
+rem
+rem  The new version is installed into a temporary folder first and only then
+rem  swapped into App.  The old version is kept in Updates\backup, your data in
+rem  PortableData is never touched.  The program's own "restart to update"
+rem  button is intercepted by the launcher and ends up in the same procedure.
+rem ============================================================================
+setlocal
+set "PORTABLE_ROOT=%~dp0"
+if not exist "%PORTABLE_ROOT%App\{exe_launcher}" (
+  echo {exe_launcher} was not found in the App folder.
+  pause
+  exit /b 1
+)
+if /i "%~1" == "--rollback" (
+  start "" /wait "%PORTABLE_ROOT%App\{exe_launcher}" %*
+  exit /b
+)
+rem The launcher is a windowed program: /wait keeps this script (and the
+rem exit code) in step with it.
+start "" /wait "%PORTABLE_ROOT%App\{exe_launcher}" --update %*
+exit /b %errorlevel%
+"""
+
+
+def render_update_cmd(cfg: LauncherConfig,
+                      exe_launcher_name: str = "LaunchPortable.exe") -> str:
+    """Скрипт «обновить программу в портативе» (перетащить установщик на него)."""
+    return ensure_ascii_bat(_UPDATE_TEMPLATE.format(
+        title=_bat_echo(ascii_display(cfg.app_name)),
+        exe_launcher=exe_launcher_name,
+    ))
+
+
+#: Известные программы с собственным апдейтером. Это ТЕ ЖЕ данные, что в
+#: ``portable_launcher_entry.UPDATE_PROFILES``: сборщик записывает их в
+#: ``launcher_config.json`` явно, а встроенная копия нужна лончеру только для
+#: портативов, собранных до появления блока ``update``. Тест следит за тем,
+#: чтобы копии не разошлись.
+UPDATE_PROFILES = (
+    ("ollama", {
+        "engine": "inno",
+        "source_url": "https://ollama.com/download/OllamaSetup.exe",
+        "staged": [
+            "AppData/Local/Ollama/updates_v2/*/*.exe",
+            "AppData/Local/Ollama/updates/*/*.exe",
+            "AppData/Local/Ollama/OllamaSetup.exe",
+        ],
+        "handoff": ["AppData/Local/Ollama/OllamaSetup.exe"],
+        "markers": ["AppData/Local/Ollama/upgraded"],
+        "installer_names": ["ollamasetup*"],
+    }),
+)
+
+
+def update_settings(cfg: "LauncherConfig") -> Optional[Dict[str, object]]:
+    """Блок ``update`` для launcher_config.json или ``None``.
+
+    Явные настройки (``cfg.update``) перекрывают профиль. Для программ без
+    профиля и без явных настроек блока нет: ручное обновление
+    (``UpdatePortable.cmd``) всё равно работает, а родной апдейтер лончер не
+    трогает - он не знает, по каким следам его узнавать.
+    """
+    names = [cfg.app_name, cfg.target_exe_rel, cfg.launcher_target_rel]
+    names.extend(f"{t.name} {t.rel_path}" for t in cfg.targets)
+    haystack = " ".join(str(n) for n in names).casefold()
+    block: Dict[str, object] = {}
+    for marker, profile in UPDATE_PROFILES:
+        if marker in haystack:
+            block = {k: (list(v) if isinstance(v, list) else v)
+                     for k, v in profile.items()}
+            break
+    block.update(cfg.update or {})
+    return block or None
 
 
 # --- Вспомогательные лаунчеры и меню ------------------------------------------
@@ -1864,4 +1962,8 @@ def render_config_json(cfg: LauncherConfig) -> str:
     identity = identity_settings(cfg)
     if identity is not None:
         payload["identity"] = identity
+    # Обновление внутри портатива: адрес установщика и следы родного апдейтера.
+    update = update_settings(cfg)
+    if update is not None:
+        payload["update"] = update
     return json.dumps(payload, ensure_ascii=False, indent=2)
