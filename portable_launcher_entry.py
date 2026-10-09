@@ -2505,7 +2505,8 @@ def shutdown_settings(cfg: Dict[str, Any]) -> Dict[str, float]:
 
 def _wait_for_portable_processes(root: Path, grace: float = 6.0,
                                  limit: float = 86400.0,
-                                 settings: Optional[Dict[str, float]] = None
+                                 settings: Optional[Dict[str, float]] = None,
+                                 tick: "Optional[Any]" = None
                                  ) -> int:
     """Wait while the portable program is really being used.
 
@@ -2538,6 +2539,8 @@ def _wait_for_portable_processes(root: Path, grace: float = 6.0,
     while time.monotonic() < spawn_deadline:
         if _portable_processes(root):
             break
+        if tick is not None:
+            tick()
         time.sleep(0.5)
 
     idle_since: Optional[float] = None
@@ -2558,7 +2561,14 @@ def _wait_for_portable_processes(root: Path, grace: float = 6.0,
             # left is background noise the caller will clean up.
             return waited
         waited += 1
-        time.sleep(1.0)
+        if tick is not None:
+            # Родной апдейтер надо ловить за доли секунды, до первого файла.
+            tick()
+            time.sleep(0.5)
+            tick()
+            time.sleep(0.5)
+        else:
+            time.sleep(1.0)
 
 
 def release_portable_folder(root: Path,
@@ -2976,11 +2986,1495 @@ def sweep_stale_session(root: Path, cfg: "Dict[str, Any]") -> "list[str]":
     return done
 
 
+# --- обновление программы внутри портатива ------------------------------------
+#
+# Жалоба, ради которой написан раздел: Ollama показала «доступна новая версия»,
+# пользователь нажал «перезапустить для обновления» - и всё зависло, а после
+# принудительного завершения программа вылетала при каждом запуске.
+#
+# Причина в самом механизме. «Родное» обновление скачивает установщик в
+# %LOCALAPPDATA%\Ollama\updates_v2, переименовывает его в
+# %LOCALAPPDATA%\Ollama\OllamaSetup.exe, запускает его ОТДЕЛЬНЫМ процессом
+# (/CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS /SILENT) и тут же завершается.
+# В портативе это ломается трижды:
+#   * установщик не знает про папку App: он ставит программу по умолчанию -
+#     в профиль ЭТОГО ПК, а не в портатив;
+#   * лончер видит живой процесс из своей папки и ждёт его (окно установщика
+#     считается «видимым» - ждать можно сутки), а потом убивает его на
+#     полпути: половина файлов новая, половина старая;
+#   * файл-маркер ``upgraded`` и недоустановленный OllamaSetup.exe остаются
+#     лежать, и программа при следующем старте снова лезет в «обновление».
+#
+# Поэтому лончер перехватывает обновление и делает его сам, по правилам
+# портатива: (1) не даёт родному установщику что-либо менять; (2) ставит
+# новую версию во ВРЕМЕННУЮ папку Updates\stage; (3) проверяет, что программа
+# там действительно появилась; (4) только после этого подменяет файлы в App,
+# сохранив старую версию в Updates\backup. Любой сбой откатывается, а журнал
+# Updates\journal.json позволяет довести откат до конца даже после
+# принудительного завершения лончера.
+
+UPDATE_DIR_NAME = "Updates"
+UPDATE_JOURNAL_NAME = "journal.json"
+UPDATE_LOG_NAME = "launcher-update.log"
+
+#: Коды возврата установщиков, означающие успех.
+UPDATE_OK_CODES = (0, 3010, 1641)
+
+#: Известные программы с собственным обновлением. Значения - умолчания блока
+#: ``update`` в launcher_config.json; сам блок их перекрывает. Маркер ищется в
+#: имени программы и путях её exe, как у ``identity``.
+UPDATE_PROFILES = (
+    ("ollama", {
+        "engine": "inno",
+        "source_url": "https://ollama.com/download/OllamaSetup.exe",
+        # Куда родной апдейтер кладёт скачанное (относительно PortableData).
+        "staged": [
+            "AppData/Local/Ollama/updates_v2/*/*.exe",
+            "AppData/Local/Ollama/updates/*/*.exe",
+            "AppData/Local/Ollama/OllamaSetup.exe",
+        ],
+        # Файл, который программа запускает при «перезапуске для обновления».
+        "handoff": ["AppData/Local/Ollama/OllamaSetup.exe"],
+        # Метка «обновление начато»: после УСПЕШНОГО старта программа сама её
+        # удаляет, поэтому оставшаяся метка - след прерванного обновления.
+        "markers": ["AppData/Local/Ollama/upgraded"],
+        "installer_names": ["ollamasetup*"],
+    }),
+)
+
+
+def _update_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    names = [cfg.get("app_name", ""), cfg.get("target_exe_rel", ""),
+             cfg.get("launcher_target_rel", "")]
+    targets = cfg.get("targets")
+    if isinstance(targets, list):
+        names.extend(str(item.get("rel_path", ""))
+                     for item in targets if isinstance(item, dict))
+    haystack = " ".join(str(n) for n in names).casefold()
+    for marker, profile in UPDATE_PROFILES:
+        if marker in haystack:
+            return profile
+    return {}
+
+
+def update_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Настройки обновления: блок ``update`` поверх профиля программы.
+
+    Ручное обновление (``--update``) работает для любого портатива и без
+    блока; перехват родного апдейтера включается только там, где известно,
+    что и где он кладёт (профиль или явные ``staged``/``handoff``).
+    """
+    block = cfg.get("update")
+    block = block if isinstance(block, dict) else {}
+    merged: Dict[str, Any] = dict(_update_profile(cfg))
+    merged.update(block)
+
+    def texts(name: str) -> "list[str]":
+        value = merged.get(name)
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value if str(item).strip()]
+
+    try:
+        timeout = float(merged.get("timeout", 3600.0))
+    except (TypeError, ValueError):
+        timeout = 3600.0
+    args = merged.get("installer_args")
+    handoff = texts("handoff")
+    markers = texts("markers")
+    names = [item.casefold() for item in texts("installer_names")]
+    return {
+        "enabled": merged.get("enabled", True) is not False,
+        "engine": str(merged.get("engine", "")).strip().casefold(),
+        "source_url": str(merged.get("source_url", "")).strip(),
+        "staged": texts("staged"),
+        "handoff": handoff,
+        "markers": markers,
+        "installer_names": names,
+        "preserve": texts("preserve"),
+        "keep_backup": merged.get("keep_backup", True) is not False,
+        "installer_args": ([str(a) for a in args]
+                           if isinstance(args, list) and args else None),
+        "timeout": max(60.0, min(86400.0, timeout)),
+        # Следить за родным апдейтером можно, только если известно, по каким
+        # следам его узнать.
+        "watch": bool(handoff or markers),
+    }
+
+
+def _data_dir(root: Path, cfg: Dict[str, Any]) -> Path:
+    return root / str(cfg.get("data_dir_name", "PortableData"))
+
+
+def _update_log(root: Optional[Path], message: str) -> None:
+    """Пишет и в общий журнал, и в отдельный журнал обновлений."""
+    _run_log(root, "update: " + message)
+    if root is None:
+        return
+    try:
+        import time
+
+        data = root / "PortableData"
+        data.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with (data / UPDATE_LOG_NAME).open("a", encoding="utf-8") as fh:
+            fh.write(f"[{stamp}] {message}\n")
+    except OSError:
+        pass
+
+
+def _glob_in_data(root: Path, cfg: Dict[str, Any],
+                  patterns: Iterable[str]) -> "list[Path]":
+    """Файлы PortableData по шаблонам вида ``AppData/Local/X/*/*.exe``."""
+    data = _data_dir(root, cfg)
+    found: "list[Path]" = []
+    for pattern in patterns:
+        text = str(pattern).replace("\\", "/").strip("/")
+        if not text or ".." in text.split("/") or ":" in text:
+            continue
+        try:
+            for item in data.glob(text):
+                if item.is_file() and item not in found:
+                    found.append(item)
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def staged_installers(root: Path, cfg: Dict[str, Any]) -> "list[Path]":
+    """Установщики, которые программа сама скачала для обновления.
+
+    Самый свежий - первым.
+    """
+    settings = update_settings(cfg)
+    items = _glob_in_data(root, cfg, settings["staged"])
+    items.sort(key=lambda p: _mtime(p), reverse=True)
+    return items
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def update_markers(root: Path, cfg: Dict[str, Any]) -> "list[Path]":
+    return _glob_in_data(root, cfg, update_settings(cfg)["markers"])
+
+
+def stop_stray_installers(root: Path, cfg: Dict[str, Any]) -> "list[str]":
+    """Завершает «родной» установщик, запущенный из портатива.
+
+    Он поставил бы программу мимо App и умер бы на полпути вместе с лончером.
+    Совпадение по имени (``ollamasetup*``): у Inno Setup рабочая копия в
+    Temp называется ``OllamaSetup.tmp``, и она тоже должна уйти.
+    """
+    import fnmatch
+
+    names = update_settings(cfg)["installer_names"]
+    if not names:
+        return []
+    victims = []
+    for pid, image in _portable_process_list(root):
+        name = _image_name(image).casefold()
+        if any(fnmatch.fnmatch(name, pattern) for pattern in names):
+            victims.append((pid, _image_name(image)))
+    if victims:
+        _terminate_pids(pid for pid, _ in victims)
+    return [name for _, name in victims]
+
+
+def _remove_file(path: Path) -> bool:
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _remove_empty_parents(path: Path, stop: Path) -> None:
+    parent = path.parent
+    while parent != stop and stop in parent.parents:
+        try:
+            parent.rmdir()
+        except OSError:
+            return
+        parent = parent.parent
+
+
+def quarantine_staged_update(root: Path, cfg: Dict[str, Any]
+                             ) -> "tuple[Optional[Path], bool]":
+    """Забирает у программы её обновление: установщик - в ``Updates``.
+
+    Возвращает ``(путь_к_установщику_или_None, всё_ли_убрано)``. После этого
+    программе нечего «применять» при старте, а скачанный установщик не
+    пропадает - его можно поставить правильно, внутрь портатива.
+    """
+    settings = update_settings(cfg)
+    installers = staged_installers(root, cfg)
+    data = _data_dir(root, cfg)
+    kept: Optional[Path] = None
+    clean = True
+    if installers:
+        folder = root / UPDATE_DIR_NAME
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / installers[0].name
+            os.replace(installers[0], target)
+            kept = target
+        except OSError:
+            clean = False
+        for extra in installers[1:]:
+            if not _remove_file(extra):
+                clean = False
+        for item in installers:
+            _remove_empty_parents(item, data)
+    for marker in _glob_in_data(root, cfg, settings["markers"]):
+        if not _remove_file(marker):
+            clean = False
+    # Недоустановленная рабочая копия «на месте запуска» тоже убирается: иначе
+    # программа решит, что обновление всё ещё идёт.
+    for leftover in _glob_in_data(root, cfg, settings["handoff"]):
+        if not _remove_file(leftover):
+            clean = False
+    return kept, clean
+
+
+def _pending_file(root: Path) -> Path:
+    return root / UPDATE_DIR_NAME / "pending.json"
+
+
+def _remember_pending(root: Path, installer: Path, declined: bool = False,
+                      interrupted: bool = False) -> None:
+    """Запоминает установщик, ждущий установки.
+
+    ``interrupted`` - его уже пытались применить (пользователь нажал
+    «перезапустить для обновления»); ``declined`` - от предложения поставить
+    его пользователь отказался, и спрашивать каждый запуск не нужно.
+    """
+    try:
+        _pending_file(root).parent.mkdir(parents=True, exist_ok=True)
+        _pending_file(root).write_text(
+            json.dumps({"installer": installer.name, "declined": declined,
+                        "interrupted": interrupted}, ensure_ascii=False),
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _forget_pending(root: Path) -> None:
+    _remove_file(_pending_file(root))
+
+
+def _pending_state(root: Path) -> "tuple[Optional[Path], bool, bool]":
+    """``(установщик, отказ, прервано)`` из Updates\\pending.json."""
+    try:
+        data = json.loads(_pending_file(root).read_text(encoding="utf-8"))
+        candidate = root / UPDATE_DIR_NAME / Path(str(data["installer"])).name
+        if candidate.is_file():
+            return (candidate, bool(data.get("declined")),
+                    bool(data.get("interrupted")))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None, False, False
+
+
+def pending_installer(root: Path) -> Optional[Path]:
+    """Установщик, оставшийся от перехваченного (или прерванного) обновления."""
+    return _pending_state(root)[0]
+
+
+class UpdateWatch:
+    """Следит за родным апдейтером, пока работает программа.
+
+    ``poll()`` дешёвый: пока нет следов обновления - это пара ``stat``.
+    Как только программа начала «перезапуск для обновления» (появился
+    файл установщика или метка), запущенный ею установщик завершается ДО
+    того, как успеет что-то записать, а скачанный файл переезжает в
+    ``Updates``. Саму программу не трогаем: она завершается сама.
+    """
+
+    def __init__(self, root: Path, cfg: Dict[str, Any]) -> None:
+        self.root = root
+        self.cfg = cfg
+        self.settings = update_settings(cfg)
+        self.active = bool(self.settings["enabled"]
+                           and self.settings["watch"])
+        self.handoff = False
+        self.installer: Optional[Path] = None
+        self._logged = False
+
+    def _triggered(self) -> bool:
+        return bool(
+            _glob_in_data(self.root, self.cfg, self.settings["handoff"])
+            or _glob_in_data(self.root, self.cfg, self.settings["markers"]))
+
+    def poll(self) -> bool:
+        """``True``, если обновление перехвачено (или перехватывается)."""
+        if not self.active:
+            return False
+        if not self._triggered():
+            return self.handoff
+        if not self.handoff:
+            self.handoff = True
+            _update_log(self.root, "the program started its own updater - "
+                        "intercepting it, the update will be installed "
+                        "into the portable folder instead")
+        stopped = stop_stray_installers(self.root, self.cfg)
+        if stopped and not self._logged:
+            self._logged = True
+            _update_log(self.root, "stopped the built-in installer: "
+                        + ", ".join(sorted(set(stopped))))
+        if stopped:
+            return True  # дочерние процессы установщика могли ещё остаться
+        kept, clean = quarantine_staged_update(self.root, self.cfg)
+        if kept is not None:
+            self.installer = kept
+            _remember_pending(self.root, kept, interrupted=True)
+            _update_log(self.root, f"the downloaded update is kept: {kept.name}")
+        return True
+
+    def finish(self, timeout: float = 15.0) -> None:
+        """Дожимает перехват после выхода программы."""
+        if not self.active:
+            return
+        import time
+
+        deadline = time.monotonic() + timeout
+        while self._triggered() and time.monotonic() < deadline:
+            self.poll()
+            time.sleep(0.5)
+        self.poll()
+
+    def take(self) -> Optional[Path]:
+        """Установщик, который надо поставить после этого сеанса."""
+        if self.installer is not None and self.installer.is_file():
+            return self.installer
+        if self.handoff:
+            return pending_installer(self.root)
+        return None
+
+
+def _wait_target(process: "subprocess.Popen", watch: "Optional[UpdateWatch]"
+                 ) -> int:
+    """``process.wait()``, но с проверкой родного апдейтера каждые полсекунды."""
+    if watch is None or not watch.active:
+        return process.wait()
+    while True:
+        try:
+            return process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            try:
+                watch.poll()
+            except Exception as exc:  # noqa: BLE001 - слежка не срывает запуск
+                _run_log(watch.root, f"update watch failed: {exc}")
+
+
+# --- установщик: определение движка и команды тихой установки ------------------
+
+def installer_engine(path: Path) -> str:
+    """``inno`` / ``nsis`` / ``msi`` / ``unknown`` по самому файлу."""
+    if path.suffix.lower() == ".msi":
+        return "msi"
+    try:
+        with path.open("rb") as fh:
+            blob = fh.read(8 * 1024 * 1024)
+            try:
+                fh.seek(-2 * 1024 * 1024, os.SEEK_END)
+                blob += fh.read()
+            except OSError:
+                pass
+    except OSError:
+        return "unknown"
+    if blob.startswith(b"\xd0\xcf\x11\xe0"):
+        return "msi"
+    if (b"Inno Setup" in blob or b"JR.Inno.Setup" in blob
+            or b"Inno Setup Setup Data" in blob):
+        return "inno"
+    if b"Nullsoft Install System" in blob or b"NullsoftInst" in blob:
+        return "nsis"
+    return "unknown"
+
+
+def install_commands(installer: Path, target_dir: Path, engine: str,
+                     settings: Optional[Dict[str, Any]] = None,
+                     log_file: Optional[Path] = None
+                     ) -> "list[tuple[str, str]]":
+    """Лестница команд тихой установки в ``target_dir``: ``(подпись, команда)``.
+
+    Команда - готовая строка: у NSIS параметр ``/D=`` обязан идти последним и
+    без кавычек, обычный список аргументов этого не умеет.
+    """
+    settings = settings or {}
+    quote = subprocess.list2cmdline
+    program = str(installer)
+    target = str(target_dir)
+    custom = settings.get("installer_args")
+    if custom:
+        args = [str(a).replace("{DIR}", target).replace(
+            "{INSTALLER}", program) for a in custom]
+        return [("свои ключи", quote([program, *args]))]
+
+    def inno() -> "tuple[str, str]":
+        args = [program, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                "/NOICONS", "/SP-", f"/DIR={target}"]
+        if log_file:
+            args.append(f"/LOG={log_file}")
+        return "Inno Setup", quote(args)
+
+    def nsis() -> "tuple[str, str]":
+        return "NSIS", quote([program, "/S"]) + f" /D={target}"
+
+    if engine == "inno":
+        return [inno()]
+    if engine == "nsis":
+        return [nsis()]
+    if engine == "msi":
+        return [
+            ("MSI: административная распаковка",
+             quote(["msiexec.exe", "/a", program, "/qn", "/norestart",
+                    f"TARGETDIR={target}"])),
+            ("MSI: установка в папку",
+             quote(["msiexec.exe", "/i", program, "/qn", "/norestart",
+                    f"INSTALLDIR={target}"])),
+        ]
+    return [inno(), nsis()]
+
+
+def _clear_dir(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    if path.is_dir():  # антивирус мог держать файл: вторая попытка
+        import time
+
+        time.sleep(1.0)
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _app_relative_target(cfg: Dict[str, Any]) -> str:
+    """Путь главного exe относительно App (то, что должно появиться в stage)."""
+    rel = str(cfg.get("target_exe_rel", "")).replace("\\", "/").strip("/")
+    if rel.casefold().startswith("app/"):
+        rel = rel[4:]
+    return rel
+
+
+def locate_payload(stage: Path, cfg: Dict[str, Any]) -> Optional[Path]:
+    """Корень установленной программы внутри ``stage`` или ``None``.
+
+    Установщик мог положить файлы прямо в ``stage`` или создать там ещё одну
+    папку (``stage\\Ollama``); «установлено» - это когда в нём нашёлся
+    главный exe программы.
+    """
+    rel = _app_relative_target(cfg)
+    if not rel or not stage.is_dir():
+        return None
+    direct = stage / rel.replace("/", os.sep)
+    if direct.is_file():
+        return stage
+    parts = rel.split("/")
+    wanted = parts[-1].casefold()
+    for folder, dirs, files in os.walk(stage):
+        depth = len(Path(folder).relative_to(stage).parts)
+        if depth > 4:
+            dirs[:] = []
+            continue
+        if any(name.casefold() == wanted for name in files):
+            candidate = Path(folder)
+            for _ in parts[:-1]:
+                candidate = candidate.parent
+            if candidate == stage or stage in candidate.parents:
+                return candidate
+    return None
+
+
+# --- следы установки на этом ПК -------------------------------------------------
+
+_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_ENV_KEY = "Environment"
+
+
+class HostTraceGuard:
+    """Возвращает компьютеру то, что установщик в нём изменил.
+
+    Установка во временную папку - всё равно установка: Inno Setup пишет
+    запись в «Установленные программы», ярлык автозапуска и дописывает
+    ``PATH`` пользователя. Папка Updates\\stage вскоре исчезнет, а след
+    остался бы навсегда. Поэтому до установки запоминается состояние, а
+    после - всё НОВОЕ откатывается. Существующее никогда не удаляется.
+    """
+
+    def __init__(self) -> None:
+        self.active = IS_WINDOWS
+        self._uninstall: "set[str]" = set()
+        self._run: "dict[str, Any]" = {}
+        self._env: "dict[str, tuple]" = {}
+        self._shortcuts: "set[str]" = set()
+        self.removed: "list[str]" = []
+
+    @staticmethod
+    def _shortcut_folders() -> "list[Path]":
+        folders = []
+        appdata = os.environ.get("APPDATA", "")
+        public = os.environ.get("PUBLIC", "")
+        profile = os.environ.get("USERPROFILE", "")
+        programdata = os.environ.get("PROGRAMDATA", "")
+        if appdata:
+            folders.append(Path(appdata) / "Microsoft" / "Windows"
+                           / "Start Menu")
+        if profile:
+            folders.append(Path(profile) / "Desktop")
+        if programdata:
+            folders.append(Path(programdata) / "Microsoft" / "Windows"
+                           / "Start Menu")
+        if public:
+            folders.append(Path(public) / "Desktop")
+        return [f for f in folders if f.is_dir()]
+
+    def _lnk_files(self) -> "set[str]":
+        found: "set[str]" = set()
+        for folder in self._shortcut_folders():
+            try:
+                for item in folder.rglob("*.lnk"):
+                    found.add(str(item))
+            except OSError:
+                continue
+        return found
+
+    @staticmethod
+    def _values(subkey: str) -> "dict[str, tuple]":
+        import winreg
+
+        values: "dict[str, tuple]" = {}
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey, 0,
+                                winreg.KEY_QUERY_VALUE) as key:
+                index = 0
+                while True:
+                    try:
+                        name, value, kind = winreg.EnumValue(key, index)
+                    except OSError:
+                        break
+                    values[name] = (value, kind)
+                    index += 1
+        except OSError:
+            pass
+        return values
+
+    @staticmethod
+    def _subkeys(subkey: str) -> "set[str]":
+        import winreg
+
+        names: "set[str]" = set()
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey, 0,
+                                winreg.KEY_ENUMERATE_SUB_KEYS) as key:
+                index = 0
+                while True:
+                    try:
+                        names.add(winreg.EnumKey(key, index))
+                    except OSError:
+                        break
+                    index += 1
+        except OSError:
+            pass
+        return names
+
+    def snapshot(self) -> None:
+        if not self.active:
+            return
+        try:
+            self._uninstall = self._subkeys(_UNINSTALL_KEY)
+            self._run = self._values(_RUN_KEY)
+            self._env = self._values(_ENV_KEY)
+            self._shortcuts = self._lnk_files()
+        except Exception:  # noqa: BLE001 - без снимка просто нечего откатывать
+            self.active = False
+
+    def restore(self) -> "list[str]":
+        if not self.active:
+            return []
+        try:
+            import winreg
+
+            for name in sorted(self._subkeys(_UNINSTALL_KEY)
+                               - self._uninstall):
+                try:
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
+                                     _UNINSTALL_KEY + "\\" + name)
+                    self.removed.append("Uninstall\\" + name)
+                except OSError:
+                    pass
+            now = self._values(_RUN_KEY)
+            for name in set(now) - set(self._run):
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                                        winreg.KEY_SET_VALUE) as key:
+                        winreg.DeleteValue(key, name)
+                    self.removed.append("Run\\" + name)
+                except OSError:
+                    pass
+            env_changed = False
+            now_env = self._values(_ENV_KEY)
+            for name, (value, kind) in self._env.items():
+                if now_env.get(name) != (value, kind):
+                    try:
+                        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _ENV_KEY,
+                                            0, winreg.KEY_SET_VALUE) as key:
+                            winreg.SetValueEx(key, name, 0, kind, value)
+                        self.removed.append("Environment\\" + name)
+                        env_changed = True
+                    except OSError:
+                        pass
+            for name in set(now_env) - set(self._env):
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _ENV_KEY, 0,
+                                        winreg.KEY_SET_VALUE) as key:
+                        winreg.DeleteValue(key, name)
+                    self.removed.append("Environment\\" + name)
+                    env_changed = True
+                except OSError:
+                    pass
+            if env_changed:
+                self._broadcast_environment()
+            for path in sorted(self._lnk_files() - self._shortcuts):
+                if _remove_file(Path(path)):
+                    self.removed.append(path)
+        except Exception:  # noqa: BLE001 - откат следов не должен ронять обновление
+            pass
+        return self.removed
+
+    @staticmethod
+    def _broadcast_environment() -> None:
+        try:
+            import ctypes
+
+            result = ctypes.c_ulong()
+            ctypes.windll.user32.SendMessageTimeoutW(  # type: ignore[attr-defined]
+                0xFFFF, 0x001A, 0, "Environment", 0x0002, 2000,
+                ctypes.byref(result))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# --- окно «идёт обновление» --------------------------------------------------
+
+class _BusyNotice:
+    """Окно с названием этапа и процентами, пока идёт долгая работа.
+
+    Лончер собран без консоли и без GUI-библиотек. Обычное окно сообщения,
+    показанное в фоновом потоке, прекрасно справляется: заголовок
+    обновляется на лету (``SetWindowTextW``), а в конце окно закрывается
+    само (``WM_CLOSE``). Кнопка «OK» его просто скрывает - обновление
+    продолжается.
+    """
+
+    def __init__(self, title: str, text: str) -> None:
+        self.base = title
+        self.text = text
+        self.token = f"[{os.getpid()}]"
+        self.current = f"{title} {self.token}"
+        self.thread = None
+
+    def start(self) -> None:
+        if not IS_WINDOWS:
+            return
+        import threading
+
+        def show() -> None:  # pragma: no cover - нужен рабочий стол
+            try:
+                import ctypes
+
+                MB_OK, MB_ICONINFORMATION = 0x0, 0x40
+                MB_TOPMOST, MB_SETFOREGROUND = 0x40000, 0x10000
+                ctypes.windll.user32.MessageBoxW(  # type: ignore[attr-defined]
+                    None, self.text, self.current,
+                    MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND)
+            except Exception:  # noqa: BLE001
+                pass
+
+        self.thread = threading.Thread(target=show, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def _user32():  # pragma: no cover - нужен Windows
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        user32.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        return user32
+
+    def update(self, stage: str) -> None:
+        if not IS_WINDOWS or self.thread is None:
+            return
+        try:
+            import ctypes
+
+            user32 = self._user32()
+            hwnd = user32.FindWindowW(None, self.current)
+            new_title = f"{self.base} - {stage} {self.token}"
+            if hwnd and user32.SetWindowTextW(hwnd, new_title):
+                self.current = new_title
+        except Exception:  # noqa: BLE001
+            pass
+
+    def close(self) -> None:
+        if not IS_WINDOWS or self.thread is None:
+            return
+        try:
+            import ctypes
+
+            user32 = self._user32()
+            hwnd = user32.FindWindowW(None, self.current)
+            if hwnd:
+                user32.PostMessageW(hwnd, 0x0010, 0, 0)
+            self.thread.join(timeout=3.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _ask_yes_no(message: str, title: str = "Portable Launcher") -> bool:
+    """Вопрос «Да/Нет». Без рабочего стола ответ всегда «нет»: молча менять
+    файлы программы лончер не вправе."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+
+        MB_YESNO, MB_ICONQUESTION, MB_TOPMOST = 0x4, 0x20, 0x40000
+        IDYES = 6
+        return ctypes.windll.user32.MessageBoxW(  # type: ignore[attr-defined]
+            None, message, title, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST
+        ) == IDYES
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _show_info(message: str, title: str = "Portable Launcher") -> None:
+    if IS_WINDOWS:
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(  # type: ignore[attr-defined]
+                None, message, title, 0x40 | 0x40000)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        print(message, file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --- загрузка установщика -----------------------------------------------------
+
+def _authenticode_status(path: Path) -> Optional[str]:
+    """Статус подписи Windows (``Valid``, ``NotSigned``...) или ``None``."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "(Get-AuthenticodeSignature -LiteralPath $env:PORTABLE_CHECK)"
+             ".Status"],
+            capture_output=True, text=True, timeout=120,
+            creationflags=NO_WINDOW,
+            env={**os.environ, "PORTABLE_CHECK": str(path)})
+        status = completed.stdout.strip()
+        return status or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def download_installer(url: str, destination: Path,
+                       progress: "Optional[Any]" = None,
+                       opener: "Optional[Any]" = None) -> Path:
+    """Скачивает установщик в ``destination`` (через ``.part``).
+
+    ``progress(done_bytes, total_bytes)`` вызывается по ходу. Недокачанный
+    файл никогда не остаётся под настоящим именем: оборванное соединение не
+    должно превратиться в «установщик».
+    """
+    import urllib.request
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(destination.name + ".part")
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "PortableLauncher/1.0"})
+    open_url = opener or urllib.request.urlopen
+    try:
+        with open_url(request, timeout=60) as response, \
+                partial.open("wb") as out:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+        if total and done != total:
+            raise OSError(f"скачано {done} байт из {total}")
+        if done == 0:
+            raise OSError("сервер вернул пустой файл")
+        os.replace(partial, destination)
+    except Exception:
+        _remove_file(partial)
+        raise
+    return destination
+
+
+def _download_name(url: str) -> str:
+    from urllib.parse import urlparse, unquote
+
+    name = Path(unquote(urlparse(url).path)).name
+    return name if name.lower().endswith((".exe", ".msi")) else "Update.exe"
+
+
+# --- само обновление ---------------------------------------------------------
+
+class UpdateResult:
+    def __init__(self) -> None:
+        self.ok = False
+        self.message = ""
+        self.backup: Optional[Path] = None
+        self.traces: "list[str]" = []
+
+    def fail(self, message: str) -> "UpdateResult":
+        self.ok = False
+        self.message = message
+        return self
+
+
+def _pid_alive(pid: int) -> bool:
+    """Жив ли процесс ``pid`` (другой экземпляр, делающий обновление)."""
+    if pid <= 0:
+        return False
+    if IS_WINDOWS:
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _journal_path(root: Path) -> Path:
+    return root / UPDATE_DIR_NAME / UPDATE_JOURNAL_NAME
+
+
+def _read_journal(root: Path) -> "Dict[str, Any]":
+    try:
+        data = json.loads(_journal_path(root).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_journal(root: Path, data: "Dict[str, Any]") -> None:
+    try:
+        path = _journal_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                             encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        pass
+
+
+def _move_with_retry(source: Path, destination: Path, attempts: int = 6) -> None:
+    """Перенос с повторами: сканер антивируса держит свежие файлы секунды."""
+    import time
+
+    last: Optional[OSError] = None
+    for attempt in range(attempts):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(1.0)
+    assert last is not None
+    raise last
+
+
+def _protected_names(cfg: Dict[str, Any]) -> "set[str]":
+    names = {"launchportable.exe", "saves"}
+    settings = update_settings(cfg)
+    names.update(Path(p.replace("\\", "/")).name.casefold()
+                 for p in settings["preserve"])
+    for alias in (cfg.get("launcher_aliases") or {}):
+        names.add(Path(str(alias)).name.casefold())
+    return names
+
+
+def _rollback_journal(root: Path, journal: "Dict[str, Any]") -> "list[str]":
+    """Возвращает App к состоянию до подмены. Идемпотентно."""
+    app_dir = root / "App"
+    backup = root / UPDATE_DIR_NAME / "backup"
+    problems: "list[str]" = []
+    for name in list(journal.get("added", [])):
+        path = app_dir / name
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        except OSError as exc:
+            problems.append(f"{name}: {exc}")
+    for name in list(journal.get("replaced", [])):
+        saved = backup / name
+        if not saved.exists():
+            continue
+        path = app_dir / name
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+            _move_with_retry(saved, path)
+        except OSError as exc:
+            problems.append(f"{name}: {exc}")
+    return problems
+
+
+def _default_installer_runner(command: str, env: "Dict[str, str]", cwd: str,
+                              timeout: float) -> Optional[int]:
+    """Запускает установщик и ждёт его завершения. ``None`` - таймаут."""
+    process = subprocess.Popen(  # noqa: S603
+        command, cwd=cwd, env=env, creationflags=NO_WINDOW,
+        stdin=subprocess.DEVNULL)
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return None
+
+
+def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
+                 progress: "Optional[Any]" = None,
+                 runner: "Optional[Any]" = None) -> UpdateResult:
+    """Ставит новую версию программы внутрь портатива.
+
+    Порядок продуман так, чтобы в любой момент можно было вернуться назад:
+    установка идёт во временную папку, App не трогается, пока там не
+    появилась рабочая программа, а подмена записывается в журнал.
+    """
+    import time
+
+    result = UpdateResult()
+    say = progress or (lambda text: None)
+    settings = update_settings(cfg)
+    app_dir = root / "App"
+    updates = root / UPDATE_DIR_NAME
+    stage = updates / "stage"
+    backup = updates / "backup"
+    run_installer = runner or _default_installer_runner
+
+    if not installer.is_file():
+        return result.fail(f"Установщик не найден: {installer}")
+    if not app_dir.is_dir():
+        return result.fail(f"В портативе нет папки App: {app_dir}")
+
+    shutdown = shutdown_settings(cfg)
+    say("закрываю программу")
+    _update_log(root, f"update started from {installer.name}")
+    release_portable_folder(root, shutdown)
+    if IS_WINDOWS and _portable_process_list(root):
+        return result.fail(
+            "Не удалось закрыть программу из портативной папки. Закройте её "
+            "и повторите обновление.")
+
+    updates.mkdir(parents=True, exist_ok=True)
+    _clear_dir(stage)
+    stage.mkdir(parents=True, exist_ok=True)
+    journal: "Dict[str, Any]" = {
+        "state": "installing", "installer": installer.name,
+        "pid": os.getpid(),
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "replaced": [], "added": [],
+    }
+    _write_journal(root, journal)
+
+    engine = settings["engine"] or installer_engine(installer)
+    log_file = _data_dir(root, cfg) / "installer-update.log"
+    commands = install_commands(installer, stage, engine, settings, log_file)
+    _update_log(root, f"installer engine: {engine}; {len(commands)} command(s)")
+
+    guard = HostTraceGuard()
+    guard.snapshot()
+    env = _prepare_environment(root, cfg)
+    payload: Optional[Path] = None
+    failures: "list[str]" = []
+    try:
+        for label, command in commands:
+            say(f"устанавливаю новую версию ({label})")
+            _update_log(root, f"running: {command}")
+            try:
+                code = run_installer(command, env, str(updates),
+                                     settings["timeout"])
+            except OSError as exc:
+                failures.append(f"{label}: не запустился ({exc})")
+                _update_log(root, failures[-1])
+                continue
+            # Установщик мог запустить только что поставленную программу.
+            release_portable_folder(root, shutdown)
+            payload = locate_payload(stage, cfg)
+            if payload is not None and code in UPDATE_OK_CODES:
+                _update_log(root, f"{label}: installed, code {code}")
+                break
+            payload = None
+            failures.append(f"{label}: код {code}")
+            _update_log(root, f"{label}: no usable result (code {code})")
+            _clear_dir(stage)
+            stage.mkdir(parents=True, exist_ok=True)
+    finally:
+        result.traces = guard.restore()
+        if result.traces:
+            _update_log(root, "removed installer traces from this PC: "
+                        + ", ".join(result.traces))
+
+    if payload is None:
+        journal["state"] = "failed"
+        _write_journal(root, journal)
+        _clear_dir(stage)
+        return result.fail(
+            "Установщик не положил программу в папку: "
+            + ("; ".join(failures) or "нет результата") + ". Портатив не "
+            "изменён. Подробности: PortableData\\" + UPDATE_LOG_NAME)
+
+    say("заменяю файлы программы")
+    journal["state"] = "swapping"
+    _clear_dir(backup)
+    backup.mkdir(parents=True, exist_ok=True)
+    protected = _protected_names(cfg)
+    try:
+        for entry in sorted(payload.iterdir(), key=lambda p: p.name.casefold()):
+            if entry.name.casefold() in protected:
+                continue
+            target = app_dir / entry.name
+            if target.exists() or target.is_symlink():
+                _move_with_retry(target, backup / entry.name)
+                journal["replaced"].append(entry.name)
+            else:
+                journal["added"].append(entry.name)
+            _write_journal(root, journal)
+            _move_with_retry(entry, target)
+    except OSError as exc:
+        _update_log(root, f"swap failed: {exc}; rolling back")
+        problems = _rollback_journal(root, journal)
+        journal["state"] = "rolled-back" if not problems else "rollback-failed"
+        _write_journal(root, journal)
+        _clear_dir(stage)
+        suffix = ("" if not problems else " Откат прошёл не полностью: "
+                  + "; ".join(problems[:3]) + ".")
+        return result.fail(
+            f"Не удалось заменить файлы ({exc}). Прежняя версия возвращена."
+            + suffix)
+
+    journal["state"] = "done"
+    _write_journal(root, journal)
+    _clear_dir(stage)
+    if settings["keep_backup"]:
+        result.backup = backup
+    else:
+        _clear_dir(backup)
+    # Всё, что осталось от «родного» обновления, больше не нужно: иначе
+    # программа при старте решит, что обновление не закончено.
+    quarantine_staged_update(root, cfg)
+    for leftover in sorted((root / UPDATE_DIR_NAME).glob("*")):
+        if (leftover.is_file() and leftover.suffix.lower() in (".exe", ".msi")
+                and leftover.resolve() == installer.resolve()):
+            _remove_file(leftover)
+    _forget_pending(root)
+    purge_portable_temp(root, cfg)
+    result.ok = True
+    result.message = ("Программа обновлена внутри портатива."
+                      + (" Прежняя версия сохранена в папке Updates\\backup "
+                         "(команда --rollback вернёт её; папку можно удалить, "
+                         "чтобы освободить место)." if result.backup else ""))
+    _update_log(root, "update finished successfully")
+    return result
+
+
+def rollback_update(root: Path, cfg: Dict[str, Any]) -> UpdateResult:
+    """Возвращает версию, сохранённую при последнем обновлении."""
+    result = UpdateResult()
+    journal = _read_journal(root)
+    backup = root / UPDATE_DIR_NAME / "backup"
+    if not journal or not (journal.get("replaced") or journal.get("added")):
+        return result.fail("Нет сохранённой прежней версии: откатывать нечего.")
+    if journal.get("state") == "rolled-back":
+        return result.fail("Откат уже выполнен.")
+    if journal.get("replaced") and not backup.is_dir():
+        return result.fail("Папка Updates\\backup удалена: откатывать не из чего.")
+    release_portable_folder(root, shutdown_settings(cfg))
+    problems = _rollback_journal(root, journal)
+    if problems:
+        return result.fail("Откат прошёл не полностью: "
+                           + "; ".join(problems[:3]))
+    journal["state"] = "rolled-back"
+    _write_journal(root, journal)
+    _clear_dir(backup)
+    result.ok = True
+    result.message = "Прежняя версия программы возвращена."
+    _update_log(root, "rolled back to the previous version")
+    return result
+
+
+def recover_interrupted_update(root: Path, cfg: Dict[str, Any]) -> Optional[str]:
+    """Доводит до конца обновление, прерванное принудительным завершением.
+
+    ``swapping`` - подмена файлов началась, но не закончилась: App
+    наполовину новый, наполовину старый, и единственный верный ход - вернуть
+    сохранённое. ``installing`` - до App дело не дошло, достаточно убрать
+    недоустановленную временную папку.
+    """
+    journal = _read_journal(root)
+    state = journal.get("state")
+    if state in ("installing", "swapping"):
+        # Обновление, которое ещё идёт в ДРУГОМ процессе (UpdatePortable.cmd
+        # и параллельный запуск программы), откатывать нельзя.
+        try:
+            owner = int(journal.get("pid", 0))
+        except (TypeError, ValueError):
+            owner = 0
+        if owner and owner != os.getpid() and _pid_alive(owner):
+            return None
+    if state == "installing":
+        _clear_dir(root / UPDATE_DIR_NAME / "stage")
+        journal["state"] = "failed"
+        _write_journal(root, journal)
+        _update_log(root, "an interrupted installation was cleaned up; "
+                    "the portable folder was not changed")
+        return ("Прошлое обновление было прервано до замены файлов. "
+                "Портатив не изменён.")
+    if state == "swapping":
+        problems = _rollback_journal(root, journal)
+        journal["state"] = "rollback-failed" if problems else "rolled-back"
+        _write_journal(root, journal)
+        _clear_dir(root / UPDATE_DIR_NAME / "stage")
+        _update_log(root, "an interrupted file swap was rolled back"
+                    + (": " + "; ".join(problems[:3]) if problems else ""))
+        if problems:
+            return ("Прошлое обновление было прервано, а вернуть прежнюю "
+                    "версию полностью не удалось: " + "; ".join(problems[:3])
+                    + ". Запустите UpdatePortable.cmd - программа будет "
+                    "установлена заново.")
+        return ("Прошлое обновление было прервано посреди замены файлов. "
+                "Прежняя версия возвращена, программа запустится как раньше.")
+    return None
+
+
+def _find_installer(root: Path, cfg: Dict[str, Any]) -> Optional[Path]:
+    """Готовый установщик: оставленный перехватом, в Updates или скачанный."""
+    pending = pending_installer(root)
+    if pending is not None:
+        return pending
+    folder = root / UPDATE_DIR_NAME
+    found = []
+    if folder.is_dir():
+        found = [p for p in folder.iterdir()
+                 if p.is_file() and p.suffix.lower() in (".exe", ".msi")]
+    found.extend(staged_installers(root, cfg))
+    found.sort(key=_mtime, reverse=True)
+    return found[0] if found else None
+
+
+def run_update(root: Path, cfg: Dict[str, Any], source: str = "",
+               interactive: bool = True, confirm_download: bool = True,
+               runner: "Optional[Any]" = None,
+               downloader: "Optional[Any]" = None) -> UpdateResult:
+    """Весь сценарий: найти или скачать установщик, показать ход, поставить.
+
+    ``source`` - путь к установщику или ``http(s)``-адрес; пусто - взять
+    готовый (оставленный перехватом, лежащий в ``Updates``) или скачать по
+    ``source_url`` из настроек.
+    """
+    settings = update_settings(cfg)
+    result = UpdateResult()
+    downloaded: Optional[Path] = None
+    installer: Optional[Path] = None
+    url = ""
+    if source.lower().startswith(("http://", "https://")):
+        url = source
+    elif source:
+        installer = Path(source)
+        if not installer.is_file():
+            return result.fail(f"Файл установщика не найден: {source}")
+    else:
+        installer = _find_installer(root, cfg)
+        if installer is None:
+            url = settings["source_url"]
+    if installer is None and not url:
+        return result.fail(
+            "Нет установщика новой версии. Положите его в папку Updates, "
+            "перетащите на UpdatePortable.cmd или запустите "
+            "App\\LaunchPortable.exe --update <файл или ссылка>.")
+    if url and confirm_download and interactive and not _ask_yes_no(
+            f"Скачать новую версию программы с адреса\n{url}\n"
+            "и установить её внутрь портатива?\n\n"
+            "Данные и настройки (PortableData) не затрагиваются, прежняя "
+            "версия сохраняется для отката."):
+        return result.fail("Обновление отменено.")
+
+    notice = _BusyNotice(
+        "Обновление портатива",
+        "Идёт обновление программы внутри портативной папки.\n\n"
+        "Не выключайте компьютер и не вынимайте флешку. Окно закроется "
+        "само; ход работы пишется в PortableData\\" + UPDATE_LOG_NAME + ".")
+    if interactive:
+        notice.start()
+    try:
+        if url:
+            target = root / UPDATE_DIR_NAME / _download_name(url)
+            fetch = downloader or download_installer
+
+            def report(done: int, total: int) -> None:
+                if total:
+                    notice.update(f"скачиваю {done * 100 // total}%")
+                else:
+                    notice.update(f"скачиваю {done // (1024 * 1024)} МБ")
+
+            _update_log(root, f"downloading {url}")
+            try:
+                downloaded = fetch(url, target, report)
+            except Exception as exc:  # noqa: BLE001 - сеть бывает любой
+                _update_log(root, f"download failed: {exc}")
+                return result.fail(f"Не удалось скачать установщик: {exc}")
+            status = _authenticode_status(downloaded)
+            if status in ("NotSigned", "HashMismatch"):
+                _remove_file(downloaded)
+                _update_log(root, f"signature check failed: {status}")
+                return result.fail(
+                    "Скачанный файл не прошёл проверку цифровой подписи "
+                    f"({status}); он удалён и не будет запущен.")
+            if status not in (None, "Valid"):
+                _update_log(root, f"signature status: {status} (not blocking)")
+            installer = downloaded
+        assert installer is not None
+        return apply_update(root, cfg, installer, progress=notice.update,
+                            runner=runner)
+    finally:
+        notice.close()
+
+
+def offer_recovery(root: Path, cfg: Dict[str, Any],
+                   ask: "Optional[Any]" = None,
+                   updater: "Optional[Any]" = None) -> Optional[str]:
+    """Предстартовая проверка: не осталось ли следов прерванного обновления.
+
+    Именно это состояние остаётся после «зависло - закрыл через диспетчер
+    задач»: маркер ``upgraded`` и недоустановленный OllamaSetup.exe. Они
+    сами по себе роняют программу при старте, а App мог остаться
+    наполовину обновлённым. Следы убираются, а пользователю предлагается
+    поставить программу заново - правильно, внутрь портатива.
+    """
+    settings = update_settings(cfg)
+    if not settings["enabled"]:
+        return None
+    ask = ask or _ask_yes_no
+    notes: "list[str]" = []
+    # Дешёвые проверки файлов - первыми: у обычного запуска их результат
+    # пуст, и список процессов (дорогой) строить не нужно.
+    journal_state = _read_journal(root).get("state")
+    markers = update_markers(root, cfg)
+    leftovers = _glob_in_data(root, cfg, settings["handoff"])
+    staged = staged_installers(root, cfg)
+    pending, declined, pending_interrupted = _pending_state(root)
+    if not (markers or leftovers or staged or pending
+            or journal_state in ("installing", "swapping")):
+        return None
+    if _portable_process_list(root):
+        return None  # второй экземпляр программы: ничего не трогаем
+    interrupted = recover_interrupted_update(root, cfg)
+    if interrupted:
+        notes.append(interrupted)
+        if IS_WINDOWS:
+            _show_info(interrupted)
+    if not (markers or leftovers or staged or pending):
+        return "\n".join(notes) or None
+
+    stop_stray_installers(root, cfg)
+    kept, clean = quarantine_staged_update(root, cfg)
+    installer = kept or pending
+    # Прерванным обновление считается, если остались следы ЗАПУСКА установщика
+    # (метка, рабочая копия) или перехват не довёл дело до конца. Просто
+    # скачанная программой новая версия - обычная ситуация «обновление
+    # готово», об отказе от неё спрашивать каждый запуск не нужно.
+    interrupted_update = bool(
+        markers or leftovers
+        or (pending and pending_interrupted and not declined))
+    _update_log(root, "found traces of the program's own update: "
+                f"markers={len(markers)}, started installers={len(leftovers)}, "
+                f"downloaded={len(staged)}; cleaned"
+                + ("" if clean else " (not completely)"))
+    if installer is not None and declined and not interrupted_update:
+        return "\n".join(notes) or None
+    if installer is None and not interrupted_update:
+        return "\n".join(notes) or None
+
+    if installer is not None and interrupted_update:
+        question = (
+            "Обновление программы было прервано, а в портативной папке "
+            f"остался скачанный установщик ({installer.name}).\n\n"
+            "Установить новую версию сейчас - правильно, внутрь портатива? "
+            "Это займёт несколько минут. Данные и настройки не "
+            "затрагиваются, прежняя версия сохранится для отката.")
+    elif installer is not None:
+        question = (
+            "Программа скачала новую версию "
+            f"({installer.name}).\n\nУстановить её сейчас внутрь портатива? "
+            "Это займёт несколько минут. Данные и настройки не "
+            "затрагиваются, прежняя версия сохранится для отката.\n\n"
+            "Если отказаться, файл останется в папке Updates: поставить его "
+            "можно в любой момент через UpdatePortable.cmd.")
+    else:
+        question = (
+            "Прошлое обновление программы было прервано: часть файлов могла "
+            "остаться недоустановленной, и из-за этого программа вылетает при "
+            "запуске.\n\nСкачать актуальную версию и переустановить её "
+            "внутрь портатива? Данные и настройки не затрагиваются.")
+        if not settings["source_url"]:
+            _show_info(question.split("\n\n")[0]
+                       + "\n\nСледы прерванного обновления убраны. Если "
+                         "программа всё равно не запускается, поставьте её "
+                         "заново: перетащите установщик на UpdatePortable.cmd.")
+            return "\n".join(notes) or None
+    was_interrupted = interrupted_update or pending_interrupted
+    if installer is not None:
+        _remember_pending(root, installer, declined=False,
+                          interrupted=was_interrupted)
+    if not ask(question):
+        _update_log(root, "the user postponed the update")
+        if installer is not None:
+            _remember_pending(root, installer, declined=True,
+                              interrupted=was_interrupted)
+        return "\n".join(notes) or None
+    run = updater or run_update
+    outcome = run(root, cfg, str(installer) if installer else "",
+                  interactive=True, confirm_download=False)
+    if outcome.ok:
+        notes.append(outcome.message)
+    else:
+        _show_error("Обновление не удалось.\n\n" + outcome.message)
+    return "\n".join(notes) or None
+
+
+def update_command(root: Path, argv: Sequence[str]) -> int:
+    """``LaunchPortable.exe --update [файл|ссылка] [--yes]``.
+
+    Коды: 0 - обновлено, 1 - не удалось, 3 - отказ пользователя.
+    """
+    with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
+        cfg: Dict[str, Any] = json.load(fh)
+    arguments = [str(a) for a in argv]
+    quiet = any(a.casefold() in ("--yes", "/yes", "--quiet") for a in arguments)
+    rest = [a for a in arguments
+            if a.casefold() not in ("--update", "/update", "--yes", "/yes",
+                                    "--quiet", "--elevated")]
+    source = rest[0] if rest else ""
+    result = run_update(root, cfg, source, interactive=True,
+                        confirm_download=not quiet)
+    if result.ok:
+        # С ключом --yes окно итога не нужно: результат уходит в код возврата
+        # и журнал, а показывает его тот, кто нас вызвал (Portablizer).
+        if not quiet:
+            _show_info(result.message)
+        return 0
+    _update_log(root, "failed: " + result.message)
+    if result.message == "Обновление отменено.":
+        return 3
+    if not quiet:
+        _show_error("Обновление не удалось.\n\n" + result.message)
+    return 1
+
+
+def rollback_command(root: Path) -> int:
+    with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
+        cfg: Dict[str, Any] = json.load(fh)
+    result = rollback_update(root, cfg)
+    if result.ok:
+        _show_info(result.message)
+        return 0
+    _show_error(result.message)
+    return 1
+
+
 def run(argv: Optional[Sequence[str]] = None) -> int:
+    """Запуск программы + обновление внутри портатива, если оно понадобилось."""
     root = find_portable_root()
     with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
         cfg: Dict[str, Any] = json.load(fh)
 
+    # Следы прерванного обновления (принудительно закрытая программа, зависший
+    # «перезапуск для обновления») убираются ДО старта: именно они роняют
+    # программу при каждом следующем запуске.
+    already_elevated = any(
+        str(arg).casefold() == "--elevated"
+        for arg in (argv if argv is not None else sys.argv[1:]))
+    if not already_elevated:
+        try:
+            note = offer_recovery(root, cfg)
+            if note:
+                _run_log(root, "update: " + note.replace("\n", " "))
+        except Exception as exc:  # noqa: BLE001 - восстановление не срывает запуск
+            _run_log(root, f"update: recovery check failed ({exc})")
+
+    watch = UpdateWatch(root, cfg)
+    code = _run_session(argv, root, cfg, watch)
+    # «Перезапустить для обновления»: родной установщик перехвачен, новая
+    # версия ставится в портатив, после чего программа запускается снова.
+    for _attempt in range(2):
+        installer = watch.take() if watch.active else None
+        if installer is None:
+            break
+        _update_log(root, "the program asked to restart for an update")
+        outcome = run_update(root, cfg, str(installer), interactive=True,
+                             confirm_download=False)
+        if not outcome.ok:
+            _update_log(root, "failed: " + outcome.message)
+            _show_error("Обновление не удалось.\n\n" + outcome.message
+                        + "\n\nПрограмма останется прежней версии.")
+            break
+        watch = UpdateWatch(root, cfg)
+        code = _run_session(argv, root, cfg, watch)
+    return code
+
+
+def _run_session(argv: Optional[Sequence[str]], root: Path,
+                 cfg: Dict[str, Any], watch: "UpdateWatch") -> int:
     # Остатки прошлого запуска убираются ДО старта: иначе они так и будут
     # держать папку, пока пользователь не перезагрузит компьютер.
     stale = sweep_stale_session(root, cfg)
@@ -3095,8 +4589,8 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                      + f" (cwd={target.parent}, elevated={_is_elevated()}, "
                      + f"job={'yes' if job.handle else 'no'})")
             try:
-                code = _spawn_target(
-                    command, str(target.parent), env, job).wait()
+                code = _wait_target(_spawn_target(
+                    command, str(target.parent), env, job), watch)
             except OSError as exc:
                 if getattr(exc, "winerror", None) != 14001:
                     raise
@@ -3124,7 +4618,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             # The official launcher usually starts the game and exits at once.
             # Restoring the registry right now would pull the install keys out
             # from under the game that is just starting, so wait for it.
-            waited = _wait_for_portable_processes(root, settings=shutdown)
+            waited = _wait_for_portable_processes(
+                root, settings=shutdown,
+                tick=watch.poll if watch.active else None)
+            # Родной апдейтер мог стартовать в последний момент: дожимаем.
+            watch.finish()
             if waited:
                 _run_log(root, f"waited {waited}s for programs started from "
                                f"the portable folder to finish")
@@ -3305,6 +4803,12 @@ def main() -> int:
         if any(str(arg).casefold() in ("--stop", "/stop")
                for arg in sys.argv[1:]):
             return stop(root)
+        if any(str(arg).casefold() in ("--update", "/update")
+               for arg in sys.argv[1:]):
+            return update_command(root, sys.argv[1:])
+        if any(str(arg).casefold() in ("--rollback", "/rollback")
+               for arg in sys.argv[1:]):
+            return rollback_command(root)
         if any(str(arg).casefold() in ("--sync-saves", "/sync-saves")
                for arg in sys.argv[1:]):
             return sync_saves(root)

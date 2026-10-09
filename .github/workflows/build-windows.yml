@@ -271,6 +271,72 @@ jobs:
           }
           if (-not $holder.HasExited) { $holder.Kill() }
 
+      - name: Smoke test - update inside the portable folder
+        shell: pwsh
+        run: |
+          # Регрессия на «перезапуск для обновления»: новая версия должна
+          # встать внутрь портатива через временную папку, прежняя - уйти в
+          # Updates\backup, данные PortableData - остаться на месте, а
+          # установщик не должен оставить следов на этом ПК.
+          $root = Join-Path $env:RUNNER_TEMP "UpdateSmoke"
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "App") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "PortableData/User") | Out-Null
+          Copy-Item dist/PortableLauncher.exe (Join-Path $root "App/LaunchPortable.exe")
+          Copy-Item $env:ComSpec (Join-Path $root "App/cmd.exe")
+          Set-Content -Path (Join-Path $root "App/old-version.txt") -Value "old"
+          Set-Content -Path (Join-Path $root "PortableData/User/keep.txt") -Value "mine"
+          $culture = (Get-UICulture).Name
+          $muiSource = Join-Path (Split-Path $env:ComSpec) "$culture/cmd.exe.mui"
+          if (Test-Path $muiSource) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $root "App/$culture") | Out-Null
+            Copy-Item $muiSource (Join-Path $root "App/$culture/cmd.exe.mui")
+          }
+          @{
+            app_name = "UpdateSmoke"
+            target_exe_rel = "App/cmd.exe"
+            data_dir_name = "PortableData"
+            registry = @{ enabled = $false }
+            update = @{ installer_args = @("{DIR}") }
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $root "launcher_config.json")
+
+          # «Установщик»: кладёт cmd.exe и новый файл в папку из первого аргумента.
+          $installer = Join-Path $env:RUNNER_TEMP "FakeSetup.cmd"
+          @(
+            '@echo off',
+            'mkdir "%~1" 2>nul',
+            'copy /y "%ComSpec%" "%~1\cmd.exe" >nul',
+            'echo new> "%~1\new-version.txt"',
+            'exit /b 0'
+          ) | Set-Content -Encoding ascii $installer
+
+          $process = Start-Process -FilePath (Join-Path $root "App/LaunchPortable.exe") `
+            -ArgumentList @('--update', $installer, '--yes') -PassThru
+          if (-not $process.WaitForExit(180000)) {
+            $process.Kill()
+            Write-Host "::error title=Update smoke failure::the launcher did not finish the update within 180 s"
+            throw "--update did not finish within 180 s"
+          }
+          $log = Join-Path $root "PortableData/launcher-update.log"
+          $logText = if (Test-Path $log) { Get-Content $log -Raw } else { "no update log" }
+          Write-Host $logText
+          if ($process.ExitCode -ne 0) {
+            $d = $logText.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Update smoke failure::exit=$($process.ExitCode); $d"
+            throw "--update returned $($process.ExitCode)"
+          }
+          if (-not (Test-Path (Join-Path $root "App/new-version.txt"))) { throw "the new version was not swapped into App" }
+          if (-not (Test-Path (Join-Path $root "Updates/backup/cmd.exe"))) { throw "the previous version was not kept in Updates/backup" }
+          if (-not (Test-Path (Join-Path $root "PortableData/User/keep.txt"))) { throw "PortableData was touched" }
+          if (-not (Test-Path (Join-Path $root "App/old-version.txt"))) { throw "files that the installer does not ship must stay" }
+          if (Test-Path (Join-Path $root "Updates/stage")) { throw "the temporary stage folder was not removed" }
+
+          # Откат возвращает прежнюю версию.
+          $rb = Start-Process -FilePath (Join-Path $root "App/LaunchPortable.exe") `
+            -ArgumentList @('--rollback') -PassThru
+          if (-not $rb.WaitForExit(120000)) { $rb.Kill(); throw "--rollback did not finish" }
+          if ($rb.ExitCode -ne 0) { throw "--rollback returned $($rb.ExitCode)" }
+          if (Test-Path (Join-Path $root "App/new-version.txt")) { throw "rollback left the new file in App" }
+
       - name: Smoke test (import only)
         run: |
           python -c "import portablizer, portablizer.core.portablizer, portablizer.gui.main_window; print('import OK')"

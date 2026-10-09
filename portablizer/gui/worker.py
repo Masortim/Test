@@ -91,10 +91,11 @@ class MaintenanceWorker(QThread):
     log_line = Signal(str, str)              # level, message
     finished_report = Signal(object)         # MaintenanceReport
 
-    def __init__(self, folder: str, action: str) -> None:
+    def __init__(self, folder: str, action: str, installer: str = "") -> None:
         super().__init__()
         self.folder = folder
-        self.action = action                 # "release" | "refresh"
+        self.action = action                 # "release" | "refresh" | "update"
+        self.installer = installer           # для "update": файл или ссылка
         self.logger = Logger()
         self.logger.add_sink(lambda lvl, msg: self.log_line.emit(lvl, msg))
 
@@ -106,6 +107,9 @@ class MaintenanceWorker(QThread):
                 copy_exe=lambda folder, rel: engine._copy_exe_launcher(
                     folder, rel),
             )
+        elif self.action == "update":
+            report = maintenance.update_app(
+                self.folder, self.installer, self.logger)
         else:
             report = maintenance.release(self.folder, self.logger)
         self.finished_report.emit(report)

@@ -27,13 +27,20 @@
     у которого прямой запуск ``App\\Game.exe`` и ``LaunchPortable.exe``
     видели разные сейвы: пересобирать его не нужно.
 
-Обе операции ничего не устанавливают и не трогают ничего за пределами
-указанной папки.
+``update``
+    «Вышла новая версия программы». Запускает ``App\\LaunchPortable.exe
+    --update``: тот ставит новую версию во временную папку, проверяет и
+    только потом подменяет файлы в ``App`` (прежняя версия остаётся в
+    ``Updates\\backup``). Данные в ``PortableData`` не затрагиваются.
+
+``release`` и ``refresh`` ничего не устанавливают и не трогают ничего за
+пределами указанной папки.
 """
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -242,6 +249,8 @@ def refresh(folder: str, log: Optional[Logger] = None,
         "LaunchHidden.vbs": (launcher_mod.render_vbs(), "ascii"),
         launcher_mod.STOP_SCRIPT_NAME: (
             launcher_mod.render_stop_cmd(cfg), "ascii"),
+        launcher_mod.UPDATE_SCRIPT_NAME: (
+            launcher_mod.render_update_cmd(cfg), "ascii"),
     }
     for name, (text, encoding) in files.items():
         try:
@@ -281,4 +290,78 @@ def refresh(folder: str, log: Optional[Logger] = None,
                    "Обновлено файлов: " + str(len(report.updated)))
         log.ok(message)
         report.messages.append(message)
+    return report
+
+
+#: Имя журнала обновления (лежит в папке данных портатива).
+UPDATE_LOG_NAME = "launcher-update.log"
+
+
+def _tail(path: str, lines: int = 6) -> List[str]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return [line.rstrip() for line in handle.readlines()[-lines:]
+                    if line.strip()]
+    except OSError:
+        return []
+
+
+def update_app(folder: str, installer: str = "", log: Optional[Logger] = None,
+               runner=None) -> MaintenanceReport:
+    """Обновляет программу внутри портатива через его собственный лончер.
+
+    ``installer`` - файл установщика или ``http(s)``-адрес; пусто - лончер
+    возьмёт скачанное программой или загрузит актуальную версию по адресу
+    из ``launcher_config.json``. ``runner(command) -> int`` подменяется в
+    тестах.
+    """
+    log = log or Logger()
+    report = MaintenanceReport(folder=folder)
+    exe = os.path.join(folder, "App", "LaunchPortable.exe")
+    if not looks_like_portable(folder) or not os.path.isfile(exe):
+        message = (
+            "В папке нет App\\LaunchPortable.exe. Сначала нажмите «Обновить "
+            "лончер»: он перевыпустит лончер, умеющий обновлять программу.")
+        log.error(message)
+        report.messages.append(message)
+        return report
+
+    command = [exe, "--update", "--yes"]
+    if installer:
+        command.insert(2, installer)
+    log.info("Обновляю программу внутри портатива: " + " ".join(command[1:]))
+    data_name = "PortableData"
+    try:
+        with open(os.path.join(folder, CONFIG_NAME), "r",
+                  encoding="utf-8-sig") as handle:
+            data_name = str(json.load(handle).get("data_dir_name", data_name))
+    except (OSError, ValueError):
+        pass
+    update_log = os.path.join(folder, data_name, UPDATE_LOG_NAME)
+    try:
+        code = (runner or (lambda cmd: subprocess.call(cmd, cwd=folder)))(
+            command)
+    except OSError as exc:
+        message = f"Не удалось запустить лончер: {exc}"
+        log.error(message)
+        report.messages.append(message)
+        return report
+
+    for line in _tail(update_log):
+        log.debug(line)
+    if code == 0:
+        report.success = True
+        report.updated.append("App")
+        message = ("Программа обновлена внутри портатива. Прежняя версия "
+                   "сохранена в Updates\\backup (откат: UpdatePortable.cmd "
+                   "--rollback). Данные в PortableData не тронуты.")
+        log.ok(message)
+    elif code == 3:
+        message = "Обновление отменено."
+        log.warn(message)
+    else:
+        message = (f"Обновление не удалось (код {code}). Портатив остался "
+                   f"прежним. Подробности: {update_log}")
+        log.error(message)
+    report.messages.append(message)
     return report
