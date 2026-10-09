@@ -3234,6 +3234,11 @@ class Portablizer:
         # Общий config читают и корневые скрипты, и готовый EXE в App/.
         self._write_text(os.path.join(portable_dir, "launcher_config.json"),
                          launcher_mod.render_config_json(cfg), newline="\n")
+        if launcher_mod.identity_settings(cfg) is not None:
+            self.log.info(
+                "Программа входит в аккаунт ключом профиля (Ollama): ключ "
+                "переносится в портатив при запуске через лончер, если его там "
+                "ещё нет. Проверка: App\\LaunchPortable.exe --check-identity")
         if opts.build_exe_launcher:
             self._copy_exe_launcher(portable_dir)
             for exe_name in cfg.launcher_aliases:
