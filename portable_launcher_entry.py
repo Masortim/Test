@@ -4421,14 +4421,19 @@ def update_command(root: Path, argv: Sequence[str]) -> int:
     return 1
 
 
-def rollback_command(root: Path) -> int:
+def rollback_command(root: Path, argv: Sequence[str] = ()) -> int:
+    """``LaunchPortable.exe --rollback [--yes]``: вернуть прежнюю версию."""
     with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
         cfg: Dict[str, Any] = json.load(fh)
+    quiet = any(str(a).casefold() in ("--yes", "/yes", "--quiet") for a in argv)
     result = rollback_update(root, cfg)
     if result.ok:
-        _show_info(result.message)
+        if not quiet:
+            _show_info(result.message)
         return 0
-    _show_error(result.message)
+    _update_log(root, "rollback failed: " + result.message)
+    if not quiet:
+        _show_error(result.message)
     return 1
 
 
@@ -4808,7 +4813,7 @@ def main() -> int:
             return update_command(root, sys.argv[1:])
         if any(str(arg).casefold() in ("--rollback", "/rollback")
                for arg in sys.argv[1:]):
-            return rollback_command(root)
+            return rollback_command(root, sys.argv[1:])
         if any(str(arg).casefold() in ("--sync-saves", "/sync-saves")
                for arg in sys.argv[1:]):
             return sync_saves(root)

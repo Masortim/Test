@@ -1545,7 +1545,7 @@ if not exist "%PORTABLE_ROOT%App\{exe_launcher}" (
   exit /b 1
 )
 if /i "%~1" == "--rollback" (
-  start "" /wait "%PORTABLE_ROOT%App\{exe_launcher}" --rollback
+  start "" /wait "%PORTABLE_ROOT%App\{exe_launcher}" %*
   exit /b
 )
 rem The launcher is a windowed program: /wait keeps this script (and the

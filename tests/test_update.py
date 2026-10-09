@@ -309,6 +309,14 @@ class ApplyUpdateTests(unittest.TestCase):
         self.assertFalse((app / "unins000.exe").exists(), "добавленное при обновлении убирается")
         self.assertFalse(exe_launcher.rollback_update(self.root, OLLAMA_CFG).ok)
 
+    def test_rollback_command_is_quiet_with_yes(self):
+        self.assertTrue(self.apply().ok)
+        with mock.patch.object(exe_launcher, "_show_info") as info:
+            self.assertEqual(exe_launcher.rollback_command(
+                self.root, ["--rollback", "--yes"]), 0)
+        info.assert_not_called()
+        self.assertEqual((self.root / "App" / "ollama app.exe").read_text(), "old-app")
+
     def test_keep_backup_false_removes_it(self):
         cfg = dict(OLLAMA_CFG, update={"keep_backup": False})
         result = self.apply(cfg=cfg)

@@ -347,7 +347,7 @@ jobs:
 
             # Откат возвращает прежнюю версию.
             $rb = Start-Process -FilePath (Join-Path $root "App/LaunchPortable.exe") `
-              -ArgumentList @('--rollback') -PassThru
+              -ArgumentList @('--rollback', '--yes') -PassThru
             if (-not $rb.WaitForExit(120000)) { $rb.Kill(); throw "UPDATE-SMOKE: --rollback did not finish" }
             if ($rb.ExitCode -ne 0) { throw "UPDATE-SMOKE: --rollback returned $($rb.ExitCode)" }
             if (Test-Path (Join-Path $root "App/new-version.txt")) { throw "UPDATE-SMOKE: rollback left the new file in App" }
