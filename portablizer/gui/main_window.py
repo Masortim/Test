@@ -26,7 +26,8 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..core import elevate
 from ..core import redist as redist_mod
-from ..core.detect import detect_installer
+from ..core.detect import InstallerType, detect_installer
+from ..core.languages import LANGUAGES, supports_language_switch
 from ..core.portablizer import (
     INSTALL_HARD_LIMIT, INSTALL_IDLE_LIMIT, STALL_CANCEL, STALL_STOP,
     STALL_WAIT, InstallStall, PortableOptions, PortableResult,
@@ -89,6 +90,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.worker: Optional[PortableWorker] = None
         self.maintenance_worker: Optional[MaintenanceWorker] = None
+        #: Тип последнего определённого установщика (для подсказки о языке).
+        self._detected_type: Optional[InstallerType] = None
         self.last_result: Optional[PortableResult] = None
         #: Запоминаем папку вывода между запусками: каждый раз искать её
         #: заново — лишнее вмешательство пользователя в то, что программа
@@ -145,6 +148,12 @@ class MainWindow(QMainWindow):
             mode = 0
         if 0 <= mode < self.long_install_combo.count():
             self.long_install_combo.setCurrentIndex(mode)
+        remembered_lang = str(
+            self.settings.value("install_language", "") or "")
+        lang_index = self.language_combo.findData(remembered_lang)
+        if lang_index >= 0:
+            self.language_combo.setCurrentIndex(lang_index)
+        self._update_language_hint()
 
     # -- шапка ----------------------------------------------------------------
     def _build_header(self) -> QWidget:
@@ -243,6 +252,27 @@ class MainWindow(QMainWindow):
                 self.long_install_combo.count() - 1, note,
                 Qt.ToolTipRole)
         grid.addWidget(self.long_install_combo, 4, 1, 1, 2)
+
+        # Язык многоязычного установщика. От него зависит, какие текст,
+        # субтитры и шрифты попадут в портатив: установка на английском не
+        # даёт русского текста, и субтитры выводятся без букв.
+        grid.addWidget(QLabel("Язык установки:"), 5, 0)
+        self.language_combo = QComboBox()
+        self.language_combo.setToolTip(
+            "Язык, который Portablizer выберет в многоязычном установщике. "
+            "Передаётся ключом установщика (Inno Setup, NSIS, InstallShield).\n\n"
+            "Выбирайте язык, на котором нужны субтитры и текст игры. Если в "
+            "установщике такого языка нет, он поставит язык по умолчанию.")
+        self.language_combo.addItem("Как в самом установщике", "")
+        for lang in LANGUAGES:
+            self.language_combo.addItem(lang.title, lang.code)
+        self.language_combo.currentIndexChanged.connect(
+            lambda _i: self._update_language_hint())
+        grid.addWidget(self.language_combo, 5, 1, 1, 2)
+        self.language_hint = QLabel("")
+        self.language_hint.setObjectName("Hint")
+        self.language_hint.setWordWrap(True)
+        grid.addWidget(self.language_hint, 6, 1, 1, 2)
         grid.setColumnStretch(1, 1)
         lay.addLayout(grid)
 
@@ -605,9 +635,11 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(path)
 
     def _on_installer_changed(self, path: str) -> None:
+        self._detected_type = None
         if path and os.path.isfile(path):
             try:
                 det = detect_installer(path)
+                self._detected_type = det.installer_type
                 notes = []
                 if det.requires_admin:
                     notes.append("нужны права администратора")
@@ -627,6 +659,25 @@ class MainWindow(QMainWindow):
                     os.path.splitext(os.path.basename(path))[0])
         else:
             self.detect_label.setText("Тип установщика: —")
+        self._update_language_hint()
+
+    def _update_language_hint(self) -> None:
+        """Подсказка под списком языков: умеет ли установщик выбирать язык."""
+        code = self.language_combo.currentData() or ""
+        itype = self._detected_type
+        if not code:
+            text = ""
+        elif itype is None:
+            text = ("Тип установщика ещё не определён: язык будет передан "
+                    "ключом, только если установщик его поддерживает.")
+        elif supports_language_switch(itype):
+            text = ("Язык передаётся ключом установщика. Если в установщике "
+                    "нет этого языка, будет установлен язык по умолчанию.")
+        else:
+            text = ("Этот тип установщика язык ключом не выбирает. Выберите "
+                    "его в окне самого установщика или укажите ключ в поле "
+                    "«Доп. аргументы установки».")
+        self.language_hint.setText(text)
 
     def _parse_env(self) -> dict:
         env = {}
@@ -729,6 +780,7 @@ class MainWindow(QMainWindow):
                                     and self.cb_silent_redist.isChecked()),
             shared_saves=self.cb_shared_saves.isChecked(),
             extra_install_args=args,
+            install_language=self.language_combo.currentData() or "",
             extra_env=self._parse_env(),
             install_timeout=idle_limit,
             install_deadline=deadline,
@@ -753,6 +805,8 @@ class MainWindow(QMainWindow):
 
         self.settings.setValue("long_install_mode",
                                self.long_install_combo.currentIndex())
+        self.settings.setValue("install_language",
+                               self.language_combo.currentData() or "")
         self.worker = PortableWorker(opts)
         self.worker.log_line.connect(self._on_log)
         self.worker.progress.connect(self._on_progress)

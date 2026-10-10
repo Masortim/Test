@@ -33,6 +33,7 @@ from typing import List, Optional, Sequence
 from .detect import (
     TRUSTED_CONFIDENCE, DetectionResult, InstallerType, InstallShieldGeneration,
 )
+from .languages import plan_language
 
 #: Больше попыток запускать бессмысленно: каждая стоит времени пользователя.
 MAX_ATTEMPTS = 6
@@ -610,6 +611,13 @@ def build_installshield_attempts(
     return attempts
 
 
+def _effective_type(detection: DetectionResult) -> InstallerType:
+    """Тип, по которому строится команда: MSI-пакет важнее всего."""
+    if detection.is_msi:
+        return InstallerType.MSI
+    return detection.installer_type
+
+
 def build_attempts(
     detection: DetectionResult,
     installer_path: str,
@@ -619,6 +627,7 @@ def build_attempts(
     layout_dir: str = "",
     response_file: str = "",
     allow_assisted: bool = False,
+    language: str = "",
 ) -> List[SilentPlan]:
     """Строит упорядоченную лестницу попыток тихой установки.
 
@@ -626,8 +635,16 @@ def build_attempts(
     ``App`` появились файлы программы. Это принципиально надёжнее одной
     «правильной» команды: у одного и того же движка встречаются сборки с
     разным набором поддерживаемых ключей.
+
+    ``language`` — код языка из ``languages.LANGUAGES`` (пусто — язык по
+    умолчанию установщика). Ключ выбора языка добавляется ко ВСЕМ попыткам
+    движка, кроме универсального набора: тот не знает, какой движок на самом
+    деле, и чужой ключ ``/LANG=`` ему бы только мешал.
     """
-    extra = list(extra_args or [])
+    user_extra = list(extra_args or [])
+    lang_plan = plan_language(
+        _effective_type(detection), language, user_extra)
+    extra = user_extra + lang_plan.args
     native_target = _native(target_dir)
     installer_path = _norm(installer_path)
     target_dir = _norm(target_dir)
@@ -723,7 +740,7 @@ def build_attempts(
                      "ненадёжно, пробуем типовые ключи по очереди.")
         for switches in _GENERIC_LADDER:
             plan = SilentPlan(
-                program=installer_path, args=list(switches) + extra,
+                program=installer_path, args=list(switches) + user_extra,
                 notes=[note],
                 label="Универсальные ключи: " + " ".join(switches),
                 output_dir=native_target,
