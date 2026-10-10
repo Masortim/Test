@@ -321,5 +321,404 @@ class _MemorySettings:
         self.data[str(key)] = value
 
 
+class AssassinsCreedBrotherhoodLangSwTests(unittest.TestCase):
+    """Сценарий [dixen18] Assassins Creed - Brotherhood:
+
+    Репак в тихом режиме ставит ``"Language"="English"`` в
+    ``HKLM\\Software\\WOW6432Node\\Ubisoft\\Assassin's Creed Brotherhood``, а
+    файлы переключения языка кладёт в ``App\\_Lang_SW\\x64`` и ``App\\_Lang_SW\\x86``.
+    Без русского ``Language`` в реестре игра грузит английский интерфейс и
+    латинский атлас шрифтов, из-за чего русские субтитры отображают только
+    знаки препинания.
+    """
+
+    ACB_WOW_KEY = (
+        r"HKLM\Software\WOW6432Node\Ubisoft\Assassin's Creed Brotherhood"
+    )
+    ACB_X86_KEY = (
+        r"HKLM\Software\Ubisoft\Assassin's Creed Brotherhood"
+    )
+
+    def _populate_lang_sw(self, app_dir: Path) -> None:
+        x64_dir = app_dir / "_Lang_SW" / "x64"
+        x86_dir = app_dir / "_Lang_SW" / "x86"
+        x64_dir.mkdir(parents=True, exist_ok=True)
+        x86_dir.mkdir(parents=True, exist_ok=True)
+
+        (x64_dir / "Rus.reg").write_text(
+            "Windows Registry Editor Version 5.00\r\n\r\n"
+            "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\Ubisoft\\"
+            "Assassin's Creed Brotherhood]\r\n"
+            '"Language"="Russian"\r\n',
+            encoding="utf-16",
+        )
+        (x64_dir / "Eng.reg").write_text(
+            "Windows Registry Editor Version 5.00\r\n\r\n"
+            "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\Ubisoft\\"
+            "Assassin's Creed Brotherhood]\r\n"
+            '"Language"="English"\r\n',
+            encoding="utf-16",
+        )
+        (x86_dir / "Rus.reg").write_text(
+            "Windows Registry Editor Version 5.00\r\n\r\n"
+            "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Ubisoft\\"
+            "Assassin's Creed Brotherhood]\r\n"
+            '"Language"="Russian"\r\n',
+            encoding="utf-16",
+        )
+        (x86_dir / "Eng.reg").write_text(
+            "Windows Registry Editor Version 5.00\r\n\r\n"
+            "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Ubisoft\\"
+            "Assassin's Creed Brotherhood]\r\n"
+            '"Language"="English"\r\n',
+            encoding="utf-16",
+        )
+
+    def test_capture_registry_applies_lang_sw_and_rewrites_english_to_russian(self):
+        from portablizer.core import registry as reg_mod
+        from portablizer.core.logutil import Logger
+        from portablizer.core.portablizer import Portablizer
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "ACB_Portable")
+            app_dir = portable / "App"
+            self._populate_lang_sw(app_dir)
+
+            before = {}
+            after = {
+                self.ACB_WOW_KEY: {
+                    "InstallDir": (reg_mod.REG_SZ, repr(str(app_dir))),
+                    "Language": (reg_mod.REG_SZ, repr("English")),
+                },
+            }
+            engine = Portablizer(Logger())
+            capture = engine._capture_registry(
+                str(portable),
+                before,
+                after,
+                PortableOptions(
+                    installer_path="setup.exe",
+                    output_dir=temp,
+                    install_language="ru",
+                ),
+            )
+
+            self.assertTrue(os.path.isfile(capture.reg_file))
+            self.assertTrue(os.path.isfile(capture.machine_reg_file))
+
+            user_reg = (portable / "portable.reg").read_text(encoding="utf-16")
+            machine_reg = (portable / "portable_machine.reg").read_text(
+                encoding="utf-16"
+            )
+
+            self.assertIn('"Language"="Russian"', user_reg)
+            self.assertNotIn('"Language"="English"', user_reg)
+            self.assertIn('"Language"="Russian"', machine_reg)
+            self.assertNotIn('"Language"="English"', machine_reg)
+            # И 32-битная (WOW6432Node), и 64-битная ветки присутствуют в machine_reg
+            self.assertIn(
+                "[HKEY_LOCAL_MACHINE\\Software\\WOW6432Node\\Ubisoft\\"
+                "Assassin's Creed Brotherhood]",
+                machine_reg,
+            )
+            self.assertIn(
+                "[HKEY_LOCAL_MACHINE\\Software\\Ubisoft\\"
+                "Assassin's Creed Brotherhood]",
+                machine_reg,
+            )
+            # И VirtualStore, и прямой HKCU присутствуют в portable.reg
+            self.assertIn(
+                "[HKEY_CURRENT_USER\\Software\\Classes\\VirtualStore\\MACHINE\\"
+                "SOFTWARE\\WOW6432Node\\Ubisoft\\Assassin's Creed Brotherhood]",
+                user_reg,
+            )
+
+    def test_capture_registry_works_even_if_key_already_existed_before_build(self):
+        """Если пользователь уже запускал .reg или старую сборку до пересборки,
+        ключ в before не должен помешать захвату в portable.reg.
+        """
+        from portablizer.core import registry as reg_mod
+        from portablizer.core.logutil import Logger
+        from portablizer.core.portablizer import Portablizer
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "ACB_Portable")
+            app_dir = portable / "App"
+            self._populate_lang_sw(app_dir)
+
+            # На ПК до сборки уже висел ключ с тем же самым содержимым
+            before = {
+                self.ACB_WOW_KEY: {
+                    "InstallDir": (reg_mod.REG_SZ, repr(str(app_dir))),
+                    "Language": (reg_mod.REG_SZ, repr("Russian")),
+                },
+            }
+            after = {
+                self.ACB_WOW_KEY: {
+                    "InstallDir": (reg_mod.REG_SZ, repr(str(app_dir))),
+                    "Language": (reg_mod.REG_SZ, repr("English")),
+                },
+            }
+            engine = Portablizer(Logger())
+            capture = engine._capture_registry(
+                str(portable),
+                before,
+                after,
+                PortableOptions(
+                    installer_path="setup.exe",
+                    output_dir=temp,
+                    install_language="ru",
+                ),
+            )
+            self.assertTrue(os.path.isfile(capture.machine_reg_file))
+            machine_reg = (portable / "portable_machine.reg").read_text(
+                encoding="utf-16"
+            )
+            self.assertIn('"Language"="Russian"', machine_reg)
+
+    def test_prepare_output_clears_stale_portable_data_registry_session(self):
+        """При повторной сборке в ту же папку старый кэш PortableData\\Registry
+        с английским языком удаляется, а пользовательские сейвы сохраняются.
+        """
+        from portablizer.core.logutil import Logger
+        from portablizer.core.portablizer import Portablizer
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "ACB_Portable")
+            app_dir = portable / "App"
+            data_dir = portable / "PortableData"
+            stale_reg = data_dir / "Registry" / "k00.reg"
+            stale_reg.parent.mkdir(parents=True)
+            stale_reg.write_text('"Language"="English"', encoding="utf-8")
+
+            save_file = (
+                data_dir / "User" / "Saved Games"
+                / "Assassin's Creed Brotherhood" / "SAVES" / "OPTIONS"
+            )
+            save_file.parent.mkdir(parents=True)
+            save_file.write_bytes(b"SAVEDATA")
+
+            engine = Portablizer(Logger())
+            engine._prepare_output(str(portable), str(app_dir), str(data_dir))
+
+            self.assertFalse(stale_reg.exists())
+            self.assertTrue(save_file.is_file())
+
+
+class MaintenanceLanguageRefreshTests(unittest.TestCase):
+    """Обновление лончера («Обновить лончер») чинит язык уже собранного портатива."""
+
+    def test_refresh_applies_lang_sw_and_updates_cached_session_regs(self):
+        from portablizer.core import launcher as launcher_mod
+        from portablizer.core import maintenance
+        from portablizer.core import registry as reg_mod
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "ACB_Portable")
+            app_dir = portable / "App"
+            (app_dir / "_Lang_SW" / "x64").mkdir(parents=True)
+            (app_dir / "ACBSP.exe").write_bytes(b"MZ")
+            (app_dir / "_Lang_SW" / "x64" / "Rus.reg").write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\Ubisoft\\"
+                "Assassin's Creed Brotherhood]\r\n"
+                '"Language"="Russian"\r\n',
+                encoding="utf-16",
+            )
+
+            # Изначально в портативе захвачен английский язык и в portable.reg,
+            # и в portable_machine.reg, и в сохранённой сессии PortableData\Registry
+            reg_mod.write_reg_file(
+                str(portable / "portable.reg"),
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Classes\\VirtualStore\\MACHINE\\"
+                "SOFTWARE\\WOW6432Node\\Ubisoft\\Assassin's Creed Brotherhood]\r\n"
+                '"Language"="English"\r\n\r\n',
+            )
+            reg_mod.write_reg_file(
+                str(portable / "portable_machine.reg"),
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_LOCAL_MACHINE\\Software\\WOW6432Node\\Ubisoft\\"
+                "Assassin's Creed Brotherhood]\r\n"
+                '"InstallDir"="@@PORTABLE_ROOT@@\\\\App"\r\n'
+                '"Language"="English"\r\n\r\n',
+            )
+            session_dir = portable / "PortableData" / "Registry"
+            session_dir.mkdir(parents=True)
+            reg_mod.write_reg_file(
+                str(session_dir / "k00.reg"),
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Classes\\VirtualStore\\MACHINE\\"
+                "SOFTWARE\\WOW6432Node\\Ubisoft\\Assassin's Creed Brotherhood]\r\n"
+                '"Language"="English"\r\n\r\n',
+            )
+
+            cfg = launcher_mod.LauncherConfig(
+                app_name="Assassins Creed - Brotherhood",
+                target_exe_rel="App/ACBSP.exe",
+                apply_registry=True,
+                registry_keys=[
+                    r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\WOW6432Node\Ubisoft\Assassin's Creed Brotherhood",
+                    r"HKLM\Software\WOW6432Node\Ubisoft\Assassin's Creed Brotherhood",
+                ],
+                registry_created_keys=[
+                    r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\WOW6432Node\Ubisoft\Assassin's Creed Brotherhood",
+                    r"HKLM\Software\WOW6432Node\Ubisoft\Assassin's Creed Brotherhood",
+                ],
+                registry_has_root_token=True,
+            )
+            (portable / "launcher_config.json").write_text(
+                launcher_mod.render_config_json(cfg), encoding="utf-8"
+            )
+
+            report = maintenance.refresh(
+                str(portable), shared_saves=False, language="ru"
+            )
+            self.assertTrue(report.success)
+
+            for reg_file in (
+                portable / "portable.reg",
+                portable / "portable_machine.reg",
+                session_dir / "k00.reg",
+            ):
+                content = reg_file.read_text(encoding="utf-16")
+                self.assertIn('"Language"="Russian"', content, str(reg_file))
+                self.assertNotIn('"Language"="English"', content, str(reg_file))
+
+            # InstallDir в portable_machine.reg сохранён
+            machine_content = (portable / "portable_machine.reg").read_text(
+                encoding="utf-16"
+            )
+            self.assertIn('"InstallDir"="@@PORTABLE_ROOT@@\\\\App"', machine_content)
+
+
+class LauncherExternalRegSwitchTests(unittest.TestCase):
+    """Применение .reg-файла из _Lang_SW на хосте перед запуском лончера."""
+
+    def test_launcher_absorbs_external_host_reg_switch_instead_of_overwriting_it(self):
+        import portable_launcher_entry as exe_launcher
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "ACB_Portable")
+            app_dir = root / "App"
+            (app_dir / "_Lang_SW" / "x64").mkdir(parents=True)
+
+            (root / "portable.reg").write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Classes\\VirtualStore\\MACHINE\\"
+                "SOFTWARE\\WOW6432Node\\Ubisoft\\Assassin's Creed Brotherhood]\r\n"
+                '"Language"="English"\r\n\r\n',
+                encoding="utf-16",
+            )
+            (root / "portable_machine.reg").write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_LOCAL_MACHINE\\Software\\WOW6432Node\\Ubisoft\\"
+                "Assassin's Creed Brotherhood]\r\n"
+                '"InstallDir"="@@PORTABLE_ROOT@@\\\\App"\r\n'
+                '"Language"="English"\r\n\r\n',
+                encoding="utf-16",
+            )
+            session_dir = root / "PortableData" / "Registry"
+            session_dir.mkdir(parents=True)
+            (session_dir / "k00.reg").write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Classes\\VirtualStore\\MACHINE\\"
+                "SOFTWARE\\WOW6432Node\\Ubisoft\\Assassin's Creed Brotherhood]\r\n"
+                '"Language"="English"\r\n\r\n',
+                encoding="utf-16",
+            )
+
+            cfg = {
+                "data_dir_name": "PortableData",
+                "registry": {
+                    "enabled": True,
+                    "file": "portable.reg",
+                    "machine_file": "portable_machine.reg",
+                    "restore_on_exit": True,
+                    "keys": [
+                        r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\WOW6432Node\Ubisoft\Assassin's Creed Brotherhood",
+                        r"HKLM\Software\WOW6432Node\Ubisoft\Assassin's Creed Brotherhood",
+                    ],
+                    "created_keys": [
+                        r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\WOW6432Node\Ubisoft\Assassin's Creed Brotherhood",
+                        r"HKLM\Software\WOW6432Node\Ubisoft\Assassin's Creed Brotherhood",
+                    ],
+                },
+            }
+
+            # Симулируем: пользователь кликнул _Lang_SW\x64\Rus.reg на хосте,
+            # поэтому в HKLM на хосте сейчас лежит "Language"="Russian".
+            def fake_host_read(key: str):
+                if "assassin's creed brotherhood" in key.casefold() and key.upper().startswith("HKLM"):
+                    return {"Language": '"Russian"'}
+                return {}
+
+            reg_calls = []
+
+            def fake_reg(args):
+                reg_calls.append(tuple(args))
+                return 0
+
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(
+                        exe_launcher, "_read_host_key_reg_values",
+                        side_effect=fake_host_read,
+                    ), \
+                    mock.patch.object(
+                        exe_launcher, "_reg", side_effect=fake_reg
+                    ):
+                session = exe_launcher.RegistrySession(root, cfg)
+                session.load()
+
+                # Все файлы портатива (portable.reg, portable_machine.reg, k00.reg)
+                # поглотили "Language"="Russian" с хоста и не перетёрли его обратно.
+                for reg_file in (
+                    root / "portable.reg",
+                    root / "portable_machine.reg",
+                    session_dir / "k00.reg",
+                ):
+                    text = reg_file.read_text(encoding="utf-16")
+                    self.assertIn('"Language"="Russian"', text, str(reg_file))
+                    self.assertNotIn('"Language"="English"', text, str(reg_file))
+                    self.assertIn(
+                        '"InstallDir"="@@PORTABLE_ROOT@@\\\\App"',
+                        text,
+                        str(reg_file),
+                    )
+
+                session.save_and_restore()
+
+            # После выхода созданный ключ удаляется с хоста, а не восстанавливается
+            deletes = [c for c in reg_calls if c[0] == "delete"]
+            self.assertEqual(len(deletes), 2)
+
+    def test_hklm_key_missing_detects_partial_lang_sw_key_without_installdir(self):
+        import portable_launcher_entry as exe_launcher
+
+        with tempfile.TemporaryDirectory() as temp:
+            machine_path = Path(temp, "portable_machine.reg")
+            machine_path.write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_LOCAL_MACHINE\\Software\\WOW6432Node\\Ubisoft\\"
+                "Assassin's Creed Brotherhood]\r\n"
+                '"InstallDir"="@@PORTABLE_ROOT@@\\\\App"\r\n'
+                '"Language"="Russian"\r\n\r\n',
+                encoding="utf-16",
+            )
+
+            # На хосте есть только Language="Russian" (после клика по Rus.reg),
+            # а InstallDir из portable_machine.reg ещё не импортирован.
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(
+                        exe_launcher,
+                        "_read_host_key_reg_values",
+                        return_value={"Language": '"Russian"'},
+                    ):
+                self.assertTrue(
+                    exe_launcher._hklm_key_missing([], machine_path)
+                )
+
+
+
 if __name__ == "__main__":
     unittest.main()

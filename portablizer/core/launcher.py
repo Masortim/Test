@@ -157,6 +157,8 @@ class LauncherConfig:
     # следы родного апдейтера, ключи тихой установки (см. UPDATE_PROFILES).
     # Пустой словарь - значит «взять профиль программы, если он есть».
     update: Dict[str, object] = field(default_factory=dict)
+    # Код выбранного языка установки («ru», «en», ...), если задан.
+    language: str = ""
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -435,11 +437,23 @@ def _registry_load_block(cfg: LauncherConfig) -> str:
     # Прежнее состояние чужого ПК сохраняем до любых изменений, чтобы после
     # выхода вернуть всё как было.
     keys = consolidate_root_keys(cfg.registry_keys)
+    created = set(consolidate_root_keys(cfg.registry_created_keys))
     for index, key in enumerate(keys):
         backup = f'%PORTABLE_REG_BACKUP%\\k{index:02d}.reg'
         lines.append(
             f'if not exist "{backup}" reg export "{key}" "{backup}" /y >nul 2>&1'
         )
+
+    external_overrides: List[str] = []
+    for index, key in enumerate(keys):
+        if key in created:
+            backup = f'%PORTABLE_REG_BACKUP%\\k{index:02d}.reg'
+            external_overrides.append(
+                f'if exist "{backup}" reg import "{backup}" >nul 2>&1'
+            )
+            external_overrides.append(
+                f'if exist "{backup}" del /f /q "{backup}" >nul 2>&1'
+            )
 
     # Настройки прошлого запуска имеют приоритет над исходным снимком.
     initial = '%PORTABLE_ROOT%\\' + _bat_set_value(cfg.reg_file_name)
@@ -452,12 +466,16 @@ def _registry_load_block(cfg: LauncherConfig) -> str:
         f'  if exist "{machine}" call :portable_registry_import "{machine}"',
         '  for %%F in ("%PORTABLE_REG_SESSION%\\*.reg") do '
         'call :portable_registry_import "%%~fF"',
+        *(['  rem Apply external .reg changes imported on host while closed']
+          + [f'  {line}' for line in external_overrides]
+          if external_overrides else []),
         '  goto :eof',
         ')',
         f'if exist "{initial}" call :portable_registry_import "{initial}"',
         'rem HKLM entries need administrator rights; keep them in a separate',
         'rem file so a failure here cannot abort the user-level import.',
         f'if exist "{machine}" call :portable_registry_import "{machine}"',
+        *external_overrides,
         'goto :eof',
     ]
     return "\n".join(lines)
@@ -487,7 +505,8 @@ def _registry_save_block(cfg: LauncherConfig) -> str:
         lines.append(f'if exist "{session}" call :portable_registry_pack "{session}"')
         if key in created:
             lines.append(f'reg delete "{key}" /f >nul 2>&1')
-        lines.append(f'if exist "{backup}" reg import "{backup}" >nul 2>&1')
+        else:
+            lines.append(f'if exist "{backup}" reg import "{backup}" >nul 2>&1')
         lines.append(f'del /f /q "{backup}" >nul 2>&1')
     lines.append("goto :eof")
     return "\n".join(lines)
@@ -1395,6 +1414,7 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         shutdown_deep_check=shutdown.get("deep_check", True) is not False,
         shutdown_handle_budget=number("handle_budget", 8.0),
         shutdown_purge_temp=shutdown.get("purge_temp", True) is not False,
+        language=text("language"),
     )
 
 
@@ -1958,6 +1978,8 @@ def render_config_json(cfg: LauncherConfig) -> str:
             "created_keys": consolidate_root_keys(cfg.registry_created_keys),
         },
     }
+    if cfg.language:
+        payload["language"] = cfg.language
     # Ключ входа переносится только для программ из IDENTITY_PROFILES.
     identity = identity_settings(cfg)
     if identity is not None:
