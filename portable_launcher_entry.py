@@ -547,12 +547,17 @@ def _reg(args: Sequence[str]) -> int:
 def _decode_reg(raw: bytes) -> str:
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16")
+    if b"\x00" in raw[:64]:
+        return raw.decode("utf-16-le", "replace")
     if raw.startswith(b"\xef\xbb\xbf"):
         return raw.decode("utf-8-sig")
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
-        return raw.decode("utf-16-le", "replace")
+        try:
+            return raw.decode("cp1251")
+        except UnicodeDecodeError:
+            return raw.decode("utf-16-le", "replace")
 
 
 def _rewrite_reg(source: Path, destination: Path, replacements: Iterable[tuple[str, str]]) -> bool:
@@ -1192,12 +1197,332 @@ class ShellFolderSession:
             self.restore()
 
 
+def _normalize_reg_section_header(raw_header: str) -> Optional[str]:
+    cleaned = (raw_header or "").strip().strip("[]").strip().rstrip("\\")
+    if not cleaned or cleaned.startswith("-"):
+        return None
+    parts = [p for p in cleaned.split("\\") if p]
+    if len(parts) < 2:
+        return None
+    root_up = parts[0].upper()
+    if root_up in ("HKEY_LOCAL_MACHINE", "HKLM"):
+        parts[0] = "HKEY_LOCAL_MACHINE"
+    elif root_up in ("HKEY_CURRENT_USER", "HKCU"):
+        parts[0] = "HKEY_CURRENT_USER"
+    else:
+        return None
+    if parts[1].upper() == "SOFTWARE":
+        parts[1] = "Software"
+    if len(parts) >= 3 and parts[2].upper() == "WOW6432NODE":
+        parts[2] = "WOW6432Node"
+    if (len(parts) >= 6
+            and parts[1] == "Software"
+            and parts[2].upper() == "CLASSES"
+            and parts[3].upper() == "VIRTUALSTORE"
+            and parts[4].upper() == "MACHINE"
+            and parts[5].upper() == "SOFTWARE"):
+        parts[2] = "Classes"
+        parts[3] = "VirtualStore"
+        parts[4] = "MACHINE"
+        parts[5] = "SOFTWARE"
+        if len(parts) >= 7 and parts[6].upper() == "WOW6432NODE":
+            parts[6] = "WOW6432Node"
+    return "\\".join(parts)
+
+
+def _extract_software_tail(key: str) -> Optional[str]:
+    norm = _normalize_reg_section_header(key)
+    if not norm:
+        return None
+    parts = norm.split("\\")
+    if len(parts) < 3 or parts[1] != "Software":
+        return None
+    if (len(parts) >= 7
+            and parts[2] == "Classes"
+            and parts[3] == "VirtualStore"
+            and parts[4] == "MACHINE"
+            and parts[5] == "SOFTWARE"):
+        rest = parts[7:] if parts[6] == "WOW6432Node" else parts[6:]
+    elif parts[2] == "WOW6432Node":
+        rest = parts[3:]
+    else:
+        rest = parts[2:]
+    if not rest:
+        return None
+    first_low = rest[0].casefold()
+    if first_low == "classes":
+        return None
+    if first_low == "microsoft" and len(rest) >= 2 and rest[1].casefold() in (
+        "windows", "windows nt",
+    ):
+        return None
+    return "\\".join(rest)
+
+
+def _machine_sibling_reg_key(key: str) -> Optional[str]:
+    cleaned = str(key).strip().rstrip("\\")
+    head, sep, rest = cleaned.partition("\\")
+    if not sep or head.upper() not in ("HKLM", "HKEY_LOCAL_MACHINE"):
+        return None
+    s_head, s_sep, tail = rest.partition("\\")
+    if not s_sep or s_head.upper() != "SOFTWARE" or not tail:
+        return None
+    if tail.lower().startswith("wow6432node\\"):
+        sub = tail[len("wow6432node\\"):].strip("\\")
+        return f"{head}\\{s_head}\\{sub}" if sub else None
+    if tail.lower() == "wow6432node":
+        return None
+    return f"{head}\\{s_head}\\WOW6432Node\\{tail}"
+
+
+def _split_reg_assignment(line: str) -> Optional[tuple[str, str]]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(";"):
+        return None
+    if stripped.startswith("@"):
+        rest = stripped[1:].lstrip()
+        if not rest.startswith("="):
+            return None
+        return "", rest[1:].strip()
+    if not stripped.startswith('"'):
+        return None
+    i = 1
+    n = len(stripped)
+    chars: list[str] = []
+    while i < n:
+        ch = stripped[i]
+        if ch == "\\" and i + 1 < n:
+            chars.append(stripped[i + 1])
+            i += 2
+            continue
+        if ch == '"':
+            i += 1
+            break
+        chars.append(ch)
+        i += 1
+    else:
+        return None
+    rest = stripped[i:].lstrip()
+    if not rest.startswith("="):
+        return None
+    return "".join(chars), rest[1:].strip()
+
+
+def _parse_reg_sections(text: str) -> Dict[str, Dict[str, str]]:
+    sections: Dict[str, Dict[str, str]] = {}
+    if not text:
+        return sections
+    logical_lines: list[str] = []
+    carry = ""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if carry:
+            if line.endswith("\\"):
+                carry += line[:-1].strip()
+            else:
+                carry += line
+                logical_lines.append(carry)
+                carry = ""
+            continue
+        if line.endswith("\\") and not line.startswith(";"):
+            carry = line[:-1].strip()
+        else:
+            logical_lines.append(line)
+    if carry:
+        logical_lines.append(carry)
+
+    current: Optional[str] = None
+    sec_lookup: Dict[str, str] = {}
+    for line in logical_lines:
+        if not line or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            header = _normalize_reg_section_header(line)
+            if header is None:
+                current = None
+                continue
+            existing = sec_lookup.get(header.casefold())
+            if existing is None:
+                existing = header
+                sec_lookup[header.casefold()] = existing
+                sections[existing] = {}
+            current = existing
+            continue
+        if current is None:
+            continue
+        parsed = _split_reg_assignment(line)
+        if parsed is None:
+            continue
+        name, rhs = parsed
+        if rhs == "-":
+            for k in list(sections[current]):
+                if k.casefold() == name.casefold():
+                    del sections[current][k]
+            continue
+        actual = next(
+            (k for k in sections[current] if k.casefold() == name.casefold()),
+            name,
+        )
+        sections[current][actual] = rhs
+    return sections
+
+
+def _render_reg_sections(sections: Dict[str, Dict[str, str]]) -> str:
+    lines = ["Windows Registry Editor Version 5.00", ""]
+    for header, values in sections.items():
+        if not values:
+            continue
+        lines.append(f"[{header}]")
+        for name, rhs in values.items():
+            if name == "":
+                quoted = "@"
+            else:
+                escaped_name = name.replace("\\", "\\\\").replace('"', '\\"')
+                quoted = f'"{escaped_name}"'
+            lines.append(f"{quoted}={rhs}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n\n"
+
+
+def _format_reg_sz_rhs(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _read_host_key_reg_values(key: str) -> Dict[str, str]:
+    """Read string/dword values from a host registry key into .reg RHS syntax."""
+    if not IS_WINDOWS:
+        return {}
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - Windows only
+        return {}
+    cleaned = str(key).replace("/", "\\").strip("\\")
+    head, _, subkey = cleaned.partition("\\")
+    if not subkey:
+        return {}
+    roots = {
+        "HKLM": winreg.HKEY_LOCAL_MACHINE,
+        "HKEY_LOCAL_MACHINE": winreg.HKEY_LOCAL_MACHINE,
+        "HKCU": winreg.HKEY_CURRENT_USER,
+        "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
+    }
+    root_handle = roots.get(head.upper())
+    if root_handle is None:
+        return {}
+    out: Dict[str, str] = {}
+    for access in (winreg.KEY_READ,
+                   winreg.KEY_READ | getattr(winreg, "KEY_WOW64_32KEY", 0),
+                   winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)):
+        try:
+            with winreg.OpenKey(root_handle, subkey, 0, access) as handle:
+                idx = 0
+                while True:
+                    try:
+                        name, val, typ = winreg.EnumValue(handle, idx)
+                    except OSError:
+                        break
+                    idx += 1
+                    if typ == winreg.REG_SZ and isinstance(val, str):
+                        out[name] = _format_reg_sz_rhs(val)
+                    elif typ == winreg.REG_DWORD and isinstance(val, int):
+                        out[name] = f"dword:{val & 0xFFFFFFFF:08x}"
+                if out:
+                    break
+        except OSError:
+            continue
+    return out
+
+
+_LAUNCHER_LANG_TOKENS: Dict[str, tuple[str, ...]] = {
+    "ru": ("ru", "rus", "russian", "ru-ru", "ru_ru", "ruru", "1049", "0419", "0x0419", "00000419", "рус", "русский"),
+    "en": ("en", "eng", "enu", "english", "en-us", "en_us", "enus", "1033", "0409", "0x0409", "00000409", "анг", "английский"),
+    "uk": ("uk", "ukr", "ua", "ukrainian", "uk-ua", "uk_ua", "1058", "0422", "0x0422", "укр", "українська"),
+    "de": ("de", "ger", "deu", "german", "deutsch", "de-de", "de_de", "1031", "0407", "0x0407"),
+    "fr": ("fr", "fre", "fra", "french", "francais", "français", "fr-fr", "fr_fr", "1036", "040c", "0x040c"),
+    "it": ("it", "ita", "italian", "italiano", "it-it", "it_it", "1040", "0410", "0x0410"),
+    "es": ("es", "spa", "esp", "spanish", "espanol", "español", "es-es", "es_es", "3082", "1034", "0c0a", "040a"),
+    "pl": ("pl", "pol", "polish", "polski", "pl-pl", "pl_pl", "1045", "0415", "0x0415"),
+    "pt-br": ("pt-br", "pt_br", "ptbr", "pt", "ptb", "bra", "por", "brazilian", "portuguese", "1046", "0416"),
+    "zh-cn": ("zh-cn", "zh_cn", "zhcn", "zh", "chs", "chi", "zho", "schinese", "chinese", "2052", "0804"),
+    "ja": ("ja", "jp", "jpn", "jap", "japanese", "ja-jp", "ja_jp", "1041", "0411"),
+    "tr": ("tr", "tur", "trk", "turkish", "tr-tr", "tr_tr", "1055", "041f"),
+}
+
+
+def _identify_launcher_lang(token: str) -> Optional[str]:
+    low = (token or "").strip().strip("\"'").casefold()
+    if not low:
+        return None
+    for code, toks in _LAUNCHER_LANG_TOKENS.items():
+        if low in toks:
+            return code
+    return None
+
+
+def _detect_app_reg_file_lang(
+    sections: Dict[str, Dict[str, str]],
+    rel_path: str,
+) -> Optional[str]:
+    for vals in sections.values():
+        for name, rhs in vals.items():
+            if name.casefold() in (
+                "language", "installlanguage", "textlanguage",
+                "subtitlelanguage", "uilanguage", "locale", "lang",
+            ):
+                code = _identify_launcher_lang(rhs)
+                if code:
+                    return code
+    stem = os.path.splitext(rel_path.replace("/", "\\"))[0]
+    for part in reversed([p for p in stem.split("\\") if p]):
+        subtokens = [t for t in re.split(r"[^0-9A-Za-zА-Яа-яЁёІіЇїЄєҐґ]+", part) if t]
+        found: list[str] = []
+        for cand in [part, *subtokens]:
+            code = _identify_launcher_lang(cand)
+            if code and code not in found:
+                found.append(code)
+        if len(found) == 1:
+            return found[0]
+    return None
+
+
+def _discover_app_reg_files(
+    root: Path,
+) -> list[tuple[Path, Dict[str, Dict[str, str]], Optional[str]]]:
+    app_dir = root / "App"
+    if not app_dir.is_dir():
+        return []
+    out: list[tuple[Path, Dict[str, Dict[str, str]], Optional[str]]] = []
+    skip = {"portabledata", "redist", "_redist_cache", "updates"}
+    for cur_root, dirs, files in os.walk(app_dir):
+        dirs[:] = sorted(d for d in dirs if d.casefold() not in skip)
+        for fname in sorted(files):
+            if not fname.lower().endswith(".reg"):
+                continue
+            if fname.lower() in ("portable.reg", "portable_machine.reg", "cleanup_host.reg"):
+                continue
+            fpath = Path(cur_root) / fname
+            try:
+                text = _decode_reg(fpath.read_bytes())
+            except OSError:
+                continue
+            sections = _parse_reg_sections(text)
+            if not any(_extract_software_tail(sec) for sec in sections):
+                continue
+            rel = str(fpath.relative_to(app_dir))
+            lang = _detect_app_reg_file_lang(sections, rel)
+            out.append((fpath, sections, lang))
+    return out
+
+
 class RegistrySession:
     """Apply portable settings, save changes, and restore the host afterwards."""
 
     def __init__(self, root: Path, cfg: Dict[str, Any]) -> None:
         self.root = root
+        self.full_cfg = cfg
         self.cfg = cfg.get("registry", {})
+        self.language = str(cfg.get("language") or "").strip()
         data = root / cfg.get("data_dir_name", "PortableData")
         self.session = data / "Registry"
         self.backup = data / "RegistryHostBackup"
@@ -1207,6 +1532,262 @@ class RegistrySession:
         self.active = bool(self.cfg.get("enabled")) and IS_WINDOWS
         self.started = False
 
+    def _apply_tail_overrides_to_files(
+        self,
+        overrides: Dict[str, Tuple[str, Dict[str, Tuple[str, str]]]],
+        base_values: Dict[str, Tuple[str, Dict[str, Tuple[str, str]]]],
+    ) -> None:
+        """Write overridden (tail, val_name -> rhs) into portable.reg,
+        portable_machine.reg, and PortableData\\Registry\\*.reg across all
+        HKLM, WOW6432Node, HKCU, and VirtualStore mirrors.
+        """
+        if not overrides:
+            return
+        initial_name = self.cfg.get("file", "portable.reg")
+        machine_name = self.cfg.get("machine_file", "portable_machine.reg")
+        initial_path = self.root / str(initial_name) if initial_name else None
+        machine_path = self.root / str(machine_name) if machine_name else None
+
+        def _update_section_map(
+            sections: Dict[str, Dict[str, str]],
+            target_headers: Sequence[str],
+            tail_cf: str,
+        ) -> bool:
+            changed = False
+            _tail_orig, ov_vals = overrides[tail_cf]
+            base_vals = base_values.get(tail_cf, ("", {}))[1]
+            for hdr in target_headers:
+                actual_hdr = next(
+                    (h for h in sections if h.casefold() == hdr.casefold()),
+                    hdr,
+                )
+                sec_vals = sections.setdefault(actual_hdr, {})
+                existing_names = {n.casefold(): n for n in sec_vals}
+                for b_cf, (b_name, b_rhs) in base_vals.items():
+                    if b_cf not in existing_names:
+                        sec_vals[b_name] = b_rhs
+                        existing_names[b_cf] = b_name
+                        changed = True
+                for v_cf, (v_name, v_rhs) in ov_vals.items():
+                    target_name = existing_names.get(v_cf, v_name)
+                    if sec_vals.get(target_name) != v_rhs:
+                        sec_vals[target_name] = v_rhs
+                        existing_names[v_cf] = target_name
+                        changed = True
+            return changed
+
+        if initial_path and initial_path.is_file():
+            try:
+                u_sec = _parse_reg_sections(_decode_reg(initial_path.read_bytes()))
+                u_changed = False
+                for tail_cf, (tail_str, _ov) in overrides.items():
+                    u_headers = (
+                        f"HKEY_CURRENT_USER\\Software\\{tail_str}",
+                        f"HKEY_CURRENT_USER\\Software\\WOW6432Node\\{tail_str}",
+                        f"HKEY_CURRENT_USER\\Software\\Classes\\VirtualStore\\MACHINE\\SOFTWARE\\{tail_str}",
+                        f"HKEY_CURRENT_USER\\Software\\Classes\\VirtualStore\\MACHINE\\SOFTWARE\\WOW6432Node\\{tail_str}",
+                    )
+                    if _update_section_map(u_sec, u_headers, tail_cf):
+                        u_changed = True
+                if u_changed and u_sec:
+                    initial_path.write_text(
+                        _render_reg_sections(u_sec),
+                        encoding="utf-16",
+                        newline="\r\n",
+                    )
+            except OSError:
+                pass
+
+        if machine_path and machine_path.is_file():
+            try:
+                m_sec = _parse_reg_sections(_decode_reg(machine_path.read_bytes()))
+                m_changed = False
+                for tail_cf, (tail_str, _ov) in overrides.items():
+                    m_headers = (
+                        f"HKEY_LOCAL_MACHINE\\Software\\{tail_str}",
+                        f"HKEY_LOCAL_MACHINE\\Software\\WOW6432Node\\{tail_str}",
+                    )
+                    if _update_section_map(m_sec, m_headers, tail_cf):
+                        m_changed = True
+                if m_changed and m_sec:
+                    machine_path.write_text(
+                        _render_reg_sections(m_sec),
+                        encoding="utf-16",
+                        newline="\r\n",
+                    )
+            except OSError:
+                pass
+
+        if self.session.is_dir():
+            for s_file in sorted(self.session.glob("*.reg")):
+                try:
+                    s_sec = _parse_reg_sections(_decode_reg(s_file.read_bytes()))
+                    if not s_sec:
+                        continue
+                    s_changed = False
+                    for hdr in list(s_sec.keys()):
+                        tail = _extract_software_tail(hdr)
+                        if not tail or tail.casefold() not in overrides:
+                            continue
+                        if _update_section_map(s_sec, (hdr,), tail.casefold()):
+                            s_changed = True
+                    if s_changed:
+                        s_file.write_text(
+                            _render_reg_sections(s_sec),
+                            encoding="utf-16",
+                            newline="\r\n",
+                        )
+                except OSError:
+                    pass
+
+    def sync_external_changes(
+        self,
+        extra_files: Sequence[Path] = (),
+    ) -> list[str]:
+        """Absorb external .reg changes (such as _Lang_SW\\x64\\Rus.reg applied
+        on the host PC while the game was closed) into portable.reg,
+        portable_machine.reg, and PortableData\\Registry\\*.reg before import.
+        """
+        if not self.active:
+            return []
+
+        initial_name = self.cfg.get("file", "portable.reg")
+        machine_name = self.cfg.get("machine_file", "portable_machine.reg")
+        initial_path = self.root / str(initial_name) if initial_name else None
+        machine_path = self.root / str(machine_name) if machine_name else None
+
+        base_values: Dict[str, Tuple[str, Dict[str, Tuple[str, str]]]] = {}
+        user_current: Dict[str, Dict[str, str]] = {}
+        for p in (initial_path, machine_path):
+            if p is None or not p.is_file():
+                continue
+            try:
+                secs = _parse_reg_sections(_decode_reg(p.read_bytes()))
+            except OSError:
+                continue
+            for hdr, vals in secs.items():
+                tail = _extract_software_tail(hdr)
+                if not tail:
+                    continue
+                t_cf = tail.casefold()
+                _, b_map = base_values.setdefault(t_cf, (tail, {}))
+                for v_name, v_rhs in vals.items():
+                    b_map.setdefault(v_name.casefold(), (v_name, v_rhs))
+                    if hdr.startswith("HKEY_CURRENT_USER\\"):
+                        user_current.setdefault(t_cf, {})[v_name.casefold()] = v_rhs
+
+        saved_files = sorted(self.session.glob("*.reg")) if self.session.is_dir() else []
+        session_hklm: Dict[str, Tuple[str, Dict[str, Tuple[str, str]]]] = {}
+        for s_file in saved_files:
+            try:
+                secs = _parse_reg_sections(_decode_reg(s_file.read_bytes()))
+            except OSError:
+                continue
+            for hdr, vals in secs.items():
+                tail = _extract_software_tail(hdr)
+                if not tail:
+                    continue
+                t_cf = tail.casefold()
+                if hdr.startswith("HKEY_CURRENT_USER\\"):
+                    for v_name, v_rhs in vals.items():
+                        user_current.setdefault(t_cf, {})[v_name.casefold()] = v_rhs
+                elif hdr.startswith("HKEY_LOCAL_MACHINE\\"):
+                    _, m_map = session_hklm.setdefault(t_cf, (tail, {}))
+                    for v_name, v_rhs in vals.items():
+                        m_map[v_name.casefold()] = (v_name, v_rhs)
+
+        candidate_tails: Dict[str, str] = {}
+        for k in list(self.cfg.get("created_keys", [])) + list(self.keys):
+            tail = _extract_software_tail(str(k))
+            if tail:
+                candidate_tails.setdefault(tail.casefold(), tail)
+
+        app_regs = _discover_app_reg_files(self.root)
+        for _fpath, secs, _lang in app_regs:
+            for hdr in secs:
+                tail = _extract_software_tail(hdr)
+                if tail:
+                    candidate_tails.setdefault(tail.casefold(), tail)
+
+        overrides: Dict[str, Tuple[str, Dict[str, Tuple[str, str]]]] = {}
+        notes: list[str] = []
+
+        def _record_override(tail: str, v_name: str, v_rhs: str, source_tag: str) -> None:
+            if v_name.casefold() in (
+                "installdir", "installdirectory", "installfolder", "installlocation",
+            ):
+                return
+            t_cf = tail.casefold()
+            v_cf = v_name.casefold()
+            base_rhs = base_values.get(t_cf, ("", {}))[1].get(v_cf, ("", ""))[1]
+            cur_u_rhs = user_current.get(t_cf, {}).get(v_cf, "")
+            if v_rhs == base_rhs and (not cur_u_rhs or v_rhs == cur_u_rhs):
+                return
+            _, ov_map = overrides.setdefault(t_cf, (tail, {}))
+            if ov_map.get(v_cf) != (v_name, v_rhs):
+                ov_map[v_cf] = (v_name, v_rhs)
+                notes.append(f"{source_tag}: {tail} -> {v_name}={v_rhs}")
+
+        # 1. Явно переданные .reg-файлы (например, экспортированный с хоста
+        #    created_key перед импортом).
+        for ef in extra_files:
+            if not ef.is_file():
+                continue
+            try:
+                secs = _parse_reg_sections(_decode_reg(ef.read_bytes()))
+            except OSError:
+                continue
+            for hdr, vals in secs.items():
+                tail = _extract_software_tail(hdr)
+                if not tail:
+                    continue
+                for v_name, v_rhs in vals.items():
+                    _record_override(tail, v_name, v_rhs, "host-export")
+
+        # 2. Значения в реестре хоста (например, после двойного клика по
+        #    _Lang_SW\x64\Rus.reg при закрытой игре).
+        no_active_backup = not (self.backup.is_dir() and any(self.backup.glob("*.reg")))
+        if no_active_backup and candidate_tails:
+            for t_cf, tail in candidate_tails.items():
+                for probe_key in (
+                    f"HKLM\\Software\\WOW6432Node\\{tail}",
+                    f"HKLM\\Software\\{tail}",
+                    f"HKCU\\Software\\WOW6432Node\\{tail}",
+                    f"HKCU\\Software\\{tail}",
+                ):
+                    host_vals = _read_host_key_reg_values(probe_key)
+                    for v_name, v_rhs in host_vals.items():
+                        _record_override(tail, v_name, v_rhs, "host-registry")
+
+        # 3. Несоответствие между сохранённым HKLM (k04.reg) и HKCU/VirtualStore
+        #    от прошлого запуска без прав администратора.
+        for t_cf, (tail, m_map) in session_hklm.items():
+            for v_cf, (v_name, v_rhs) in m_map.items():
+                base_rhs = base_values.get(t_cf, ("", {}))[1].get(v_cf, ("", ""))[1]
+                cur_u_rhs = user_current.get(t_cf, {}).get(v_cf, "")
+                if cur_u_rhs and v_rhs != cur_u_rhs and v_rhs != base_rhs:
+                    _record_override(tail, v_name, v_rhs, "session-hklm")
+
+        # 4. Если выбран язык в launcher_config.json, а в App есть _Lang_SW .reg
+        #    для этого языка и внешних переопределений с хоста не было.
+        if self.language and not overrides and app_regs:
+            target_lang = self.language.casefold()
+            for fpath, secs, lang in app_regs:
+                if not lang or lang.casefold() != target_lang:
+                    continue
+                for hdr, vals in secs.items():
+                    tail = _extract_software_tail(hdr)
+                    if not tail:
+                        continue
+                    for v_name, v_rhs in vals.items():
+                        _record_override(tail, v_name, v_rhs, fpath.name)
+
+        if overrides:
+            self._apply_tail_overrides_to_files(overrides, base_values)
+            for note in notes:
+                _run_log(self.root, f"registry sync: {note}")
+        return notes
+
     def load(self) -> None:
         if not self.active:
             return
@@ -1214,10 +1795,18 @@ class RegistrySession:
         self.backup.mkdir(parents=True, exist_ok=True)
         self.runtime.mkdir(parents=True, exist_ok=True)
 
+        self.sync_external_changes()
+
+        created_exports: list[Path] = []
         for index, key in enumerate(self.keys):
             backup_file = self.backup / f"k{index:02d}.reg"
             if not backup_file.exists():
                 _reg(("export", str(key), str(backup_file), "/y"))
+            if str(key).casefold() in self.created and backup_file.is_file():
+                created_exports.append(backup_file)
+
+        if created_exports:
+            self.sync_external_changes(extra_files=created_exports)
 
         saved = sorted(self.session.glob("*.reg"))
         initial_name = self.cfg.get("file", "portable.reg")
@@ -1244,6 +1833,13 @@ class RegistrySession:
                     f"registry import {source.name}: "
                     f"{'ok' if code == 0 else f'FAILED (reg.exe rc={code})'}",
                 )
+        for ext_file in created_exports:
+            if ext_file.is_file():
+                _reg(("import", str(ext_file)))
+                try:
+                    ext_file.unlink()
+                except OSError:
+                    pass
         self.started = True
 
     def save_and_restore(self) -> None:
@@ -1262,10 +1858,15 @@ class RegistrySession:
             if _reg(("export", str(key), str(session_file), "/y")) == 0 and session_file.exists():
                 _pack_reg(session_file, self.root)
 
+            backup_file = self.backup / f"k{index:02d}.reg"
             if str(key).casefold() in self.created:
                 _reg(("delete", str(key), "/f"))
-            backup_file = self.backup / f"k{index:02d}.reg"
-            if backup_file.exists():
+                if backup_file.exists():
+                    try:
+                        backup_file.unlink()
+                    except OSError:
+                        pass
+            elif backup_file.exists():
                 _reg(("import", str(backup_file)))
                 try:
                     backup_file.unlink()
@@ -1573,42 +2174,73 @@ def _machine_file_needs_admin(path: Path) -> bool:
     return "[hkey_local_machine" in lowered
 
 
-def _hklm_key_missing(keys: Iterable[str]) -> bool:
-    """True when at least one captured HKLM key is absent on this computer.
+def _hklm_key_missing(
+    keys: Iterable[str],
+    machine_path: Optional[Path] = None,
+) -> bool:
+    """True when at least one captured HKLM key or value is absent on this PC.
 
     Games such as The Witcher read their install path from HKLM and quit with
-    exit code 1 when the value is not there.  The captured machine file can
-    only be imported with administrator rights, so the launcher has to know
-    whether the data is already in place before deciding to ask for UAC.
+    exit code 1 when the value is not there.  When a user imports a partial
+    .reg file (for example _Lang_SW\\x64\\Rus.reg in Assassin's Creed
+    Brotherhood), the key itself exists in HKLM with only "Language"="Russian"
+    while "InstallDir" from portable_machine.reg is still missing.  Checking
+    the sections and values of portable_machine.reg ensures the launcher still
+    asks for UAC and imports the complete machine snapshot.
     """
     if not IS_WINDOWS:
         return False
+
+    hklm_names = ("HKLM", "HKEY_LOCAL_MACHINE")
+    checked = False
     try:
         import winreg
-    except ImportError:  # pragma: no cover - Windows only
-        return False
+    except ImportError:
+        winreg = None  # type: ignore[assignment]
 
-    roots = {
-        "HKLM": winreg.HKEY_LOCAL_MACHINE,
-        "HKEY_LOCAL_MACHINE": winreg.HKEY_LOCAL_MACHINE,
-    }
-    checked = False
-    for key in keys:
-        head, _, tail = str(key).replace("/", "\\").partition("\\")
-        handle = roots.get(head.upper())
-        if handle is None or not tail:
-            continue
-        checked = True
-        for access in (winreg.KEY_READ,
-                       winreg.KEY_READ | getattr(winreg, "KEY_WOW64_32KEY", 0),
-                       winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)):
-            try:
-                winreg.CloseKey(winreg.OpenKey(handle, tail, 0, access))
-                break
-            except OSError:
+    if winreg is not None:
+        roots = {
+            "HKLM": winreg.HKEY_LOCAL_MACHINE,
+            "HKEY_LOCAL_MACHINE": winreg.HKEY_LOCAL_MACHINE,
+        }
+        for key in keys:
+            head, _, tail = str(key).replace("/", "\\").partition("\\")
+            handle = roots.get(head.upper())
+            if handle is None or not tail:
                 continue
-        else:
-            return True
+            checked = True
+            for access in (winreg.KEY_READ,
+                           winreg.KEY_READ | getattr(winreg, "KEY_WOW64_32KEY", 0),
+                           winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)):
+                try:
+                    winreg.CloseKey(winreg.OpenKey(handle, tail, 0, access))
+                    break
+                except OSError:
+                    continue
+            else:
+                return True
+
+    if machine_path is not None and machine_path.is_file():
+        try:
+            sections = _parse_reg_sections(_decode_reg(machine_path.read_bytes()))
+        except OSError:
+            sections = {}
+        for header, expected_vals in sections.items():
+            head, _, tail = header.partition("\\")
+            if head.upper() not in hklm_names or not tail:
+                continue
+            checked = True
+            host_vals = _read_host_key_reg_values(f"HKLM\\{tail}")
+            if not host_vals and expected_vals:
+                return True
+            host_cf = {k.casefold(): v for k, v in host_vals.items()}
+            for v_name, v_rhs in expected_vals.items():
+                actual_rhs = host_cf.get(v_name.casefold())
+                if actual_rhs is None:
+                    return True
+                if ROOT_TOKEN not in v_rhs and actual_rhs.casefold() != v_rhs.casefold():
+                    return True
+
     return False if checked else False
 
 
@@ -3881,6 +4513,8 @@ def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
+    except PermissionError:
+        return True
     except OSError:
         return False
 
@@ -4515,6 +5149,12 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     except Exception as exc:  # noqa: BLE001 - ключ не должен срывать запуск
         _run_log(root, f"identity: check failed ({exc})")
 
+    if bool(registry_cfg.get("enabled")):
+        try:
+            RegistrySession(root, cfg).sync_external_changes()
+        except Exception as exc:  # noqa: BLE001
+            _run_log(root, f"registry sync check failed: {exc}")
+
     # Not only launchers and configurators need the captured HKLM data: old
     # games (The Witcher and other GOG re-releases) read their install path
     # from HKLM themselves and quit with exit code 1 when it is not there.
@@ -4523,7 +5163,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # real - and that needs administrator rights, once, for this run.
     if not needs_machine and machine_available and bool(registry_cfg.get("enabled")) \
             and _machine_file_needs_admin(machine_path) \
-            and _hklm_key_missing(registry_cfg.get("keys", [])):
+            and _hklm_key_missing(registry_cfg.get("keys", []), machine_path):
         needs_machine = True
         _run_log(root, "captured HKLM keys are missing on this PC: "
                        "the machine registry file has to be imported")

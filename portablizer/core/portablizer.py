@@ -55,7 +55,7 @@ from . import registry as reg_mod
 from . import saves as saves_mod
 from .detect import DetectionResult, InstallerType, detect_installer
 from .logutil import Logger
-from .languages import plan_language
+from .languages import find_language, plan_language
 from .silentargs import SilentPlan, build_attempts, build_silent_plan
 
 ProgressCB = Callable[[int, str], None]
@@ -916,6 +916,18 @@ class Portablizer:
         os.makedirs(app_dir, exist_ok=True)
         os.makedirs(data_dir, exist_ok=True)
 
+        # Сохранённая сессия реестра от предыдущей сборки (PortableData\Registry)
+        # при запуске имеет приоритет над portable.reg и portable_machine.reg.
+        # При пересборке портатива с нуля (например, с другим языком установки)
+        # старый кэш реестра нужно сбросить, сохранив пользовательские сейвы.
+        for reg_subdir in ("Registry", "RegistryHostBackup"):
+            reg_cache = os.path.join(data_dir, reg_subdir)
+            if os.path.exists(reg_cache):
+                try:
+                    self._remove_path(reg_cache)
+                except OSError:
+                    pass
+
         for filename in (
             "Launch.bat", "LaunchHidden.vbs", "launcher.py",
             "launcher_config.json", "README_PORTABLE.txt", "portable.reg",
@@ -1124,7 +1136,7 @@ class Portablizer:
                 self.progress(62, "Распаковка вложенного архива установщика")
                 self._extract_zip_payload(opts.installer_path, app_dir, name)
 
-            # 5. Снимок реестра ПОСЛЕ + diff
+            # 5. Снимок реестра ПОСЛЕ + поиск файлов + diff
             after: reg_mod.Snapshot = {}
             capture = None
             if opts.capture_registry and IS_WINDOWS:
@@ -1132,12 +1144,6 @@ class Portablizer:
                 self.progress(65, "Снимок реестра (после установки)")
                 self.log.info("Делаю снимок реестра после установки...")
                 after = reg_mod.snapshot()
-                capture = self._capture_registry(
-                    portable_dir, before, after, opts,
-                )
-                result.reg_file = capture.reg_file
-                result.registry_keys = capture.keys
-                result.removed_from_installed_list = capture.uninstall_entries
 
             # Если установщик не послушался целевого пути, ищем его результат
             # в перенаправленном профиле и в новых каталогах Program Files.
@@ -1154,6 +1160,24 @@ class Portablizer:
                 )
                 if recovered:
                     self.log.ok("Файлы программы перенесены в папку App.")
+
+            if opts.capture_registry and (IS_WINDOWS or opts.install_language.strip()):
+                capture = self._capture_registry(
+                    portable_dir, before, after, opts,
+                )
+                result.reg_file = capture.reg_file
+                result.registry_keys = capture.keys
+                result.removed_from_installed_list = capture.uninstall_entries
+            elif opts.install_language.strip():
+                updated_inis = reg_mod.apply_language_to_ini_files(
+                    app_dir, opts.install_language)
+                if updated_inis:
+                    lang_obj = find_language(opts.install_language)
+                    lang_title = lang_obj.title if lang_obj else opts.install_language
+                    self.log.ok(
+                        f"Язык «{lang_title}» прописан в настройках: "
+                        f"{', '.join(updated_inis)}."
+                    )
 
             # 6. Поиск главного exe и обнаружение всех вспомогательных программ
             self._check_cancel()
@@ -1582,17 +1606,52 @@ class Portablizer:
         Windows Installer) переносить нельзя: иначе портатив «устанавливал»
         бы себя на каждом чужом ПК — ровно то, чего от него не ждут.
         """
-        diff = reg_mod.compute_diff(before, after)
+        raw_diff = reg_mod.compute_diff(before, after)
+        portable_before: reg_mod.Snapshot = {
+            k: dict(v) for k, v in before.items()
+        }
+        portable_after_in: reg_mod.Snapshot = {
+            k: dict(v) for k, v in after.items()
+        }
+
+        app_dir = os.path.join(portable_dir, "App")
+        if opts.install_language.strip():
+            applied_regs, touched_keys = reg_mod.apply_language_to_snapshot(
+                portable_before, portable_after_in, app_dir,
+                opts.install_language,
+            )
+            updated_inis = reg_mod.apply_language_to_ini_files(
+                app_dir, opts.install_language,
+            )
+            lang_obj = find_language(opts.install_language)
+            lang_title = lang_obj.title if lang_obj else opts.install_language
+            if applied_regs:
+                self.log.ok(
+                    f"Применён языковой файл реестра из папки программы "
+                    f"({lang_title}): {', '.join(applied_regs)}."
+                )
+            elif touched_keys:
+                self.log.ok(
+                    f"Язык «{lang_title}» прописан в захваченных ключах реестра "
+                    f"({len(touched_keys)} вет.)."
+                )
+            if updated_inis:
+                self.log.ok(
+                    f"Язык «{lang_title}» прописан в настройках: "
+                    f"{', '.join(updated_inis)}."
+                )
+
+        diff = reg_mod.compute_diff(portable_before, portable_after_in)
         capture = RegistryCapture(diff=diff)
 
         wanted = [reg_mod.CATEGORY_APP]
         if opts.include_shell_integration:
             wanted.append(reg_mod.CATEGORY_INTEGRATION)
         portable_keys = diff.keys_of(*wanted)
-        trace_keys = diff.keys_of(reg_mod.CATEGORY_TRACE)
+        trace_keys = raw_diff.keys_of(reg_mod.CATEGORY_TRACE)
         skipped_integration = (
             [] if opts.include_shell_integration
-            else diff.keys_of(reg_mod.CATEGORY_INTEGRATION)
+            else raw_diff.keys_of(reg_mod.CATEGORY_INTEGRATION)
         )
 
         # Путь портативной папки заменяем маркером: иначе настройки указывали
@@ -1602,16 +1661,22 @@ class Portablizer:
         if alt != portable_dir:
             tokens.append((alt, launcher_mod.ROOT_TOKEN))
 
-        user_keys = [k for k in portable_keys if k.startswith("HKCU")]
-        machine_keys = [k for k in portable_keys if k.startswith("HKLM")]
-
         # Если установщик сначала писал в Program Files, а затем его файлы были
         # перенесены в App, InstallFolder не должен остаться направленным в
         # старый/удалённый каталог. Именно из-за такого значения The Witcher 2
         # запускался напрямую, но Launcher.exe и Configurator.exe считали
         # установку недействительной и сразу закрывались.
         portable_after = reg_mod.retarget_install_paths(
-            after, portable_keys, os.path.join(portable_dir, "App"))
+            portable_after_in, portable_keys, app_dir)
+
+        user_keys = [k for k in portable_keys if k.startswith("HKCU")]
+        machine_keys = [k for k in portable_keys if k.startswith("HKLM")]
+        if machine_keys:
+            portable_after, machine_keys = reg_mod.mirror_machine_views(
+                portable_after, machine_keys)
+            for mk in machine_keys:
+                if mk not in portable_keys:
+                    portable_keys.append(mk)
 
         # Виртуализация HKLM-ключей остаётся бесправным fallback. Для программ
         # с manifest (у них Windows отключает VirtualStore) вспомогательные
@@ -1647,16 +1712,23 @@ class Portablizer:
 
         all_portable_keys = sorted(set(portable_keys + virtual_keys))
         capture.keys = launcher_mod.consolidate_root_keys(all_portable_keys)
+        created_machine = [
+            mk for mk in machine_keys
+            if mk not in before
+        ]
         capture.created_keys = launcher_mod.consolidate_root_keys(
-            [k for k in diff.new_keys if k in set(portable_keys)] + virtual_keys
+            [k for k in diff.new_keys if k in set(portable_keys)]
+            + created_machine
+            + virtual_keys
         )
 
         # Всё, что установщик наследил на этом ПК: и следы, и перенесённые в
         # портатив настройки — на исходной машине они больше не нужны.
+        raw_portable_keys = raw_diff.keys_of(*wanted)
         capture.cleanup_keys = sorted(
-            set(trace_keys) | set(portable_keys) | set(skipped_integration)
+            set(trace_keys) | set(raw_portable_keys) | set(skipped_integration)
         )
-        cleanup_text = reg_mod.render_host_cleanup(diff, capture.cleanup_keys)
+        cleanup_text = reg_mod.render_host_cleanup(raw_diff, capture.cleanup_keys)
         if reg_mod.has_entries(cleanup_text):
             cleanup_path = os.path.join(portable_dir, "cleanup_host.reg")
             reg_mod.write_reg_file(cleanup_path, cleanup_text)
@@ -1674,7 +1746,7 @@ class Portablizer:
 
         capture.uninstall_entries = [
             name for _key, name
-            in reg_mod.installed_program_entries(diff, after)
+            in reg_mod.installed_program_entries(raw_diff, after)
         ]
 
         if capture.reg_file or capture.machine_reg_file:
@@ -3192,6 +3264,7 @@ class Portablizer:
             ),
             shared_saves=(save_setup.to_dict()
                           if save_setup is not None else {}),
+            language=opts.install_language.strip(),
         )
         # Launch.bat — CRLF, чистый ASCII и без BOM. cmd.exe читает .bat по
         # байтовым смещениям: BOM, LF-концы строк или многобайтовый символ

@@ -554,7 +554,11 @@ class MainWindow(QMainWindow):
         self.maintenance_status.setText(
             {"release": "Освобождаю папку…",
              "update": "Обновляю программу…"}.get(action, "Обновляю…"))
-        self.maintenance_worker = MaintenanceWorker(folder, action, installer)
+        lang_code = str(self.language_combo.currentData() or "")
+        if action == "refresh":
+            self.settings.setValue("install_language", lang_code)
+        self.maintenance_worker = MaintenanceWorker(
+            folder, action, installer, language=lang_code)
         self.maintenance_worker.log_line.connect(self._on_log)
         self.maintenance_worker.finished_report.connect(
             self._on_maintenance_done)

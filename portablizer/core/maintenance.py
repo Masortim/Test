@@ -46,7 +46,9 @@ from typing import List, Optional
 
 from . import launcher as launcher_mod
 from . import procutil
+from . import registry as reg_mod
 from . import saves as saves_mod
+from .languages import find_language
 from .logutil import Logger
 
 CONFIG_NAME = "launcher_config.json"
@@ -176,7 +178,8 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
 
 
 def refresh(folder: str, log: Optional[Logger] = None,
-            copy_exe=None, shared_saves: bool = True) -> MaintenanceReport:
+            copy_exe=None, shared_saves: bool = True,
+            language: str = "") -> MaintenanceReport:
     """Перевыпускает лончеры существующего портатива текущей версией.
 
     ``copy_exe`` — функция ``(portable_dir, destination_rel) -> str``,
@@ -185,6 +188,11 @@ def refresh(folder: str, log: Optional[Logger] = None,
 
     ``shared_saves`` — настроить ли заодно сквозные сохранения: свести
     сейвы прямого запуска и лончера в одно хранилище внутри портатива.
+
+    ``language`` — код выбранного языка (например, ``"ru"``): применяет
+    комплектные языковые .reg-переключатели из ``App`` (``_Lang_SW`` и т.п.)
+    и переводит языковые значения в ``portable.reg``, ``portable_machine.reg``
+    и ``PortableData\\Registry``.
     """
     log = log or Logger()
     report = MaintenanceReport(folder=folder)
@@ -214,6 +222,51 @@ def refresh(folder: str, log: Optional[Logger] = None,
 
     cfg = launcher_mod.config_from_dict(data)
     log.info(f"Обновляю лончеры портатива «{cfg.app_name}»")
+
+    effective_lang = (language or cfg.language or "").strip()
+    if effective_lang:
+        cfg.language = effective_lang
+        applied_regs, all_reg_keys, updated_inis = (
+            reg_mod.apply_language_to_portable_folder(
+                folder,
+                effective_lang,
+                reg_file_name=cfg.reg_file_name,
+                machine_reg_file_name=cfg.machine_reg_file_name,
+                data_dir_name=cfg.data_dir_name,
+            )
+        )
+        lang_obj = find_language(effective_lang)
+        lang_title = lang_obj.title if lang_obj else effective_lang
+        if all_reg_keys:
+            cfg.apply_registry = True
+            cfg.registry_keys = launcher_mod.consolidate_root_keys(
+                list(cfg.registry_keys) + all_reg_keys
+            )
+            cfg.registry_created_keys = launcher_mod.consolidate_root_keys(
+                list(cfg.registry_created_keys) + all_reg_keys
+            )
+            for r_name in (cfg.reg_file_name, cfg.machine_reg_file_name):
+                r_path = os.path.join(folder, r_name)
+                if os.path.isfile(r_path):
+                    if launcher_mod.ROOT_TOKEN in reg_mod.read_reg_file_text(r_path):
+                        cfg.registry_has_root_token = True
+                    if r_name not in report.updated:
+                        report.updated.append(r_name)
+        if applied_regs:
+            msg = (f"Применён языковой файл реестра ({lang_title}): "
+                   f"{', '.join(applied_regs)}.")
+            log.ok(msg)
+            report.messages.append(msg)
+        elif all_reg_keys:
+            msg = f"Язык «{lang_title}» обновлён в реестре портатива."
+            log.ok(msg)
+            report.messages.append(msg)
+        if updated_inis:
+            msg = (f"Язык «{lang_title}» прописан в настройках: "
+                   f"{', '.join(updated_inis)}.")
+            log.ok(msg)
+            report.messages.append(msg)
+            report.updated.extend(updated_inis)
 
     # Сквозные сохранения настраиваются ЗДЕСЬ, а не только при сборке: иначе
     # уже готовый портатив так и остался бы с двумя разными хранилищами
