@@ -55,6 +55,7 @@ from . import registry as reg_mod
 from . import saves as saves_mod
 from .detect import DetectionResult, InstallerType, detect_installer
 from .logutil import Logger
+from .languages import plan_language
 from .silentargs import SilentPlan, build_attempts, build_silent_plan
 
 ProgressCB = Callable[[int, str], None]
@@ -334,6 +335,10 @@ class PortableOptions:
     # не нужно, а портативность от этого только страдает.
     include_shell_integration: bool = False
     extra_install_args: List[str] = field(default_factory=list)
+    # Язык многоязычного установщика (код из core/languages.py, например
+    # «ru»). Пусто — язык по умолчанию, как выбрал бы установщик сам. От языка
+    # зависит, какие текстовые файлы, субтитры и шрифты попадут в портатив.
+    install_language: str = ""
     extra_env: Dict[str, str] = field(default_factory=dict)
     # Предел ожидания установки. Считается НЕ от запуска, а от последнего
     # признака работы (запись в целевую папку, ввод-вывод и процессорное время
@@ -962,6 +967,19 @@ class Portablizer:
         except OSError:
             pass
 
+    def _log_language_choice(self, det, opts: PortableOptions) -> None:
+        """Пишет в журнал, какой язык установщика будет выбран и как."""
+        if not opts.install_language.strip():
+            self.log.info("Язык установщика: по умолчанию (как в самом "
+                          "установщике).")
+            return
+        plan = plan_language(det.installer_type, opts.install_language,
+                             opts.extra_install_args)
+        if plan.level == "warn":
+            self.log.warn(plan.message)
+        else:
+            self.log.ok(plan.message)
+
     # -- шаги -----------------------------------------------------------------
     def run(self, opts: PortableOptions) -> PortableResult:
         result = PortableResult(success=False)
@@ -1015,6 +1033,7 @@ class Portablizer:
 
             # 2. Лестница планов тихой установки
             self.progress(15, "Построение команды тихой установки")
+            self._log_language_choice(det, opts)
             attempts = build_attempts(
                 det, opts.installer_path, app_dir,
                 log_dir=portable_dir,
@@ -1022,6 +1041,7 @@ class Portablizer:
                 layout_dir=os.path.join(portable_dir, "_bundle_layout"),
                 response_file=response_file,
                 allow_assisted=opts.allow_assisted_install,
+                language=opts.install_language,
             )
             result.plan = attempts[0] if attempts else None
             result.attempts_planned = len(attempts)
