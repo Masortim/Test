@@ -92,6 +92,7 @@ class MainWindow(QMainWindow):
         self.maintenance_worker: Optional[MaintenanceWorker] = None
         #: Тип последнего определённого установщика (для подсказки о языке).
         self._detected_type: Optional[InstallerType] = None
+        self._detected_is_gog = False
         self.last_result: Optional[PortableResult] = None
         #: Запоминаем папку вывода между запусками: каждый раз искать её
         #: заново — лишнее вмешательство пользователя в то, что программа
@@ -640,10 +641,12 @@ class MainWindow(QMainWindow):
 
     def _on_installer_changed(self, path: str) -> None:
         self._detected_type = None
+        self._detected_is_gog = False
         if path and os.path.isfile(path):
             try:
                 det = detect_installer(path)
                 self._detected_type = det.installer_type
+                self._detected_is_gog = bool(getattr(det, "is_gog", False))
                 notes = []
                 if det.requires_admin:
                     notes.append("нужны права администратора")
@@ -674,6 +677,11 @@ class MainWindow(QMainWindow):
         elif itype is None:
             text = ("Тип установщика ещё не определён: язык будет передан "
                     "ключом, только если установщик его поддерживает.")
+        elif self._detected_is_gog:
+            text = ("GOG-установщик: в мастер уходит /LANG=ru (не russian), "
+                    "а язык самой игры после установки прописывается в "
+                    "goggame-*.info и в реестре GOG.com\\Games. Иначе игра "
+                    "остаётся на английском — так бывает у Sleeping Dogs.")
         elif supports_language_switch(itype):
             text = ("Язык передаётся ключом установщика. Если в установщике "
                     "нет этого языка, будет установлен язык по умолчанию.")

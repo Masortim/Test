@@ -643,7 +643,11 @@ def build_attempts(
     """
     user_extra = list(extra_args or [])
     lang_plan = plan_language(
-        _effective_type(detection), language, user_extra)
+        _effective_type(detection), language, user_extra,
+        is_gog=bool(getattr(detection, "is_gog", False)),
+        inno_language_names=list(
+            getattr(detection, "inno_language_names", ()) or ()),
+    )
     extra = user_extra + lang_plan.args
     native_target = _native(target_dir)
     installer_path = _norm(installer_path)

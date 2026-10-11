@@ -330,6 +330,46 @@ def read_pe_info(path: str) -> PEInfo:
 
 # --- сканирование содержимого -------------------------------------------------
 
+#: Маркеры офлайн-установщика GOG. Сами по себе тип движка не решают
+#: (это почти всегда Inno Setup), но от них зависит имя языка в ``/LANG=``
+#: и пост-обработка ``goggame-*.info``.
+_GOG_MARKERS: Tuple[str, ...] = (
+    "gog.com", "gog galaxy", "goggame-", "gog.com/games",
+)
+
+#: Пары «короткий код + английское имя» как их кладёт Inno Setup GOG:
+#: ``ru\\0Russian``. По ним ``/LANG=`` берёт ``ru``, а не ``russian``.
+_INNO_SHORT_LANG_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("en", "english"),
+    ("ru", "russian"),
+    ("uk", "ukrainian"),
+    ("de", "german"),
+    ("fr", "french"),
+    ("it", "italian"),
+    ("es", "spanish"),
+    ("pl", "polish"),
+    ("pt", "brazilianportuguese"),
+    ("pt", "portuguese"),
+    ("br", "brazilian"),
+    ("zh", "chinesesimplified"),
+    ("zh", "chinese"),
+    ("ja", "japanese"),
+    ("tr", "turkish"),
+)
+
+#: Полные имена секции [Languages] обычного (не GOG) Inno Setup.
+_INNO_LONG_LANG_NAMES: Tuple[str, ...] = (
+    "english", "russian", "ukrainian", "german", "french", "italian",
+    "spanish", "polish", "brazilianportuguese", "chinesesimplified",
+    "japanese", "turkish",
+)
+
+
+def _wide_bytes(ascii_data: bytes) -> bytes:
+    """ASCII (включая нули) → UTF-16LE."""
+    return b"".join(bytes((byte, 0)) for byte in ascii_data)
+
+
 @dataclass
 class ScanResult:
     """Что нашлось при однопроходном чтении файла."""
@@ -340,6 +380,10 @@ class ScanResult:
     requires_admin: bool = False
     #: Найденные строки-маркеры поколения (см. ``_MARKER_TOKENS``).
     markers: Set[str] = field(default_factory=set)
+    #: Маркеры GOG (gog.com, goggame- и т.п.).
+    gog_hits: List[str] = field(default_factory=list)
+    #: Имена языков Inno Setup, найденные внутри файла (``ru``, ``russian``).
+    inno_language_names: List[str] = field(default_factory=list)
 
 
 def _needles(text: str) -> Tuple[bytes, bytes]:
@@ -363,8 +407,20 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
     }
     switch_needles = [(token, _needles(token)) for token in _SWITCH_TOKENS]
     marker_needles = [(token, _needles(token)) for token in _MARKER_TOKENS]
+    gog_needles = [(token, _needles(token)) for token in _GOG_MARKERS]
+    short_lang_needles: List[Tuple[str, bytes, bytes]] = []
+    for code, english in _INNO_SHORT_LANG_PAIRS:
+        ascii_pair = f"{code}\x00{english}".encode("ascii")
+        short_lang_needles.append((code, ascii_pair, _wide_bytes(ascii_pair)))
+    long_lang_needles: List[Tuple[str, bytes, bytes]] = []
+    for name in _INNO_LONG_LANG_NAMES:
+        ascii_name = name.encode("ascii") + b"\x00"
+        long_lang_needles.append((name, ascii_name, _wide_bytes(ascii_name)))
     found_switches: Set[str] = set()
     found_markers: Set[str] = set()
+    found_gog: Set[str] = set()
+    found_short_langs: Set[str] = set()
+    found_long_langs: Set[str] = set()
     urls: List[str] = []
     seen_urls: Set[str] = set()
 
@@ -374,6 +430,11 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
          for encoded in pair]
         + [len(encoded) for _t, pair in switch_needles for encoded in pair]
         + [len(encoded) for _t, pair in marker_needles for encoded in pair]
+        + [len(encoded) for _t, pair in gog_needles for encoded in pair]
+        + [len(encoded) for _c, ascii_p, wide_p in short_lang_needles
+           for encoded in (ascii_p, wide_p)]
+        + [len(encoded) for _n, ascii_p, wide_p in long_lang_needles
+           for encoded in (ascii_p, wide_p)]
         + [400]  # запас на URL, разрезанный границей чанка
     )
 
@@ -407,6 +468,24 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
                     if ascii_sig in data or wide_sig in data:
                         found_markers.add(token)
 
+                for token, (ascii_sig, wide_sig) in gog_needles:
+                    if token in found_gog:
+                        continue
+                    if ascii_sig in data or wide_sig in data:
+                        found_gog.add(token)
+
+                for code, ascii_sig, wide_sig in short_lang_needles:
+                    if code in found_short_langs:
+                        continue
+                    if ascii_sig in data or wide_sig in data:
+                        found_short_langs.add(code)
+
+                for name, ascii_sig, wide_sig in long_lang_needles:
+                    if name in found_long_langs:
+                        continue
+                    if ascii_sig in data or wide_sig in data:
+                        found_long_langs.add(name)
+
                 if not result.requires_admin:
                     result.requires_admin = any(m in data for m in _ADMIN_MARKERS)
 
@@ -426,6 +505,17 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
     result.switches = [t for t in _SWITCH_TOKENS if t in found_switches]
     result.markers = found_markers
     result.urls = urls
+    result.gog_hits = [t for t in _GOG_MARKERS if t in found_gog]
+    # Короткая пара ``ru\\0Russian`` надёжнее голого ``russian\\0``: второе
+    # совпадает с отображаемым именем рядом с кодом ``ru``.
+    inno_names: List[str] = []
+    seen_inno: Set[str] = set()
+    for name in list(found_short_langs) + list(found_long_langs):
+        if name in seen_inno:
+            continue
+        seen_inno.add(name)
+        inno_names.append(name)
+    result.inno_language_names = inno_names
     return result
 
 
@@ -582,6 +672,10 @@ class DetectionResult:
     response_files: List[str] = field(default_factory=list)
     #: Папка с установщиком (медиа-раскладка диска).
     media_dir: str = ""
+    #: Офлайн-установщик GOG (Inno Setup с gog.com / setup_*.exe + .bin).
+    is_gog: bool = False
+    #: Имена языков из секции [Languages] Inno Setup (``ru``, ``russian``).
+    inno_language_names: List[str] = field(default_factory=list)
 
     @property
     def human(self) -> str:
@@ -800,4 +894,51 @@ def detect_installer(path: str) -> DetectionResult:
         )
     if result.has_zip_payload:
         result.evidence.append("внутри есть ZIP — возможна распаковка без установки")
+
+    result.inno_language_names = list(scan.inno_language_names)
+    result.is_gog = _looks_like_gog(path, scan, layout)
+    if result.is_gog:
+        why = []
+        if scan.gog_hits:
+            why.append("строки " + ", ".join(scan.gog_hits[:4]))
+        if _gog_bin_siblings(layout, path):
+            why.append("рядом лежат setup_*.bin")
+        if _gog_filename(path):
+            why.append("имя файла setup_*.exe")
+        result.evidence.append(
+            "GOG-установщик (" + "; ".join(why or ["эвристика"]) + "): "
+            "язык игры после установки берётся из goggame-*.info и "
+            "GOG.com\\Games, а /LANG= у Inno — двухбуквенный (ru, не russian)"
+        )
+        if result.vendor_name == "":
+            result.vendor_name = "GOG"
+    if result.inno_language_names:
+        result.evidence.append(
+            "языки Inno Setup внутри файла: "
+            + ", ".join(result.inno_language_names[:12])
+            + (" …" if len(result.inno_language_names) > 12 else "")
+        )
     return result
+
+
+def _gog_filename(path: str) -> bool:
+    name = os.path.basename(path).casefold()
+    return name.startswith("setup_") and name.endswith(".exe")
+
+
+def _gog_bin_siblings(layout: MediaLayout, path: str) -> bool:
+    stem = os.path.splitext(os.path.basename(path))[0].casefold()
+    for name in layout.files:
+        lowered = name.casefold()
+        if not lowered.endswith(".bin"):
+            continue
+        if lowered.startswith(stem) or lowered.startswith("setup_"):
+            return True
+    return False
+
+
+def _looks_like_gog(path: str, scan: ScanResult, layout: MediaLayout) -> bool:
+    """GOG offline installer: строки gog.com и/или setup_*.exe + .bin."""
+    if scan.gog_hits:
+        return True
+    return _gog_filename(path) and _gog_bin_siblings(layout, path)

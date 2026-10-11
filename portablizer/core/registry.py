@@ -754,6 +754,13 @@ _LANGUAGE_VALUE_NAMES = frozenset({
     "langid",
     "languageid",
     "culture",
+    "lang-code",
+    "lang_code",
+    "langcode",
+    "languagecode",
+    "defaultlanguage",
+    "gamelanguage",
+    "selectedlanguage",
 })
 
 #: Имена папок в репаках (например, _Lang_SW у dixen18), где лежат .reg-переключатели.
@@ -784,8 +791,23 @@ _LANGUAGE_INI_FILENAMES = frozenset({
     "hlm.ini",
     "hoodlum.ini",
     "goggame.ini",
+    "galaxy.ini",
+    "comm.ini",
     "force_language.txt",
 })
+
+#: JSON GOG Galaxy: ``goggame-1446200766.info``. Поле ``language`` — то, что
+#: читает игра без клиента Galaxy; без правки остаётся English.
+_GOG_INFO_NAME_RE = re.compile(r"^goggame-.*\.(info|json)$", re.IGNORECASE)
+_GOG_JSON_LANGUAGE_RE = re.compile(
+    r'("language"\s*:\s*")([^"]*)(")',
+    re.IGNORECASE,
+)
+
+_GOG_GAMES_MARKERS = (
+    r"software\gog.com\games",
+    r"software\wow6432node\gog.com\games",
+)
 
 
 def read_reg_file_text(path: str) -> str:
@@ -1245,6 +1267,118 @@ def _rewrite_snapshot_language_values(
     return updated_keys
 
 
+def _is_gog_games_key(key_path: str) -> bool:
+    """``HKLM\\Software\\[WOW6432Node\\]GOG.com\\Games\\{id}`` (не корень Games)."""
+    path = _strip_hive(key_path)
+    for marker in _GOG_GAMES_MARKERS:
+        if path.startswith(marker + "\\"):
+            rest = path[len(marker) + 1:].strip("\\")
+            return bool(rest)
+    return False
+
+
+def _gog_game_ids_from_app(app_dir: str) -> List[str]:
+    """Идентификаторы GOG-игр из имён ``goggame-{id}.info`` в ``App``."""
+    if not app_dir or not os.path.isdir(app_dir):
+        return []
+    ids: List[str] = []
+    seen = set()
+    skip_dirs = {"portabledata", "redist", "_redist_cache", "updates"}
+    for root, dirs, files in os.walk(app_dir):
+        dirs[:] = [d for d in dirs if d.casefold() not in skip_dirs]
+        for fname in files:
+            if not _is_gog_info_file(fname):
+                continue
+            match = re.match(r"goggame-(\d+)\.", fname, re.IGNORECASE)
+            if not match:
+                continue
+            game_id = match.group(1)
+            if game_id not in seen:
+                seen.add(game_id)
+                ids.append(game_id)
+    return ids
+
+
+def _set_gog_language_values(
+    values: KeyValues, lang_code: str,
+) -> bool:
+    """Пишет ``language`` / ``lang-code`` в значения ключа GOG.com\\Games."""
+    from .languages import convert_language_string, find_registry_profile
+
+    profile = find_registry_profile(lang_code)
+    if profile is None:
+        return False
+    changed = False
+    existing = {n.casefold(): n for n in values}
+
+    def _put(want_names: Sequence[str], new_val: str) -> None:
+        nonlocal changed
+        for candidate in want_names:
+            actual = existing.get(candidate.casefold())
+            if actual is None:
+                continue
+            typ, _raw = _as_entry(values[actual])
+            if typ not in (REG_SZ, REG_EXPAND_SZ):
+                continue
+            old = _entry_value(values[actual])
+            if not isinstance(old, str):
+                continue
+            converted = convert_language_string(old, lang_code)
+            if converted is None:
+                converted = new_val
+            if converted != old:
+                values[actual] = _encode_value(typ, converted)
+                changed = True
+            return
+        # Значения не было — GOG Galaxy как раз его и создаёт.
+        name = want_names[0]
+        values[name] = _encode_value(REG_SZ, new_val)
+        existing[name.casefold()] = name
+        changed = True
+
+    _put(("language", "Language"), profile.english_name)
+    _put(("lang-code", "lang_code", "Lang-Code"), profile.locale_hyphen)
+    return changed
+
+
+def _ensure_gog_registry_language(
+    snapshot: Snapshot, app_dir: str, lang_code: str,
+) -> List[str]:
+    """Прописывает язык в ``GOG.com\\Games\\{id}`` и создаёт ключ, если его нет.
+
+    Без Galaxy офлайн-установщик GOG оставляет ``language=English`` (или не
+    пишет его вовсе) — Sleeping Dogs и другие игры тогда стартуют по-английски
+    даже при выбранном русском в Portablizer.
+    """
+    from .languages import find_registry_profile
+
+    profile = find_registry_profile(lang_code)
+    if profile is None:
+        return []
+
+    touched: List[str] = []
+    found_ids: Set[str] = set()
+    for key in list(snapshot.keys()):
+        if not _is_gog_games_key(key):
+            continue
+        leaf = key.rsplit("\\", 1)[-1]
+        found_ids.add(leaf)
+        values = snapshot.setdefault(key, {})
+        if _set_gog_language_values(values, lang_code):
+            touched.append(key)
+
+    for game_id in _gog_game_ids_from_app(app_dir):
+        if any(game_id.casefold() == existing.casefold()
+               for existing in found_ids):
+            continue
+        key = rf"HKLM\Software\WOW6432Node\GOG.com\Games\{game_id}"
+        values = snapshot.setdefault(key, {})
+        values.setdefault("gameID", _encode_value(REG_SZ, game_id))
+        _set_gog_language_values(values, lang_code)
+        touched.append(key)
+    return touched
+
+
 def apply_language_to_snapshot(
     before: Snapshot,
     after: Snapshot,
@@ -1313,6 +1447,13 @@ def apply_language_to_snapshot(
         if k not in app_keys:
             app_keys.append(k)
 
+    gog_keys = _ensure_gog_registry_language(after, app_dir, lang_code)
+    for k in gog_keys:
+        if k not in touched_keys:
+            touched_keys.append(k)
+        if k not in app_keys:
+            app_keys.append(k)
+
     # Зеркалируем 32-битное (WOW6432Node) и 64-битное представления HKLM
     mirrored_after, mirrored_keys = mirror_machine_views(after, app_keys)
     after.clear()
@@ -1339,8 +1480,48 @@ def apply_language_to_snapshot(
     return applied_files, touched_keys
 
 
+def _is_gog_info_file(fname: str) -> bool:
+    return bool(_GOG_INFO_NAME_RE.match(fname or ""))
+
+
+def _is_language_settings_file(fname: str) -> bool:
+    low = (fname or "").casefold()
+    return low in _LANGUAGE_INI_FILENAMES or _is_gog_info_file(fname)
+
+
+def _rewrite_gog_info_language(text: str, lang_code: str) -> Optional[str]:
+    """Меняет поле ``language`` в JSON ``goggame-*.info``, сохраняя формат."""
+    from .languages import convert_language_string, find_registry_profile
+
+    profile = find_registry_profile(lang_code)
+    if profile is None:
+        return None
+
+    def _repl(match: re.Match) -> str:
+        old = match.group(2)
+        converted = convert_language_string(old, lang_code)
+        if converted is None:
+            # GOG после обновлений требует имя с заглавной: «Russian».
+            converted = profile.english_name
+        if converted == old:
+            return match.group(0)
+        return f"{match.group(1)}{converted}{match.group(3)}"
+
+    new_text, count = _GOG_JSON_LANGUAGE_RE.subn(_repl, text, count=1)
+    if count:
+        return new_text if new_text != text else None
+
+    # Поля нет — вставляем сразу после открывающей скобки, как делает Galaxy.
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        return None
+    brace = text.find("{")
+    insert = f'\n  "language": "{profile.english_name}",'
+    return text[:brace + 1] + insert + text[brace + 1:]
+
+
 def apply_language_to_ini_files(app_dir: str, lang_code: str) -> List[str]:
-    """Обновляет параметр языка в INI-файлах эмуляторов/загрузчиков внутри ``App``."""
+    """Обновляет параметр языка в INI/JSON эмуляторов, загрузчиков и GOG."""
     from .languages import convert_language_string, find_registry_profile
 
     profile = find_registry_profile(lang_code)
@@ -1351,7 +1532,8 @@ def apply_language_to_ini_files(app_dir: str, lang_code: str) -> List[str]:
     skip_dirs = {"portabledata", "redist", "_redist_cache", "updates"}
     ini_key_re = re.compile(
         r"^(\s*(?:Language|InstallLanguage|TextLanguage|SubtitleLanguage|"
-        r"SubtitlesLanguage|UILanguage|InterfaceLanguage|Locale|Lang)\s*=\s*)"
+        r"SubtitlesLanguage|UILanguage|InterfaceLanguage|Locale|Lang|"
+        r"Lang-Code|Lang_Code|LangCode)\s*=\s*)"
         r"([^\r\n;#]*?)(\s*(?:[;#].*)?)$",
         re.IGNORECASE,
     )
@@ -1359,7 +1541,7 @@ def apply_language_to_ini_files(app_dir: str, lang_code: str) -> List[str]:
     for root, dirs, files in os.walk(app_dir):
         dirs[:] = sorted(d for d in dirs if d.casefold() not in skip_dirs)
         for fname in sorted(files):
-            if fname.casefold() not in _LANGUAGE_INI_FILENAMES:
+            if not _is_language_settings_file(fname):
                 continue
             full_path = os.path.join(root, fname)
             try:
@@ -1386,6 +1568,17 @@ def apply_language_to_ini_files(app_dir: str, lang_code: str) -> List[str]:
                     try:
                         with open(full_path, "w", encoding=enc, newline="\r\n") as fh:
                             fh.write(new_val + "\n")
+                        updated_files.append(os.path.relpath(full_path, app_dir))
+                    except OSError:
+                        pass
+                continue
+
+            if _is_gog_info_file(fname):
+                rewritten = _rewrite_gog_info_language(text, lang_code)
+                if rewritten is not None and rewritten != text:
+                    try:
+                        with open(full_path, "w", encoding=enc, newline="\n") as fh:
+                            fh.write(rewritten)
                         updated_files.append(os.path.relpath(full_path, app_dir))
                     except OSError:
                         pass
