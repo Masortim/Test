@@ -11,7 +11,10 @@
 Синтаксис ключа зависит от движка установщика:
 
   * Inno Setup     — ``/LANG=<имя языка>`` из секции [Languages] сценария
-                     (``/LANG=russian``, без учёта регистра);
+                     (``/LANG=russian``, без учёта регистра). У **GOG** имя
+                     почти всегда двухбуквенное (``/LANG=ru``), а не
+                     ``russian``: неверный ключ Inno молча ставит язык по
+                     умолчанию — английский;
   * NSIS           — ``/LANG=<LCID в десятичной записи>`` (``/LANG=1049``);
   * InstallShield  — ``/L0x<LCID в шестнадцатеричной записи>`` (``/L0x0419``).
 
@@ -19,6 +22,12 @@
 WiX Burn и собственные bootstrapper'ы — своими средствами). Для них модуль
 честно сообщает, что язык нужно выбрать в самом окне установщика или задать
 ключ вручную в поле «Доп. аргументы».
+
+GOG-установщик (``setup_*.exe`` + ``gog.com`` внутри) ставит все языковые
+файлы, а **какой язык включит сама игра** берёт не из ключа установщика, а из
+``goggame-*.info`` и ветки ``GOG.com\\Games`` в реестре. Поэтому после
+установки выбранный язык туда дописывается отдельно — иначе Sleeping Dogs и
+другие GOG-игры остаются на английском даже при выбранном русском.
 
 Если ключ передан, а в установщике такого языка нет, движок ставит язык по
 умолчанию и не падает — поэтому выбранный язык журналируется, а установщик
@@ -64,10 +73,30 @@ LANGUAGES: List[InstallerLanguage] = [
 
 _BY_CODE = {lang.code.lower(): lang for lang in LANGUAGES}
 
+#: Дополнительные имена секции [Languages] Inno Setup. GOG почти всегда
+#: использует двухбуквенный код (``ru``), обычные скрипты — полное имя
+#: (``russian``). Неверный ``/LANG=`` Inno молча игнорирует.
+_INNO_EXTRA_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "ru": ("ru", "rus"),
+    "en": ("en", "enu"),
+    "uk": ("uk", "ua"),
+    "de": ("de",),
+    "fr": ("fr",),
+    "it": ("it",),
+    "es": ("es",),
+    "pl": ("pl",),
+    "pt-BR": ("pt", "ptb", "br", "brazilian"),
+    "zh-CN": ("zh", "cn", "chs"),
+    "ja": ("ja", "jp"),
+    "tr": ("tr",),
+}
+
 #: Признаки уже заданного языка в пользовательских аргументах. Если человек
 #: сам написал ``/LANG=…`` или ``/L0x…``, второй ключ ставить нельзя.
 _LANG_SWITCH_RE = re.compile(
-    r"^(?:/LANG=|/L0x|/L\d|/L=|-LANG=|/langid=|-langid=)", re.IGNORECASE)
+    r"^(?:/LANG=|/L0x|/L\d|/L=|-LANG=|/langid=|-langid="
+    r"|--language=|--lang=)",
+    re.IGNORECASE)
 
 
 def find_language(code: str) -> Optional[InstallerLanguage]:
@@ -92,11 +121,54 @@ def has_language_switch(args: Sequence[str]) -> bool:
     return any(_LANG_SWITCH_RE.match(str(a).strip()) for a in args)
 
 
+def inno_language_aliases(language: InstallerLanguage) -> Tuple[str, ...]:
+    """Имена языка, которые Inno Setup может ждать в ``/LANG=``.
+
+    Порядок: короткое GOG-имя (``ru``), затем штатное ``russian``. Для GOG
+    короткое имя важнее: ``/LANG=russian`` при ``Name: "ru"`` молча ставит
+    английский.
+    """
+    names: List[str] = []
+    seen = set()
+
+    def _add(name: str) -> None:
+        key = name.casefold()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        names.append(name)
+
+    for extra in _INNO_EXTRA_ALIASES.get(language.code, ()):
+        _add(extra)
+    iso = language.code.split("-")[0].lower()
+    _add(iso)
+    _add(language.inno_name)
+    return tuple(names)
+
+
+def pick_inno_language_name(
+    language: InstallerLanguage,
+    found_names: Sequence[str] = (),
+    is_gog: bool = False,
+) -> str:
+    """Выбирает значение ``/LANG=`` по тому, что реально есть в установщике."""
+    aliases = inno_language_aliases(language)
+    found = {n.casefold() for n in found_names if n}
+    for alias in aliases:
+        if alias.casefold() in found:
+            return alias
+    if is_gog:
+        return aliases[0] if aliases else language.inno_name
+    return language.inno_name
+
+
 def switch_for(installer_type: InstallerType,
-               language: InstallerLanguage) -> Optional[str]:
+               language: InstallerLanguage,
+               *,
+               inno_name: Optional[str] = None) -> Optional[str]:
     """Ключ выбора языка для движка или ``None``, если движок его не знает."""
     if installer_type == InstallerType.INNO:
-        return f"/LANG={language.inno_name}"
+        return f"/LANG={inno_name or language.inno_name}"
     if installer_type == InstallerType.NSIS:
         return f"/LANG={language.lcid}"
     if installer_type == InstallerType.INSTALLSHIELD:
@@ -117,12 +189,17 @@ class LanguagePlan:
 
 
 def plan_language(installer_type: InstallerType, code: str,
-                  user_args: Sequence[str] = ()) -> LanguagePlan:
+                  user_args: Sequence[str] = (),
+                  *,
+                  is_gog: bool = False,
+                  inno_language_names: Sequence[str] = ()) -> LanguagePlan:
     """Аргументы выбора языка для установщика данного типа.
 
     ``code`` — код из ``LANGUAGES`` или пустая строка (язык по умолчанию).
     ``user_args`` — уже введённые пользователем аргументы: если в них есть
     выбор языка, Portablizer ничего не добавляет.
+    ``is_gog`` / ``inno_language_names`` — результат определения установщика:
+    GOG ждёт ``/LANG=ru``, а не ``/LANG=russian``.
     """
     if not (code or "").strip():
         return LanguagePlan()
@@ -141,23 +218,37 @@ def plan_language(installer_type: InstallerType, code: str,
             level="warn")
 
     if not supports_language_switch(installer_type):
+        extra = ""
+        if is_gog:
+            extra = (" GOG-игра после установки всё равно получит выбранный "
+                     "язык в goggame-*.info и в реестре GOG.com\\Games.")
         return LanguagePlan(
             message=(f"Тип установщика «{installer_type.value}» не выбирает "
                      "язык ключом командной строки. Выберите язык в самом "
                      "окне установщика или укажите его в доп. аргументах; "
-                     "иначе портатив получит язык по умолчанию."),
+                     "иначе портатив получит язык по умолчанию." + extra),
             level="warn")
 
-    switch = switch_for(installer_type, language)
+    inno_name = None
+    if installer_type == InstallerType.INNO:
+        inno_name = pick_inno_language_name(
+            language, inno_language_names, is_gog=is_gog)
+    switch = switch_for(installer_type, language, inno_name=inno_name)
     if switch is None:  # страховка: supports_language_switch уже проверил тип
         return LanguagePlan(
             message=f"Язык {language.title} для этого установщика не задаётся.",
             level="warn")
+    gog_note = ""
+    if is_gog:
+        gog_note = (" GOG: ключ задаёт язык мастера; язык самой игры "
+                    "дополнительно прописывается в goggame-*.info и "
+                    "GOG.com\\Games — иначе игра останется на английском.")
     return LanguagePlan(
         args=[switch],
         message=(f"Язык установки: {language.title} (ключ {switch}). Если в "
                  "установщике нет этого языка, он поставит язык по "
-                 "умолчанию — проверьте файлы App и субтитры в игре."),
+                 "умолчанию — проверьте файлы App и субтитры в игре."
+                 f"{gog_note}"),
     )
 
 

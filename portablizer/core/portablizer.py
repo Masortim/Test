@@ -985,12 +985,24 @@ class Portablizer:
             self.log.info("Язык установщика: по умолчанию (как в самом "
                           "установщике).")
             return
-        plan = plan_language(det.installer_type, opts.install_language,
-                             opts.extra_install_args)
+        plan = plan_language(
+            det.installer_type, opts.install_language,
+            opts.extra_install_args,
+            is_gog=bool(getattr(det, "is_gog", False)),
+            inno_language_names=list(
+                getattr(det, "inno_language_names", ()) or ()),
+        )
         if plan.level == "warn":
             self.log.warn(plan.message)
         else:
             self.log.ok(plan.message)
+        if getattr(det, "is_gog", False) and opts.install_language.strip():
+            self.log.info(
+                "GOG-установщик: язык мастера и язык игры — разные вещи. "
+                "После установки выбранный язык будет прописан в "
+                "goggame-*.info и в ветке GOG.com\\Games, иначе игра "
+                "(Sleeping Dogs и другие) останется на английском."
+            )
 
     # -- шаги -----------------------------------------------------------------
     def run(self, opts: PortableOptions) -> PortableResult:

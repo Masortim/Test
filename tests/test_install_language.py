@@ -44,7 +44,8 @@ from portablizer.core.detect import (  # noqa: E402
     DetectionResult, InstallerType, InstallShieldGeneration,
 )
 from portablizer.core.languages import (  # noqa: E402
-    LANGUAGES, find_language, has_language_switch, plan_language, switch_for,
+    LANGUAGES, find_language, has_language_switch, pick_inno_language_name,
+    plan_language, switch_for,
 )
 from portablizer.core.portablizer import PortableOptions  # noqa: E402
 from portablizer.core.silentargs import build_attempts  # noqa: E402
@@ -699,9 +700,9 @@ class LauncherExternalRegSwitchTests(unittest.TestCase):
             machine_path = Path(temp, "portable_machine.reg")
             machine_path.write_text(
                 "Windows Registry Editor Version 5.00\r\n\r\n"
-                "[HKEY_LOCAL_MACHINE\\Software\\WOW6432Node\\Ubisoft\\"
+                "[HKEY_LOCAL_MACHINE\\\\Software\\\\WOW6432Node\\\\Ubisoft\\\\"
                 "Assassin's Creed Brotherhood]\r\n"
-                '"InstallDir"="@@PORTABLE_ROOT@@\\\\App"\r\n'
+                '"InstallDir"="@@PORTABLE_ROOT@@\\\\\\\\App"\r\n'
                 '"Language"="Russian"\r\n\r\n',
                 encoding="utf-16",
             )
@@ -717,6 +718,251 @@ class LauncherExternalRegSwitchTests(unittest.TestCase):
                 self.assertTrue(
                     exe_launcher._hklm_key_missing([], machine_path)
                 )
+
+
+class GogInnoLanguageSwitchTests(unittest.TestCase):
+    """GOG offline installer: /LANG=ru, не /LANG=russian.
+
+    У Sleeping Dogs: Definitive Edition (и других GOG Inno) секция
+    [Languages] называется ``ru``. Ключ ``/LANG=russian`` Inno молча
+    игнорирует — в портативе остаётся английский.
+    """
+
+    def test_gog_inno_uses_the_short_language_code(self):
+        plan = plan_language(InstallerType.INNO, "ru", is_gog=True)
+        self.assertEqual(plan.args, ["/LANG=ru"])
+        self.assertIn("GOG", plan.message)
+
+    def test_regular_inno_keeps_the_full_language_name(self):
+        self.assertEqual(
+            plan_language(InstallerType.INNO, "ru").args, ["/LANG=russian"])
+
+    def test_found_full_name_wins_over_the_gog_default(self):
+        plan = plan_language(
+            InstallerType.INNO, "ru", is_gog=True,
+            inno_language_names=("english", "russian"))
+        self.assertEqual(plan.args, ["/LANG=russian"])
+
+    def test_found_short_name_wins_for_gog(self):
+        plan = plan_language(
+            InstallerType.INNO, "ru", is_gog=True,
+            inno_language_names=("en", "ru", "de"))
+        self.assertEqual(plan.args, ["/LANG=ru"])
+
+    def test_pick_prefers_short_pair_over_display_name(self):
+        ru = find_language("ru")
+        self.assertEqual(
+            pick_inno_language_name(ru, ("ru", "russian"), is_gog=True), "ru")
+        self.assertEqual(
+            pick_inno_language_name(ru, (), is_gog=True), "ru")
+        self.assertEqual(
+            pick_inno_language_name(ru, (), is_gog=False), "russian")
+
+    def test_attempts_for_gog_inno_pass_short_lang(self):
+        det = DetectionResult(
+            InstallerType.INNO, 1.0, is_gog=True,
+            inno_language_names=["en", "ru"])
+        plans = build_attempts(
+            det, r"E:\Setup\setup_sleeping_dogs.exe",
+            r"E:\Portable\SleepingDogs_Portable\App",
+            language="ru")
+        self.assertTrue(plans)
+        for plan in plans:
+            self.assertIn("/LANG=ru", plan.args, plan.label)
+            self.assertNotIn("/LANG=russian", plan.args)
+
+    def test_non_gog_attempts_still_use_russian(self):
+        det = DetectionResult(InstallerType.INNO, 1.0, is_gog=False)
+        plans = build_attempts(
+            det, r"E:\Setup\setup.exe",
+            r"E:\Portable\Game_Portable\App",
+            language="ru")
+        self.assertIn("/LANG=russian", plans[0].args)
+
+
+class GogGameInfoLanguageTests(unittest.TestCase):
+    """После установки GOG язык должен попасть в goggame-*.info и реестр."""
+
+    INFO = (
+        "{\n"
+        '  "gameId": "1446200766",\n'
+        '  "language": "English",\n'
+        '  "languages": ["en", "ru", "de", "fr", "pl", "es", "it"],\n'
+        '  "name": "Sleeping Dogs: Definitive Edition"\n'
+        "}\n"
+    )
+
+    def test_goggame_info_english_becomes_russian(self):
+        from portablizer.core import registry as reg_mod
+
+        with tempfile.TemporaryDirectory() as temp:
+            info = Path(temp, "goggame-1446200766.info")
+            info.write_text(self.INFO, encoding="utf-8")
+            updated = reg_mod.apply_language_to_ini_files(temp, "ru")
+            self.assertEqual(updated, ["goggame-1446200766.info"])
+            text = info.read_text(encoding="utf-8")
+            self.assertIn('"language": "Russian"', text)
+            self.assertNotIn('"language": "English"', text)
+            # Список доступных языков не трогаем.
+            self.assertIn('"languages": ["en", "ru", "de", "fr", "pl", "es", "it"]',
+                          text)
+
+    def test_goggame_info_inserts_language_when_missing(self):
+        from portablizer.core import registry as reg_mod
+
+        with tempfile.TemporaryDirectory() as temp:
+            info = Path(temp, "goggame-1446200766.info")
+            info.write_text('{\n  "gameId": "1446200766"\n}\n', encoding="utf-8")
+            updated = reg_mod.apply_language_to_ini_files(temp, "ru")
+            self.assertEqual(updated, ["goggame-1446200766.info"])
+            self.assertIn('"language": "Russian"', info.read_text(encoding="utf-8"))
+
+    def test_gog_registry_rewrites_language_and_lang_code(self):
+        from portablizer.core import registry as reg_mod
+
+        key = r"HKLM\Software\WOW6432Node\GOG.com\Games\1446200766"
+        before = {}
+        after = {
+            key: {
+                "gameID": (reg_mod.REG_SZ, repr("1446200766")),
+                "language": (reg_mod.REG_SZ, repr("english")),
+                "lang-code": (reg_mod.REG_SZ, repr("en-US")),
+                "path": (reg_mod.REG_SZ, repr(r"C:\Games\Sleeping Dogs")),
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            applied, touched = reg_mod.apply_language_to_snapshot(
+                before, after, temp, "ru")
+        self.assertIn(key, touched)
+        values = after[key]
+        self.assertEqual(reg_mod._entry_value(values["language"]), "russian")
+        self.assertEqual(reg_mod._entry_value(values["lang-code"]), "ru-RU")
+
+    def test_gog_registry_key_is_created_from_goggame_info(self):
+        from portablizer.core import registry as reg_mod
+
+        with tempfile.TemporaryDirectory() as temp:
+            Path(temp, "goggame-1446200766.info").write_text(
+                self.INFO, encoding="utf-8")
+            before: dict = {}
+            after: dict = {}
+            _applied, touched = reg_mod.apply_language_to_snapshot(
+                before, after, temp, "ru")
+            key = r"HKLM\Software\WOW6432Node\GOG.com\Games\1446200766"
+            self.assertTrue(any(k.casefold() == key.casefold() for k in touched))
+            match = next(k for k in after if k.casefold() == key.casefold())
+            values = after[match]
+            self.assertEqual(
+                reg_mod._entry_value(values["language"]).casefold(), "russian")
+            self.assertEqual(
+                reg_mod._entry_value(values["lang-code"]).casefold(), "ru-ru")
+
+    def test_capture_registry_writes_gog_russian_into_portable_machine_reg(self):
+        from portablizer.core import registry as reg_mod
+        from portablizer.core.logutil import Logger
+        from portablizer.core.portablizer import Portablizer
+
+        key = r"HKLM\Software\WOW6432Node\GOG.com\Games\1446200766"
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "SleepingDogs_Portable")
+            app_dir = portable / "App"
+            app_dir.mkdir(parents=True)
+            (app_dir / "goggame-1446200766.info").write_text(
+                self.INFO, encoding="utf-8")
+            before = {}
+            after = {
+                key: {
+                    "gameID": (reg_mod.REG_SZ, repr("1446200766")),
+                    "language": (reg_mod.REG_SZ, repr("english")),
+                    "lang-code": (reg_mod.REG_SZ, repr("en-US")),
+                },
+            }
+            engine = Portablizer(Logger())
+            capture = engine._capture_registry(
+                str(portable), before, after,
+                PortableOptions(
+                    installer_path="setup_sleeping_dogs.exe",
+                    output_dir=temp,
+                    install_language="ru",
+                ),
+            )
+            self.assertTrue(os.path.isfile(capture.machine_reg_file))
+            machine = (portable / "portable_machine.reg").read_text(
+                encoding="utf-16")
+            self.assertRegex(machine, r'(?i)"language"="russian"')
+            self.assertNotRegex(machine, r'(?i)"language"="english"')
+            info_text = (app_dir / "goggame-1446200766.info").read_text(
+                encoding="utf-8")
+            self.assertIn('"language": "Russian"', info_text)
+
+    def test_gog_note_is_logged_when_language_is_chosen(self):
+        from portablizer.core.logutil import Logger
+        from portablizer.core.portablizer import Portablizer
+
+        lines = []
+        logger = Logger()
+        logger.add_sink(lambda level, message: lines.append((level, message)))
+        engine = Portablizer(logger)
+        opts = PortableOptions(
+            installer_path="setup_sleeping_dogs.exe",
+            output_dir="out",
+            install_language="ru",
+        )
+        engine._log_language_choice(
+            DetectionResult(InstallerType.INNO, 1.0, is_gog=True,
+                            inno_language_names=["ru", "en"]),
+            opts,
+        )
+        joined = " ".join(msg for _level, msg in lines)
+        self.assertIn("/LANG=ru", joined)
+        self.assertIn("goggame", joined.casefold())
+
+
+class GogInstallerDetectionTests(unittest.TestCase):
+    def test_setup_exe_with_gog_strings_and_short_lang_pair(self):
+        from portablizer.core.detect import detect_installer
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(
+                temp, "setup_sleeping_dogs_definitive_edition_2.0.0.16.exe")
+            payload = (
+                b"MZ This installation was built with Inno Setup. "
+                b"Download from gog.com Galaxy client. goggame-1446200766 "
+                b"ru\x00Russian en\x00English"
+            )
+            installer.write_bytes(payload)
+            (Path(temp, "setup_sleeping_dogs_definitive_edition_2.0.0.16-1.bin")
+             ).write_bytes(b"BIN")
+            det = detect_installer(str(installer))
+            self.assertTrue(det.is_gog)
+            self.assertEqual(det.installer_type, InstallerType.INNO)
+            self.assertIn("ru", det.inno_language_names)
+            self.assertTrue(any("GOG" in e for e in det.evidence))
+
+    def test_plain_inno_is_not_gog(self):
+        from portablizer.core.detect import detect_installer
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "setup.exe")
+            installer.write_bytes(b"MZ This installation was built with Inno Setup")
+            det = detect_installer(str(installer))
+            self.assertFalse(det.is_gog)
+            self.assertEqual(det.installer_type, InstallerType.INNO)
+
+
+class GogLanguageInterfaceTests(unittest.TestCase):
+    @unittest.skipUnless(_QT_READY, f"PySide6/Qt недоступен: {_QT_ERROR}")
+    def test_gog_hint_mentions_goggame_info(self):
+        from portablizer.gui import main_window
+
+        with mock.patch.object(main_window, "QSettings", _MemorySettings):
+            window = main_window.MainWindow()
+        window._detected_type = InstallerType.INNO
+        window._detected_is_gog = True
+        window.language_combo.setCurrentIndex(
+            window.language_combo.findData("ru"))
+        self.assertIn("goggame", window.language_hint.text().casefold())
+        self.assertIn("/LANG=ru", window.language_hint.text())
 
 
 
