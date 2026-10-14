@@ -2975,6 +2975,9 @@ class Portablizer:
             rc, plan.label, command, events,
             installer_path=self._installer_name,
             temp_line=self._temp_line(),
+            # Версия — чтобы по одной жалобе сразу было видно, какая сборка
+            # это написала: старые версии давали неверный диагноз.
+            version=__version__,
         )
         path = os.path.join(os.path.dirname(console_log),
                             crash_mod.CRASH_LOG_NAME)

@@ -117,6 +117,55 @@ class CrashCodeTests(unittest.TestCase):
         self.assertIn("администратора", hint)
         self.assertIn("администратора", hint)
 
+    def test_unknown_ntstatus_inside_the_fatal_band_is_still_a_crash(self):
+        """Кода нет в таблице — диагноз всё равно «падение», а не «права»."""
+        for value in (0xC000001E, 0xC0000225, 0xC000FFFF, 0xC0005C1F,
+                      0xC0000009, 0xC00000FE):
+            with self.subTest(value=value):
+                item = crash_mod.crash_code(value)
+                self.assertIsNotNone(item)
+                self.assertTrue(crash_mod.is_crash_code(value))
+                # Имени константы нет — выдумывать его нельзя.
+                self.assertEqual(item.name, "")
+                self.assertIn("NTSTATUS", item.summary)
+                # О правах говорится только затем, чтобы снять ложный след:
+                # вредна не сама тема, а совет «не хватило прав».
+                self.assertIn("правам администратора", item.hint)
+                self.assertNotIn("не хватило прав", item.hint)
+
+    def test_codes_outside_the_fatal_band_are_not_crashes(self):
+        for value in (0xFFFFFFFF, 0xC0010000, 0x80000002, 0xB0000000,
+                      0, 1, 740, -1, None):
+            with self.subTest(value=value):
+                self.assertFalse(crash_mod.is_crash_code(value))
+                self.assertFalse(crash_mod.is_retryable(value))
+
+    def test_handles_and_missing_drives_are_explained_by_name(self):
+        """Коды из таблицы узнаются по имени, а не как «что-то упало»."""
+        for value, name in ((0xC0000008, "STATUS_INVALID_HANDLE"),
+                            (0xC000000E, "STATUS_NO_SUCH_DEVICE")):
+            with self.subTest(value=value):
+                item = crash_mod.crash_code(value)
+                self.assertIsNotNone(item)
+                self.assertEqual(item.name, name)
+
+    def test_dotnet_bootstrap_crash_has_its_own_explanation(self):
+        # 0xE0434352 стоит ВНЕ полосы 0xC0000…, поэтому обязан быть в таблице:
+        # так завершаются бутстрапперы на .NET.
+        item = crash_mod.crash_code(0xE0434352)
+        self.assertIsNotNone(item)
+        self.assertIn(".NET", item.summary)
+
+    def test_engine_never_blames_rights_for_a_fatal_ntstatus(self):
+        for value in (CRASH_CALLBACK_UNSIGNED, 0xC000001E, 0xC000000E,
+                      0xE0434352):
+            with self.subTest(value=value):
+                self.assertNotIn("не хватило прав администратора",
+                                 engine_mod._exit_code_hint(value))
+        # А для exit(-1) прежняя расшифровка остаётся: это не падение.
+        self.assertIn("администратора",
+                      engine_mod._exit_code_hint(0xFFFFFFFF))
+
     def test_code_is_printed_in_all_three_forms(self):
         # Сообщение должно содержать и беззнаковый код, и знаковый, и
         # шестнадцатеричный: пользователь ищет их в разных источниках.
@@ -268,6 +317,23 @@ class CrashReportTests(unittest.TestCase):
         self.assertIn("STATUS_FATAL_USER_CALLBACK_EXCEPTION", report)
         self.assertIn("журнал событий", report.lower())
 
+    def test_report_carries_the_build_version(self):
+        """По жалобе сразу видно, какая сборка написала отчёт.
+
+        Разные версии дают разный диагноз одному и тому же коду, поэтому
+        «у меня снова 0xC000041D» без версии ничего не значит.
+        """
+        report = crash_mod.format_report(
+            CRASH_CALLBACK_UNSIGNED, "попытка", "setup.exe", [],
+            version=engine_mod.__version__)
+        self.assertIn(f"Portablizer: {engine_mod.__version__}", report)
+
+    def test_report_about_an_unknown_ntstatus_says_the_name_is_unknown(self):
+        report = crash_mod.format_report(0xC000001E, "попытка", "setup.exe", [])
+        self.assertIn("0xC000001E", report)
+        self.assertIn("NTSTATUS", report)
+        self.assertNotIn("не хватило прав", report)
+
 
 class CrashHintTests(unittest.TestCase):
     def test_hatred_like_failure_gets_actionable_advice(self):
@@ -313,6 +379,23 @@ class CrashHintTests(unittest.TestCase):
     def test_plain_exit_code_produces_no_crash_hints(self):
         self.assertEqual(crash_mod.crash_hints(1), [])
         self.assertEqual(crash_mod.crash_hints(None), [])
+
+    def test_hints_for_an_unknown_code_admit_the_code_is_unknown(self):
+        """Неизвестный NTSTATUS: честно сказать, что расшифровки нет.
+
+        Раньше такой код уходил в общую ветку и получал совет «не хватило
+        прав администратора» — то есть ровно тот неверный диагноз, из-за
+        которого всё это и делалось. Теперь есть и диагноз, и точка опоры:
+        имя упавшего модуля в отчёте.
+        """
+        hints = crash_mod.crash_hints(0xC000001E, is_inno=True)
+        text = "\n".join(hints)
+        self.assertIn("не отказался от работы, а упал", text)
+        self.assertIn("0xC000001E", text)
+        self.assertIn("не станет повторять запуск вслепую", text)
+        self.assertIn("installer-crash.log", text)
+        self.assertNotIn("не хватило прав", text)
+        self.assertNotIn("запустите portablizer", text.lower())
 
     def test_gog_advice_is_absent_for_other_installers(self):
         text = "\n".join(crash_mod.crash_hints(CRASH_CALLBACK_UNSIGNED,
