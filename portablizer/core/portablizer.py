@@ -36,6 +36,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -170,6 +171,22 @@ EXTERNAL_TEMP_PREFIX = "Portablizer-"
 #: только потом переносят их в целевую, то есть на диске одновременно живут
 #: дистрибутив, распакованная копия и результат.
 TEMP_NEED_FACTOR = 2.0
+
+#: Масштаб плавного прогресса установщика (секунды). Установщик не сообщает
+#: своих процентов, а большая игра ставится минутами. Прежняя линейная шкала
+#: «доля = время / 60 с» насыщалась на первой минуте, и полоса замирала на
+#: верхней границе этапа (58 %) до конца установки. Кривая ``1 - exp(-t/T)``
+#: растёт всё время работы и никогда не достигает конца отрезка, поэтому
+#: полоса видимо движется, а следующий этап наступает только по факту.
+INSTALL_PROGRESS_SCALE = 600.0
+
+
+def creep_fraction(elapsed: float, scale: float = INSTALL_PROGRESS_SCALE) -> float:
+    """Доля 0..1 для плавной полосы по времени работы (никогда не 1.0)."""
+    value = 1.0 - math.exp(-max(0.0, float(elapsed)) / max(1.0, float(scale)))
+    # В float при очень долгой работе exp() даёт 1.0 — ограничиваем, чтобы
+    # int(span * доля) никогда не дотягивал до конца отрезка.
+    return min(value, 0.999)
 
 #: Потолок на распаковку установщика без запуска (секунды). Даже если потолок
 #: установки снят (``install_deadline = 0``), распаковка не может идти вечно:
@@ -1275,6 +1292,11 @@ class Portablizer:
             install_rc, used_plan = self._run_attempts(
                 attempts, opts, app_dir, data_dir, portable_dir, name,
                 recover=recover)
+            # Лестница закончилась на 58 %, а следующий этап ниже сам по себе
+            # полосу не двигает (закрытие процессов, распаковка без запуска).
+            # Честно подписываем переход, иначе выглядит как зависание.
+            self._check_cancel()
+            self.progress(59, "Проверка результата установки")
             result.attempts_made = self._attempts_made
             if used_plan is not None:
                 result.plan = used_plan
@@ -2417,7 +2439,7 @@ class Portablizer:
             elapsed = now - started
             idle = now - last_work
             # Плавный прогресс во время установки: progress_from -> progress_to.
-            frac = min(1.0, elapsed / 60.0)
+            frac = creep_fraction(elapsed)
             span = max(1, progress_to - progress_from)
             title = ("Установка в окне мастера..." if plan.interactive
                      else "Тихая установка...")
@@ -3137,8 +3159,10 @@ class Portablizer:
                     handle.close()
                 raise RuntimeError("Операция отменена пользователем.")
             elapsed = time.monotonic() - started
-            fraction = min(1.0, elapsed / 120.0)
-            self._emit_progress(63 + int(1 * fraction), "Распаковка установщика")
+            fraction = creep_fraction(elapsed, scale=120.0)
+            # Отрезок 63..65 (а не один процент): плавная полоса должна
+            # сдвигаться, иначе она замирала бы на 63 % на всё время распаковки.
+            self._emit_progress(63 + int(2 * fraction), "Распаковка установщика")
             self._detail(
                 min(99, int(fraction * 100)),
                 "Распаковка без запуска идёт "

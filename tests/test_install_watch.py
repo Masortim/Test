@@ -570,5 +570,71 @@ class PlanLogTests(unittest.TestCase):
             self.assertEqual(plan.progress_logs, [])
 
 
+class CreepProgressTests(unittest.TestCase):
+    """Полоса прогресса тихой установки не замирает на верхней границе.
+
+    Регрессия: линейная шкала ``min(1, elapsed / 60)`` насыщалась через
+    минуту, и на долгой установке полоса навсегда застывала на 58 %.
+    """
+
+    def test_fraction_grows_and_never_reaches_the_end(self):
+        values = [engine_mod.creep_fraction(t) for t in (0, 60, 600, 3600, 36000)]
+        self.assertEqual(values[0], 0.0)
+        self.assertEqual(values, sorted(values))
+        self.assertTrue(all(0.0 <= v < 1.0 for v in values))
+        self.assertGreaterEqual(values[-1], 0.999)
+
+    def test_bar_keeps_moving_after_the_first_minute(self):
+        # Через минуту старая шкала давала бы 1.0; новая ещё далеко от конца.
+        self.assertLess(engine_mod.creep_fraction(60.0), 0.2)
+        self.assertGreater(engine_mod.creep_fraction(600.0), 0.5)
+
+    def test_long_install_reports_increasing_progress_inside_its_span(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = os.path.join(temp, "App")
+            data = os.path.join(temp, "PortableData")
+            os.makedirs(app)
+            os.makedirs(data)
+            plan = build_silent_plan(InstallerType.INNO, "setup.exe", app)
+            engine = Portablizer(logger=Logger(), progress=None)
+            seen = []
+            engine._emit_progress = lambda pct, text: seen.append(pct)
+            engine._detail = lambda pct, text: None
+
+            class _Proc:
+                pid = 4242
+                returncode = 0
+                calls = 0
+
+                def poll(self):
+                    _Proc.calls += 1
+                    return None if _Proc.calls < 40 else 0
+
+            real_monotonic = time.monotonic
+            base = real_monotonic()
+            fake_now = {"t": base}
+
+            def fake_monotonic():
+                return fake_now["t"]
+
+            def fake_sleep(seconds):
+                fake_now["t"] += 60.0  # имитируем минуту работы за опрос
+
+            with mock.patch.object(engine_mod.time, "monotonic", fake_monotonic), \
+                    mock.patch.object(engine_mod.time, "sleep", fake_sleep), \
+                    mock.patch.object(engine_mod, "_InstallWatchdog") as dog:
+                dog.return_value.poll.return_value = False
+                dog.return_value.summary.return_value = "тест"
+                dog.return_value.report.return_value = None
+                engine._wait_for_install(
+                    _Proc(), plan, app, data, idle_limit=1e9, deadline=0.0,
+                    progress_from=30, progress_to=58)
+            self.assertTrue(seen)
+            self.assertTrue(all(30 <= v <= 57 for v in seen), seen)
+            # Полоса ушла дальше первых секунд и не зависла на границе.
+            self.assertGreater(seen[-1], seen[0])
+            self.assertLess(seen[-1], 58)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
