@@ -452,8 +452,15 @@ class BuildEndToEndTests(unittest.TestCase):
             build_exe_launcher=False, cleanup_host=False,
             redirect_userdirs=True)
         engine = Portablizer(Logger())
-        with mock.patch.object(engine_mod.subprocess, "Popen",
-                               side_effect=lambda *_a, **_k: _FakeProc()):
+        # Процесс установщика здесь подменён двойником, который «работает»
+        # вечно. Распаковка без запуска (последний шаг для падающего
+        # установщика) ходит в тот же subprocess и ждала бы этого двойника
+        # бесконечно — на этом и повис один прогон сборки. В этом тесте она
+        # не проверяется: распаковщика как будто нет.
+        with mock.patch.object(engine_mod.unpacker_mod, "find_unpacker",
+                               return_value=""), \
+                mock.patch.object(engine_mod.subprocess, "Popen",
+                                  side_effect=lambda *_a, **_k: _FakeProc()):
             result = engine.run(opts)
 
         self.assertFalse(result.success)

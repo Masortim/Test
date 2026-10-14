@@ -444,6 +444,58 @@ class UnpackerFallbackTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("не дала файлов программы", engine._unpacker_result)
 
+    def _stuck_run(self, deadline: float):
+        """Прогон распаковщика, который запустился и не завершается.
+
+        Возвращает ``(код, текст, был_ли_снят_процесс)``: время идёт
+        подставными часами, поэтому тест не ждёт ни секунды.
+        """
+        engine = Portablizer(Logger())
+        opts = PortableOptions(installer_path=self.installer,
+                               output_dir=self.temp.name,
+                               install_deadline=deadline)
+        console_log = os.path.join(self.temp.name, "unpacker-output.log")
+
+        class StuckProcess:
+            pid = 4321
+            returncode = None
+
+            def poll(self):
+                return None
+
+        stopped = []
+        with mock.patch.object(engine_mod.subprocess, "Popen",
+                               lambda *a, **k: StuckProcess()), \
+                mock.patch.object(engine, "_stop_installer",
+                                  side_effect=lambda proc: stopped.append(proc)), \
+                mock.patch.object(engine_mod.time, "sleep", lambda _s: None), \
+                mock.patch.object(engine_mod.time, "monotonic",
+                                  side_effect=[100.0, 100.0, 2000.0, 4000.0]):
+            code, text = engine._run_unpacker_command(["7z", "x"], console_log,
+                                                      opts)
+        return code, text, stopped
+
+    def test_a_stuck_unpacker_is_stopped_by_the_deadline(self):
+        """Незавершающийся распаковщик не держит сборку вечно.
+
+        Регрессия сборки на Windows: тест подменял ``subprocess.Popen``
+        «вечно работающим» двойником, а распаковка без запуска ходит в тот же
+        subprocess — и ждала этот двойник бесконечно. Прогон молчал 28 минут
+        и был снят целиком. Ждать вечно распаковка не имеет права.
+        """
+        code, text, stopped = self._stuck_run(deadline=0.05)
+        self.assertEqual(code, -1)
+        self.assertIn("предел", text)
+        self.assertEqual(len(stopped), 1)
+
+    def test_unpacker_keeps_its_own_ceiling_when_the_install_limit_is_off(self):
+        """Потолок установки снят (0) — у распаковки всё равно есть свой."""
+        code, text, stopped = self._stuck_run(deadline=0)
+        self.assertEqual(code, -1)
+        self.assertIn("предел", text)
+        self.assertEqual(len(stopped), 1)
+        self.assertGreater(engine_mod.UNPACK_HARD_LIMIT, 0)
+
 
 class EndToEndWiringTests(unittest.TestCase):
     """Связка целиком: run() доводит до подсказок всё, что узнал по пути."""
