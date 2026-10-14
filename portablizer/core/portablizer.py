@@ -48,15 +48,21 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .. import __version__
+from . import crashinfo as crash_mod
 from . import launcher as launcher_mod
 from . import procutil
 from . import redist as redist_mod
 from . import registry as reg_mod
 from . import saves as saves_mod
+from . import space as space_mod
+from . import unpacker as unpacker_mod
 from .detect import DetectionResult, InstallerType, detect_installer
 from .logutil import Logger
 from .languages import find_language, plan_language
-from .silentargs import SilentPlan, build_attempts, build_silent_plan
+from .silentargs import (
+    SilentPlan, build_attempts, build_progress_window_attempt,
+    build_silent_plan, repeat_attempt,
+)
 
 ProgressCB = Callable[[int, str], None]
 #: Ход текущей операции: ``(процент или -1, подпись)``. ``-1`` означает, что
@@ -144,6 +150,42 @@ _NEGATIVE_EXIT_HINT = (
     "администратора или тихий режим не поддерживается"
 )
 
+# -- аварийное завершение процесса --------------------------------------------
+#
+# Отрицательный код возврата — это не всегда «мало прав». Коды вида 0xC0000…
+# (NTSTATUS) означают, что процесс УПАЛ: он стартовал, начал работу и был
+# оборван исключением. Пользователю нужен именно такой диагноз: он ведёт к
+# месту в TEMP, целостности дистрибутива и стороннему коду в процессе, а не к
+# повышению прав, которое в этом случае ничего не меняет.
+# Расшифровка кодов и факты о падении — в core/crashinfo.py.
+
+#: Столько живёт папка TEMP установщика ВНЕ портатива, если его пришлось
+#: перенести на другой диск: папка удаляется сразу после сборки, но если
+#: сборку снимут аварийно (питание, диспетчер задач), на диске останется
+#: каталог с известным именем — его видно и можно удалить руками.
+EXTERNAL_TEMP_PREFIX = "Portablizer-"
+
+#: Сколько места нужно установщику в TEMP относительно веса дистрибутива.
+#: Офлайн-установщики GOG распаковывают данные целиком во временную папку и
+#: только потом переносят их в целевую, то есть на диске одновременно живут
+#: дистрибутив, распакованная копия и результат.
+TEMP_NEED_FACTOR = 2.0
+
+#: Падение через считанные секунды после старта и до записи файлов — обычно
+#: разовая помеха (антивирус проверял бинарник, не хватило памяти в момент
+#: распаковки). Такую попытку повторяют один раз, но только если она была
+#: короткой: повторять падение, случившееся после часа работы, бессмысленно.
+CRASH_RETRY_MAX_SECONDS = 240.0
+
+#: Установщики, содержимое которых умеет доставать сторонний распаковщик
+#: (Inno Setup, NSIS и самораспаковывающиеся архивы). У MSI, InstallShield и
+#: остальных движков своя упаковка — для них распаковка без запуска не
+#: предлагается.
+UNPACKABLE_TYPES = (
+    InstallerType.INNO, InstallerType.NSIS, InstallerType.SELF_EXTRACT,
+    InstallerType.UNKNOWN,
+)
+
 #: Код -1 от bootstrapper'а почти всегда означает «не разобрал командную
 #: строку»: неизвестный ключ, отсутствие обязательного (например, принятия
 #: лицензии) или запрет на запуск без UAC.
@@ -181,8 +223,17 @@ def _format_exit_code(rc: Optional[int]) -> str:
 
 
 def _exit_code_hint(rc: Optional[int]) -> str:
+    """Расшифровка кода возврата для журнала и итогового сообщения.
+
+    Сначала проверяются коды аварийного завершения процесса: у них своя
+    расшифровка (NTSTATUS), и подменять её общей фразой про права
+    администратора нельзя — она уводит в сторону от настоящей причины.
+    """
     if rc is None:
         return ""
+    crash = crash_mod.crash_code(rc)
+    if crash is not None:
+        return crash.hint
     if rc > 0x7FFFFFFF:
         return _NEGATIVE_EXIT_HINT
     return _EXIT_CODE_HINTS.get(rc, "")
@@ -259,6 +310,18 @@ def _encode_installer_text(text: str, sample: bytes) -> bytes:
         return text.encode("cp1251")
     except UnicodeEncodeError:
         return text.encode("utf-8")
+
+
+def _text_tail(path: str, limit: int = 2000) -> str:
+    """Последние байты текстового журнала — для сообщения об ошибке."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > limit:
+                fh.seek(size - limit)
+            return fh.read(limit).decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
 
 
 def retarget_response_file(text: str, target_dir: str) -> Tuple[str, int]:
@@ -452,6 +515,15 @@ class PortableResult:
     folder_is_free: bool = True
     #: Кто держит папку, если это всё же не так (для показа пользователю).
     folder_holders: List[str] = field(default_factory=list)
+    #: Где установщик брал временное место (``PortableData\\Temp`` или
+    #: перенесённая папка на другом диске — такую папку сборка удаляет).
+    installer_temp_dir: str = ""
+    #: Отчёт о падении установщика (``installer-crash.log``), если процесс
+    #: завершился аварийно.
+    crash_report_rel: str = ""
+    #: Распаковщик, которым достали содержимое установщика БЕЗ его запуска
+    #: (пусто — не потребовался).
+    unpacked_with: str = ""
     #: Службы Windows, снятые с регистрации (их бинарник лежал в портативе).
     removed_services: List[str] = field(default_factory=list)
     #: Режим сквозных сохранений: ``inplace`` | ``mirror`` | ``off``.
@@ -715,6 +787,33 @@ class Portablizer:
         self._install_stalled = False
         #: Доклад о последнем затишье: по нему строятся подсказки.
         self._install_stall: Optional[InstallStall] = None
+        #: Папка TEMP, из которой работает установщик. По умолчанию —
+        #: ``PortableData\Temp``; может быть перенесена на другой диск, если на
+        #: диске портатива для распаковки не хватает места (см.
+        #: ``_prepare_install_temp``).
+        self._install_temp_dir = ""
+        #: Временные папки ВНЕ портатива, созданные для установщика: после
+        #: сборки их надо убрать, иначе на компьютере останется мусор.
+        self._external_temp_dirs: List[str] = []
+        #: Что сказать про свободное место (заполняется, только если места
+        #: действительно не хватало).
+        self._temp_space_note = ""
+        #: Падения установщика: (название сценария, код возврата).
+        self._crash_history: List[Tuple[str, int]] = []
+        #: Записи журнала событий Windows о последнем падении.
+        self._crash_events: List[crash_mod.CrashEvent] = []
+        #: Повтор той же команды после падения уже выполнялся.
+        self._crash_retried = False
+        #: Сценарий «с окном прогресса» после падения уже добавлялся.
+        self._progress_retry_done = False
+        #: Сколько секунд шла последняя попытка установки.
+        self._last_install_seconds = 0.0
+        #: Имя упавшего процесса: по нему ищутся записи в журнале событий.
+        self._installer_name = ""
+        #: Чем закончилась распаковка без запуска (для подсказок).
+        self._unpacker_result = ""
+        #: Каким распаковщиком воспользовались (пусто — ни одним).
+        self._unpacked_with = ""
 
     # -- вспомогательное ------------------------------------------------------
     def progress(self, percent: int, stage: str) -> None:
@@ -928,14 +1027,36 @@ class Portablizer:
                 except OSError:
                     pass
 
+        # Временная папка установщика от предыдущей сборки. Она же — «второй
+        # потребитель» места на диске: неудачная установка большой игры
+        # оставляет в ней десятки гигабайт, и следующая попытка начинается
+        # уже с пустым диском. Содержимое TEMP по определению не нужно — его
+        # удаление безопасно, и об освобождённом месте честно сообщается.
+        stale_temp = os.path.join(data_dir, "Temp")
+        if os.path.isdir(stale_temp):
+            freed = _tree_usage(stale_temp)[0]
+            try:
+                self._remove_path(stale_temp)
+            except OSError as exc:
+                self.log.debug(f"  • старую временную папку очистить не удалось: {exc}")
+            else:
+                if freed:
+                    self.log.info(
+                        "Временная папка прошлой сборки очищена: освобождено "
+                        f"{redist_mod.format_size(freed)}."
+                    )
+        os.makedirs(stale_temp, exist_ok=True)
+
         for filename in (
             "Launch.bat", "LaunchHidden.vbs", "launcher.py",
             "launcher_config.json", "README_PORTABLE.txt", "portable.reg",
             "portable_machine.reg", "cleanup_host.reg", "cleanup_host.cmd",
             "install.log",
             "install-retry.log", "install-layout.log", "installer-engine.log",
-            "installer-output.log", "portablizer.log", "_bundle_layout",
-            "setup-installshield.log", redist_mod.REPORT_NAME, "_redist_cache",
+            "installer-output.log", "installer-crash.log",
+            "unpacker-output.log", "portablizer.log", "_bundle_layout",
+            "_unpacked", "setup-installshield.log", redist_mod.REPORT_NAME,
+            "_redist_cache",
             launcher_mod.STOP_SCRIPT_NAME, launcher_mod.UPDATE_SCRIPT_NAME,
             "Updates",
         ):
@@ -1015,6 +1136,20 @@ class Portablizer:
             self._installshield_result = None
             self._install_stalled = False
             self._install_stall = None
+            # Всё, что относится к диагностике падений и временному месту
+            # установщика, начинается заново: один и тот же объект может
+            # собирать несколько портативов подряд.
+            self._install_temp_dir = ""
+            self._external_temp_dirs = []
+            self._temp_space_note = ""
+            self._crash_history = []
+            self._crash_events = []
+            self._crash_retried = False
+            self._progress_retry_done = False
+            self._last_install_seconds = 0.0
+            self._unpacker_result = ""
+            self._unpacked_with = ""
+            self._installer_name = opts.installer_path
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
                 raise FileNotFoundError(f"Установщик не найден: {opts.installer_path}")
@@ -1054,6 +1189,13 @@ class Portablizer:
             # 1c. Классический InstallShield: подготовка файла ответов.
             response_file = self._prepare_response_file(
                 det, portable_dir, app_dir, opts)
+
+            # 1d. Временное место установщика. Проверяется ДО первой команды
+            # установки: большие (особенно GOG) распаковывают данные в TEMP, и
+            # нехватка места проявляется не отказом, а падением установщика.
+            self._check_cancel()
+            self.progress(12, "Проверка места под распаковку")
+            self._prepare_install_temp(opts, portable_dir, data_dir, det)
 
             # 2. Лестница планов тихой установки
             self.progress(15, "Построение команды тихой установки")
@@ -1147,6 +1289,14 @@ class Portablizer:
                 self._check_cancel()
                 self.progress(62, "Распаковка вложенного архива установщика")
                 self._extract_zip_payload(opts.installer_path, app_dir, name)
+
+            # 4c. Последний честный шанс для падающего установщика: достать
+            # его содержимое БЕЗ запуска (Inno Setup и NSIS — обычные
+            # контейнеры, и установленный 7-Zip читает их напрямую). Код
+            # установщика при этом не выполняется вовсе — он и не падает.
+            if not self._find_main_exe(app_dir, name):
+                self._try_unpacker_fallback(opts, app_dir, portable_dir, det,
+                                            name)
 
             # 5. Снимок реестра ПОСЛЕ + поиск файлов + diff
             after: reg_mod.Snapshot = {}
@@ -1266,14 +1416,22 @@ class Portablizer:
             self.progress(100, "Готово")
             self.log.ok("Портативное приложение успешно создано!")
             result.success = True
+            self._fill_temp_fields(result, portable_dir)
             self._save_run_log(result.portable_dir)
             return result
 
         except Exception as exc:  # noqa: BLE001
             self.log.error(str(exc))
             result.messages.append(str(exc))
+            self._fill_temp_fields(result, result.portable_dir)
             self._save_run_log(result.portable_dir)
             return result
+        finally:
+            # Временные папки вне портатива (если установщику не хватило
+            # места на диске портатива и его TEMP перенесли) убираются в
+            # любом случае: на компьютере пользователя не должно оставаться
+            # ни гигабайта мусора, ни после успеха, ни после ошибки.
+            self._cleanup_install_temp()
 
     # -- классический InstallShield ------------------------------------------
     def _record_command(self, det: DetectionResult, opts: PortableOptions,
@@ -1410,6 +1568,28 @@ class Portablizer:
 
         if self._install_stalled:
             hints.extend(self._stall_hints())
+
+        # Падение установщика: свой диагноз и свои шаги. Общие советы про
+        # «непонятую командную строку» здесь были бы прямым обманом.
+        crash_rc = rc if crash_mod.is_crash_code(rc) else self._last_crash_rc()
+        if crash_rc is not None:
+            hints.extend(crash_mod.crash_hints(
+                crash_rc,
+                installer_path=opts.installer_path,
+                event=self._crash_events[0] if self._crash_events else None,
+                is_gog=bool(getattr(det, "is_gog", False)),
+                is_inno=det.installer_type == InstallerType.INNO,
+                space_note=self._temp_space_note,
+                relocated_to=(", ".join(self._external_temp_dirs)
+                              if self._install_temp_dir
+                              in self._external_temp_dirs else ""),
+                retried=self._crash_retried,
+                progress_retry=self._crash_retry_note(),
+                suggest_unpacker=(self._unpacker_worth_trying(det)
+                                  and not self._unpacked_with
+                                  and not self._unpacker_result),
+                unpacker_result=self._unpacker_result,
+            ))
 
         needs_admin = det.requires_admin or (
             rc is not None and rc in _BAD_COMMAND_LINE_CODES)
@@ -1587,6 +1767,16 @@ class Portablizer:
                 if os.path.getsize(output_log) > 0:
                     output_note = ("\nТекстовый вывод установщика "
                                    "(stdout/stderr) — в installer-output.log.")
+            except OSError:
+                pass
+            try:
+                crash_log = os.path.join(result.portable_dir,
+                                         crash_mod.CRASH_LOG_NAME)
+                if os.path.getsize(crash_log) > 0:
+                    output_note += (
+                        "\nГде именно упал установщик (модуль, код "
+                        f"исключения, состояние TEMP) — в {crash_mod.CRASH_LOG_NAME}."
+                    )
             except OSError:
                 pass
         kept_text = ""
@@ -2062,6 +2252,7 @@ class Portablizer:
         else:
             self.log.info("Запуск установщика (тихо, изолированно)...")
         rc: Optional[int] = None
+        started = time.monotonic()
         try:
             try:
                 if plan.raw_tail:
@@ -2092,6 +2283,7 @@ class Portablizer:
                                         progress_to=progress_to,
                                         console_log=console_log)
         finally:
+            self._last_install_seconds = time.monotonic() - started
             if console_handle is not None:
                 try:
                     code = (str(rc) if rc is not None
@@ -2103,6 +2295,7 @@ class Portablizer:
                 except OSError:
                     pass
 
+        crash = crash_mod.crash_code(rc)
         if rc == redist_mod.TIMEOUT_EXIT_CODE:
             # Это наша метка, а не код движка: подробности уже сказаны выше
             # (см. _note_stall), здесь важно лишь подвести итог попытки.
@@ -2110,6 +2303,16 @@ class Portablizer:
                 "Установщик был снят по пределу ожидания (это не код движка, "
                 "а решение Portablizer). Проверяю, что он успел установить."
             )
+        elif crash is not None:
+            # Падение — не «отказ понять командную строку»: процесс стартовал
+            # и был оборван исключением. Отдельный диагноз (и отдельные шаги)
+            # описан в core/crashinfo.py.
+            self.log.warn(
+                f"Установщик аварийно завершился через "
+                f"{redist_mod.human_duration(self._last_install_seconds)} "
+                f"работы: {_format_exit_code(rc)} — {crash.hint}."
+            )
+            self._note_crash(plan, rc, cmdline, console_log)
         elif rc not in (0, 3010):  # 3010 = успех, требуется перезагрузка
             hint = _exit_code_hint(rc)
             self.log.warn(
@@ -2168,7 +2371,10 @@ class Portablizer:
             if path:
                 logs.append(path)
         if data_dir:
-            temp = os.path.join(data_dir, "Temp")
+            # TEMP может быть перенесён на другой диск (нехватка места на
+            # диске портатива): журналы ищутся там, где установщик реально
+            # работал, а не там, где папка была бы по умолчанию.
+            temp = self._temp_dir_for(data_dir)
             try:
                 for name in os.listdir(temp):
                     if name.lower().endswith(".log"):
@@ -2310,11 +2516,16 @@ class Portablizer:
         установщики отдают ненулевой код, успев разложить файлы.
         """
         last_rc: Optional[int] = None
-        total = len(attempts)
         span = max(1, 58 - 30)
         console_log = os.path.join(portable_dir, "installer-output.log")
-
-        for index, plan in enumerate(attempts):
+        # Очередь, а не просто список: после падения установщика в неё
+        # добавляются сценарии, которых в обычной лестнице нет (повтор той же
+        # команды и запуск с окном прогресса). См. _queue_crash_recovery.
+        queue: List[SilentPlan] = list(attempts)
+        index = 0
+        while index < len(queue):
+            plan = queue[index]
+            total = len(queue)
             self._check_cancel()
             start = 30 + int(span * index / max(1, total))
             stop = 30 + int(span * (index + 1) / max(1, total))
@@ -2337,6 +2548,7 @@ class Portablizer:
             self._report_installshield_log(plan)
             self._attempts_made += 1
             self._attempt_history.append((plan.label, rc))
+            index += 1
 
             if plan.interactive and plan.response_file \
                     and os.path.isfile(plan.response_file):
@@ -2358,7 +2570,7 @@ class Portablizer:
                 continue
 
             if self._find_main_exe(app_dir, name):
-                if index:
+                if index > 1:
                     self.log.ok(f"Сработал запасной сценарий: {plan.label}")
                 else:
                     self.log.ok("Тихая установка прошла успешно.")
@@ -2391,7 +2603,13 @@ class Portablizer:
                 )
                 break
 
-            if index + 1 < total:
+            # Падение — отдельный случай: лестница команд рассчитана на
+            # «установщик не понял ключи», а упавшему нужны другие шаги.
+            if crash_mod.is_crash_code(rc) and self._queue_crash_recovery(
+                    plan, rc, app_dir, queue, index):
+                continue
+
+            if index < total:
                 self.log.warn(
                     f"Сценарий «{plan.label}» не дал файлов в App — перехожу "
                     "к следующему."
@@ -2399,6 +2617,67 @@ class Portablizer:
 
         self._collect_engine_log(opts, data_dir, portable_dir)
         return last_rc, None
+
+    def _queue_crash_recovery(self, plan: SilentPlan, rc: Optional[int],
+                              app_dir: str, queue: List[SilentPlan],
+                              index: int) -> bool:
+        """Добавляет в очередь шаги, которые делают только после падения.
+
+        Их два, и оба основаны на природе таких сбоев:
+
+        * **повтор той же команды** — если установщик упал через секунды
+          после старта и ничего не записал, причиной могла быть разовая
+          помеха (антивирус проверял файл, не хватило памяти в момент
+          распаковки). Падение после часа работы повторять бессмысленно;
+        * **запуск с окном прогресса** — в самом тихом режиме (``/VERYSILENT``)
+          установщик вообще не создаёт окно, а в ``/SILENT`` создаёт. Это
+          другой путь в его коде, и падение в отрисовке прогресса на нём не
+          повторяется.
+
+        Возвращает ``True``, если сценарий добавлен прямо перед текущей позицией:
+        тогда вызывающий цикл переходит к нему, а не идёт дальше по лестнице.
+        """
+        if not crash_mod.is_crash_code(rc):
+            return False
+
+        if (crash_mod.is_retryable(rc) and not self._crash_retried
+                and self._last_install_seconds <= CRASH_RETRY_MAX_SECONDS
+                and not self._app_has_payload(app_dir)):
+            self._crash_retried = True
+            queue.insert(index, repeat_attempt(plan, "повтор после падения"))
+            self.log.info(
+                "Падение произошло сразу после старта и до записи файлов: "
+                "такие сбои часто разовые. Повторяю ровно ту же команду ещё "
+                "раз — без этого шага Portablizer сразу перешёл бы к другим "
+                "ключам и не проверил, что дело не в разовой помехе."
+            )
+            return True
+
+        if not self._progress_retry_done:
+            self._progress_retry_done = True
+            recovery = build_progress_window_attempt(plan)
+            if recovery is not None and self._enqueue_plan(queue, index,
+                                                           recovery):
+                self.log.info(
+                    "Пробую тот же запуск, но с окном прогресса (/SILENT "
+                    "вместо /VERYSILENT): в самом тихом режиме окно не "
+                    "создаётся вообще, и исключение могло прилететь именно в "
+                    "его отрисовку."
+                )
+                return True
+        return False
+
+    @staticmethod
+    def _enqueue_plan(queue: List[SilentPlan], index: int,
+                      plan: SilentPlan) -> bool:
+        """Вставляет сценарий в очередь, если такого в ней ещё нет."""
+        key = (plan.program, tuple(plan.args), plan.raw_tail)
+        for existing in queue:
+            if (existing.program, tuple(existing.args),
+                    existing.raw_tail) == key:
+                return False
+        queue.insert(index, plan)
+        return True
 
     def _install_layout_packages(self, layout_dir: str, opts: PortableOptions,
                                  app_dir: str, data_dir: str,
@@ -2499,7 +2778,7 @@ class Portablizer:
         if os.path.exists(os.path.join(portable_dir, "install.log")):
             return
         since = self._run_started or 0.0
-        temp = os.path.join(data_dir, "Temp")
+        temp = self._temp_dir_for(data_dir)
         candidates: List[str] = []
         for current, _dirs, files in os.walk(temp):
             for filename in files:
@@ -2521,13 +2800,344 @@ class Portablizer:
         except OSError:
             pass
 
+    # -- временное место установщика ------------------------------------------
+    def _temp_dir_for(self, data_dir: str) -> str:
+        """Папка TEMP, которая сейчас отдана установщику."""
+        return self._install_temp_dir or os.path.join(data_dir, "Temp")
+
+    def _prepare_install_temp(self, opts: PortableOptions, portable_dir: str,
+                              data_dir: str, det: DetectionResult) -> None:
+        """Выбирает временное место установщика — с оглядкой на свободный диск.
+
+        Установщики больших игр (особенно офлайн-установщики GOG)
+        распаковывают данные СНАЧАЛА во временную папку и только потом
+        переносят их в целевую. Значит, на диске должны одновременно
+        уместиться дистрибутив, распакованная копия и результат. Portablizer
+        перенаправляет TEMP внутрь портативной папки — это правильно для
+        чистоты компьютера, но на флешке или небольшом разделе установщику
+        места не хватает, и он **падает** (типичный код 0xC000041D —
+        исключение в обработчике прогресса, когда распаковка оборвалась).
+
+        Поэтому место проверяется заранее, а если его нет — TEMP установщика
+        переносится на другой диск. Папка временная: она удаляется сразу
+        после сборки (``_cleanup_install_temp``).
+        """
+        default_temp = os.path.join(data_dir, "Temp")
+        self._install_temp_dir = default_temp
+        need = int(space_mod.media_bytes(opts.installer_path)
+                   * TEMP_NEED_FACTOR)
+        available = space_mod.free_space(portable_dir)
+        if need <= 0 or available < 0:
+            self.log.debug(
+                "  • размер дистрибутива или свободное место определить не "
+                "удалось — TEMP остаётся в папке портатива."
+            )
+            return
+        fmt = redist_mod.format_size
+        if available >= need:
+            self.log.info(
+                "Место под распаковку: свободно "
+                f"{fmt(available)}, установщику нужно около {fmt(need)} "
+                "(TEMP — в папке портатива)."
+            )
+            return
+
+        root = space_mod.pick_temp_root(portable_dir, need)
+        target = self._make_external_temp(root, opts) if root else ""
+        if not target:
+            self._temp_space_note = (
+                f"На диске «{space_mod.volume_of(portable_dir) or portable_dir}» "
+                f"свободно {fmt(available)}, а установщику нужно около "
+                f"{fmt(need)}: распаковка идёт через TEMP, и в момент "
+                "установки на диске должны уместиться и дистрибутив, и "
+                "распакованная копия. Места хватит, если освободить диск или "
+                "собирать портатив на другом диске."
+            )
+            self.log.warn(self._temp_space_note)
+            return
+
+        self._install_temp_dir = target
+        self.log.warn(
+            f"На диске «{space_mod.volume_of(portable_dir) or portable_dir}» "
+            f"свободно {fmt(available)}, а установщику нужно около "
+            f"{fmt(need)}: он распаковывает данные в TEMP. Переношу "
+            f"временную папку установщика на другой диск: {target}. "
+            "Папка будет удалена сразу после сборки."
+        )
+        if getattr(det, "is_gog", False):
+            self.log.info(
+                "  • GOG-установщик распаковывает данные в TEMP целиком — "
+                "именно поэтому места нужно вдвое больше веса дистрибутива."
+            )
+
+    def _make_external_temp(self, root: str, opts: PortableOptions) -> str:
+        """Создаёт временную папку вне портатива и берёт её на уборку."""
+        safe = "".join(c for c in self._safe_name(opts)
+                       if c.isalnum() or c in "-_")[:40] or "installer"
+        target = os.path.join(root, f"{EXTERNAL_TEMP_PREFIX}{safe}-Temp")
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+            os.makedirs(target, exist_ok=True)
+        except OSError as exc:
+            self.log.debug(f"  • временную папку вне портатива создать не "
+                           f"удалось: {exc}")
+            return ""
+        self._external_temp_dirs.append(target)
+        return target
+
+    def _cleanup_install_temp(self) -> None:
+        """Убирает временные папки, созданные ВНЕ портатива.
+
+        TEMP внутри портативной папки не трогаем: он принадлежит лончеру и
+        нужен программе при запуске. А перенесённая папка — чужая территория,
+        на компьютере пользователя её оставлять нельзя.
+        """
+        for path in list(self._external_temp_dirs):
+            if not os.path.isdir(path):
+                continue
+            try:
+                procutil.release_folder(path)
+            except Exception as exc:  # noqa: BLE001 - уборка не ломает сборку
+                self.log.debug(f"  • не удалось опросить процессы временной "
+                               f"папки: {exc}")
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                self.log.warn(
+                    f"Временную папку установщика удалить не удалось: {path} "
+                    f"({exc}). Её можно удалить вручную — в ней нет ничего "
+                    "нужного."
+                )
+            else:
+                self.log.info(f"Временная папка установщика удалена: {path}")
+        self._external_temp_dirs = []
+
+    # -- диагностика падения ---------------------------------------------------
+    def _fill_temp_fields(self, result: "PortableResult",
+                          portable_dir: str) -> None:
+        """Переносит в результат сведения о временном месте и о падении.
+
+        Итоговое окно показывает их пользователю: где установщик брал
+        временное место и есть ли отчёт о падении, который стоит открыть.
+        """
+        result.installer_temp_dir = self._install_temp_dir
+        result.unpacked_with = self._unpacked_with
+        if not portable_dir:
+            return
+        report = os.path.join(portable_dir, crash_mod.CRASH_LOG_NAME)
+        if os.path.isfile(report):
+            result.crash_report_rel = os.path.relpath(report, portable_dir)
+
+    def _note_crash(self, plan: SilentPlan, rc: Optional[int],
+                    command: str, console_log: Optional[str]) -> None:
+        """Собирает факты о падении установщика и пишет ``installer-crash.log``.
+
+        Код возврата говорит только «процесс упал». Где именно и в каком
+        модуле — знает журнал событий Windows, поэтому после падения он
+        читается один раз: имя модуля отделяет падение самого установщика от
+        вмешательства чужого кода (антивируса, оверлея, инжектора).
+        """
+        if not crash_mod.is_crash_code(rc):
+            return
+        self._crash_history.append((plan.label, int(rc)))  # type: ignore[arg-type]
+        names = [name for name in (self._installer_name,
+                                   os.path.basename(plan.program)) if name]
+        try:
+            events = crash_mod.read_crash_events(names, since=self._run_started)
+        except Exception as exc:  # noqa: BLE001 - журнал не ломает сборку
+            self.log.debug(f"  • журнал событий прочитать не удалось: {exc}")
+            events = []
+        if events:
+            # Накапливаем (в подсказках пригодится любая запись этого запуска),
+            # а в отчёт выше попадают только записи ТЕКУЩЕГО падения.
+            self._crash_events = events
+            first = events[0]
+            where = crash_mod.module_verdict(first.module, first.module_path,
+                                             self._installer_name)
+            self.log.warn(
+                "  • журнал событий: упал " + (first.module or "неизвестный "
+                                               "модуль")
+                + (f" ({first.module_path})" if first.module_path else "")
+                + (f" — {where}." if where else ".")
+            )
+        else:
+            self.log.debug("  • записей об этом падении в журнале событий нет.")
+
+        if not console_log:
+            return
+        report = crash_mod.format_report(
+            rc, plan.label, command, events,
+            installer_path=self._installer_name,
+            temp_line=self._temp_line(),
+        )
+        path = os.path.join(os.path.dirname(console_log),
+                            crash_mod.CRASH_LOG_NAME)
+        try:
+            with open(path, "a", encoding="utf-8-sig", newline="\r\n") as fh:
+                fh.write(report)
+                fh.write("\n")
+        except OSError as exc:
+            self.log.debug(f"  • отчёт о падении записать не удалось: {exc}")
+        else:
+            self.log.info(f"Отчёт о падении сохранён: {path}")
+
+    def _temp_line(self) -> str:
+        """Строка про временное место для отчёта о падении."""
+        if not self._install_temp_dir:
+            return ""
+        available = space_mod.free_space(self._install_temp_dir)
+        text = f"TEMP установщика: {self._install_temp_dir}"
+        if available >= 0:
+            text += f" (свободно {redist_mod.format_size(available)})"
+        if self._install_temp_dir in self._external_temp_dirs:
+            text += " [перенесён с диска портатива из-за нехватки места]"
+        return text
+
+    def _last_crash_rc(self) -> Optional[int]:
+        if self._crash_history:
+            return self._crash_history[-1][1]
+        return None
+
+    def _crash_retry_note(self) -> str:
+        """Подсказка про уже сделанный повтор с окном прогресса."""
+        if not self._progress_retry_done:
+            return ""
+        return ("Portablizer уже пробовал этот установщик с окном прогресса "
+                "(/SILENT вместо /VERYSILENT) — падение повторилось, значит "
+                "причина не в отрисовке тихого прогресса.")
+
+    # -- распаковка без запуска ------------------------------------------------
+    def _unpacker_worth_trying(self, det: DetectionResult) -> bool:
+        """Есть ли смысл доставать содержимое установщика распаковщиком."""
+        return det.installer_type in UNPACKABLE_TYPES
+
+    def _try_unpacker_fallback(self, opts: PortableOptions, app_dir: str,
+                               portable_dir: str, det: DetectionResult,
+                               name: str) -> bool:
+        """Достаёт файлы программы из установщика БЕЗ его запуска.
+
+        Когда установщик падает или не понимает ни одного ключа тишины,
+        остаётся последний честный путь: Inno Setup и NSIS — это обычные
+        контейнеры, и установленный на компьютере 7-Zip читает их, не
+        выполняя код установщика. Системе это не делает ничего, прав
+        администратора не требует, а программа оказывается в ``App``.
+
+        Свой распаковщик Portablizer с собой не носит и не скачивает: сборка
+        не должна молча тянуть из сети исполняемые файлы. Не нашлось — так и
+        говорится в подсказках.
+        """
+        if not self._unpacker_worth_trying(det):
+            return False
+        unpacker = unpacker_mod.find_unpacker()
+        if not unpacker:
+            self.log.info(
+                "Распаковщик (7-Zip) на этом компьютере не найден: достать "
+                "содержимое установщика без запуска нечем. В подсказках ниже "
+                "сказано, что это меняет."
+            )
+            return False
+
+        self._check_cancel()
+        self.progress(63, "Распаковка установщика без запуска")
+        self.log.info(
+            "Пробую достать файлы программы из установщика без его запуска: "
+            f"{os.path.basename(unpacker)} читает такие контейнеры напрямую."
+        )
+        work = os.path.join(portable_dir, "_unpacked")
+        shutil.rmtree(work, ignore_errors=True)
+        console_log = os.path.join(portable_dir, "unpacker-output.log")
+
+        def runner(cmd, timeout):  # noqa: ANN001 - подпись задана unpacker'ом
+            return self._run_unpacker_command(cmd, console_log, opts)
+
+        try:
+            ok, message = unpacker_mod.unpack_installer(
+                unpacker, opts.installer_path, app_dir, work, runner=runner,
+                installer_path=opts.installer_path)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+        if ok and self._find_main_exe(app_dir, name):
+            self._unpacked_with = unpacker
+            self.log.ok(
+                "Установщик распакован без запуска — файлы программы в папке "
+                f"App ({message})."
+            )
+            return True
+        self._unpacker_result = (
+            f"Распаковка без запуска ({os.path.basename(unpacker)}) не дала "
+            f"файлов программы: {message}"
+        )
+        self.log.warn(self._unpacker_result)
+        return False
+
+    def _run_unpacker_command(self, cmd: Sequence[str], console_log: str,
+                              opts: PortableOptions) -> "Tuple[int, str]":
+        """Запускает распаковщик с возможностью отмены и отчётом о ходе.
+
+        Распаковка десятков гигабайт идёт минутами, поэтому у неё тот же
+        контракт, что у установки: видимый прогресс, реакция на «Отменить» и
+        жёсткий потолок по времени вместо молчаливого зависания.
+        """
+        handle = None
+        try:
+            handle = open(console_log, "wb")
+            handle.write(("===== распаковка без запуска =====\r\n"
+                          + " ".join(cmd) + "\r\n").encode("utf-8", "replace"))
+            handle.flush()
+        except OSError:
+            handle = None
+        creationflags = 0x08000000 if IS_WINDOWS else 0  # CREATE_NO_WINDOW
+        try:
+            proc = subprocess.Popen(
+                list(cmd), stdout=handle or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if handle else subprocess.DEVNULL,
+                creationflags=creationflags)
+        except OSError as exc:
+            if handle is not None:
+                handle.close()
+            return -1, str(exc)
+
+        deadline = max(0.0, float(opts.install_deadline))
+        started = time.monotonic()
+        timed_out = False
+        while proc.poll() is None:
+            if self.cancel.is_set():
+                self._stop_installer(proc)
+                if handle is not None:
+                    handle.close()
+                raise RuntimeError("Операция отменена пользователем.")
+            elapsed = time.monotonic() - started
+            fraction = min(1.0, elapsed / 120.0)
+            self._emit_progress(63 + int(1 * fraction), "Распаковка установщика")
+            self._detail(
+                min(99, int(fraction * 100)),
+                "Распаковка без запуска идёт "
+                f"{redist_mod.format_duration(elapsed)}")
+            if deadline and elapsed > deadline:
+                timed_out = True
+                self._stop_installer(proc)
+                break
+            time.sleep(0.5)
+        rc = proc.returncode if not timed_out else -1
+        if handle is not None:
+            try:
+                handle.write(f"<<< код: {rc} >>>\r\n".encode("utf-8", "replace"))
+                handle.close()
+            except OSError:
+                pass
+        if timed_out:
+            return -1, "распаковка снята по пределу времени"
+        return int(rc or 0), _text_tail(console_log)
+
     def _build_isolated_env(self, opts: PortableOptions,
                             data_dir: str) -> Dict[str, str]:
         env = dict(os.environ)
         if opts.redirect_userdirs:
             appdata = os.path.join(data_dir, "AppData", "Roaming")
             local = os.path.join(data_dir, "AppData", "Local")
-            temp = os.path.join(data_dir, "Temp")
+            temp = self._temp_dir_for(data_dir)
             user = os.path.join(data_dir, "User")
             programdata = os.path.join(data_dir, "ProgramData")
             for d in (appdata, local, temp, user, programdata):

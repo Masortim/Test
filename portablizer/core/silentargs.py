@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import ntpath
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Sequence
 
 from .detect import (
@@ -781,3 +781,59 @@ def candidate_silent_switches(installer_type: InstallerType) -> List[str]:
     """Возвращает список ключей-кандидатов для перебора, если основной не сработал."""
     common = ["/S", "/silent", "/VERYSILENT", "/quiet", "/qn", "-s", "-silent"]
     return common
+
+
+# -- восстановление после падения установщика ---------------------------------
+#
+# лестница попыток рассчитана на «установщик не понял ключи». Падение — другая
+# ситуация: движок стартовал и рухнул внутри себя (типичный код 0xC000041D —
+# необработанное исключение в callback’е). Здесь два шага, которые имеет смысл
+# сделать именно в этом случае.
+
+#: Чем заменить «самый тихий» ключ, чтобы у установщика появилось окно.
+#: У Inno Setup ``/VERYSILENT`` вообще не создаёт окно прогресса, а
+#: ``/SILENT`` создаёт: это другой путь в коде установщика, и падение на нём
+#: часто не повторяется — именно поэтому такой запуск стоит попробовать
+#: отдельно, а не полагаться на «а вдруг другой ключ тишины».
+_PROGRESS_WINDOW_SWITCHES = {"/VERYSILENT": "/SILENT"}
+
+
+def repeat_attempt(plan: SilentPlan, note: str) -> SilentPlan:
+    """Та же команда ещё раз, но с пометкой в названии сценария.
+
+    Повтор делается после падения, случившегося сразу после старта: такие
+    сбои часто разовые (антивирус проверял файл, памяти не хватило в момент
+    распаковки). Отличить повтор от исходной попытки в журнале нужно — иначе
+    непонятно, почему одна и та же строка встречается дважды.
+    """
+    return replace(plan, label=f"{plan.label} — {note}")
+
+
+def build_progress_window_attempt(plan: SilentPlan,
+                                  ) -> Optional[SilentPlan]:
+    """Копия попытки с окном прогресса вместо полной тишины.
+
+    Возвращает ``None``, если менять в команде нечего: у NSIS ``/S`` и у
+    собственных ключей bootstrapper'а «тише» уже некуда, а окно мастера
+    требует человека у клавиатуры (такие сценарии помечены ``interactive``).
+    """
+    if plan.interactive:
+        return None
+    replaced = False
+    args: List[str] = []
+    for arg in plan.args:
+        swap = _PROGRESS_WINDOW_SWITCHES.get(arg.upper())
+        if swap is None:
+            args.append(arg)
+        else:
+            args.append(swap)
+            replaced = True
+    if not replaced:
+        return None
+    notes = list(plan.notes) + [
+        "Повтор после падения: вместо /VERYSILENT — /SILENT. В самом тихом "
+        "режиме окно прогресса не создаётся вообще, и исключение могло "
+        "прилететь именно в его отрисовку.",
+    ]
+    return replace(plan, args=args, notes=notes,
+                   label=f"{plan.label} → окно прогресса (/SILENT)")
