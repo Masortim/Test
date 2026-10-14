@@ -98,47 +98,59 @@ class TreeUsageTests(unittest.TestCase):
 
 
 class WatchdogTests(unittest.TestCase):
+    """Наблюдения стража: что считается работой, а что затишьем.
+
+    Время здесь задаётся ЯВНО (``poll(now=…)``) — метод принимает момент
+    опроса именно для этого. Проверка «через sleep(0.06) при пороге 0.05»
+    на загруженном раннере Windows не проходит порог и падает: сон
+    отсчитывается от одного чтения часов, а опрос сравнивает другое. Тест
+    наблюдателя не должен зависеть от разрешения часов.
+    """
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.app = Path(self.temp.name, "App")
         self.app.mkdir()
+        # Счётчики процессов сюда не вмешиваются: pid 1 — системный процесс,
+        # и случайная его активность сломала бы проверку «ничего не менялось».
+        # Настоящее чтение счётчиков проверяется отдельным тестом ниже.
+        activity = mock.patch.object(procutil, "process_activity",
+                                     return_value=None)
+        activity.start()
+        self.addCleanup(activity.stop)
 
     def test_first_poll_counts_as_work(self):
         watch = _InstallWatchdog(1, roots=[str(self.app)],
                                  probe_seconds=0.0, dir_seconds=0.0)
-        self.assertTrue(watch.poll())
+        self.assertTrue(watch.poll(now=100.0))
         self.assertEqual(watch.samples, 1)
 
     def test_new_files_in_the_target_folder_are_progress(self):
         watch = _InstallWatchdog(1, roots=[str(self.app)],
                                  probe_seconds=0.05, dir_seconds=0.05)
-        watch.poll()
-        self.assertFalse(watch.poll())
+        self.assertTrue(watch.poll(now=100.0))
+        self.assertFalse(watch.poll(now=100.01))
         _touch(str(self.app), "game.bin", 1024)
-        time.sleep(0.06)
-        self.assertTrue(watch.poll())
+        self.assertTrue(watch.poll(now=100.2))
 
     def test_nothing_changed_is_not_progress(self):
         watch = _InstallWatchdog(1, roots=[str(self.app)],
                                  probe_seconds=0.05, dir_seconds=0.05)
-        watch.poll()
-        time.sleep(0.06)
-        self.assertFalse(watch.poll())
-        time.sleep(0.06)
-        self.assertFalse(watch.poll())
+        self.assertTrue(watch.poll(now=100.0))
+        self.assertFalse(watch.poll(now=100.2))
+        self.assertFalse(watch.poll(now=100.4))
 
     def test_installer_log_growth_is_progress(self):
         log = Path(self.temp.name, "install.log")
         log.write_text("start\n", encoding="utf-8")
         watch = _InstallWatchdog(1, roots=[str(self.app)], logs=[str(log)],
                                  probe_seconds=0.05, dir_seconds=60.0)
-        watch.poll()
-        self.assertFalse(watch.poll())
+        self.assertTrue(watch.poll(now=100.0))
+        self.assertFalse(watch.poll(now=100.2))
         with open(log, "a", encoding="utf-8") as fh:
             fh.write("unpacked a file\n")
-        time.sleep(0.06)
-        self.assertTrue(watch.poll())
+        self.assertTrue(watch.poll(now=100.4))
 
     def test_process_io_counters_are_progress_without_any_file(self):
         watch = _InstallWatchdog(1, roots=[str(self.app)],
@@ -146,11 +158,10 @@ class WatchdogTests(unittest.TestCase):
         activity = [procutil.ProcessActivity((1,), 1000, 0.5)]
         with mock.patch.object(procutil, "process_activity",
                                side_effect=lambda _pid: activity[0]):
-            watch.poll()
-            self.assertFalse(watch.poll())
+            self.assertTrue(watch.poll(now=100.0))
+            self.assertFalse(watch.poll(now=100.01))
             activity[0] = procutil.ProcessActivity((1,), 999_000_000, 12.0)
-            time.sleep(0.06)
-            self.assertTrue(watch.poll())
+            self.assertTrue(watch.poll(now=100.2))
         self.assertEqual(watch.io_bytes, 999_000_000)
 
     def test_summary_and_report_name_what_was_done(self):
