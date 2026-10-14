@@ -171,6 +171,11 @@ EXTERNAL_TEMP_PREFIX = "Portablizer-"
 #: дистрибутив, распакованная копия и результат.
 TEMP_NEED_FACTOR = 2.0
 
+#: Потолок на распаковку установщика без запуска (секунды). Даже если потолок
+#: установки снят (``install_deadline = 0``), распаковка не может идти вечно:
+#: 7-Zip на зашифрованном контейнере способен ждать ввод, а сборка — нет.
+UNPACK_HARD_LIMIT = 1800.0
+
 #: Падение через считанные секунды после старта и до записи файлов — обычно
 #: разовая помеха (антивирус проверял бинарник, не хватило памяти в момент
 #: распаковки). Такую попытку повторяют один раз, но только если она была
@@ -3091,7 +3096,8 @@ class Portablizer:
         creationflags = 0x08000000 if IS_WINDOWS else 0  # CREATE_NO_WINDOW
         try:
             proc = subprocess.Popen(
-                list(cmd), stdout=handle or subprocess.DEVNULL,
+                list(cmd), stdin=subprocess.DEVNULL,
+                stdout=handle or subprocess.DEVNULL,
                 stderr=subprocess.STDOUT if handle else subprocess.DEVNULL,
                 creationflags=creationflags)
         except OSError as exc:
@@ -3099,7 +3105,7 @@ class Portablizer:
                 handle.close()
             return -1, str(exc)
 
-        deadline = max(0.0, float(opts.install_deadline))
+        deadline = float(opts.install_deadline) or UNPACK_HARD_LIMIT
         started = time.monotonic()
         timed_out = False
         while proc.poll() is None:

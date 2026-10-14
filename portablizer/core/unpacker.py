@@ -103,7 +103,10 @@ def _default_runner(cmd: Sequence[str],
     if IS_WINDOWS:
         kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
     try:
-        proc = subprocess.run(list(cmd), stdout=subprocess.PIPE,
+        # stdin закрыт: 7-Zip умеет спрашивать пароль, а ждать ввода в
+        # автоматической сборке нельзя — лучше честная ошибка распаковки.
+        proc = subprocess.run(list(cmd), stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, timeout=timeout,
                               **kwargs)
     except subprocess.TimeoutExpired:
