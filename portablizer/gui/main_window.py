@@ -1101,7 +1101,8 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"✖ Не удалось: {short}")
             self.status_label.setObjectName("StatusErr")
             folder_hint = (
-                f"\n\nДиагностика: {result.portable_dir}\\portablizer.log"
+                f"\n\nДиагностика (Portablizer {__version__}): "
+                f"{result.portable_dir}\\portablizer.log"
                 if result.portable_dir else ""
             )
             box = QMessageBox(self)
