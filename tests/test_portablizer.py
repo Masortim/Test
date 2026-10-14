@@ -6,6 +6,8 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -3066,6 +3068,49 @@ class RegistryVirtualizationTests(unittest.TestCase):
         self.assertEqual(len(roots), 2)
         self.assertIn(r"HKCU\Software\CD Projekt RED\The Witcher 2", roots)
         self.assertIn(r"HKCU\Software\Classes\VirtualStore\MACHINE\SOFTWARE\CD Projekt RED\The Witcher 2", roots)
+
+
+class CallWithTimeoutTests(unittest.TestCase):
+    """Один больной вызов WinAPI не должен морозить сборку навсегда.
+
+    Регрессия: после падения установщика Hatred (0xC000041D) сборка
+    зависала на произвольном проценте без единой новой строки в журнале.
+    Причина — в ``procutil``: «бюджет времени» на обход таблицы дескрипторов
+    и на проверку занятых файлов проверялся только МЕЖДУ вызовами
+    ``DuplicateHandle``/``GetFinalPathNameByHandleW``/``CreateFileW``, а не
+    внутри них. Единственный дескриптор, завязший на зависшем антивирусном
+    фильтре или недоступной сетевой папке, останавливал весь обход
+    навсегда — ни один внешний таймаут это не замечал.
+    """
+
+    def test_returns_promptly_when_the_call_never_finishes(self):
+        released = threading.Event()
+
+        def never_returns():
+            released.wait()  # как будто завис в DuplicateHandle/GetFileType
+            return "too-late"
+
+        started = time.monotonic()
+        result = procutil._call_with_timeout(never_returns, timeout=0.2,
+                                             default="timed-out")
+        elapsed = time.monotonic() - started
+        self.assertEqual(result, "timed-out")
+        self.assertLess(elapsed, 1.0)
+        released.set()  # не оставляем поток висеть дольше необходимого
+
+    def test_returns_the_real_result_when_the_call_is_fast(self):
+        self.assertEqual(
+            procutil._call_with_timeout(lambda: "ok", timeout=1.0,
+                                        default="fallback"),
+            "ok")
+
+    def test_swallows_exceptions_from_the_wrapped_call(self):
+        def boom():
+            raise RuntimeError("дескриптор уже закрыт")
+
+        self.assertEqual(
+            procutil._call_with_timeout(boom, timeout=1.0, default="safe"),
+            "safe")
 
 
 class FolderReleaseTests(unittest.TestCase):

@@ -22,12 +22,40 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import (
-    Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple,
+    Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence,
+    Set, Tuple,
 )
 
 IS_WINDOWS = sys.platform.startswith("win")
+
+#: Один вызов WinAPI (``CreateFileW`` на файле, который прямо сейчас
+#: сканирует антивирус; ``DuplicateHandle``/``GetFinalPathNameByHandleW`` на
+#: особом дескрипторе) иногда блокируется не на миллисекунды, а насовсем —
+#: это подтверждённая особенность Windows, а не ошибка вызывающего кода.
+#: «Бюджет времени» в функциях ниже проверяется МЕЖДУ итерациями и не
+#: защищает от зависшего СЕРЕДИ одного вызова: без этой обёртки единственный
+#: больной дескриптор превращает «подождать 4 секунды» в «подождать
+#: навсегда», а сборка — в зависшую на произвольном проценте. Поток,
+#: которым делается попытка, нельзя прервать штатно (WinAPI не даёт), поэтому
+#: вызывающий просто перестаёт его ждать: подвисший поток остаётся жить
+#: демоном и не мешает ни сборке, ни завершению процесса.
+def _call_with_timeout(func: Callable[[], Any], timeout: float,
+                       default: Any = None) -> Any:
+    box: List[Any] = [default]
+
+    def runner() -> None:
+        try:
+            box[0] = func()
+        except Exception:  # noqa: BLE001 - любая ошибка внешнего вызова
+            pass
+
+    worker = threading.Thread(target=runner, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return box[0]
 
 #: (pid, полный путь к образу процесса)
 ProcessInfo = Tuple[int, str]
@@ -660,6 +688,29 @@ def open_files_in(root: str, budget: float = 20.0) -> List[OpenFile]:
         kernel32.GetCurrentProcess.restype = ctypes.c_void_p
         kernel32.OpenProcess.restype = ctypes.c_void_p
         current = ctypes.c_void_p(kernel32.GetCurrentProcess())
+        def _resolve(process: int, value: int) -> str:
+            """``DuplicateHandle`` + путь + закрытие дубликата — одним куском.
+
+            Каждый шаг здесь — чужой дескриптор произвольного типа объекта
+            ядра. ``_path_of_handle`` уже отсеивает каналы/сокеты (по
+            ``GetFileType``), но ``DuplicateHandle`` и сам ``GetFileType``
+            теоретически могут зависнуть и на диске — например, на файле с
+            другого компьютера, если сеть сейчас не отвечает, или на томе,
+            за которым стоит зависший фильтр-драйвер антивируса. Это ровно
+            то же больное место, которое в Process Explorer и похожих
+            инструментах закрывают отдельным потоком с таймаутом.
+            """
+            duplicate = ctypes.c_void_p()
+            if not kernel32.DuplicateHandle(
+                    ctypes.c_void_p(process), ctypes.c_void_p(value),
+                    current, ctypes.byref(duplicate), 0, False,
+                    _DUPLICATE_SAME_ACCESS):
+                return ""
+            try:
+                return _path_of_handle(duplicate)
+            finally:
+                kernel32.CloseHandle(duplicate)
+
         deadline = time.monotonic() + budget
         found: List[OpenFile] = []
         opened: dict = {}
@@ -678,16 +729,14 @@ def open_files_in(root: str, budget: float = 20.0) -> List[OpenFile]:
                     opened[pid] = process
                 if not process:
                     continue
-                duplicate = ctypes.c_void_p()
-                if not kernel32.DuplicateHandle(
-                        ctypes.c_void_p(process), ctypes.c_void_p(value),
-                        current, ctypes.byref(duplicate), 0, False,
-                        _DUPLICATE_SAME_ACCESS):
-                    continue
-                try:
-                    path = _path_of_handle(duplicate)
-                finally:
-                    kernel32.CloseHandle(duplicate)
+                # Бюджет времени выше проверяется МЕЖДУ итерациями и сам по
+                # себе не спасает от одного зависшего вызова внутри
+                # итерации — без таймаута здесь один больной дескриптор
+                # превращает «обойти таблицу за 20 секунд» в зависание
+                # навсегда (и сборку, застрявшую на произвольном проценте).
+                path = _call_with_timeout(
+                    lambda process=process, value=value: _resolve(process, value),
+                    timeout=0.75, default="")
                 if path and is_inside(path, root):
                     found.append(OpenFile(pid, value, path))
         finally:
@@ -811,7 +860,7 @@ def busy_files(root: str, budget: float = 8.0, limit: int = 20,
         # «не удалось открыть» станет неотличимо от удачи.
         kernel32.CreateFileW.restype = ctypes.c_void_p
 
-        def locked(path: str) -> bool:
+        def _locked_now(path: str) -> bool:
             handle = kernel32.CreateFileW(path, 0x80000000, 0, None, 3,
                                           0x80, None)
             # Код ошибки читается сразу: любое действие между вызовами
@@ -822,6 +871,17 @@ def busy_files(root: str, budget: float = 8.0, limit: int = 20,
                                  _ERROR_LOCK_VIOLATION)
             kernel32.CloseHandle(ctypes.c_void_p(handle))
             return False
+
+        def locked(path: str) -> bool:
+            # CreateFileW сам по себе мгновенен, но минифильтр антивируса,
+            # синхронно сканирующий файл при открытии (обычное дело для
+            # крупных exe сразу после падения установщика), может держать
+            # вызов секундами и даже дольше. Таймаут не даёт одному такому
+            # файлу превратить «проверить 451 файл за 4 секунды» в
+            # зависание на произвольное время — поверх подозрительного
+            # файла проще проверить ещё раз, чем ждать его бесконечно.
+            return bool(_call_with_timeout(lambda: _locked_now(path),
+                                           timeout=1.5, default=True))
 
         deadline = time.monotonic() + budget
         suspects: List[str] = []
