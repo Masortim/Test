@@ -45,6 +45,23 @@ _WRAPPER = (
 )
 
 
+def _enable_utf8() -> None:
+    """Русские строки в журнале сборки: на Windows стандартный вывод не UTF-8.
+
+    Без этого первый же ``print`` с кириллицей роняет прогон на
+    ``UnicodeEncodeError`` — именно это случилось с первой версией этого
+    файла на Windows-раннере.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            continue
+
+
 def _modules(root: str) -> List[str]:
     """Имена файлов набора в устойчивом порядке (``test_*.py``)."""
     tests_dir = os.path.join(root, "tests")
@@ -61,6 +78,9 @@ def run_module(root: str, name: str, limit: float) -> int:
     env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONFAULTHANDLER"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
+    # Дочерний процесс печатает имена тестов (в них есть кириллица) и стеки:
+    # кодировку задаём явно, иначе на Windows это UnicodeEncodeError.
+    env["PYTHONIOENCODING"] = "utf-8"
     cmd = [sys.executable, "-u", "-c", _WRAPPER, str(limit), name]
     started = time.monotonic()
     try:
@@ -79,6 +99,7 @@ def run_module(root: str, name: str, limit: float) -> int:
 
 
 def main(argv: List[str]) -> int:
+    _enable_utf8()
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     try:
         limit = float(argv[1]) if len(argv) > 1 else MODULE_LIMIT

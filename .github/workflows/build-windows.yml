@@ -59,6 +59,10 @@ jobs:
         # Модули идут отдельными процессами с потолком времени каждый: у
         # зависшего модуля печатаются стеки всех потоков, а остальные модули
         # всё равно прогоняются (см. tests/run_all.py).
+        env:
+          # Имена тестов и сообщения — на русском; без этого первый же вывод
+          # падает на UnicodeEncodeError (стандартный вывод Windows не UTF-8).
+          PYTHONIOENCODING: utf-8
         run: |
           python -u tests/run_all.py 2>&1 | Tee-Object -FilePath test-output.log
           $testStatus = $LASTEXITCODE
