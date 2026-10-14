@@ -136,6 +136,53 @@ class CrashRetryTests(unittest.TestCase):
                              for plan in engine.calls))
         self.assertTrue(os.path.isfile(os.path.join(self.app, "partial.dat")))
 
+    def test_crash_is_not_mistaken_for_success_when_exe_already_extracted(self):
+        """Регрессия: Hatred (0xC000041D) успел распаковать Hatred.exe ДО
+
+        падения, и сборка принимала это за «Тихая установка прошла
+        успешно», даже не пытаясь восстановиться. Крах должен быть замечен
+        первым, а успех — только когда лестница восстановления либо нашла
+        рабочий сценарий, либо честно исчерпалась.
+        """
+        engine = _ScriptedPortablizer([CRASH, 0])
+        original = engine._run_install
+
+        def run_install(plan, opts, app_dir, data_dir, **kwargs):
+            code = original(plan, opts, app_dir, data_dir, **kwargs)
+            if len(engine.calls) == 1:
+                # Установщик успел записать главный exe ДО того, как упал
+                # в отрисовке прогресса — это не одно и то же, что «успех».
+                _touch(app_dir, "Hatred.exe", "game")
+            return code
+
+        engine._run_install = run_install
+        rc, used = self._run(engine)
+        self.assertEqual(len(engine.calls), 2)
+        self.assertNotIn("Тихая установка прошла успешно",
+                         engine.log.text)
+        self.assertIn("/SILENT", engine.calls[1].args)
+        self.assertEqual(rc, 0)
+        self.assertIs(used, engine.calls[1])
+
+    def test_crash_is_reported_honestly_when_recovery_is_exhausted(self):
+        """Если восстановиться больше нечем, итог не красится в «успех»."""
+        engine = _ScriptedPortablizer([CRASH, CRASH])
+        original = engine._run_install
+
+        def run_install(plan, opts, app_dir, data_dir, **kwargs):
+            code = original(plan, opts, app_dir, data_dir, **kwargs)
+            if len(engine.calls) == 1:
+                _touch(app_dir, "Hatred.exe", "game")
+            return code
+
+        engine._run_install = run_install
+        rc, used = self._run(engine)
+        self.assertEqual(rc, CRASH)
+        self.assertIsNotNone(used)
+        self.assertNotIn("Тихая установка прошла успешно",
+                         engine.log.text)
+        self.assertIn("Установщик упал", engine.log.text)
+
     def test_progress_window_attempt_replaces_very_silent_switch(self):
         engine = _ScriptedPortablizer([CRASH, CRASH, 0],
                                       app_files={"Hatred.exe": "game"})
