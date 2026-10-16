@@ -2633,6 +2633,37 @@ class MultiExecutableDetectionTests(unittest.TestCase):
             self.assertEqual(roles.get("language_setup"), "config")
             self.assertEqual(roles.get("graphic_setup"), "config")
 
+    def test_witcher1_djinni_editor_is_not_the_default_launch(self):
+        """GOG Witcher EE: Launch.bat must be the game or launcher, not Djini.
+
+        ``djinni.exe`` (sometimes shown as Djini) is the adventure/mod editor
+        sitting next to ``witcher.exe`` in System\\ and is often *larger*,
+        so a size-first heuristic used to make it the portable default.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            app_dir = Path(temp, "App")
+            system = app_dir / "System"
+            system.mkdir(parents=True)
+            (app_dir / "launcher.exe").write_bytes(b"MZ" + b"\x00" * 4000)
+            (system / "witcher.exe").write_bytes(b"MZ" + b"\x00" * 8000)
+            (system / "djinni.exe").write_bytes(b"MZ" + b"\x00" * 50000)
+            (system / "djini.exe").write_bytes(b"MZ" + b"\x00" * 40000)
+            (app_dir / "unins000.exe").write_bytes(b"MZ" + b"\x00" * 1000)
+
+            port = Portablizer(Logger())
+            main_exe, targets = port._discover_app_executables(
+                str(app_dir),
+                "The Witcher Enhanced Edition Directors Cut",
+            )
+            self.assertIsNotNone(main_exe)
+            self.assertTrue(main_exe.lower().endswith("witcher.exe"), main_exe)
+            roles = {t.name.lower(): t.role for t in targets}
+            self.assertEqual(roles.get("witcher"), "main")
+            self.assertEqual(roles.get("launcher"), "launcher")
+            self.assertEqual(roles.get("djinni"), "tool")
+            self.assertEqual(roles.get("djini"), "tool")
+            self.assertNotIn("unins000", roles)
+
 
 class CompanionLauncherGenerationTests(unittest.TestCase):
     """Тесты создания сопутствующих лончеров (Launch_Launcher.bat, Launch_Configurator.bat, Launch_Menu.bat)."""

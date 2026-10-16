@@ -3462,6 +3462,46 @@ class Portablizer:
 
     # -- поиск главного exe ---------------------------------------------------
     # -- поиск и классификация исполняемых файлов -----------------------------
+    #: Filler words in GOG/Steam installer titles — they must not beat a
+    #: real game exe when matching names.
+    _GENERIC_APP_TOKENS = frozenset({
+        "the", "and", "for", "game", "games", "setup", "installer",
+        "enhanced", "edition", "directors", "director", "cut", "original",
+        "complete", "gold", "deluxe", "digital", "definitive", "ultimate",
+        "goty", "gog", "steam", "epic", "windows", "win32", "win64",
+        "version", "pack", "bundle", "collection", "anniversary",
+        "remaster", "remastered", "portable",
+    })
+    #: Bonus editors, SDKs, crash helpers — never the default Launch.bat.
+    #: The Witcher EE ships ``djinni.exe`` / ``djini.exe`` next to
+    #: ``witcher.exe``; it is a mod editor, not the game.
+    _TOOL_NAME_HINTS = (
+        "djinni", "djini", "djinn", "editor", "sdk", "worldbuilder",
+        "mapeditor", "leveleditor", "dedicated", "server", "crash",
+        "crashpad", "redist", "vcredist", "unins", "helper", "dump",
+        "benchmark", "perf", "tester", "tool", "maker", "builder",
+        "manager", "content", "mod", "patch", "werfault", "bugreport",
+    )
+
+    @staticmethod
+    def _app_name_score(stem: str, app_name: str) -> int:
+        """How well an exe stem matches the product title (no ``.exe``)."""
+        stem_l = (stem or "").lower()
+        name_l = (app_name or "").lower()
+        if not stem_l or not name_l:
+            return 0
+        if stem_l in name_l or name_l in stem_l:
+            return 100
+        tokens = [
+            token for token in re.findall(r"[a-z0-9]{4,}", name_l)
+            if token not in Portablizer._GENERIC_APP_TOKENS
+        ]
+        score = 0
+        for token in tokens:
+            if token == stem_l or token in stem_l or stem_l in token:
+                score += 80
+        return min(100, score)
+
     def _discover_app_executables(self, app_dir: str, app_name: str
                                   ) -> Tuple[Optional[str], List[launcher_mod.TargetInfo]]:
         """Сканирует App/ и находит все запускаемые программы.
@@ -3487,7 +3527,6 @@ class Portablizer:
             "bugreport", "epicwebhelper", "update", "helper", "feedback",
         )
 
-        name_l = app_name.lower()
         non_ignored: List[Tuple[int, str, str, str, str]] = []
 
         for p in candidates:
@@ -3513,16 +3552,22 @@ class Portablizer:
             elif any(k in base for k in ("config", "setting", "setup", "option", "language", "lang", "video", "graphics", "display", "resolution", "audio", "sound")):
                 role = "config"
                 desc = "Настройки графики и языка"
-            elif any(k in base for k in ("manager", "content", "mod", "editor", "edit", "tool", "bench", "maker", "builder", "patch", "server", "dedicated")):
+            elif any(k in stem.lower() for k in self._TOOL_NAME_HINTS) or any(
+                    k in base for k in ("manager", "content", "mod", "editor", "edit", "tool", "bench", "maker", "builder", "patch", "server", "dedicated")):
                 role = "tool"
                 desc = f"Утилита ({stem})"
 
             # Оценка вероятности быть главным исполняемым файлом
             s = 0
-            if name_l and (name_l in base or base in name_l):
-                s += 100
+            s += self._app_name_score(stem, app_name)
             if role == "main":
                 s += 30
+            elif role == "launcher":
+                s += 10
+            elif role == "tool":
+                s -= 80
+            elif role == "config":
+                s -= 40
             # Electron tray hosts are often "Name app.exe" next to chrome_elf.dll
             # (Ollama). Prefer that over the CLI/server sibling of the same name.
             if base.endswith(" app.exe"):
@@ -3531,15 +3576,23 @@ class Portablizer:
                 s += 25
             # exe в корне App/ или в App/bin обычно важнее
             s -= depth * 5
-            s += min(30, int(size / (1024 * 1024)))
+            # Size is a weak hint: a 40 MB mod editor must not beat a 5 MB
+            # game exe that actually matches the title.
+            s += min(12, int(size / (1024 * 1024)))
             non_ignored.append((s, p, stem, role, desc))
 
         if not non_ignored:
             return None, []
 
         non_ignored.sort(key=lambda x: x[0], reverse=True)
-        best_score, best_path, _stem, _role, _ = non_ignored[0]
-        main_exe = best_path if best_score >= 0 else non_ignored[0][1]
+        # Launch.bat must start the game or its launcher, never a bonus
+        # editor (Witcher ``djinni.exe``) just because it is large.
+        preferred = [item for item in non_ignored if item[3] == "main"]
+        if not preferred:
+            preferred = [item for item in non_ignored if item[3] == "launcher"]
+        if not preferred:
+            preferred = non_ignored
+        main_exe = preferred[0][1]
 
         def _safe_slug(s: str) -> str:
             cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", s).strip("_")
