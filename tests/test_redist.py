@@ -170,6 +170,9 @@ class RedistCatalogTests(unittest.TestCase):
             redist.classify_dll("api-ms-win-crt-math-l1-1-0.dll"), "redist")
         self.assertEqual(
             redist.classify_dll("api-ms-win-core-synch-l1-2-0.dll"), "system")
+        self.assertTrue(redist.is_ucrt_apiset("api-ms-win-crt-stdio-l1-1-0.dll"))
+        self.assertFalse(redist.is_ucrt_apiset("api-ms-win-core-file-l1-1-0.dll"))
+        self.assertTrue(redist.is_system_dll("api-ms-win-crt-math-l1-1-0.dll"))
 
     def test_unknown_library_stays_unknown(self):
         self.assertEqual(redist.classify_dll("binkw32.dll"), "unknown")
@@ -413,6 +416,12 @@ class RuntimeProvisionTests(unittest.TestCase):
             # переадресует вызовы в ucrtbase.dll, которого на Windows 7 нет.
             self.assertTrue((app / "ucrtbase.dll").is_file())
             self.assertIn("ucrtbase.dll", [r.dll for r in report.provided])
+            # Контракты API Set не числятся недостающими: иначе лончер на
+            # Windows 10/11 показывает ложное окно про VC++ 2015-2022.
+            self.assertFalse(any(redist.is_ucrt_apiset(r.dll)
+                                 for r in report.missing))
+            self.assertFalse(any(redist.is_ucrt_apiset(item["dll"])
+                                 for item in redist.launcher_requirements(report)))
 
     def test_sxs_assembly_is_deployed_with_a_private_manifest(self):
         manifest = (
@@ -944,6 +953,35 @@ class RuntimeLauncherTests(unittest.TestCase):
         # Предупреждение не отменяет запуск: часть библиотек грузится по
         # требованию, и программа вполне может работать.
         self.assertTrue(result.launched)
+
+    def test_ucrt_apiset_contracts_are_not_probed_as_files(self):
+        """api-ms-win-crt-* не должен всплывать как «отсутствует DLL»."""
+        names = (
+            "api-ms-win-crt-convert-l1-1-0.dll",
+            "api-ms-win-crt-heap-l1-1-0.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+        )
+        requirements = [
+            {"dll": name, "title": "Visual C++ 2015-2022",
+             "url": "https://aka.ms/vc14/vc_redist.x64.exe", "arch": "x64"}
+            for name in names
+        ]
+        bat = render_bat(self._cfg(requirements=requirements))
+        self.assertNotIn("api-ms-win-crt-", bat)
+        fs = self._fs(present=("ucrtbase.dll",))
+        result = self._run(self._cfg(requirements=requirements), fs)
+        self.assertNotIn("missing Microsoft runtime", result.text)
+        self.assertTrue(result.launched)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "Game_Portable")
+            (root / "App").mkdir(parents=True)
+            (root / "App" / "game.exe").write_bytes(b"MZ")
+            (root / "App" / "ucrtbase.dll").write_bytes(b"MZ")
+            missing = exe_launcher.missing_runtime_components(
+                root, {"runtime_requirements": requirements},
+                root / "App" / "game.exe", {})
+            self.assertEqual(missing, [])
 
     def test_no_warning_when_the_library_lies_next_to_the_program(self):
         fs = self._fs(present=("msvcp110.dll", "xinput1_3.dll"))

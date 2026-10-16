@@ -173,6 +173,16 @@ def _requirement_satisfied(root: Path, target: Optional[Path],
     name = str(item.get("dll", "")).strip()
     if not name:
         return True
+    # Universal CRT API Set contracts are not files.  On Windows 10/11 the
+    # loader resolves them via the schema; the payload is ucrtbase.dll.
+    # Checking the contract name in System32 always "fails" and the launcher
+    # used to nag about Visual C++ 2015-2022 on a healthy PC.
+    if name.lower().startswith("api-ms-win-crt-"):
+        ucrt = dict(item)
+        ucrt["dll"] = "ucrtbase.dll"
+        ucrt["manifest"] = ""
+        ucrt["sxs_family"] = ""
+        return _requirement_satisfied(root, target, env, search_dirs, ucrt)
     manifest = str(item.get("manifest", "") or "").strip()
     family = str(item.get("sxs_family", "") or "").strip()
     if manifest and family:

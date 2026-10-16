@@ -539,10 +539,26 @@ def find_package(dll: str) -> Optional[RedistPackage]:
     return None
 
 
+def is_ucrt_apiset(dll: str) -> bool:
+    """True for Universal CRT *contracts* (``api-ms-win-crt-*.dll``).
+
+    These names appear in import tables of VC++ 2015+ binaries, but they
+    are not files Windows looks up on disk.  On Windows 10/11 the loader
+    resolves them through the API Set schema; the real payload is
+    ``ucrtbase.dll`` (always present there, brought by the VC++ 2015-2022
+    redistributable on Windows 7/8.1).  Treating the contract names as
+    missing DLLs produces a false "install Visual C++ 2015-2022" warning
+    on a perfectly healthy PC.
+    """
+    return normalize_dll(dll).startswith("api-ms-win-crt-")
+
+
 def is_system_dll(dll: str) -> bool:
     """True для библиотек, которые есть в любой поддерживаемой Windows."""
     name = normalize_dll(dll)
     if name in SYSTEM_DLLS:
+        return True
+    if is_ucrt_apiset(name):
         return True
     return any(name.startswith(prefix) for prefix in SYSTEM_PREFIXES)
 
@@ -989,6 +1005,9 @@ def scan_app_runtime(app_dir: str, max_files: int = MAX_SCANNED_FILES
         if local:
             requirement.status = "bundled"
             requirement.source = os.path.relpath(local, app_dir).replace("\\", "/")
+        elif is_ucrt_apiset(requirement.dll):
+            # Import-table contract, not a file.  ucrtbase.dll is the payload.
+            requirement.status = "system"
         elif requirement.package is not None:
             requirement.status = "missing"
         elif is_system_dll(requirement.dll):
@@ -3683,6 +3702,10 @@ class RuntimeProvisioner:
                 _resolve, timeout=REQUIREMENT_TIMEOUT, default=("", ""),
                 on_tick=_on_requirement_tick)
             if not path:
+                if is_ucrt_apiset(requirement.dll):
+                    requirement.status = "system"
+                    report.system.append(requirement)
+                    continue
                 requirement.status = "missing"
                 (report.stock_missing if requirement.proactive
                  else report.missing).append(requirement)
@@ -3833,8 +3856,9 @@ class RuntimeProvisioner:
         без обновления UCRT — нет, и программа падает уже после того, как
         заглушки успешно загрузились.
         """
-        stubs = [item for item in report.provided + report.stock
-                 if item.dll.startswith("api-ms-win-crt-")]
+        stubs = [item for item in
+                 report.provided + report.stock + report.system + report.bundled
+                 if is_ucrt_apiset(item.dll)]
         if not stubs:
             return
         if any(item.dll == "ucrtbase.dll"
@@ -3993,6 +4017,11 @@ def launcher_requirements(report: ProvisionReport, limit: int = 24
                     entry["dlls"] = ",".join(sorted(dlls + [requirement.dll]))
             continue
         # Остальное проверяется построчно по имени файла — как раньше.
+        # Контракты UCRT (api-ms-win-crt-*) не существуют как файлы на
+        # Windows 10/11: лончер, ища их в System32, всегда «не находит» и
+        # пугает пакетом VC++ 2015-2022.  Реальная зависимость — ucrtbase.
+        if is_ucrt_apiset(requirement.dll):
+            continue
         if requirement.status != "missing" or requirement.dll in plain_seen:
             continue
         if len(out) >= limit:
