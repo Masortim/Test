@@ -31,6 +31,12 @@ OLLAMA_CFG = {
     "data_dir_name": "PortableData",
 }
 
+OPENCODE_CFG = {
+    "app_name": "OpenCode",
+    "target_exe_rel": "App/OpenCode.exe",
+    "data_dir_name": "PortableData",
+}
+
 
 def _write(path: Path, text: str = "x") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,6 +55,16 @@ def make_portable(tmp: str, cfg=None) -> Path:
     _write(root / "App" / "LaunchPortable.exe", "launcher")
     _write(root / "App" / "Saves" / "slot1.sav", "my-save")
     _write(root / "PortableData" / "User" / ".ollama" / "id_ed25519", "key")
+    return root
+
+
+def make_opencode_portable(tmp: str, cfg=None) -> Path:
+    root = Path(tmp) / "OpenCode_Portable"
+    (root / "App").mkdir(parents=True)
+    _write(root / "launcher_config.json", json.dumps(cfg or OPENCODE_CFG))
+    _write(root / "App" / "OpenCode.exe", "old-app")
+    _write(root / "App" / "LaunchPortable.exe", "launcher")
+    _write(root / "App" / "Saves" / "slot1.sav", "my-save")
     return root
 
 
@@ -82,6 +98,27 @@ class UpdateSettingsTests(unittest.TestCase):
         self.assertIn("ollamasetup*", settings["installer_names"])
         self.assertTrue(settings["source_url"].startswith("https://ollama.com/"))
 
+    def test_opencode_profile_treats_the_download_as_consent(self):
+        settings = exe_launcher.update_settings(OPENCODE_CFG)
+        self.assertTrue(settings["watch"])
+        self.assertTrue(settings["download_is_consent"])
+        self.assertEqual(settings["engine"], "nsis")
+        self.assertIn("opencode-desktop-win-*.exe", settings["installer_names"])
+        self.assertTrue(settings["source_url"].startswith("https://github.com/"))
+        # Скачанное лежит в кэше electron-updater (pending), а не запускается
+        # программой напрямую - отдельного файла-маркера нет.
+        self.assertTrue(settings["staged"])
+        self.assertFalse(settings["handoff"])
+        self.assertFalse(settings["markers"])
+
+    def test_download_is_consent_can_be_switched_off(self):
+        cfg = dict(OPENCODE_CFG, update={"download_is_consent": False,
+                                         "staged": ["AppData/Local/x/*.exe"]})
+        settings = exe_launcher.update_settings(cfg)
+        self.assertFalse(settings["download_is_consent"])
+        self.assertFalse(settings["watch"],
+                         "без меток и согласия-скачивания следить не за чем")
+
     def test_other_program_has_no_watch_but_manual_update_works(self):
         settings = exe_launcher.update_settings(
             {"app_name": "Game", "target_exe_rel": "App/game.exe"})
@@ -102,6 +139,14 @@ class UpdateSettingsTests(unittest.TestCase):
         game = launcher_mod.LauncherConfig(
             app_name="Game", target_exe_rel="App/game.exe")
         self.assertNotIn("update", json.loads(launcher_mod.render_config_json(game)))
+
+    def test_builder_writes_update_block_for_opencode(self):
+        cfg = launcher_mod.LauncherConfig(
+            app_name="OpenCode", target_exe_rel="App/OpenCode.exe")
+        data = json.loads(launcher_mod.render_config_json(cfg))
+        self.assertEqual(data["update"]["engine"], "nsis")
+        self.assertTrue(data["update"]["download_is_consent"])
+        self.assertTrue(data["update"]["staged"])
 
     def test_refresh_keeps_update_block(self):
         cfg = launcher_mod.config_from_dict(dict(
@@ -136,6 +181,15 @@ class InstallerCommandTests(unittest.TestCase):
         _label, command = exe_launcher.install_commands(
             Path("C:/dl/S.exe"), Path("C:/p/My Stage"), "nsis")[0]
         self.assertTrue(command.endswith("/D=" + str(Path("C:/p/My Stage"))))
+
+    def test_nsis_command_suppresses_desktop_shortcuts(self):
+        """Обновление не должно оставлять ярлык на рабочем столе чужого ПК."""
+        _label, command = exe_launcher.install_commands(
+            Path("C:/dl/opencode-desktop-win-x64.exe"),
+            Path("C:/p/Updates/stage"), "nsis")[0]
+        self.assertIn("--no-desktop-shortcut", command)
+        self.assertIn("/S", command)
+        self.assertTrue(command.endswith("/D=" + str(Path("C:/p/Updates/stage"))))
 
     def test_msi_and_unknown_ladders(self):
         msi = exe_launcher.install_commands(Path("a.msi"), Path("s"), "msi")
@@ -259,6 +313,126 @@ class InterceptTests(unittest.TestCase):
         proc.wait.return_value = 3
         self.assertEqual(exe_launcher._wait_target(proc, None), 3)
         proc.wait.assert_called_once_with()
+
+
+class OpenCodeInterceptTests(unittest.TestCase):
+    """OpenCode Desktop: кнопка «Обновить» = согласие на обновление.
+
+    Программа сама скачивает установщик (electron-updater кладёт его в
+    pending) и по «Перезапустить» запускает его отдельным процессом - мимо
+    папки App. Лончер обязан забрать установщик себе и поставить его внутрь
+    портатива, как только пользователь согласился.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = make_opencode_portable(self._tmp.name)
+        self.pending = (
+            self.root / "PortableData" / "AppData" / "Local"
+            / "opencode-updater" / "pending" / "opencode-desktop-win-x64.exe")
+        _write(self.pending, "installer")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_downloaded_installer_triggers_the_intercept(self):
+        watch = exe_launcher.UpdateWatch(self.root, OPENCODE_CFG)
+        self.assertTrue(watch.poll())
+        self.assertTrue(watch.handoff)
+        taken = watch.take()
+        self.assertEqual(taken, self.root / "Updates" / "opencode-desktop-win-x64.exe")
+        self.assertTrue(taken.is_file())
+        self.assertEqual(taken.read_text(), "installer")
+        self.assertFalse(self.pending.exists(), "установщик забран из кэша апдейтера")
+
+    def test_intercept_retries_while_the_installer_holds_the_file(self):
+        watch = exe_launcher.UpdateWatch(self.root, OPENCODE_CFG)
+        real = exe_launcher.quarantine_staged_update
+        calls = {"n": 0}
+
+        def flaky(root, cfg):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None, False  # файл занят запущенным установщиком
+            return real(root, cfg)
+
+        with mock.patch.object(exe_launcher, "stop_stray_installers",
+                               return_value=["opencode-desktop-win-x64.exe"]):
+            watch.poll()
+        self.assertIsNone(watch.installer, "занятый файл не переименовывается")
+        with mock.patch.object(exe_launcher, "quarantine_staged_update", flaky):
+            watch.poll()
+        self.assertIsNotNone(watch.installer)
+        self.assertEqual(calls["n"], 2)
+
+    def test_pending_state_is_kept_for_the_next_start(self):
+        watch = exe_launcher.UpdateWatch(self.root, OPENCODE_CFG)
+        watch.poll()
+        pending = exe_launcher.pending_installer(self.root)
+        self.assertEqual(pending, watch.take())
+
+    def test_another_program_downloading_silently_is_not_touched(self):
+        """У Ollama скачанное в фоне лежит нетронутым до «перезапуска»."""
+        root = make_portable(self._tmp.name)
+        staged = _write(root / "PortableData" / "AppData" / "Local" / "Ollama"
+                        / "updates_v2" / "2" / "OllamaSetup.exe", "new")
+        watch = exe_launcher.UpdateWatch(root, OLLAMA_CFG)
+        self.assertFalse(watch.poll())
+        self.assertTrue(staged.exists())
+
+
+class HostShortcutCleanupTests(unittest.TestCase):
+    """Ярлыки, оставленные установщиком на этом ПК, убираются."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = make_opencode_portable(self._tmp.name)
+        self.desktop = Path(self._tmp.name) / "Desktop"
+        self.desktop.mkdir()
+        self.programs = Path(self._tmp.name) / "Programs"
+        (self.programs / "OpenCode").mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _cleanup(self, targets, folders=None):
+        return exe_launcher.remove_host_app_shortcuts(
+            self.root, OPENCODE_CFG,
+            folders=folders if folders is not None else [self.desktop],
+            resolver=lambda p: targets.get(str(p)),
+            programs_dir=self.programs)
+
+    def test_host_install_shortcut_is_removed(self):
+        link = _write(self.desktop / "OpenCode.lnk", "x")
+        target = self.programs / "OpenCode" / "OpenCode.exe"
+        removed = self._cleanup({str(link): str(target)})
+        self.assertEqual(removed, [str(link)])
+        self.assertFalse(link.exists())
+
+    def test_shortcut_into_the_stage_folder_is_removed(self):
+        link = _write(self.desktop / "OpenCode.lnk", "x")
+        target = self.root / "Updates" / "stage" / "OpenCode.exe"
+        removed = self._cleanup({str(link): str(target)})
+        self.assertEqual(removed, [str(link)])
+
+    def test_shortcut_into_the_portable_folder_is_kept(self):
+        link = _write(self.desktop / "OpenCode.lnk", "x")
+        target = self.root / "App" / "OpenCode.exe"
+        removed = self._cleanup({str(link): str(target)})
+        self.assertEqual(removed, [])
+        self.assertTrue(link.exists())
+
+    def test_shortcut_to_another_program_is_kept(self):
+        link = _write(self.desktop / "Other.lnk", "x")
+        target = self.programs / "Other" / "Other.exe"
+        removed = self._cleanup({str(link): str(target)})
+        self.assertEqual(removed, [])
+
+    def test_shortcut_outside_installer_locations_is_kept(self):
+        link = _write(self.desktop / "OpenCode.lnk", "x")
+        target = Path("D:/Apps/opencode/OpenCode.exe")
+        removed = self._cleanup({str(link): str(target)})
+        self.assertEqual(removed, [])
 
 
 class ApplyUpdateTests(unittest.TestCase):

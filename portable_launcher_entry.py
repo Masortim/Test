@@ -3672,6 +3672,32 @@ UPDATE_PROFILES = (
         "markers": ["AppData/Local/Ollama/upgraded"],
         "installer_names": ["ollamasetup*"],
     }),
+    ("opencode", {
+        "engine": "nsis",
+        "source_url": ("https://github.com/anomalyco/opencode/releases/"
+                       "latest/download/opencode-desktop-win-x64.exe"),
+        # electron-updater кладёт скачанный установщик в
+        # %LOCALAPPDATA%\<имя-приложения>-updater\pending и по кнопке
+        # «Обновить» запускает его отдельным процессом. autoDownload у OpenCode
+        # выключен: файл появляется только после согласия пользователя.
+        "staged": [
+            "AppData/Local/*opencode*/pending/*.exe",
+            "AppData/Local/*OpenCode*/pending/*.exe",
+            "User/AppData/Local/*opencode*/pending/*.exe",
+            "User/AppData/Local/*OpenCode*/pending/*.exe",
+        ],
+        "handoff": [],
+        "markers": [],
+        # Имя запускаемого установщика (opencode-desktop-win-x64.exe) и рабочая
+        # копия NSIS в Temp. Сама программа (OpenCode.exe) под шаблоны не
+        # попадает.
+        "installer_names": ["opencode-desktop-win-*.exe", "~nsu*.tmp"],
+        # Кнопка «Обновить» = согласие на обновление: скачивание начинается
+        # только после неё, поэтому готовый установщик в pending - это и есть
+        # момент перехвата (у Ollama скачивание идёт в фоне без согласия, там
+        # перехват начинается лишь по метке «перезапуск для обновления»).
+        "download_is_consent": True,
+    }),
 )
 
 
@@ -3715,6 +3741,9 @@ def update_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
     handoff = texts("handoff")
     markers = texts("markers")
     names = [item.casefold() for item in texts("installer_names")]
+    # Готовый установщик, скачанный программой, - сигнал перехвата только там,
+    # где само скачивание происходит лишь после согласия пользователя.
+    download_is_consent = merged.get("download_is_consent", False) is True
     return {
         "enabled": merged.get("enabled", True) is not False,
         "engine": str(merged.get("engine", "")).strip().casefold(),
@@ -3728,9 +3757,10 @@ def update_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "installer_args": ([str(a) for a in args]
                            if isinstance(args, list) and args else None),
         "timeout": max(60.0, min(86400.0, timeout)),
-        # Следить за родным апдейтером можно, только если известно, по каким
-        # следам его узнать.
-        "watch": bool(handoff or markers),
+        "download_is_consent": download_is_consent,
+        # Следить за родным апдейтером можно, если известно, по каким следам
+        # его узнать (или само скачивание - уже согласие пользователя).
+        "watch": bool(handoff or markers or download_is_consent),
     }
 
 
@@ -3940,6 +3970,12 @@ class UpdateWatch:
         self._logged = False
 
     def _triggered(self) -> bool:
+        # Готовый установщик в кэше апдейтера - это сигнал только там, где
+        # программа скачивает обновление лишь после согласия пользователя
+        # (OpenCode/electron-updater). У Ollama скачанное в фоне не трогаем.
+        if (self.settings["download_is_consent"]
+                and staged_installers(self.root, self.cfg)):
+            return True
         return bool(
             _glob_in_data(self.root, self.cfg, self.settings["handoff"])
             or _glob_in_data(self.root, self.cfg, self.settings["markers"]))
@@ -3955,19 +3991,48 @@ class UpdateWatch:
             _update_log(self.root, "the program started its own updater - "
                         "intercepting it, the update will be installed "
                         "into the portable folder instead")
-        stopped = stop_stray_installers(self.root, self.cfg)
-        if stopped and not self._logged:
-            self._logged = True
-            _update_log(self.root, "stopped the built-in installer: "
-                        + ", ".join(sorted(set(stopped))))
-        if stopped:
-            return True  # дочерние процессы установщика могли ещё остаться
-        kept, clean = quarantine_staged_update(self.root, self.cfg)
-        if kept is not None:
-            self.installer = kept
-            _remember_pending(self.root, kept, interrupted=True)
-            _update_log(self.root, f"the downloaded update is kept: {kept.name}")
+        self._intercept()
         return True
+
+    def _intercept(self) -> None:
+        """Гасит родной установщик и забирает скачанное обновление себе.
+
+        У electron-updater (OpenCode) между «установщик скачан» и «он
+        запущен» проходят миллисекунды, поэтому после остановки установщика
+        перехват повторяется короткими сериями: файл бывает занят процессом,
+        и переименовать его надо до того, как установщик что-то запишет.
+        """
+        import time
+
+        guard = HostTraceGuard()
+        guard.snapshot()
+        try:
+            deadline = time.monotonic() + (
+                5.0 if self.settings["download_is_consent"] else 0.0)
+            while True:
+                stopped = stop_stray_installers(self.root, self.cfg)
+                if stopped and not self._logged:
+                    self._logged = True
+                    _update_log(self.root, "stopped the built-in installer: "
+                                + ", ".join(sorted(set(stopped))))
+                if stopped:
+                    return  # дочерние процессы установщика могли ещё остаться
+                kept, _clean = quarantine_staged_update(self.root, self.cfg)
+                if kept is not None:
+                    self.installer = kept
+                    _remember_pending(self.root, kept, interrupted=True)
+                    _update_log(self.root,
+                                f"the downloaded update is kept: {kept.name}")
+                    return
+                if not self._triggered() or time.monotonic() >= deadline:
+                    return
+                time.sleep(0.1)
+        finally:
+            traces = guard.restore()
+            traces.extend(remove_host_app_shortcuts(self.root, self.cfg))
+            if traces:
+                _update_log(self.root, "removed installer traces from this PC: "
+                            + ", ".join(traces))
 
     def finish(self, timeout: float = 15.0) -> None:
         """Дожимает перехват после выхода программы."""
@@ -4058,7 +4123,12 @@ def install_commands(installer: Path, target_dir: Path, engine: str,
         return "Inno Setup", quote(args)
 
     def nsis() -> "tuple[str, str]":
-        return "NSIS", quote([program, "/S"]) + f" /D={target}"
+        # --no-desktop-shortcut понимают установщики electron-builder (OpenCode
+        # и т.п.): обновление внутри портатива не должно оставлять ярлык на
+        # рабочем столе чужого ПК. Классический NSIS ключ просто игнорирует.
+        # /D= обязан идти последним и без кавычек.
+        return ("NSIS", quote([program, "/S", "--no-desktop-shortcut"])
+                + f" /D={target}")
 
     if engine == "inno":
         return [inno()]
@@ -4129,15 +4199,172 @@ _UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
 _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _ENV_KEY = "Environment"
 
+#: CSIDL папок «Рабочий стол» и «Пуск». Запрос через shell возвращает
+#: НАСТОЯЩИЕ папки Windows - с учётом перенаправления (OneDrive-«Рабочий
+#: стол», корпоративные политики), куда действительно пишут
+#: установщики. Пути из переменных окружения оставлены запасным вариантом.
+_CSIDL_START_MENU = 0x0B
+_CSIDL_DESKTOP = 0x10
+_CSIDL_COMMON_START_MENU = 0x16
+_CSIDL_COMMON_DESKTOP = 0x19
+
+
+def _shell_folder(csidl: int) -> Optional[Path]:
+    """Папка Windows по CSIDL (с перенаправлением) или ``None`` вне Windows."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(520)  # MAX_PATH + запас
+        if ctypes.windll.shell32.SHGetFolderPathW(  # type: ignore[attr-defined]
+                None, csidl, None, 0, buffer):
+            return None
+        return Path(buffer.value) if buffer.value else None
+    except Exception:  # noqa: BLE001 - папка не найдена, есть запасной путь
+        return None
+
+
+def shortcut_folders() -> "list[Path]":
+    """Папки, куда установщики кладут ярлыки («Рабочий стол» и меню «Пуск»)."""
+    folders: "list[Path]" = []
+    for csidl in (_CSIDL_DESKTOP, _CSIDL_START_MENU,
+                  _CSIDL_COMMON_DESKTOP, _CSIDL_COMMON_START_MENU):
+        found = _shell_folder(csidl)
+        if found is not None:
+            folders.append(found)
+    appdata = os.environ.get("APPDATA", "")
+    public = os.environ.get("PUBLIC", "")
+    profile = os.environ.get("USERPROFILE", "")
+    programdata = os.environ.get("PROGRAMDATA", "")
+    if appdata:
+        folders.append(Path(appdata) / "Microsoft" / "Windows" / "Start Menu")
+    if profile:
+        folders.append(Path(profile) / "Desktop")
+    if programdata:
+        folders.append(Path(programdata) / "Microsoft" / "Windows" / "Start Menu")
+    if public:
+        folders.append(Path(public) / "Desktop")
+    unique: "list[Path]" = []
+    seen: "set[str]" = set()
+    for folder in folders:
+        key = str(folder).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(folder)
+    return [f for f in unique if f.is_dir()]
+
+
+def _user_programs_dir() -> Path:
+    """Стандартная пользовательская папка Programs (куда ставит NSIS/Inno)."""
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        return Path(local) / "Programs"
+    return Path(os.environ.get("USERPROFILE", ".")) / "AppData" / "Local" / "Programs"
+
+
+def _app_exe_names(cfg: Dict[str, Any]) -> "set[str]":
+    """Имена файлов exe этой программы (главный и её цели запуска)."""
+    rels = [str(cfg.get("target_exe_rel", "")), str(cfg.get("launcher_target_rel", ""))]
+    targets = cfg.get("targets")
+    if isinstance(targets, list):
+        rels.extend(str(item.get("rel_path", ""))
+                    for item in targets if isinstance(item, dict))
+    names = set()
+    for rel in rels:
+        name = Path(rel.replace("\\", "/").strip("/")).name.casefold()
+        if name:
+            names.add(name)
+    return names
+
+
+def _lnk_target(path: Path) -> Optional[str]:
+    """Цель ярлыка ``.lnk`` или ``None``, если определить не удалось."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "$sh = New-Object -ComObject WScript.Shell; "
+             "$sh.CreateShortcut($env:PORTABLE_LNK).TargetPath"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=NO_WINDOW,
+            env={**os.environ, "PORTABLE_LNK": str(path)})
+        target = completed.stdout.strip()
+        return target or None
+    except Exception:  # noqa: BLE001 - ярлык останется, это не срывает обновление
+        return None
+
+
+def remove_host_app_shortcuts(root: Path, cfg: Dict[str, Any],
+                              folders: "Optional[Iterable[Path]]" = None,
+                              resolver: "Optional[Any]" = None,
+                              programs_dir: Optional[Path] = None) -> "list[str]":
+    """Убирает ярлыки на программу, которые оставил установщик ВНЕ портатива.
+
+    Обновление внутри портатива не должно оставлять на рабочем столе чужого ПК
+    ярлык на программу: он не нужен (запуск идёт через ``Launch.bat``) и ведёт
+    не туда. Удаляются только ярлыки на главный exe этой программы, чья цель
+    лежит (а) во временной папке обновления ``Updates\\stage`` или (б) в
+    стандартной пользовательской папке Programs, куда установщики ставят
+    программу на этот ПК. Ярлыки, указывающие внутрь портатива или в другие
+    папки пользователя, не трогаются.
+    """
+    app_names = _app_exe_names(cfg)
+    if not app_names:
+        return []
+    read_target = resolver or _lnk_target
+    programs = Path(programs_dir) if programs_dir is not None \
+        else _user_programs_dir()
+    try:
+        programs_key = programs.resolve()
+    except OSError:
+        programs_key = programs
+    try:
+        stage_key = (root / UPDATE_DIR_NAME / "stage").resolve()
+    except OSError:
+        stage_key = root / UPDATE_DIR_NAME / "stage"
+    try:
+        root_key = root.resolve()
+    except OSError:
+        root_key = root
+    done: "list[str]" = []
+    for folder in (list(folders) if folders is not None else shortcut_folders()):
+        try:
+            candidates = sorted(folder.glob("*.lnk"))
+        except OSError:
+            continue
+        for link in candidates:
+            target_text = read_target(link)
+            if not target_text:
+                continue
+            target = Path(str(target_text).strip().strip('"'))
+            if target.name.casefold() not in app_names:
+                continue
+            try:
+                resolved = target.resolve()
+            except OSError:
+                resolved = target
+            under_stage = stage_key in resolved.parents or resolved == stage_key
+            under_programs = (programs_key in resolved.parents
+                              or resolved == programs_key)
+            inside_portable = root_key in resolved.parents or resolved == root_key
+            if under_stage or (under_programs and not inside_portable):
+                if _remove_file(link):
+                    done.append(str(link))
+    return done
+
 
 class HostTraceGuard:
     """Возвращает компьютеру то, что установщик в нём изменил.
 
     Установка во временную папку - всё равно установка: Inno Setup пишет
     запись в «Установленные программы», ярлык автозапуска и дописывает
-    ``PATH`` пользователя. Папка Updates\\stage вскоре исчезнет, а след
-    остался бы навсегда. Поэтому до установки запоминается состояние, а
-    после - всё НОВОЕ откатывается. Существующее никогда не удаляется.
+    ``PATH`` пользователя, NSIS (OpenCode и т.п.) добавляет ярлыки на рабочий
+    стол и в меню «Пуск» и ставит программу в пользовательские Programs.
+    Папка Updates\\stage вскоре исчезнет, а след остался бы навсегда. Поэтому
+    до установки запоминается состояние, а после - всё НОВОЕ откатывается.
+    Существующее никогда не удаляется.
     """
 
     def __init__(self) -> None:
@@ -4146,26 +4373,27 @@ class HostTraceGuard:
         self._run: "dict[str, Any]" = {}
         self._env: "dict[str, tuple]" = {}
         self._shortcuts: "set[str]" = set()
+        self._programs: "dict[str, set[str]]" = {}
         self.removed: "list[str]" = []
 
     @staticmethod
     def _shortcut_folders() -> "list[Path]":
-        folders = []
-        appdata = os.environ.get("APPDATA", "")
-        public = os.environ.get("PUBLIC", "")
-        profile = os.environ.get("USERPROFILE", "")
-        programdata = os.environ.get("PROGRAMDATA", "")
-        if appdata:
-            folders.append(Path(appdata) / "Microsoft" / "Windows"
-                           / "Start Menu")
-        if profile:
-            folders.append(Path(profile) / "Desktop")
-        if programdata:
-            folders.append(Path(programdata) / "Microsoft" / "Windows"
-                           / "Start Menu")
-        if public:
-            folders.append(Path(public) / "Desktop")
-        return [f for f in folders if f.is_dir()]
+        return shortcut_folders()
+
+    @staticmethod
+    def _program_roots() -> "list[Path]":
+        """Пользовательские Programs, куда установщики ставят программу."""
+        root = _user_programs_dir()
+        return [root] if root.is_dir() else []
+
+    def _program_entries(self) -> "dict[str, set[str]]":
+        entries: "dict[str, set[str]]" = {}
+        for root in self._program_roots():
+            try:
+                entries[str(root)] = {item.name for item in root.iterdir()}
+            except OSError:
+                continue
+        return entries
 
     def _lnk_files(self) -> "set[str]":
         found: "set[str]" = set()
@@ -4224,8 +4452,28 @@ class HostTraceGuard:
             self._run = self._values(_RUN_KEY)
             self._env = self._values(_ENV_KEY)
             self._shortcuts = self._lnk_files()
+            self._programs = self._program_entries()
         except Exception:  # noqa: BLE001 - без снимка просто нечего откатывать
             self.active = False
+
+    @classmethod
+    def _delete_tree(cls, root: Any, subkey: str) -> bool:
+        """Удаляет ключ реестра вместе с подключами (иначе DeleteKey падает)."""
+        import winreg
+
+        try:
+            with winreg.OpenKey(root, subkey, 0,
+                                winreg.KEY_READ | winreg.KEY_WRITE) as key:
+                while True:
+                    try:
+                        child = winreg.EnumKey(key, 0)
+                    except OSError:
+                        break
+                    cls._delete_tree(root, subkey + "\\" + child)
+            winreg.DeleteKey(root, subkey)
+            return True
+        except OSError:
+            return False
 
     def restore(self) -> "list[str]":
         if not self.active:
@@ -4235,12 +4483,9 @@ class HostTraceGuard:
 
             for name in sorted(self._subkeys(_UNINSTALL_KEY)
                                - self._uninstall):
-                try:
-                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER,
-                                     _UNINSTALL_KEY + "\\" + name)
+                if self._delete_tree(winreg.HKEY_CURRENT_USER,
+                                     _UNINSTALL_KEY + "\\" + name):
                     self.removed.append("Uninstall\\" + name)
-                except OSError:
-                    pass
             now = self._values(_RUN_KEY)
             for name in set(now) - set(self._run):
                 try:
@@ -4276,6 +4521,22 @@ class HostTraceGuard:
             for path in sorted(self._lnk_files() - self._shortcuts):
                 if _remove_file(Path(path)):
                     self.removed.append(path)
+            # Программа, которую установщик успел положить в пользовательские
+            # Programs (родной апдейтер, проигравший гонку с перехватом), -
+            # тоже временный след: папка Updates\\stage заменит её собой.
+            for root_text, before in self._programs.items():
+                root_path = Path(root_text)
+                for name in sorted(self._program_entries().get(root_text, set())
+                                   - before):
+                    created = root_path / name
+                    try:
+                        if created.is_dir() and not created.is_symlink():
+                            shutil.rmtree(created, ignore_errors=True)
+                        else:
+                            _remove_file(created)
+                        self.removed.append(str(created))
+                    except OSError:
+                        pass
         except Exception:  # noqa: BLE001 - откат следов не должен ронять обновление
             pass
         return self.removed
@@ -4695,6 +4956,7 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
             stage.mkdir(parents=True, exist_ok=True)
     finally:
         result.traces = guard.restore()
+        result.traces.extend(remove_host_app_shortcuts(root, cfg))
         if result.traces:
             _update_log(root, "removed installer traces from this PC: "
                         + ", ".join(result.traces))
@@ -4962,6 +5224,7 @@ def offer_recovery(root: Path, cfg: Dict[str, Any],
 
     stop_stray_installers(root, cfg)
     kept, clean = quarantine_staged_update(root, cfg)
+    stray = remove_host_app_shortcuts(root, cfg)
     installer = kept or pending
     # Прерванным обновление считается, если остались следы ЗАПУСКА установщика
     # (метка, рабочая копия) или перехват не довёл дело до конца. Просто
@@ -4972,7 +5235,7 @@ def offer_recovery(root: Path, cfg: Dict[str, Any],
         or (pending and pending_interrupted and not declined))
     _update_log(root, "found traces of the program's own update: "
                 f"markers={len(markers)}, started installers={len(leftovers)}, "
-                f"downloaded={len(staged)}; cleaned"
+                f"downloaded={len(staged)}, stray shortcuts={len(stray)}; cleaned"
                 + ("" if clean else " (not completely)"))
     if installer is not None and declined and not interrupted_update:
         return "\n".join(notes) or None
