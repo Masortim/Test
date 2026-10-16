@@ -2947,6 +2947,40 @@ class GameLauncherHandoffTests(unittest.TestCase):
         self.assertIn("JOB_OBJECT_LIMIT_BREAKAWAY_OK", source)
         self.assertIn("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", source)
 
+    def test_electron_and_ollama_do_not_join_the_kill_job(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            (app / "chrome_elf.dll").write_bytes(b"MZ")
+            (app / "ollama app.exe").write_bytes(b"MZ")
+            self.assertTrue(exe_launcher.is_electron_tree(app))
+            self.assertFalse(exe_launcher.should_use_job(app / "ollama app.exe"))
+            self.assertFalse(exe_launcher.should_use_job(app / "ollama.exe"))
+            plain = Path(temp, "Game")
+            plain.mkdir()
+            (plain / "game.exe").write_bytes(b"MZ")
+            self.assertTrue(exe_launcher.should_use_job(plain / "game.exe"))
+
+    def test_ollama_without_a_window_is_still_interactive(self):
+        """Quit-from-tray must be the user's choice, not idle_grace."""
+        image = r"C:\Games\Ollama_Portable\App\ollama app.exe"
+        self.assertTrue(exe_launcher._is_interactive_image(image))
+        self.assertFalse(exe_launcher._is_interactive_image(
+            r"C:\Games\Ollama_Portable\App\crashpad_handler.exe"))
+        clock = iter(float(n) for n in range(0, 100000))
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher, "_portable_process_list",
+                                  return_value=[(10, image)]), \
+                mock.patch.object(exe_launcher, "_visible_window_pids",
+                                  return_value=set()), \
+                mock.patch("time.monotonic", side_effect=lambda: next(clock)), \
+                mock.patch("time.sleep"):
+            waited = exe_launcher._wait_for_portable_processes(
+                Path(r"C:\Games\Ollama_Portable"),
+                settings={"spawn_grace": 0.0, "idle_grace": 3.0,
+                          "max_wait": 40.0})
+        self.assertGreaterEqual(waited, 20)
+
     def test_windowless_leftover_only_gets_the_idle_grace(self):
         """Фоновый процесс без окна не должен держать папку сутками.
 
@@ -3210,6 +3244,8 @@ class FolderReleaseTests(unittest.TestCase):
         self.assertIn("$p.Kill()", bat)
         self.assertIn("PortableWins", bat)
         self.assertIn("HasUi", bat)
+        self.assertIn("FindWindowEx", bat)
+        self.assertIn("ollama", bat)
 
     def test_stop_script_is_ascii_and_prefers_the_exe_launcher(self):
         cfg = launcher_mod.LauncherConfig(
