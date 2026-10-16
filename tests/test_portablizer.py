@@ -4134,6 +4134,33 @@ class LauncherLeftoverCleanupTests(unittest.TestCase):
         self.assertTrue(restored.shutdown_purge_temp)
 
 
+class IexpressOverwriteDialogTests(unittest.TestCase):
+    """VC++ 2005 IExpress overwrite prompt during portable build."""
+
+    def test_yes_to_all_is_preferred_confirm(self):
+        from portablizer.core import redist as redist_mod
+        self.assertTrue(redist_mod.installer_button_is_confirm_all("&Yes To All"))
+        self.assertTrue(redist_mod.installer_button_is_confirm_all("Да для всех"))
+        self.assertTrue(redist_mod.installer_button_is_confirm("Yes"))
+        self.assertFalse(redist_mod.installer_button_is_confirm("No"))
+        self.assertFalse(redist_mod.installer_button_is_confirm("Cancel"))
+
+    def test_overwrite_prompt_from_screenshot_is_recognised(self):
+        from portablizer.core import redist as redist_mod
+        body = (
+            "Do you want to overwrite the file "
+            r"D:\Portable\opencode-desktop-win-x64_Portable\_redist_cache"
+            r"\vc2005\x86\eula.1028.txt?"
+        )
+        self.assertTrue(
+            redist_mod.installer_prompt_looks_like_overwrite("", body))
+        self.assertFalse(
+            redist_mod.installer_prompt_looks_like_overwrite("Notepad", "hello"))
+
+    def test_dismiss_is_a_noop_off_windows(self):
+        from portablizer.core import redist as redist_mod
+        self.assertEqual(redist_mod._dismiss_installer_dialogs(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
