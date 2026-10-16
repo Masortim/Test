@@ -1602,6 +1602,21 @@ UPDATE_PROFILES = (
         "markers": ["AppData/Local/Ollama/upgraded"],
         "installer_names": ["ollamasetup*"],
     }),
+    ("opencode", {
+        "engine": "nsis",
+        "source_url": ("https://github.com/anomalyco/opencode/releases/"
+                       "latest/download/opencode-desktop-win-x64.exe"),
+        "staged": [
+            "AppData/Local/*opencode*/pending/*.exe",
+            "AppData/Local/*OpenCode*/pending/*.exe",
+            "User/AppData/Local/*opencode*/pending/*.exe",
+            "User/AppData/Local/*OpenCode*/pending/*.exe",
+        ],
+        "handoff": [],
+        "markers": [],
+        "installer_names": ["opencode-desktop-win-*.exe", "~nsu*.tmp"],
+        "download_is_consent": True,
+    }),
 )
 
 

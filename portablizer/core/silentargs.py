@@ -174,7 +174,10 @@ def build_silent_plan(
 
     if installer_type == InstallerType.NSIS:
         # У NSIS /D должен быть ПОСЛЕДНИМ и БЕЗ кавычек.
-        args = ["/S"] + extra_args
+        # --no-desktop-shortcut понимают установщики electron-builder (OpenCode
+        # и т.п.): сборка портатива не должна оставлять ярлык на рабочем столе
+        # этого ПК. Классический NSIS ключ просто игнорирует.
+        args = ["/S", "--no-desktop-shortcut"] + extra_args
         notes.append("NSIS: /S для тишины, /D=<путь> добавлен последним без кавычек.")
         return SilentPlan(program=installer_path, args=args,
                           raw_tail=f"/D={target_dir}", notes=notes,
