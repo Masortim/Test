@@ -273,6 +273,44 @@ def _directx_commands(path: Path) -> list[list[str]]:
     return [["cmd.exe", "/v:on", "/c", line]]
 
 
+def _vcredist_scratch_dir() -> Path:
+    """Writable folder for unpacking a VC++ 2005/2008/2010 IExpress wrapper."""
+    windir = Path(os.environ.get("SystemRoot") or r"C:\\Windows")
+    candidates = [windir / "Temp", Path(tempfile.gettempdir())]
+    for base in candidates:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            probe = base / "pblz_vc.tmp"
+            probe.write_bytes(b"")
+            probe.unlink()
+            return base / "pblz_vc"
+        except OSError:
+            continue
+    return candidates[-1] / "pblz_vc"
+
+
+def _vcredist_legacy_commands(path: Path) -> list[list[str]]:
+    """Unpack vcredist_*.exe, then msiexec /qn the nested vc_red.msi.
+
+    The IExpress wrapper's `/q` is only "quiet": Windows Installer still
+    shows the "configures Visual C++ 2005 Redistributable" progress bar
+    (and `/norestart` is a syntax error).  Extract first; install the MSI
+    with `/qn`; fall back to bare `/q` only if the payload is missing.
+    """
+    scratch = _vcredist_scratch_dir()
+    line = (
+        f'rd /s /q "{scratch}" 2>nul & md "{scratch}" 2>nul & '
+        f'"{path}" /Q /C /T:{scratch} & '
+        f'if exist "{scratch}\\\\vc_red.msi" ('
+        f'msiexec /i "{scratch}\\\\vc_red.msi" /qn /norestart & set VCRC=!ERRORLEVEL!'
+        f') else if exist "{scratch}\\\\vcredist.msi" ('
+        f'msiexec /i "{scratch}\\\\vcredist.msi" /qn /norestart & set VCRC=!ERRORLEVEL!'
+        f') else ("{path}" /q & set VCRC=!ERRORLEVEL!) & '
+        f'rd /s /q "{scratch}" 2>nul & exit /b !VCRC!'
+    )
+    return [["cmd.exe", "/v:on", "/c", line]]
+
+
 def _runtime_install_commands(root: Path,
                               entry: Dict[str, Any]) -> list[list[str]]:
     """Command line that installs one package without showing anything."""
@@ -300,11 +338,11 @@ def _runtime_install_commands(root: Path,
         # command line operation" box.  Unpack first, then DXSETUP /silent.
         return _directx_commands(path)
     if kind == "vcredist_legacy":
-        # VC++ 2005 accepts /q, but rejects the commonly used /norestart with
-        # a visible "Command line option syntax error" dialog.  Do not trust
-        # stale args saved by an older Portablizer and do not try modern
-        # fallbacks against this legacy IExpress wrapper.
-        return [[str(path), "/q"]]
+        # `/q` on the IExpress wrapper still shows "Please wait while Windows
+        # configures Microsoft Visual C++ 2005 Redistributable".  `/q
+        # /norestart` additionally pops a syntax-error dialog.  Extract the
+        # payload, then run the nested MSI with /qn (no UI at all).
+        return _vcredist_legacy_commands(path)
     args = str(entry.get("args", "")).split()
     commands = [[str(path), *args]] if args else []
     for fallback in (["/quiet", "/norestart"], ["/q", "/norestart"],

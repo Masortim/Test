@@ -2349,10 +2349,25 @@ def render_silent_install_script(entries: Sequence[Dict[str, str]]) -> str:
         elif kind == "dxsetup" or relative.lower().endswith("dxsetup.exe"):
             body = [f'start "" /wait {target} /silent']
         elif kind == "vcredist_legacy":
-            # VC++ 2005 rejects `/q /norestart` with a visible modal syntax
-            # error. Ignore stale metadata too, so a regenerated script fixes
-            # portable configs made by older Portablizer versions.
-            body = [f'start "" /wait {target} /q']
+            # VC++ 2005/2008/2010 IExpress wrappers show the Windows Installer
+            # "Please wait while Windows configures Microsoft Visual C++ 2005
+            # Redistributable" progress even on `/q` (quiet is not silent; the
+            # inner msiexec runs with basic UI). `/q /norestart` additionally
+            # pops a modal syntax error. Extract the payload, then install the
+            # nested MSI fully unattended — same path as install_legacy_vcredist.
+            temp = f"%SystemRoot%\\\\Temp\\\\pblz_vc{index}"
+            body = [
+                f'set "VCTMP={temp}"',
+                'if exist "%VCTMP%" rd /s /q "%VCTMP%"',
+                'md "%VCTMP%" 2>nul',
+                f'start "" /wait {target} /Q /C /T:%VCTMP%',
+                'if exist "%VCTMP%\\\\vc_red.msi" (',
+                '  msiexec /i "%VCTMP%\\\\vc_red.msi" /qn /norestart',
+                ') else if exist "%VCTMP%\\\\vcredist.msi" (',
+                '  msiexec /i "%VCTMP%\\\\vcredist.msi" /qn /norestart',
+                f') else start "" /wait {target} /q',
+                'rd /s /q "%VCTMP%" 2>nul',
+            ]
         else:
             body = [f'start "" /wait {target} {args}'.rstrip()]
         lines += [

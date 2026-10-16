@@ -1455,10 +1455,18 @@ class SilentInstallTests(unittest.TestCase):
             # Metadata written by older versions contained this invalid pair.
             "args": "/q /norestart",
         }])
-        install_line = next(line for line in text.splitlines()
-                            if "start \"\" /wait" in line)
-        self.assertTrue(install_line.endswith(" /q"), install_line)
-        self.assertNotIn("/norestart", install_line)
+        # Wrapper is only used to extract; the MSI is installed with /qn so
+        # the "Windows configures Visual C++ 2005" progress bar never appears.
+        self.assertIn("/Q /C /T:%VCTMP%", text)
+        self.assertIn("vc_red.msi", text)
+        self.assertIn("msiexec /i", text)
+        self.assertIn("/qn /norestart", text)
+        wrapper_lines = [line for line in text.splitlines()
+                         if "vcredist_x86.exe" in line
+                         and "start \"\" /wait" in line]
+        self.assertTrue(wrapper_lines)
+        for line in wrapper_lines:
+            self.assertNotIn("/norestart", line)
 
     def test_exit_codes_are_read_the_way_microsoft_means_them(self):
         self.assertEqual(redist.classify_exit_code(0), "installed")
@@ -2309,10 +2317,16 @@ class LauncherSilentInstallTests(unittest.TestCase):
 
             self.assertEqual(left, [])
             self.assertEqual(len(calls), 1)
-            self.assertTrue(calls[0][0].endswith("vcredist_x86.exe"))
-            # The old config still contains /norestart; the launcher must
-            # discard it because VC++ 2005 shows a modal syntax-error dialog.
-            self.assertEqual(calls[0][1:], ["/q"])
+            # Extract the IExpress payload, then msiexec /qn — never run the
+            # wrapper with /q (that shows the "Windows configures" progress).
+            self.assertEqual(calls[0][0], "cmd.exe")
+            line = calls[0][-1]
+            self.assertIn("vcredist_x86.exe", line)
+            self.assertIn("/Q /C /T:", line)
+            self.assertIn("vc_red.msi", line)
+            self.assertIn("msiexec", line)
+            self.assertIn("/qn", line)
+            self.assertNotIn("/q /norestart", line)
 
     def test_failed_installation_still_warns_the_user_once(self):
         with tempfile.TemporaryDirectory() as temp:
