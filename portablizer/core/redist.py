@@ -59,6 +59,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1514,6 +1515,112 @@ NATIVE_TOOL_TIMEOUT = 300
 #: помечается недостающей, и доставка продолжается со следующей.
 REQUIREMENT_TIMEOUT = 15 * 60
 
+# IExpress/wextract «Do you want to overwrite the file …?» — if we unpack
+# into a folder that already has files from an earlier pass, the wrapper
+# pops a Yes/Yes-to-All dialog even with /Q. Prefer an empty dest, and
+# click through leftovers so the build does not sit waiting for a click.
+_CONFIRM_ALL_TITLES = (
+    "yes to all", "да для всех", "sí a todo", "oui pour tous",
+    "ja zu allen", "tak dla wszystkich",
+)
+_CONFIRM_TITLES = (
+    "yes", "да", "sí", "oui", "ja", "tak", "ok", "ок",
+)
+_OVERWRITE_HINTS = (
+    "overwrite", "already exists", "перезапис", "уже существ",
+    "do you want to", "хотите",
+)
+
+
+def installer_button_is_confirm_all(title: str) -> bool:
+    """True for the IExpress «Yes To All» (and localised) button caption."""
+    text = (title or "").replace("&", "").strip().lower()
+    return any(text == needle or text.startswith(needle) for needle in _CONFIRM_ALL_TITLES)
+
+
+def installer_button_is_confirm(title: str) -> bool:
+    """True for Yes / OK / Yes To All — never No / Cancel."""
+    text = (title or "").replace("&", "").strip().lower()
+    if any(bad in text for bad in ("no", "нет", "cancel", "отмена", "abort")):
+        if not installer_button_is_confirm_all(title):
+            return False
+    return installer_button_is_confirm_all(title) or any(
+        text == needle for needle in _CONFIRM_TITLES
+    )
+
+
+def installer_prompt_looks_like_overwrite(title: str, body: str = "") -> bool:
+    """IExpress overwrite / confirm dialog, including the user's screenshot."""
+    blob = f"{title or ''} {body or ''}".lower()
+    if not blob.strip():
+        return False
+    return any(hint in blob for hint in _OVERWRITE_HINTS)
+
+
+def _dismiss_installer_dialogs() -> int:
+    """Click Yes To All / Yes on leftover IExpress overwrite prompts.
+
+    CREATE_NO_WINDOW does not hide dialogs that wextract itself creates.
+    Returns how many buttons were clicked (0 on non-Windows).
+    """
+    if not IS_WINDOWS:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return 0
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    clicked = 0
+    BM_CLICK = 0x00F5
+
+    def window_text(hwnd) -> str:
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value or ""
+
+    def class_name(hwnd) -> str:
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        return buf.value or ""
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def each_top(hwnd, _lparam):
+        nonlocal clicked
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = window_text(hwnd)
+        body_parts = [title]
+        buttons: List[Tuple[object, str]] = []
+
+        def collect(child, _lp):
+            body_parts.append(window_text(child))
+            if class_name(child).lower() == "button":
+                buttons.append((child, window_text(child)))
+            return True
+
+        user32.EnumChildWindows(hwnd, WNDENUMPROC(collect), 0)
+        body = " ".join(body_parts)
+        if not installer_prompt_looks_like_overwrite(title, body):
+            return True
+        preferred = [item for item in buttons if installer_button_is_confirm_all(item[1])]
+        fallback = [item for item in buttons if installer_button_is_confirm(item[1])]
+        for child, _caption in (preferred or fallback):
+            user32.PostMessageW(child, BM_CLICK, 0, 0)
+            clicked += 1
+            break
+        return True
+
+    try:
+        user32.EnumWindows(WNDENUMPROC(each_top), 0)
+    except Exception:  # noqa: BLE001
+        return clicked
+    return clicked
+
 
 def _run_quiet(args: Sequence[str], timeout: int = 600,
                on_tick: Optional[Callable[[float, int], None]] = None) -> int:
@@ -1545,6 +1652,10 @@ def _run_quiet(args: Sequence[str], timeout: int = 600,
             try:
                 return process.wait(timeout=min(_WAIT_POLL_SECONDS, remaining))
             except subprocess.TimeoutExpired:
+                try:
+                    _dismiss_installer_dialogs()
+                except Exception:  # noqa: BLE001
+                    pass
                 if on_tick is not None:
                     try:
                         on_tick(time.monotonic() - started, timeout)
@@ -2878,7 +2989,11 @@ class RuntimeProvisioner:
         # Ступени 2-3 требуют Windows: там живут wextract, expand и msiexec.
         if not IS_WINDOWS:
             return bool(_find_file(destination, wanted)) if wanted else bool(_has_files(destination))
-        staging = cmdline_safe_dir(destination) or destination
+        parent = os.path.dirname(os.path.abspath(destination)) or None
+        unique = tempfile.mkdtemp(
+            prefix="pblzwx_",
+            dir=parent if parent and os.path.isdir(parent) else None)
+        staging = cmdline_safe_dir(unique) or unique
         source = archive
         if not is_cmdline_safe(source):
             shortened = short_path(source)
@@ -2893,10 +3008,10 @@ class RuntimeProvisioner:
                 self._expand_payloads(staging, wanted)
                 if (bool(_find_file(staging, wanted)) if wanted else _has_files(staging)):
                     break
-            if not _same_dir(staging, destination):
-                merge_tree(staging, destination)
+            merge_tree(staging, destination)
         finally:
-            if not _same_dir(staging, destination):
+            shutil.rmtree(unique, ignore_errors=True)
+            if not _same_dir(staging, unique):
                 shutil.rmtree(staging, ignore_errors=True)
         self._expand_payloads(destination, wanted)
         return bool(_find_file(destination, wanted)) if wanted else bool(_has_files(destination))
