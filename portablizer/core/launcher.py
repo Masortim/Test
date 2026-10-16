@@ -278,6 +278,11 @@ def _runtime_check_block(cfg: LauncherConfig) -> str:
         dll = _ascii_token(item.get("dll", ""))
         if not dll:
             continue
+        # api-ms-win-crt-* is an API Set contract, not a file.  Looking for
+        # it in System32 always fails on Windows 10/11 and pops a false
+        # "install Visual C++ 2015-2022" warning.  ucrtbase.dll is the payload.
+        if dll.lower().startswith("api-ms-win-crt-"):
+            continue
         title = ascii_display(item.get("title", ""),
                               fallback="Microsoft runtime package")
         url = _ascii_token(item.get("url", ""))
