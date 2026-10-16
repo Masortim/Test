@@ -3127,6 +3127,18 @@ class ProgressWiringTests(unittest.TestCase):
 class DxsetupCommandTests(unittest.TestCase):
     """DXSETUP.exe понимает только /silent — иначе окно с ошибкой."""
 
+    def setUp(self):
+        # Глобальный счётчик IFEO не должен протекать между тестами —
+        # на Windows-раннере это ломает соседние проверки.
+        self._depth = redist._GUARD_DEPTH
+        self._helper = redist._GUARD_HELPER
+        redist._GUARD_DEPTH = 0
+        redist._GUARD_HELPER = ""
+
+    def tearDown(self):
+        redist._GUARD_DEPTH = self._depth
+        redist._GUARD_HELPER = self._helper
+
     def test_quiet_and_s_are_rewritten_to_silent(self):
         path = r"C:\game\_CommonRedist\DirectX\DXSETUP.exe"
         self.assertTrue(redist.is_dxsetup_image(path))
@@ -3169,10 +3181,11 @@ class DxsetupCommandTests(unittest.TestCase):
         self.assertNotIn("args(1)", text)
 
     def test_guard_is_a_noop_off_windows(self):
-        guard = redist.DxsetupSilentGuard()
-        self.assertFalse(guard.install())
-        self.assertFalse(guard.active)
-        guard.remove()  # не должно бросать
+        with mock.patch.object(redist, "IS_WINDOWS", False):
+            guard = redist.DxsetupSilentGuard()
+            self.assertFalse(guard.install())
+            self.assertFalse(guard.active)
+            guard.remove()  # не должно бросать
 
     def test_guard_writes_helper_and_ifeo_debugger(self):
         with tempfile.TemporaryDirectory() as temp:
