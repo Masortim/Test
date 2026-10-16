@@ -2918,6 +2918,35 @@ class GameLauncherHandoffTests(unittest.TestCase):
         # Ни одного досрочного выхода: полоса ожидания честно дошла до конца.
         self.assertGreaterEqual(waited, 90)
 
+    def test_hidden_tray_window_is_not_a_leftover(self):
+        """Ollama-style tray icon: no visible main window, but a hidden HWND.
+
+        The user is still using the app (Open Ollama, quit, …).  Killing it
+        after idle_grace froze the tray and made the menu do nothing.
+        """
+        calls = {"n": 0}
+
+        def fake_list(_root):
+            calls["n"] += 1
+            return [(10, self.GAME_IMAGE)] if calls["n"] < 40 else []
+
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher, "_portable_process_list",
+                                  side_effect=fake_list), \
+                mock.patch.object(exe_launcher, "_visible_window_pids",
+                                  return_value={10}), \
+                mock.patch("time.sleep"):
+            waited = exe_launcher._wait_for_portable_processes(
+                Path(r"C:\Games\Portable"),
+                settings={"spawn_grace": 0.0, "idle_grace": 3.0,
+                          "max_wait": 86400.0})
+        self.assertGreaterEqual(waited, 30)
+
+    def test_job_object_allows_electron_to_break_away(self):
+        source = Path(exe_launcher.__file__).read_text(encoding="utf-8")
+        self.assertIn("JOB_OBJECT_LIMIT_BREAKAWAY_OK", source)
+        self.assertIn("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", source)
+
     def test_windowless_leftover_only_gets_the_idle_grace(self):
         """Фоновый процесс без окна не должен держать папку сутками.
 
@@ -3179,6 +3208,8 @@ class FolderReleaseTests(unittest.TestCase):
         # Фоновые остатки закрываются, а не переживают лончер.
         self.assertIn("CloseMainWindow", bat)
         self.assertIn("$p.Kill()", bat)
+        self.assertIn("PortableWins", bat)
+        self.assertIn("HasUi", bat)
 
     def test_stop_script_is_ascii_and_prefers_the_exe_launcher(self):
         cfg = launcher_mod.LauncherConfig(

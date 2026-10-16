@@ -1100,8 +1100,10 @@ goto :eof
 rem Waits while the program is really being used, then frees the folder.
 rem
 rem Two rules, and the second one is what makes the folder deletable again:
-rem   * a process from this folder that owns a visible window means the user
-rem     is still working - wait as long as it takes;
+rem   * a process from this folder that owns ANY top-level window (visible
+rem     or hidden) means the user is still working - wait as long as it takes.
+rem     A tray icon (Ollama and similar) has no MainWindowHandle but still
+rem     owns a hidden HWND; that is not a leftover.
 rem   * a process WITHOUT any window (updater, crash handler, silent helper)
 rem     only gets PORTABLE_IDLE_GRACE seconds. Afterwards it is asked to close
 rem     and then terminated. Otherwise it would keep running in the background
@@ -1109,7 +1111,7 @@ rem     after the program was closed, and Windows would refuse to delete the
 rem     portable folder.
 if not defined PORTABLE_IDLE_GRACE set "PORTABLE_IDLE_GRACE={idle_grace}"
 if not defined PORTABLE_KILL_LEFTOVERS set "PORTABLE_KILL_LEFTOVERS={kill_leftovers}"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$r=$env:PORTABLE_ROOT.TrimEnd('\')+'\'; function GetPortableProcesses(){{ $a=@(); foreach($p in [Diagnostics.Process]::GetProcesses()){{ if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $a+=$p }} }} }}; return $a }}; $grace=8; $idle=[int]$env:PORTABLE_IDLE_GRACE; if($idle -le 0){{ $idle=20 }}; $t=0; $seen=$false; $q=0; while($t -lt 86400){{ $ps=@(GetPortableProcesses); if($ps.Count -gt 0){{ $seen=$true; $vis=0; foreach($p in $ps){{ if($p.MainWindowHandle.ToInt64() -ne 0){{ $vis++ }} }}; if($vis -gt 0){{ $q=0 }} else {{ $q++; if($q -ge $idle){{ break }} }} }} elseif($seen -or $t -ge $grace){{ break }}; Start-Sleep -Seconds 1; $t++ }}; if($env:PORTABLE_KILL_LEFTOVERS -eq '0'){{ exit 0 }}; $ps=@(GetPortableProcesses); if($ps.Count -gt 0){{ foreach($p in $ps){{ try{{ [void]$p.CloseMainWindow() }}catch{{}} }}; Start-Sleep -Seconds 3; foreach($p in @(GetPortableProcesses)){{ try{{ $p.Kill() }}catch{{}} }} }}" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$r=$env:PORTABLE_ROOT.TrimEnd('\\')+'\\'; $cs='using System;using System.Runtime.InteropServices;public class PortableWins{{public delegate bool CB(IntPtr h,IntPtr l);[DllImport('+[char]34+'user32.dll'+[char]34+')]public static extern bool EnumWindows(CB p,IntPtr l);[DllImport('+[char]34+'user32.dll'+[char]34+')]public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);public static bool Has(int id){{bool f=false;EnumWindows((h,l)=>{{uint x;GetWindowThreadProcessId(h,out x);if((int)x==id)f=true;return true;}},IntPtr.Zero);return f;}}}}'; try{{ Add-Type -TypeDefinition $cs -ErrorAction Stop }}catch{{}}; function GetPortableProcesses(){{ $a=@(); foreach($p in [Diagnostics.Process]::GetProcesses()){{ if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $a+=$p }} }} }}; return $a }}; function HasUi($p){{ if($p.MainWindowHandle.ToInt64() -ne 0){{ return $true }}; try{{ return [PortableWins]::Has($p.Id) }}catch{{ return $false }} }}; $grace=8; $idle=[int]$env:PORTABLE_IDLE_GRACE; if($idle -le 0){{ $idle=20 }}; $t=0; $seen=$false; $q=0; while($t -lt 86400){{ $ps=@(GetPortableProcesses); if($ps.Count -gt 0){{ $seen=$true; $vis=0; foreach($p in $ps){{ if(HasUi $p){{ $vis++ }} }}; if($vis -gt 0){{ $q=0 }} else {{ $q++; if($q -ge $idle){{ break }} }} }} elseif($seen -or $t -ge $grace){{ break }}; Start-Sleep -Seconds 1; $t++ }}; if($env:PORTABLE_KILL_LEFTOVERS -eq '0'){{ exit 0 }}; $ps=@(GetPortableProcesses); if($ps.Count -gt 0){{ foreach($p in $ps){{ try{{ [void]$p.CloseMainWindow() }}catch{{}} }}; Start-Sleep -Seconds 3; foreach($p in @(GetPortableProcesses)){{ try{{ $p.Kill() }}catch{{}} }} }} }}" >nul 2>&1
 rem The temp folder of the portable app must not outlive the session: the
 rem files installers unpack there (fonts above all) are picked up by Windows
 rem services and keep the whole folder locked long after the program is gone.

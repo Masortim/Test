@@ -2405,12 +2405,17 @@ def _portable_processes(root: Path) -> int:
 
 
 def _visible_window_pids() -> "set[int]":
-    """PIDs that own at least one visible top-level window.
+    """PIDs that own a UI - a visible window *or* a hidden top-level one.
 
-    A program the user is actually looking at must never be killed, no matter
-    how long it runs.  A process without any window, on the other hand, is
-    either a crash handler, an updater or a leftover service - exactly the
-    kind of thing that keeps the portable folder undeletable.
+    A program the user is actually looking at must never be killed.  The
+    same is true of a tray application (Ollama, messengers, GPU overlays):
+    it has no visible main window, ``MainWindowHandle`` is zero, but it
+    still owns a hidden top-level HWND for the notification icon.  Treating
+    that as a leftover used to kill the app ~20 s after start - the tray
+    icon froze and "Open …" did nothing.
+
+    A process with *no* top-level window at all is a crash handler, an
+    updater or a silent helper - those still get ``idle_grace``.
     """
     if not IS_WINDOWS:
         return set()
@@ -2424,11 +2429,12 @@ def _visible_window_pids() -> "set[int]":
             wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         def collect(hwnd, _lparam):  # pragma: no cover - needs a desktop
-            if user32.IsWindowVisible(hwnd):
-                pid = wintypes.DWORD()
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if pid.value:
-                    pids.add(int(pid.value))
+            # Hidden top-level windows count: that is how a tray icon lives.
+            # Message-only windows (HWND_MESSAGE) are not enumerated here.
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value:
+                pids.add(int(pid.value))
             return True
 
         user32.EnumWindows(callback_type(collect), 0)
@@ -3203,7 +3209,9 @@ def _wait_for_portable_processes(root: Path, grace: float = 6.0,
     launcher alive for up to 24 hours, and the launcher EXE itself sits inside
     ``App``: the user closed the program but could not delete the folder.
     Such windowless stragglers now only get ``idle_grace`` seconds, after
-    which the caller shuts them down.
+    which the caller shuts them down.  A tray icon (hidden top-level
+    window, no ``MainWindowHandle``) is *not* windowless: it is the
+    program the user is still using.
     """
     if not IS_WINDOWS:
         return 0
@@ -3406,6 +3414,13 @@ class _JobObject:
 
             JobObjectExtendedLimitInformation = 9
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+            # Chromium/Electron (Ollama, OpenCode, …) spawn GPU/renderer
+            # processes with CREATE_BREAKAWAY_FROM_JOB.  Without BREAKAWAY_OK
+            # that CreateProcess fails: the tray icon is alive but "Open
+            # Ollama" never shows a window and the UI then stops responding.
+            # Children that do break away are still found by image path and
+            # closed in release_portable_folder.
+            JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 
             class IO_COUNTERS(ctypes.Structure):
                 _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
@@ -3440,8 +3455,9 @@ class _JobObject:
             if not handle:
                 return
             info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-            info.BasicLimitInformation.LimitFlags = \
+            info.BasicLimitInformation.LimitFlags = (
                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                | JOB_OBJECT_LIMIT_BREAKAWAY_OK)
             if not kernel32.SetInformationJobObject(
                     handle, JobObjectExtendedLimitInformation,
                     ctypes.byref(info), ctypes.sizeof(info)):
