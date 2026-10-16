@@ -2987,7 +2987,7 @@ class GameLauncherHandoffTests(unittest.TestCase):
     def test_webview2_bridge_points_at_host_edge_runtime(self):
         with tempfile.TemporaryDirectory() as temp:
             host = Path(temp, "HostLocal")
-            runtime = host / "Microsoft" / "EdgeWebView" / "Application" / "1.2.3"
+            runtime = host / "Microsoft" / "EdgeWebView" / "Application" / "9.9.9"
             runtime.mkdir(parents=True)
             (runtime / "msedgewebview2.exe").write_bytes(b"MZ")
             portable = Path(temp, "Ollama_Portable")
@@ -3001,7 +3001,12 @@ class GameLauncherHandoffTests(unittest.TestCase):
                 "LOCALAPPDATA": str(local),
             }
             with mock.patch.object(exe_launcher, "_junction_directory",
-                                   return_value=True) as junction:
+                                   return_value=True) as junction, \
+                    mock.patch.dict(os.environ, {
+                        "ProgramFiles": str(Path(temp, "no-pf")),
+                        "ProgramFiles(x86)": str(Path(temp, "no-pf86")),
+                        "ProgramW6432": str(Path(temp, "no-pf64")),
+                    }, clear=False):
                 patched = exe_launcher.apply_webview2_bridge(
                     env, gui, host_localappdata=host)
             self.assertEqual(
