@@ -2947,6 +2947,24 @@ class GameLauncherHandoffTests(unittest.TestCase):
         self.assertIn("JOB_OBJECT_LIMIT_BREAKAWAY_OK", source)
         self.assertIn("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", source)
 
+    def test_electron_host_gets_sandbox_off_flags(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            (app / "chrome_elf.dll").write_bytes(b"MZ")
+            gui = app / "ollama app.exe"
+            gui.write_bytes(b"MZ" + b"\x00" * (9 * 1024 * 1024))
+            cli = app / "ollama.exe"
+            cli.write_bytes(b"MZ" + b"\x00" * 4096)
+            self.assertTrue(exe_launcher.needs_electron_sandbox_off(gui))
+            self.assertFalse(exe_launcher.needs_electron_sandbox_off(cli))
+            command = exe_launcher.with_electron_flags([str(gui)], gui)
+            self.assertEqual(command[0], str(gui))
+            self.assertIn("--no-sandbox", command)
+            self.assertIn("--disable-gpu-sandbox", command)
+            skipped = exe_launcher.with_electron_flags([str(cli)], cli)
+            self.assertEqual(skipped, [str(cli)])
+
     def test_electron_and_ollama_do_not_join_the_kill_job(self):
         with tempfile.TemporaryDirectory() as temp:
             app = Path(temp, "App")
@@ -3246,6 +3264,7 @@ class FolderReleaseTests(unittest.TestCase):
         self.assertIn("HasUi", bat)
         self.assertIn("FindWindowEx", bat)
         self.assertIn("ollama", bat)
+        self.assertNotIn("USERNAME=Portable", bat)
 
     def test_stop_script_is_ascii_and_prefers_the_exe_launcher(self):
         cfg = launcher_mod.LauncherConfig(
