@@ -53,6 +53,7 @@ Portablizer собирается в один EXE, а разбор PE здесь 
 """
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import shutil
@@ -1701,6 +1702,252 @@ def _dismiss_installer_dialogs() -> int:
     return clicked
 
 
+# =============================================================================
+#  DXSETUP: неверная командная строка не должна возникать вовсе
+# =============================================================================
+#
+# DXSETUP.exe понимает ровно ``/silent``. Установщик игры часто запускает
+# его с ``/quiet``, ``/q``, ``/S`` или ``/norestart`` — тогда появляется
+# MessageBox «Установка DirectX — Неверная операция командной строки».
+# Кликать OK — это запасной путь. Правильное решение: подменить аргументы
+# **до** того, как DXSETUP их разберёт.
+#
+# 1. Любой наш запуск (``_run_quiet``, тихая установка) принудительно
+#    сводится к ``DXSETUP.exe /silent``.
+# 2. Пока идёт сборка, Image File Execution Options перехватывает *чужие*
+#    запуски (вложенный DXSETUP установщика игры, в том числе из
+#    ``directx_*_redist.exe``): Windows стартует helper, а тот вызывает
+#    настоящий DXSETUP уже с ``/silent``. Окно не появляется, потому что
+#    неверных аргументов процесс никогда не видит.
+
+DXSETUP_IMAGE = "dxsetup.exe"
+DXSETUP_SILENT_SWITCH = "/silent"
+DXSETUP_IFEO_SUBKEY = (
+    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+    r"\Image File Execution Options\DXSETUP.exe"
+)
+DXSETUP_HELPER_NAME = "dxsetup-silent.vbs"
+#: 64- и 32-битный обзор реестра: 32-битный DXSETUP (июнь 2010 — такой)
+#: читает Wow6432Node.
+_IFEO_VIEWS = (0x0100, 0x0200)  # KEY_WOW64_64KEY, KEY_WOW64_32KEY
+
+_GUARD_DEPTH = 0
+_GUARD_HELPER = ""
+
+
+def is_dxsetup_image(path: str) -> bool:
+    """True, если это ``DXSETUP.exe`` (любой регистр, с путём или без)."""
+    name = str(path).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return name == DXSETUP_IMAGE
+
+
+def dxsetup_command_is_safe(args: Sequence[str]) -> bool:
+    """True, если DXSETUP не покажет «Неверная операция командной строки».
+
+    Пустой список ключей безопасен в смысле ошибки разбора, но открывает
+    мастер — для автоматической сборки это тоже неприемлемо, поэтому
+    безопасной считается только ровно ``/silent``.
+    """
+    extra = [str(item) for item in list(args)[1:] if str(item).strip()]
+    if len(extra) != 1:
+        return False
+    return extra[0].lower().lstrip("-/") == "silent"
+
+
+def coerce_dxsetup_command(args: Sequence[str]) -> List[str]:
+    """Любой запуск DXSETUP сводит к единственному допустимому ключу.
+
+    Чужие exe не трогает: ``expand``, ``msiexec``, установщик игры.
+    """
+    command = [str(item) for item in args]
+    if not command or not is_dxsetup_image(command[0]):
+        return command
+    return [command[0], DXSETUP_SILENT_SWITCH]
+
+
+def render_dxsetup_silent_helper() -> str:
+    """VBScript: запускает настоящий DXSETUP только с ``/silent``.
+
+    IFEO подставляет этот файл вместо ``DXSETUP.exe``, поэтому исходные
+    (часто неверные) ключи до процесса не доходят. Копия называется
+    ``_pblz_dxsetup.exe``, чтобы IFEO не перехватил её повторно.
+    """
+    lines = [
+        "Option Explicit",
+        "' Portablizer: DXSETUP.exe accepts only /silent.",
+        "' Image File Execution Options runs this instead of DXSETUP.",
+        "Dim args, real, dir, alias, sh, fso, rc",
+        "Set args = WScript.Arguments",
+        "If args.Count < 1 Then WScript.Quit 1",
+        "real = args(0)",
+        'Set fso = CreateObject("Scripting.FileSystemObject")',
+        "If Not fso.FileExists(real) Then WScript.Quit 1",
+        "dir = fso.GetParentFolderName(real)",
+        'If dir = "" Then dir = "."',
+        'alias = dir & "\\_pblz_dxsetup.exe"',
+        "On Error Resume Next",
+        "If fso.FileExists(alias) Then fso.DeleteFile alias, True",
+        "Err.Clear",
+        "fso.CopyFile real, alias, True",
+        "If Not fso.FileExists(alias) Then WScript.Quit 1",
+        'Set sh = CreateObject("WScript.Shell")',
+        "sh.CurrentDirectory = dir",
+        'rc = sh.Run("""" & alias & """ /silent", 0, True)',
+        "If fso.FileExists(alias) Then fso.DeleteFile alias, True",
+        "WScript.Quit rc",
+        "",
+    ]
+    return "\r\n".join(lines)
+
+
+def _ifeo_set_debugger(debugger: str) -> bool:
+    """Пишет IFEO Debugger для DXSETUP.exe в оба обзора реестра."""
+    try:
+        import winreg  # type: ignore
+    except ImportError:
+        return False
+    ok = False
+    for view in _IFEO_VIEWS:
+        try:
+            key = winreg.CreateKeyEx(
+                winreg.HKEY_LOCAL_MACHINE, DXSETUP_IFEO_SUBKEY, 0,
+                winreg.KEY_SET_VALUE | view)
+            try:
+                winreg.SetValueEx(key, "Debugger", 0, winreg.REG_SZ, debugger)
+            finally:
+                winreg.CloseKey(key)
+            ok = True
+        except OSError:
+            continue
+    return ok
+
+
+def _ifeo_clear_debugger() -> None:
+    """Убирает IFEO Debugger, не трогая чужие параметры ключа."""
+    try:
+        import winreg  # type: ignore
+    except ImportError:
+        return
+    for view in _IFEO_VIEWS:
+        try:
+            key = winreg.OpenKeyEx(
+                winreg.HKEY_LOCAL_MACHINE, DXSETUP_IFEO_SUBKEY, 0,
+                winreg.KEY_SET_VALUE | view)
+            try:
+                winreg.DeleteValue(key, "Debugger")
+            except OSError:
+                pass
+            finally:
+                winreg.CloseKey(key)
+        except OSError:
+            continue
+
+
+def _atexit_clear_dxsetup_ifeo() -> None:
+    """Если сборка умерла, DXSETUP на этой машине не должен остаться сломанным."""
+    global _GUARD_DEPTH, _GUARD_HELPER
+    if not _GUARD_DEPTH and not _GUARD_HELPER:
+        return
+    _GUARD_DEPTH = 0
+    _ifeo_clear_debugger()
+    if _GUARD_HELPER:
+        try:
+            os.remove(_GUARD_HELPER)
+        except OSError:
+            pass
+        _GUARD_HELPER = ""
+
+
+atexit.register(_atexit_clear_dxsetup_ifeo)
+
+
+class DxsetupSilentGuard:
+    """На время сборки любой DXSETUP.exe стартует только с ``/silent``.
+
+    Вложенность безопасна: несколько ``with`` делят один IFEO. Снимается
+    ключ, когда выходит последний. Вне Windows и без прав администратора
+    — пустая операция (тогда остаётся запасной автоклик OK).
+    """
+
+    def __init__(self, log=None) -> None:
+        self.log = log
+        self._held = False
+
+    @property
+    def active(self) -> bool:
+        return _GUARD_DEPTH > 0
+
+    def __enter__(self) -> "DxsetupSilentGuard":
+        self.install()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.remove()
+
+    def install(self) -> bool:
+        global _GUARD_DEPTH, _GUARD_HELPER
+        if self._held:
+            return self.active
+        if not IS_WINDOWS:
+            return False
+        if _GUARD_DEPTH > 0:
+            _GUARD_DEPTH += 1
+            self._held = True
+            return True
+        helper = self._write_helper()
+        if not helper:
+            return False
+        wscript = system_tool("wscript")
+        debugger = f'{wscript} //B //Nologo "{helper}"'
+        if not _ifeo_set_debugger(debugger):
+            try:
+                os.remove(helper)
+            except OSError:
+                pass
+            if self.log is not None:
+                self.log.debug(
+                    "Перехват DXSETUP.exe через IFEO недоступен (нет прав "
+                    "администратора). Чужой запуск с /quiet закрою по "
+                    "факту появления окна.")
+            return False
+        _GUARD_HELPER = helper
+        _GUARD_DEPTH = 1
+        self._held = True
+        if self.log is not None:
+            self.log.info(
+                "DXSETUP.exe: командная строка принудительно /silent "
+                "— окна «Неверная операция командной строки» не будет.")
+        return True
+
+    def remove(self) -> None:
+        global _GUARD_DEPTH, _GUARD_HELPER
+        if not self._held:
+            return
+        self._held = False
+        _GUARD_DEPTH = max(0, _GUARD_DEPTH - 1)
+        if _GUARD_DEPTH > 0:
+            return
+        _ifeo_clear_debugger()
+        if _GUARD_HELPER:
+            try:
+                os.remove(_GUARD_HELPER)
+            except OSError:
+                pass
+            _GUARD_HELPER = ""
+
+    @staticmethod
+    def _write_helper() -> str:
+        try:
+            folder = _public_temp_root()
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, DXSETUP_HELPER_NAME)
+            with open(path, "w", encoding="ascii", newline="") as handle:
+                handle.write(render_dxsetup_silent_helper())
+            return path
+        except OSError:
+            return ""
+
+
 def _run_quiet(args: Sequence[str], timeout: int = 600,
                on_tick: Optional[Callable[[float, int], None]] = None) -> int:
     """Запускает внешний инструмент (expand/msiexec/DXSETUP) без окна.
@@ -1714,6 +1961,7 @@ def _run_quiet(args: Sequence[str], timeout: int = 600,
     """
     if not IS_WINDOWS:
         return 1
+    args = coerce_dxsetup_command(list(args))
     flags = 0x08000000  # CREATE_NO_WINDOW
     try:
         process = subprocess.Popen(
