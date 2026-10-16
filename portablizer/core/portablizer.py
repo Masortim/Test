@@ -3926,9 +3926,16 @@ class Portablizer:
         main_dir = os.path.dirname(main_abs)
         main_base = os.path.basename(main_abs).lower()
         electron_host = (
-            main_base.endswith(" app.exe")
-            or os.path.isfile(os.path.join(main_dir, "chrome_elf.dll"))
+            os.path.isfile(os.path.join(main_dir, "chrome_elf.dll"))
+            or os.path.isfile(os.path.join(main_dir, "libcef.dll"))
             or os.path.isfile(os.path.join(main_dir, "resources", "app.asar"))
+        )
+        webview2_host = (
+            not electron_host
+            and (
+                os.path.isfile(os.path.join(main_dir, "WebView2Loader.dll"))
+                or (main_base.endswith(" app.exe") and "ollama" in main_base)
+            )
         )
         if electron_host and not main_base.endswith("ollama.exe"):
             extra_env.setdefault("ELECTRON_NO_SANDBOX", "1")
@@ -3938,6 +3945,11 @@ class Portablizer:
                 "--disable-gpu-sandbox",
                 "--disable-features=RendererCodeIntegrity",
             ]
+        if webview2_host:
+            extra_env.setdefault(
+                "WEBVIEW2_USER_DATA_FOLDER",
+                "%PORTABLE_ROOT%\\PortableData\\WebView2",
+            )
 
         cfg = launcher_mod.LauncherConfig(
             app_name=name,

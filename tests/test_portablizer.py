@@ -2965,6 +2965,58 @@ class GameLauncherHandoffTests(unittest.TestCase):
             skipped = exe_launcher.with_electron_flags([str(cli)], cli)
             self.assertEqual(skipped, [str(cli)])
 
+    def test_real_ollama_gui_is_webview2_not_electron(self):
+        """OllamaSetup.exe ships a Go+WebView2 tray, not chrome_elf.
+
+        Passing --no-sandbox to ollama app.exe is what left the tray icon
+        alive while Open / Logs / Settings / Quit did nothing.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            gui = app / "ollama app.exe"
+            gui.write_bytes(b"MZ" + b"\x00" * (9 * 1024 * 1024))
+            (app / "ollama.exe").write_bytes(b"MZ")
+            self.assertFalse(exe_launcher.is_electron_tree(app))
+            self.assertFalse(exe_launcher.needs_electron_sandbox_off(gui))
+            self.assertEqual(
+                exe_launcher.with_electron_flags([str(gui)], gui), [str(gui)])
+            self.assertTrue(exe_launcher.needs_webview2_bridge(gui))
+            self.assertFalse(exe_launcher.should_use_job(gui))
+
+    def test_webview2_bridge_points_at_host_edge_runtime(self):
+        with tempfile.TemporaryDirectory() as temp:
+            host = Path(temp, "HostLocal")
+            runtime = host / "Microsoft" / "EdgeWebView" / "Application" / "1.2.3"
+            runtime.mkdir(parents=True)
+            (runtime / "msedgewebview2.exe").write_bytes(b"MZ")
+            portable = Path(temp, "Ollama_Portable")
+            local = portable / "PortableData" / "AppData" / "Local"
+            local.mkdir(parents=True)
+            gui = Path(temp, "App", "ollama app.exe")
+            gui.parent.mkdir(parents=True, exist_ok=True)
+            gui.write_bytes(b"MZ")
+            env = {
+                "PORTABLE_ROOT": str(portable),
+                "LOCALAPPDATA": str(local),
+            }
+            with mock.patch.object(exe_launcher, "_junction_directory",
+                                   return_value=True) as junction:
+                patched = exe_launcher.apply_webview2_bridge(
+                    env, gui, host_localappdata=host)
+            self.assertEqual(
+                patched["WEBVIEW2_BROWSER_EXECUTABLE_FOLDER"], str(runtime))
+            self.assertTrue(
+                patched["WEBVIEW2_USER_DATA_FOLDER"].endswith("WebView2"))
+            self.assertTrue(junction.called)
+
+    def test_launch_bat_bridges_host_webview2(self):
+        bat = render_bat(LauncherConfig(
+            app_name="Ollama", target_exe_rel="App/ollama app.exe"))
+        self.assertIn("PORTABLE_HOST_LOCALAPPDATA", bat)
+        self.assertIn("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", bat)
+        self.assertIn("mklink /J", bat)
+
     def test_electron_and_ollama_do_not_join_the_kill_job(self):
         with tempfile.TemporaryDirectory() as temp:
             app = Path(temp, "App")
