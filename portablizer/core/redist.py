@@ -1531,6 +1531,30 @@ _OVERWRITE_HINTS = (
     "do you want to", "хотите",
 )
 
+# DXSETUP / старый vcredist на «не тот» ключ показывают MessageBox и ждут
+# мышку. Установщик игры часто запускает вложенный DXSETUP со своими
+# аргументами — тогда то же окно всплывает уже во время основной установки,
+# даже если предусловия Portablizer поставил правильно. Закрываем его сами.
+_COMMAND_ERROR_HINTS = (
+    "неверная операция командной строки",
+    "неверный параметр командной строки",
+    "invalid command line operation",
+    "invalid command-line operation",
+    "invalid command line parameter",
+    "invalid command-line parameter",
+    "command line option syntax error",
+    "command-line option syntax error",
+    "syntax error in command line",
+)
+#: Заголовок MessageBox DXSETUP (как на скриншоте: «Установка DirectX»).
+_DIRECTX_WINDOW_TITLES = (
+    "установка directx",
+    "directx setup",
+    "directx installation",
+    "installing directx",
+    "microsoft directx",
+)
+
 
 def installer_button_is_confirm_all(title: str) -> bool:
     """True for the IExpress «Yes To All» (and localised) button caption."""
@@ -1557,22 +1581,65 @@ def installer_prompt_looks_like_overwrite(title: str, body: str = "") -> bool:
     return any(hint in blob for hint in _OVERWRITE_HINTS)
 
 
-def _dismiss_installer_dialogs() -> int:
-    """Click Yes To All / Yes on leftover IExpress overwrite prompts.
+def installer_prompt_looks_like_command_error(title: str, body: str = "") -> bool:
+    """DXSETUP / vcredist «неверная операция командной строки».
 
-    CREATE_NO_WINDOW does not hide dialogs that wextract itself creates.
-    Returns how many buttons were clicked (0 on non-Windows).
+    Скриншот, ради которого это написано: заголовок «Установка DirectX»,
+    текст «Неверная операция командной строки.», кнопка OK. Английский
+    DXSETUP пишет «Invalid command line operation.»; старый vcredist —
+    «Command line option syntax error. Type Command /? for Help».
+    """
+    blob = f"{title or ''} {body or ''}".lower()
+    if not blob.strip():
+        return False
+    return any(hint in blob for hint in _COMMAND_ERROR_HINTS)
+
+
+def installer_prompt_looks_like_directx_notice(title: str, body: str = "") -> bool:
+    """Заголовок MessageBox DXSETUP («Установка DirectX» / «DirectX Setup»).
+
+    Прогресс установки DirectX — другое окно (полоса, иногда Cancel), его
+    мы не трогаем: кликаем только OK, и только если такая кнопка есть.
+    ``body`` принят для единообразия с соседними распознавателями.
+    """
+    heading = (title or "").replace("&", "").strip().lower()
+    if not heading:
+        return False
+    return any(needle in heading for needle in _DIRECTX_WINDOW_TITLES)
+
+
+def installer_prompt_should_dismiss(title: str, body: str = "") -> bool:
+    """True, если окно надо закрыть самим, не дожидаясь мышки."""
+    if installer_prompt_looks_like_overwrite(title, body):
+        return True
+    if installer_prompt_looks_like_command_error(title, body):
+        return True
+    return installer_prompt_looks_like_directx_notice(title, body)
+
+
+def _dismiss_installer_dialogs() -> int:
+    """Click through leftover installer MessageBoxes that block the build.
+
+    Two families, both of which CREATE_NO_WINDOW does not hide:
+
+    * IExpress/wextract «Do you want to overwrite the file …?» — Yes To All;
+    * DXSETUP / vcredist «Неверная операция командной строки» /
+      «Invalid command line operation» / «Command line option syntax error»
+      — OK (the dialog from the user's screenshot).
+
+    Returns how many buttons (or WM_CLOSE) were posted (0 on non-Windows).
     """
     if not IS_WINDOWS:
         return 0
     try:
         import ctypes
         from ctypes import wintypes
-    except ImportError:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
         return 0
-    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
     clicked = 0
     BM_CLICK = 0x00F5
+    WM_CLOSE = 0x0010
 
     def window_text(hwnd) -> str:
         length = user32.GetWindowTextLengthW(hwnd)
@@ -1605,14 +1672,26 @@ def _dismiss_installer_dialogs() -> int:
 
         user32.EnumChildWindows(hwnd, WNDENUMPROC(collect), 0)
         body = " ".join(body_parts)
-        if not installer_prompt_looks_like_overwrite(title, body):
+        if not installer_prompt_should_dismiss(title, body):
             return True
-        preferred = [item for item in buttons if installer_button_is_confirm_all(item[1])]
-        fallback = [item for item in buttons if installer_button_is_confirm(item[1])]
-        for child, _caption in (preferred or fallback):
-            user32.PostMessageW(child, BM_CLICK, 0, 0)
+        overwrite = installer_prompt_looks_like_overwrite(title, body)
+        command_error = installer_prompt_looks_like_command_error(title, body)
+        preferred = [item for item in buttons
+                     if installer_button_is_confirm_all(item[1])]
+        fallback = [item for item in buttons
+                    if installer_button_is_confirm(item[1])]
+        # Overwrite: Yes To All is the right answer. Command-line error and
+        # DirectX notices: OK. Never Cancel / No / Next.
+        targets = (preferred or fallback) if overwrite else (fallback or preferred)
+        if targets:
+            user32.PostMessageW(targets[0][0], BM_CLICK, 0, 0)
             clicked += 1
-            break
+        elif command_error:
+            # MessageBox without a reachable button: closing it equals OK.
+            # Not used for a bare DirectX title — that might be a progress
+            # window, and WM_CLOSE would cancel the install.
+            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            clicked += 1
         return True
 
     try:

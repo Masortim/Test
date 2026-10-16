@@ -4230,6 +4230,8 @@ class IexpressOverwriteDialogTests(unittest.TestCase):
         self.assertTrue(redist_mod.installer_button_is_confirm_all("&Yes To All"))
         self.assertTrue(redist_mod.installer_button_is_confirm_all("Да для всех"))
         self.assertTrue(redist_mod.installer_button_is_confirm("Yes"))
+        self.assertTrue(redist_mod.installer_button_is_confirm("OK"))
+        self.assertTrue(redist_mod.installer_button_is_confirm("ОК"))
         self.assertFalse(redist_mod.installer_button_is_confirm("No"))
         self.assertFalse(redist_mod.installer_button_is_confirm("Cancel"))
 
@@ -4244,6 +4246,30 @@ class IexpressOverwriteDialogTests(unittest.TestCase):
             redist_mod.installer_prompt_looks_like_overwrite("", body))
         self.assertFalse(
             redist_mod.installer_prompt_looks_like_overwrite("Notepad", "hello"))
+
+    def test_directx_command_line_error_from_screenshot_is_recognised(self):
+        """Окно «Установка DirectX / Неверная операция командной строки»."""
+        from portablizer.core import redist as redist_mod
+        title = "Установка DirectX"
+        body = "Неверная операция командной строки."
+        self.assertTrue(
+            redist_mod.installer_prompt_looks_like_command_error(title, body))
+        self.assertTrue(
+            redist_mod.installer_prompt_looks_like_directx_notice(title))
+        self.assertTrue(redist_mod.installer_prompt_should_dismiss(title, body))
+        self.assertTrue(redist_mod.installer_prompt_looks_like_command_error(
+            "DirectX Setup", "Invalid command line operation."))
+        self.assertTrue(redist_mod.installer_prompt_looks_like_command_error(
+            "Microsoft Visual C++ 2005 Redistributable",
+            "Command line option syntax error. Type Command /? for Help"))
+        self.assertFalse(
+            redist_mod.installer_prompt_looks_like_command_error(
+                "Notepad", "hello"))
+        self.assertFalse(
+            redist_mod.installer_prompt_should_dismiss("Notepad", "hello"))
+        self.assertFalse(
+            redist_mod.installer_prompt_looks_like_directx_notice(
+                "Portablizer"))
 
     def test_dismiss_is_a_noop_off_windows(self):
         from portablizer.core import redist as redist_mod
