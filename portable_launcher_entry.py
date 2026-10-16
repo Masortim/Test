@@ -713,7 +713,6 @@ def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
         "TMP": str(temp),
         "PROGRAMDATA": str(programdata),
         "PUBLIC": str(public),
-        "USERNAME": "Portable",
         "PORTABLE_APP": "1",
         "PORTABLE_ROOT": str(root),
         "PORTABLE_DOCUMENTS": str(userprofile / "Documents"),
@@ -730,6 +729,16 @@ def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
         if key:
             env[str(key)] = _expand_environment(value, env)
     return env
+
+
+def _electron_environment(env: Dict[str, str], target: Path) -> Dict[str, str]:
+    """Relax Chromium's sandbox when the target is an Electron host."""
+    if not needs_electron_sandbox_off(target):
+        return env
+    patched = dict(env)
+    patched["ELECTRON_NO_SANDBOX"] = "1"
+    patched["ELECTRON_DISABLE_SANDBOX"] = "1"
+    return patched
 
 
 # --- сквозные сохранения ------------------------------------------------------
@@ -2408,8 +2417,18 @@ def _portable_processes(root: Path) -> int:
 #: and renderer processes with CREATE_BREAKAWAY_FROM_JOB and often keep
 #: only a message-only HWND for the tray icon.
 _ELECTRON_MARKERS = frozenset({
-    "chrome_elf.dll", "libcef.dll", "nw.dll", "libGLESv2.dll",
+    "chrome_elf.dll", "libcef.dll", "nw.dll",
 })
+
+#: Chromium flags that let a portable Electron app (Ollama) actually open a
+#: window.  The renderer sandbox assumes a normal install layout and a job
+#: it owns; inside a portable folder "Open Ollama" then shows nothing and
+#: the tray icon stops responding.
+_ELECTRON_CLI_FLAGS = (
+    "--no-sandbox",
+    "--disable-gpu-sandbox",
+    "--disable-features=RendererCodeIntegrity",
+)
 
 _LEFTOVER_IMAGE_TOKENS = (
     "crashpad", "crashhandler", "unitycrash", "updater", "unins",
@@ -2425,7 +2444,14 @@ def is_electron_tree(directory: Path) -> bool:
         return False
     if names & _ELECTRON_MARKERS:
         return True
-    return "icudtl.dat" in names and "snapshot_blob.bin" in names
+    if "icudtl.dat" in names and "snapshot_blob.bin" in names:
+        return True
+    try:
+        if (directory / "resources" / "app.asar").is_file():
+            return True
+    except OSError:
+        return False
+    return False
 
 
 def should_use_job(target: Path) -> bool:
@@ -2442,6 +2468,33 @@ def should_use_job(target: Path) -> bool:
     if "ollama" in name and "setup" not in name:
         return False
     return not is_electron_tree(target.parent)
+
+
+def needs_electron_sandbox_off(target: Path) -> bool:
+    """True when ``target`` is the Electron/CEF host, not a sibling CLI.
+
+    ``ollama.exe`` (Go server) and ``ollama app.exe`` (Electron) live in the
+    same folder.  Chromium flags passed to the CLI make it exit; the GUI
+    host needs them or "Open Ollama" never creates a window.
+    """
+    name = target.name.casefold()
+    if name.endswith(" app.exe") or name in {"electron.exe", "nw.exe"}:
+        return True
+    if not is_electron_tree(target.parent):
+        return False
+    try:
+        return target.stat().st_size >= 8 * 1024 * 1024
+    except OSError:
+        return False
+
+
+def with_electron_flags(command: Sequence[str], target: Path) -> list[str]:
+    """Prepend Chromium sandbox-off switches after the executable."""
+    parts = [str(item) for item in command]
+    if not parts or not needs_electron_sandbox_off(target):
+        return parts
+    extra = [flag for flag in _ELECTRON_CLI_FLAGS if flag not in parts]
+    return [parts[0], *extra, *parts[1:]]
 
 
 def _is_interactive_image(image: str) -> bool:
@@ -5617,15 +5670,19 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # Kill-on-close job: nothing started from the portable folder may outlive
     # this launcher, otherwise the user cannot delete the folder afterwards.
     job = _JobObject(enabled=should_use_job(target))
+    env = _electron_environment(env, target)
     shell_folders.load()
     try:
         registry.load()
         try:
-            command = [
-                str(target),
-                *[str(arg) for arg in cfg.get("target_args", [])],
-                *forwarded,
-            ]
+            command = with_electron_flags(
+                [
+                    str(target),
+                    *[str(arg) for arg in cfg.get("target_args", [])],
+                    *forwarded,
+                ],
+                target,
+            )
             _run_log(root, "start: " + subprocess.list2cmdline(command)
                      + f" (cwd={target.parent}, elevated={_is_elevated()}, "
                      + f"job={'yes' if job.handle else 'no'})")

@@ -1281,6 +1281,12 @@ OpenCode всё заполняется само):
   ломает песочницу Chromium: значок в трее есть, «Open Ollama» ничего не
   открывает, затем меню перестаёт отвечать. Для деревьев с `chrome_elf.dll`
   / `ollama*.exe` job не создаётся; уборка по-прежнему идёт по пути exe.
+* **Песочница Chromium в портативе отключается.** «Open Ollama» создаёт
+  renderer с sandbox; в чужой папке он молча падает, окно не появляется,
+  трей зависает. Лончер передаёт `--no-sandbox` / `--disable-gpu-sandbox`
+  только хосту Electron (`ollama app.exe`, крупные exe рядом с
+  `chrome_elf.dll`), не CLI `ollama.exe`. `USERNAME` больше не подменяется
+  на `Portable` — из-за этого ломались WinRT и иконка в трее.
 * **Message-only окна (`HWND_MESSAGE`) считаются UI.** У иконки в трее
   часто нет обычного HWND, `EnumWindows` его не видит. Лончер и `Launch.bat`
   смотрят и туда, и не убивают процесс Ollama как «остаток».

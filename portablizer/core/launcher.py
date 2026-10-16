@@ -899,7 +899,6 @@ set "TMP=%PORTABLE_DATA%\Temp"
 set "PROGRAMDATA=%PORTABLE_DATA%\ProgramData"
 set "PUBLIC=%PORTABLE_DATA%\Public"
 set "PORTABLE_DOCUMENTS=%PORTABLE_DATA%\User\Documents"
-set "USERNAME=Portable"
 set "PORTABLE_APP=1"
 
 rem HOMEDRIVE/HOMEPATH only make sense for a real drive letter, never for UNC.
@@ -1784,7 +1783,6 @@ def main():
         "TEMP": temp, "TMP": temp,
         "PROGRAMDATA": programdata,
         "PUBLIC": public,
-        "USERNAME": "Portable",
         "PORTABLE_APP": "1",
     })
     if root[1:2] == ":":

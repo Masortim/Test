@@ -3920,15 +3920,35 @@ class Portablizer:
         launcher_target = next((t.rel_path for t in all_targets if t.role == "launcher"), "")
         config_target = next((t.rel_path for t in all_targets if t.role == "config"), "")
 
+        extra_env = dict(opts.extra_env)
+        target_args: List[str] = []
+        main_abs = os.path.join(portable_dir, main_exe_rel.replace("/", os.sep))
+        main_dir = os.path.dirname(main_abs)
+        main_base = os.path.basename(main_abs).lower()
+        electron_host = (
+            main_base.endswith(" app.exe")
+            or os.path.isfile(os.path.join(main_dir, "chrome_elf.dll"))
+            or os.path.isfile(os.path.join(main_dir, "resources", "app.asar"))
+        )
+        if electron_host and not main_base.endswith("ollama.exe"):
+            extra_env.setdefault("ELECTRON_NO_SANDBOX", "1")
+            extra_env.setdefault("ELECTRON_DISABLE_SANDBOX", "1")
+            target_args = [
+                "--no-sandbox",
+                "--disable-gpu-sandbox",
+                "--disable-features=RendererCodeIntegrity",
+            ]
+
         cfg = launcher_mod.LauncherConfig(
             app_name=name,
             target_exe_rel=main_exe_rel.replace("\\", "/"),
+            target_args=target_args,
             data_dir_name="PortableData",
             apply_registry=has_registry,
             registry_keys=list(capture.keys) if capture else [],
             registry_created_keys=list(capture.created_keys) if capture else [],
             registry_has_root_token=bool(capture and capture.has_root_token),
-            extra_env=opts.extra_env,
+            extra_env=extra_env,
             path_prepend=path_prepend,
             redirect_known_folders=True,
             targets=all_targets,
