@@ -3523,6 +3523,12 @@ class Portablizer:
                 s += 100
             if role == "main":
                 s += 30
+            # Electron tray hosts are often "Name app.exe" next to chrome_elf.dll
+            # (Ollama). Prefer that over the CLI/server sibling of the same name.
+            if base.endswith(" app.exe"):
+                s += 40
+            if os.path.isfile(os.path.join(os.path.dirname(p), "chrome_elf.dll")):
+                s += 25
             # exe в корне App/ или в App/bin обычно важнее
             s -= depth * 5
             s += min(30, int(size / (1024 * 1024)))

@@ -2404,18 +2404,70 @@ def _portable_processes(root: Path) -> int:
     return len(_portable_process_list(root))
 
 
+#: Files that mark an Electron/CEF/NW.js tree.  Those runtimes spawn GPU
+#: and renderer processes with CREATE_BREAKAWAY_FROM_JOB and often keep
+#: only a message-only HWND for the tray icon.
+_ELECTRON_MARKERS = frozenset({
+    "chrome_elf.dll", "libcef.dll", "nw.dll", "libGLESv2.dll",
+})
+
+_LEFTOVER_IMAGE_TOKENS = (
+    "crashpad", "crashhandler", "unitycrash", "updater", "unins",
+)
+
+
+def is_electron_tree(directory: Path) -> bool:
+    """True when ``directory`` looks like an Electron/CEF/NW.js app folder."""
+    try:
+        names = {item.name.casefold() for item in directory.iterdir()
+                 if item.is_file()}
+    except OSError:
+        return False
+    if names & _ELECTRON_MARKERS:
+        return True
+    return "icudtl.dat" in names and "snapshot_blob.bin" in names
+
+
+def should_use_job(target: Path) -> bool:
+    """False for Electron/Ollama: a kill-on-close job breaks their windows.
+
+    Chromium creates its own job and GPU/renderer processes with
+    ``CREATE_BREAKAWAY_FROM_JOB``.  Even with BREAKAWAY_OK, starting the
+    main process *suspended* (so it can be assigned to our job) races the
+    sandbox setup: the tray icon appears, "Open Ollama" never shows a
+    window, then the UI stops responding.  Cleanup still finds those
+    processes by image path.
+    """
+    name = target.name.casefold()
+    if "ollama" in name and "setup" not in name:
+        return False
+    return not is_electron_tree(target.parent)
+
+
+def _is_interactive_image(image: str) -> bool:
+    """True for a tray/Electron app that must not be idle-killed."""
+    name = Path(image).name.casefold()
+    if any(token in name for token in _LEFTOVER_IMAGE_TOKENS):
+        return False
+    if "ollama" in name:
+        return True
+    try:
+        return is_electron_tree(Path(image).parent)
+    except OSError:
+        return False
+
+
 def _visible_window_pids() -> "set[int]":
-    """PIDs that own a UI - a visible window *or* a hidden top-level one.
+    """PIDs that own a UI - a visible window, a hidden one, or HWND_MESSAGE.
 
     A program the user is actually looking at must never be killed.  The
     same is true of a tray application (Ollama, messengers, GPU overlays):
-    it has no visible main window, ``MainWindowHandle`` is zero, but it
-    still owns a hidden top-level HWND for the notification icon.  Treating
-    that as a leftover used to kill the app ~20 s after start - the tray
-    icon froze and "Open …" did nothing.
+    it has no visible main window, ``MainWindowHandle`` is zero, and the
+    notify-icon HWND is often a *message-only* window.  ``EnumWindows``
+    does not see those; ``FindWindowEx(HWND_MESSAGE, …)`` does.
 
-    A process with *no* top-level window at all is a crash handler, an
-    updater or a silent helper - those still get ``idle_grace``.
+    A process with *no* window at all is a crash handler, an updater or a
+    silent helper - those still get ``idle_grace``.
     """
     if not IS_WINDOWS:
         return set()
@@ -2429,8 +2481,6 @@ def _visible_window_pids() -> "set[int]":
             wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         def collect(hwnd, _lparam):  # pragma: no cover - needs a desktop
-            # Hidden top-level windows count: that is how a tray icon lives.
-            # Message-only windows (HWND_MESSAGE) are not enumerated here.
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if pid.value:
@@ -2438,6 +2488,21 @@ def _visible_window_pids() -> "set[int]":
             return True
 
         user32.EnumWindows(callback_type(collect), 0)
+
+        # Message-only windows (HWND_MESSAGE == -3) are where many tray
+        # icons listen.  EnumWindows never lists them.
+        FindWindowExW = user32.FindWindowExW
+        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+        hwnd_message = wintypes.HWND(-3)
+        hwnd = wintypes.HWND()
+        while True:
+            hwnd = FindWindowExW(hwnd_message, hwnd, None, None)
+            if not hwnd:
+                break
+            pid = wintypes.DWORD()
+            GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value:
+                pids.add(int(pid.value))
         return pids
     except Exception:
         return set()
@@ -3094,7 +3159,8 @@ def release_open_files(root: Path, budget: float = 8.0) -> "list[str]":
     background = sorted({
         pid for pid, _handle, _path, image in items
         if _image_name(image).casefold() not in PROTECTED_IMAGES
-        and pid not in visible and not _installed_software_image(image)})
+        and pid not in visible and not _is_interactive_image(image)
+        and not _installed_software_image(image)})
     if background:
         names = sorted({_image_name(image) or f"pid {pid}"
                         for pid, _h, _p, image in items
@@ -3240,7 +3306,8 @@ def _wait_for_portable_processes(root: Path, grace: float = 6.0,
         if now >= deadline:
             return waited
         visible = _visible_window_pids()
-        if any(pid in visible for pid, _ in running):
+        if any(pid in visible or _is_interactive_image(image)
+               for pid, image in running):
             idle_since = None
         elif idle_since is None:
             idle_since = now
@@ -3402,11 +3469,13 @@ class _JobObject:
     ``WM_CLOSE``), Windows destroys the job together with its last handle and
     the folder is free again.  Nothing from the portable folder can outlive
     the launcher any more.
+
+    Pass ``enabled=False`` for Electron/Ollama: see :func:`should_use_job`.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, enabled: bool = True) -> None:
         self.handle = None
-        if not IS_WINDOWS:
+        if not enabled or not IS_WINDOWS:
             return
         try:
             import ctypes
@@ -5547,7 +5616,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     shutdown = shutdown_settings(cfg)
     # Kill-on-close job: nothing started from the portable folder may outlive
     # this launcher, otherwise the user cannot delete the folder afterwards.
-    job = _JobObject()
+    job = _JobObject(enabled=should_use_job(target))
     shell_folders.load()
     try:
         registry.load()
