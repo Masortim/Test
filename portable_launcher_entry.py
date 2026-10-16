@@ -20,7 +20,7 @@ import sys
 import tempfile
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
 IS_WINDOWS = sys.platform.startswith("win")
@@ -2471,17 +2471,20 @@ def should_use_job(target: Path) -> bool:
 
 
 def needs_electron_sandbox_off(target: Path) -> bool:
-    """True when ``target`` is the Electron/CEF host, not a sibling CLI.
+    """True when ``target`` is a real Electron/CEF/NW host.
 
-    ``ollama.exe`` (Go server) and ``ollama app.exe`` (Electron) live in the
-    same folder.  Chromium flags passed to the CLI make it exit; the GUI
-    host needs them or "Open Ollama" never creates a window.
+    Ollama's ``ollama app.exe`` is a Go tray + WebView2 UI, not Electron.
+    Chromium switches passed to it are unknown arguments: the tray still
+    appears, then every menu item hangs.  Only trees with chrome_elf /
+    app.asar get those flags.
     """
     name = target.name.casefold()
-    if name.endswith(" app.exe") or name in {"electron.exe", "nw.exe"}:
+    if name in {"electron.exe", "nw.exe"}:
         return True
     if not is_electron_tree(target.parent):
         return False
+    if name.endswith(" app.exe"):
+        return True
     try:
         return target.stat().st_size >= 8 * 1024 * 1024
     except OSError:
@@ -2495,6 +2498,127 @@ def with_electron_flags(command: Sequence[str], target: Path) -> list[str]:
         return parts
     extra = [flag for flag in _ELECTRON_CLI_FLAGS if flag not in parts]
     return [parts[0], *extra, *parts[1:]]
+
+
+def needs_webview2_bridge(target: Path) -> bool:
+    """True for a WebView2 host (Ollama tray GUI, Wails, WinUI wrappers).
+
+    Opening a window talks to Edge WebView2.  The evergreen runtime lives
+    under the *host* ``%LOCALAPPDATA%\\Microsoft\\EdgeWebView``.  After the
+    portable launcher redirects LOCALAPPDATA, that lookup misses, the
+    tray menu still draws (native), and every item that should open a
+    window or the log folder hangs the icon.
+    """
+    try:
+        parent = target.parent
+        if (parent / "WebView2Loader.dll").is_file():
+            return True
+        if is_electron_tree(parent):
+            return False
+    except OSError:
+        pass
+    name = target.name.casefold()
+    return "ollama" in name and name.endswith(" app.exe")
+
+
+def discover_webview2_browser_folder(
+        host_localappdata: Optional[Path] = None) -> Optional[Path]:
+    """Newest installed Edge WebView2 ``Application\\<version>`` folder."""
+    roots: List[Path] = []
+    local = host_localappdata
+    if local is None:
+        raw = os.environ.get("LOCALAPPDATA") or ""
+        local = Path(raw) if raw else None
+    if local:
+        roots.append(local / "Microsoft" / "EdgeWebView" / "Application")
+    for key in ("ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"):
+        pf = os.environ.get(key) or ""
+        if pf:
+            roots.append(Path(pf) / "Microsoft" / "EdgeWebView" / "Application")
+    best: Optional[Path] = None
+    best_name = ""
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            for child in root.iterdir():
+                if not child.is_dir():
+                    continue
+                if not (child / "msedgewebview2.exe").is_file():
+                    continue
+                name = child.name
+                if name > best_name:
+                    best_name = name
+                    best = child
+        except OSError:
+            continue
+    return best
+
+
+def _junction_directory(link: Path, target: Path) -> bool:
+    """Point ``link`` at ``target`` (directory junction / symlink)."""
+    try:
+        if link.exists() or link.is_symlink():
+            return True
+        if not target.is_dir():
+            return False
+        link.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    try:
+        os.symlink(str(target), str(link), target_is_directory=True)
+        return True
+    except OSError:
+        pass
+    if not IS_WINDOWS:
+        return False
+    try:
+        creation = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, creationflags=creation, timeout=15,
+            check=False)
+        return completed.returncode == 0 and (link.exists() or link.is_symlink())
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def apply_webview2_bridge(env: Dict[str, str], target: Path,
+                          host_localappdata: Optional[Path] = None
+                          ) -> Dict[str, str]:
+    """Keep WebView2 able to find Edge after LOCALAPPDATA is redirected."""
+    if not needs_webview2_bridge(target):
+        return env
+    patched = dict(env)
+    local = Path(patched.get("LOCALAPPDATA") or "")
+    if local.name:
+        user_data = local.parent.parent / "WebView2"
+    else:
+        user_data = Path(patched.get("PORTABLE_ROOT") or ".") / "PortableData" / "WebView2"
+    try:
+        user_data.mkdir(parents=True, exist_ok=True)
+        patched.setdefault("WEBVIEW2_USER_DATA_FOLDER", str(user_data))
+    except OSError:
+        pass
+    host = host_localappdata
+    if host is None:
+        # os.environ still has the real profile; env already has the portable one.
+        raw = os.environ.get("LOCALAPPDATA") or ""
+        host = Path(raw) if raw else None
+    browser = discover_webview2_browser_folder(host)
+    if browser is not None:
+        patched.setdefault("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", str(browser))
+    portable_local = Path(patched.get("LOCALAPPDATA") or "")
+    if host and portable_local.name:
+        for relative in (
+            Path("Microsoft") / "EdgeWebView",
+            Path("Microsoft") / "EdgeUpdate",
+        ):
+            source = host / relative
+            dest = portable_local / relative
+            if source.is_dir():
+                _junction_directory(dest, source)
+    return patched
 
 
 def _is_interactive_image(image: str) -> bool:
@@ -5671,6 +5795,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # this launcher, otherwise the user cannot delete the folder afterwards.
     job = _JobObject(enabled=should_use_job(target))
     env = _electron_environment(env, target)
+    env = apply_webview2_bridge(env, target)
     shell_folders.load()
     try:
         registry.load()

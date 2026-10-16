@@ -883,6 +883,7 @@ rem the real Documents folder, the launcher writes inside the portable folder.
 rem Both have to end up in the same place, so the real path is captured here,
 rem while the variables below still point at this computer.
 set "PORTABLE_HOST_PROFILE=%USERPROFILE%"
+set "PORTABLE_HOST_LOCALAPPDATA=%LOCALAPPDATA%"
 set "PORTABLE_HOST_DOCUMENTS=%USERPROFILE%\Documents"
 rem On modern Windows the Documents folder is often moved into OneDrive. The
 rem EXE launcher asks the Known Folder API and is always right; this console
@@ -935,6 +936,19 @@ for %%D in (
   "%PORTABLE_REG_SESSION%"
   "%PORTABLE_REG_BACKUP%"
 ) do if not exist "%%~D" mkdir "%%~D" >nul 2>&1
+
+rem Edge WebView2 (Ollama tray GUI, Wails, ...) looks up the evergreen
+rem runtime under %LOCALAPPDATA%\Microsoft\EdgeWebView. After the redirect
+rem above that folder is empty, the tray still draws, and every menu item
+rem that should open a window hangs the icon. Junction the host runtime
+rem back in, and tell WebView2 where the browser bits live.
+if defined PORTABLE_HOST_LOCALAPPDATA if exist "%PORTABLE_HOST_LOCALAPPDATA%\Microsoft\EdgeWebView\" (
+  if not exist "%LOCALAPPDATA%\Microsoft" mkdir "%LOCALAPPDATA%\Microsoft" >nul 2>&1
+  if not exist "%LOCALAPPDATA%\Microsoft\EdgeWebView\" (
+    mklink /J "%LOCALAPPDATA%\Microsoft\EdgeWebView" "%PORTABLE_HOST_LOCALAPPDATA%\Microsoft\EdgeWebView" >nul 2>&1
+  )
+  for /d %%V in ("%PORTABLE_HOST_LOCALAPPDATA%\Microsoft\EdgeWebView\Application\*") do if exist "%%~fV\msedgewebview2.exe" set "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER=%%~fV"
+)
 
 if defined PORTABLE_RESET del /f /q "%PORTABLE_REG_SESSION%\*.reg" >nul 2>&1
 
