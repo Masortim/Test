@@ -2429,11 +2429,32 @@ class Portablizer:
         started = time.monotonic()
         last_work = started
         last_report = -1
+        dismissed = 0
+        last_dismiss_log = 0.0
         while proc.poll() is None:
             now = time.monotonic()
             if self.cancel.is_set():
                 self._stop_installer(proc)
                 raise RuntimeError("Установка отменена пользователем.")
+            # Установщик игры часто сам запускает вложенный DXSETUP со
+            # «своими» ключами — тогда всплывает «Установка DirectX /
+            # Неверная операция командной строки» и сборка ждёт мышку.
+            # Закрываем такие окна сами, не сбрасывая таймер паузы: клик
+            # по застрявшему диалогу — не признак работы установщика.
+            try:
+                clicked = redist_mod._dismiss_installer_dialogs()
+            except Exception:  # noqa: BLE001 — WinAPI не вправе ронять сборку
+                clicked = 0
+            if clicked:
+                dismissed += clicked
+                if now - last_dismiss_log >= 5.0:
+                    last_dismiss_log = now
+                    self.log.info(
+                        "  Закрыл служебное окно установщика "
+                        "(DirectX/VC++ «неверная операция командной "
+                        f"строки» и подобные). Таких окон за эту попытку: "
+                        f"{dismissed}."
+                    )
             if watchdog.poll(now):
                 last_work = now
             elapsed = now - started

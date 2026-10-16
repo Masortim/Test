@@ -335,6 +335,26 @@ class InstallWaitTests(unittest.TestCase):
         self.assertEqual(rc, engine_mod.redist_mod.TIMEOUT_EXIT_CODE)
         self.assertTrue(proc.killed)
 
+    def test_wait_loop_clicks_through_directx_warnings(self):
+        """DXSETUP «Неверная операция командной строки» закрывается сами."""
+        proc = _FakeProc()
+        clicks = []
+
+        def fake_dismiss() -> int:
+            clicks.append(1)
+            if len(clicks) >= 2:
+                proc.returncode = 0
+            return 1
+
+        with mock.patch.object(engine_mod.redist_mod,
+                               "_dismiss_installer_dialogs", fake_dismiss):
+            rc = self._run(proc, idle=8.0)
+        self.assertEqual(rc, 0)
+        self.assertFalse(proc.killed)
+        self.assertGreaterEqual(len(clicks), 2)
+        self.assertIn("служебное окно", self.engine.log.text.lower())
+        self.assertIn("directx", self.engine.log.text.lower())
+
     def test_the_hard_deadline_stops_even_a_busy_installer(self):
         """Потолок попытки — страховка от вечной работы, а не от тишины."""
         proc = _FakeProc()
