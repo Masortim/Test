@@ -1269,29 +1269,38 @@ class Portablizer:
             # сделает это сам — с окном и кнопкой «OK» на каждый пакет.
             self._check_cancel()
             self.progress(26, "Распространяемые компоненты (тихая установка)")
-            self._install_prerequisites(opts, result)
+            # Пока ставятся предусловия и идёт основной установщик, любой
+            # DXSETUP.exe (наш или вложенный) получает только /silent:
+            # иначе — «Неверная операция командной строки».
+            dx_guard = redist_mod.DxsetupSilentGuard(log=self.log)
+            dx_guard.install()
+            install_rc, used_plan = None, None
+            try:
+                self._install_prerequisites(opts, result)
 
-            # 4. Тихая установка: идём по лестнице попыток, пока в App не
-            # появятся файлы программы. Снимок реестра «после» делается ниже —
-            # он накрывает все попытки сразу.
-            self._check_cancel()
-            self.progress(30, "Тихая установка в изолированном режиме")
+                # 4. Тихая установка: идём по лестнице попыток, пока в App не
+                # появятся файлы программы. Снимок реестра «после» делается ниже —
+                # он накрывает все попытки сразу.
+                self._check_cancel()
+                self.progress(30, "Тихая установка в изолированном режиме")
 
-            def recover() -> bool:
-                """Забрать программу из каталога по умолчанию прямо в ходе
-                лестницы: движки, которые не принимают целевую папку
-                (InstallScript), иначе выглядели бы как неудача, и
-                Portablizer запускал бы следующий сценарий поверх уже
-                установленной программы."""
-                return self._recover_installed_app(
-                    app_dir=app_dir, data_dir=data_dir, app_name=name,
-                    installer_path=opts.installer_path,
-                    before=install_locations_before,
-                )
+                def recover() -> bool:
+                    """Забрать программу из каталога по умолчанию прямо в ходе
+                    лестницы: движки, которые не принимают целевую папку
+                    (InstallScript), иначе выглядели бы как неудача, и
+                    Portablizer запускал бы следующий сценарий поверх уже
+                    установленной программы."""
+                    return self._recover_installed_app(
+                        app_dir=app_dir, data_dir=data_dir, app_name=name,
+                        installer_path=opts.installer_path,
+                        before=install_locations_before,
+                    )
 
-            install_rc, used_plan = self._run_attempts(
-                attempts, opts, app_dir, data_dir, portable_dir, name,
-                recover=recover)
+                install_rc, used_plan = self._run_attempts(
+                    attempts, opts, app_dir, data_dir, portable_dir, name,
+                    recover=recover)
+            finally:
+                dx_guard.remove()
             # Лестница закончилась на 58 %, а следующий этап ниже сам по себе
             # полосу не двигает (закрытие процессов, распаковка без запуска).
             # Честно подписываем переход, иначе выглядит как зависание.
@@ -2436,11 +2445,9 @@ class Portablizer:
             if self.cancel.is_set():
                 self._stop_installer(proc)
                 raise RuntimeError("Установка отменена пользователем.")
-            # Установщик игры часто сам запускает вложенный DXSETUP со
-            # «своими» ключами — тогда всплывает «Установка DirectX /
-            # Неверная операция командной строки» и сборка ждёт мышку.
-            # Закрываем такие окна сами, не сбрасывая таймер паузы: клик
-            # по застрявшему диалогу — не признак работы установщика.
+            # Запасной путь: IFEO уже переписывает командную строку
+            # DXSETUP на /silent. Если перехват недоступен (нет прав),
+            # закрываем оставшееся окно сами — не сбрасывая таймер паузы.
             try:
                 clicked = redist_mod._dismiss_installer_dialogs()
             except Exception:  # noqa: BLE001 — WinAPI не вправе ронять сборку

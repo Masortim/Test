@@ -3118,6 +3118,115 @@ class ProgressWiringTests(unittest.TestCase):
         self.assertIn("progress=self._stage_progress(82, 87)",
                       PROGRESS_SOURCE)
 
+    def test_build_rewrites_dxsetup_command_line_instead_of_clicking(self):
+        """Сборка включает IFEO-перехват DXSETUP, а не только клик OK."""
+        self.assertIn("DxsetupSilentGuard", PROGRESS_SOURCE)
+        self.assertIn("dx_guard.install()", PROGRESS_SOURCE)
+
+
+class DxsetupCommandTests(unittest.TestCase):
+    """DXSETUP.exe понимает только /silent — иначе окно с ошибкой."""
+
+    def test_quiet_and_s_are_rewritten_to_silent(self):
+        path = r"C:\game\_CommonRedist\DirectX\DXSETUP.exe"
+        self.assertTrue(redist.is_dxsetup_image(path))
+        self.assertEqual(
+            redist.coerce_dxsetup_command([path, "/quiet", "/norestart"]),
+            [path, "/silent"])
+        self.assertEqual(
+            redist.coerce_dxsetup_command([path, "/S"]),
+            [path, "/silent"])
+        self.assertEqual(
+            redist.coerce_dxsetup_command([path, "/q"]),
+            [path, "/silent"])
+        self.assertEqual(
+            redist.coerce_dxsetup_command([path]),
+            [path, "/silent"])
+
+    def test_other_programs_keep_their_switches(self):
+        command = [r"C:\Windows\System32\expand.exe", "-F:*", "a.cab"]
+        self.assertEqual(redist.coerce_dxsetup_command(command), command)
+        self.assertFalse(redist.is_dxsetup_image("setup.exe"))
+
+    def test_only_silent_is_a_safe_dxsetup_command(self):
+        path = "DXSETUP.exe"
+        self.assertTrue(redist.dxsetup_command_is_safe([path, "/silent"]))
+        self.assertTrue(redist.dxsetup_command_is_safe([path, "/SILENT"]))
+        self.assertFalse(redist.dxsetup_command_is_safe([path, "/quiet"]))
+        self.assertFalse(redist.dxsetup_command_is_safe(
+            [path, "/silent", "/norestart"]))
+        self.assertFalse(redist.dxsetup_command_is_safe([path]))
+
+    def test_helper_script_never_forwards_original_args(self):
+        text = redist.render_dxsetup_silent_helper()
+        self.assertTrue(text.isascii())
+        self.assertIn("/silent", text)
+        self.assertIn("_pblz_dxsetup.exe", text)
+        self.assertIn("WScript.Arguments", text)
+        self.assertNotIn("/quiet", text)
+        self.assertNotIn("/norestart", text)
+        # Исходные ключи установщика (args 1+) в скрипт не подставляются.
+        self.assertNotIn("args(1)", text)
+
+    def test_guard_is_a_noop_off_windows(self):
+        guard = redist.DxsetupSilentGuard()
+        self.assertFalse(guard.install())
+        self.assertFalse(guard.active)
+        guard.remove()  # не должно бросать
+
+    def test_guard_writes_helper_and_ifeo_debugger(self):
+        with tempfile.TemporaryDirectory() as temp:
+            recorded = {}
+
+            def fake_set(debugger: str) -> bool:
+                recorded["debugger"] = debugger
+                return True
+
+            with mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "_ifeo_set_debugger", fake_set), \
+                    mock.patch.object(redist, "_ifeo_clear_debugger"), \
+                    mock.patch.object(redist, "_public_temp_root",
+                                      return_value=temp), \
+                    mock.patch.object(redist, "system_tool",
+                                      return_value=r"C:\Windows\System32\wscript.exe"):
+                log = Logger()
+                with redist.DxsetupSilentGuard(log=log) as guard:
+                    self.assertTrue(guard.active)
+                    helper = Path(temp) / redist.DXSETUP_HELPER_NAME
+                    self.assertTrue(helper.is_file())
+                    body = helper.read_text(encoding="ascii")
+                    self.assertIn("/silent", body)
+                    self.assertIn("wscript.exe", recorded["debugger"])
+                    self.assertIn("//B", recorded["debugger"])
+                    self.assertIn(redist.DXSETUP_HELPER_NAME,
+                                  recorded["debugger"])
+                    self.assertIn("/silent", log.text.lower())
+                self.assertFalse(guard.active)
+                self.assertFalse(helper.exists())
+
+    def test_run_quiet_rewrites_dxsetup_quiet_to_silent(self):
+        captured = []
+
+        class FakeProcess:
+            def __init__(self, args, **_kwargs):
+                captured.append(list(args))
+                self.pid = 7
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        with mock.patch.object(redist, "IS_WINDOWS", True), \
+                mock.patch("subprocess.Popen", FakeProcess):
+            code = redist._run_quiet(
+                [r"D:\DirectX\DXSETUP.exe", "/quiet", "/norestart"],
+                timeout=5)
+        self.assertEqual(code, 0)
+        self.assertEqual(captured[0][1:], ["/silent"])
+        self.assertTrue(captured[0][0].lower().endswith("dxsetup.exe"))
+
 
 if __name__ == "__main__":
     unittest.main()
