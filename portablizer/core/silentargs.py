@@ -670,6 +670,27 @@ def build_attempts(
     attempts: List[SilentPlan] = []
     itype = detection.installer_type
 
+    # Autodesk Fusion_360_Setup.exe is an online Application Streaming
+    # bootstrapper: generic flags are ignored and can open the same failed
+    # dialog repeatedly (exit code 0 is not a successful installation). It
+    # must be run once, visibly, so the user can complete Autodesk sign-in and
+    # the downloader can report its actual network error.
+    if "fusion" in os.path.basename(installer_path).casefold():
+        if not allow_assisted:
+            return []
+        return [SilentPlan(
+            program=installer_path,
+            output_dir=native_target,
+            label="Autodesk Fusion: online installer (interactive)",
+            interactive=True,
+            instructions=[
+                "Autodesk Fusion требует сетевой загрузки и может запросить "
+                "вход в Autodesk Account. Portablizer запустит мастер один "
+                "раз без универсальных ключей; завершите установку или "
+                "закройте её и проверьте сообщение Autodesk.",
+            ],
+        )]
+
     if detection.is_msi or itype == InstallerType.MSI:
         attempts.append(build_silent_plan(
             InstallerType.MSI, installer_path, target_dir, is_msi=True,
