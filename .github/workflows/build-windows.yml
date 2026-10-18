@@ -79,18 +79,25 @@ jobs:
               $_ -match '^(!! |-- |Ran \d+ tests|FAILED|OK$|FAIL:|ERROR:|Traceback|AssertionError|TimeoutError)'
             })
             if ($summary.Count -eq 0) { $summary = @($testLines | Select-Object -Last 12) }
-            if (@($summary | Where-Object { $_ -match '^!! ' }).Count -gt 0) {
-              $activeTest = @($testLines | Where-Object {
-                $_ -match '^test_[A-Za-z0-9_]+(?:\s+\(|\s+\.\.\.)'
-              } | Select-Object -Last 1)
-              if ($activeTest.Count -gt 0) { $summary += "Last test in progress: $($activeTest[0])" }
+            if (@($summary | Where-Object { $_ -match '^!! test_portablizer:' }).Count -gt 0) {
+              $moduleStart = -1
               $timeoutIndex = -1
               for ($i = 0; $i -lt $testLines.Count; $i++) {
-                if ($testLines[$i] -match 'Timeout \(') { $timeoutIndex = $i }
+                if ($testLines[$i] -eq '===== test_portablizer =====') { $moduleStart = $i }
+                if ($moduleStart -ge 0 -and $testLines[$i] -match '^Timeout \(') {
+                  $timeoutIndex = $i
+                  break
+                }
+              }
+              if ($moduleStart -ge 0) {
+                $end = if ($timeoutIndex -ge 0) { $timeoutIndex } else { $testLines.Count - 1 }
+                $activeTest = @($testLines[$moduleStart..$end] | Where-Object {
+                  $_ -match '^test_[A-Za-z0-9_]+(?:\s+\(|\s+\.\.\.)'
+                } | Select-Object -Last 1)
+                if ($activeTest.Count -gt 0) { $summary += "Timed out test: $($activeTest[0])" }
               }
               if ($timeoutIndex -ge 0) {
-                $stackStart = [Math]::Max(0, $timeoutIndex - 2)
-                $summary += $testLines[$stackStart..([Math]::Min($testLines.Count - 1, $timeoutIndex + 14))]
+                $summary += $testLines[$timeoutIndex..([Math]::Min($testLines.Count - 1, $timeoutIndex + 18))]
               }
             }
             $diagnostic = ($summary -join "`n")
