@@ -1608,11 +1608,45 @@ Handle: 17848, File: D:\Portable\..._Portable\PortableData\Temp\is-UQUS2.tmp\Ope
 > сознательно: сборка не ходит в сеть без явного согласия. Всё остальное
 > происходит само.
 
+### Командная строка: Portablizer.exe без окна
+
+Тот же exe умеет собираться и без интерфейса — `app.py`/`python -m portablizer`
+ведут себя точно так же:
+
+```bat
+Portablizer.exe --version
+Portablizer.exe build PlanetaVPN.exe --out D:\Portable --lang ru
+Portablizer.exe build Setup.exe --out .\out --dry-run
+```
+
+`build` принимает все переключатели окна: `--name`, `--lang`, `--extra-args`,
+`--env KEY=VALUE`, `--idle-timeout/--hard-timeout`, `--assisted`,
+`--no-registry`, `--no-userdirs`, `--no-cleanup`, `--shell-integration`,
+`--no-exe-launcher`, `--no-runtimes`, `--lean-runtimes`, `--download-runtimes`,
+`--no-silent-redist`, `--no-shared-saves`, `--no-netstack`,
+`--shared-netstack` (NetStack без изоляции: драйвер остаётся в системе),
+`--no-elevate` и `--dry-run`. Коды выхода: 0 — успех, 1 — сборка не удалась
+(подсказки движка печатаются), 2 — ошибка в командной строке.
+
+Зачем это было нужно в exe с `console=False`: у окнового бинарника стандартных
+потоков как бы не существует, и первый же запуск из cmd терял весь вывод.
+Теперь CLI при старте прицепляет родительскую консоль (а если её нет — создаёт
+свою), журнал же всегда дублируется в `portablizer-cli.log` рядом с папкой
+результата: «что программа хотела сказать» не теряется ни при каком способе
+запуска. `--dry-run` печатает разобранную задачу и путь будущей папки
+`<Имя>_Portable` — ровно теми правилами, по которым их считает движок, —
+и ничего не устанавливает; этим же путём проверка плана доступна в CI на
+любой ОС (тесты `tests/test_cli.py`).
+
+Права: CLI просит UAC один раз, как и GUI (`--no-elevate` — работать без
+повышения; именно так сборку гоняет CI).
+
 ## Запуск из исходников
 
 ```bash
 pip install -r requirements.txt
-python app.py
+python app.py                       # интерфейс
+python app.py build Setup.exe --out ./out --dry-run   # командная строка
 ```
 
 > На Linux/macOS приложение запускается и полностью работает интерфейс, но
@@ -1631,18 +1665,30 @@ build.bat
 Результат: `dist\Portablizer.exe` — один самодостаточный файл без консоли.
 `build.bat` сначала собирает универсальный `PortableLauncher.exe`, а затем
 встраивает его в Portablizer; при создании портатива этот ресурс копируется как
-`App\LaunchPortable.exe`.
+`App\LaunchPortable.exe`. Версия, описание и язык в свойствах файла
+(explorer «Свойства → Подробности») генерируются спекой `portablizer.spec`
+из `portablizer.__version__` — единого источника версии, поэтому exe, `--version`
+и журнал сборки расходятся не могут в принципе.
 
 ### Вариант B — через GitHub Actions (без своего Windows)
 В репозитории настроен workflow `.github/workflows/build-windows.yml`. Он
 собирает `Portablizer.exe` на настоящем раннере `windows-latest` при каждом
 push в ветку `arena/**` и публикует артефакт **Portablizer-windows-x64**.
 
-Скачать готовый exe:
-1. Вкладка **Actions** → последний запуск **Build Windows EXE**.
-2. Раздел **Artifacts** → **Portablizer-windows-x64**.
+Свежий бинарник попадает в двух местах:
 
-Или через CLI: `gh run download --name Portablizer-windows-x64`.
+* артефакт **Portablizer-windows-x64** (Actions → последний запуск →
+  Artifacts, или `gh run download --name Portablizer-windows-x64`);
+* `dist-windows\Portablizer.exe` прямо в ветке — workflow коммитит собран-
+  ный exe обратно в `arena/**`-ветку, так что `git pull` доставляет бинарник
+  туда, где хранилище артефактов недоступно (зеркала, офлайн-копии, песоч-
+  ницы без blob-хостов GitHub).
+
+Публикация намеренно отвязана от юнит-тестов и привязана к смоук-проверкам:
+устаревший красный модуль не должен удерживать бинарники (статус проверки
+при этом честно остаётся красным), а вот непроверенный на живой Windows exe
+в ветку не едет: смоук «папку можно удалить», «занятый файл отпускается»,
+«обновление внутри портатива» и запуск самого LaunchPortable — обязательны.
 
 ## Рекомендации по использованию
 
