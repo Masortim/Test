@@ -200,6 +200,22 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertTrue((app / "Fusion360.exe").is_file())
             self.assertTrue((app / "Fusion360.dll").is_file())
 
+    def test_fusion_streaming_launcher_is_invalid_without_nonempty_ini(self):
+        with tempfile.TemporaryDirectory() as temp:
+            exe = Path(temp, "FusionLauncher.exe")
+            exe.write_bytes(b"MZ launcher")
+            self.assertTrue(self.engine._fusion_launcher_config_missing(
+                "Fusion_360_Setup.exe", "Fusion 360", str(exe)))
+            ini = Path(str(exe) + ".ini")
+            ini.write_text("[Fusion]", encoding="utf-8")
+            self.assertFalse(self.engine._fusion_launcher_config_missing(
+                "Fusion_360_Setup.exe", "Fusion 360", str(exe)))
+            ini.write_text("", encoding="utf-8")
+            self.assertTrue(self.engine._fusion_launcher_config_missing(
+                "Fusion_360_Setup.exe", "Fusion 360", str(exe)))
+            self.assertFalse(self.engine._fusion_launcher_config_missing(
+                "Other_Setup.exe", "Other", str(exe)))
+
     def test_recovers_fusion_from_redirected_portable_localappdata(self):
         with tempfile.TemporaryDirectory() as temp:
             portable = Path(temp, "Fusion 360_Portable")
@@ -2257,6 +2273,45 @@ class FailureDiagnosticsTests(unittest.TestCase):
         self.assertIn("Разрешить окно мастера установки", advice)
         self.assertIn("Autodesk Account", advice)
         self.assertIn("Fusion Web Deploy", advice)
+
+    def test_incomplete_fusion_streaming_stub_never_gets_a_launch_bat(self):
+        class PartialFusion(Portablizer):
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                Path(app_dir, "FusionLauncher.exe").write_bytes(b"MZ launcher")
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "portablizer.core.portablizer.IS_WINDOWS", False
+        ):
+            installer = Path(temp, "Fusion_360_Setup.exe")
+            installer.write_bytes(b"MZ dummy setup")
+            result = PartialFusion(Logger()).run(PortableOptions(
+                installer_path=str(installer), output_dir=temp,
+                app_name="Fusion 360", capture_registry=False,
+                cleanup_host=False, build_exe_launcher=False,
+            ))
+            portable = Path(temp, "Fusion 360_Portable")
+            self.assertFalse(result.success)
+            self.assertFalse((portable / "Launch.bat").exists())
+            self.assertIn("FusionLauncher.exe.ini", " ".join(result.messages))
+
+    def test_fusion_failure_explains_network_errors_and_incomplete_launcher(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            (app / "FusionLauncher.exe").write_bytes(b"MZ")
+            engine = Portablizer(Logger())
+            hints = engine._failure_hints(
+                DetectionResult(InstallerType.UNKNOWN, 0.0), None,
+                PortableOptions(installer_path="Fusion_360_Setup.exe",
+                                output_dir=temp, app_name="Fusion 360"),
+                temp,
+            )
+            advice = " ".join(hints)
+            self.assertIn("FusionLauncher.exe.ini", advice)
+            self.assertIn("HTTP 403", advice)
+            self.assertIn("WinError -2147024894", advice)
+            self.assertIn("прокси", advice)
 
     def test_failure_reports_how_many_variants_were_tried(self):
         result = self._failed_result(
