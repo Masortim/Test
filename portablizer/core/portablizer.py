@@ -1381,6 +1381,14 @@ class Portablizer:
             self._check_cancel()
             self.progress(75, "Поиск главного исполняемого файла и лаунчеров")
             main_exe, targets = self._discover_app_executables(app_dir, name)
+            if main_exe and self._fusion_launcher_config_missing(
+                    opts.installer_path, name, main_exe):
+                self.log.warn(
+                    "FusionLauncher.exe найден, но FusionLauncher.exe.ini "
+                    "отсутствует или пуст. Это неполный Autodesk Web Deploy, "
+                    "а не готовый портатив."
+                )
+                main_exe, targets = "", []
             if not main_exe:
                 result.hints = self._failure_hints(det, install_rc, opts,
                                                    portable_dir)
@@ -1668,15 +1676,35 @@ class Portablizer:
             (opts.app_name or "") + " " + os.path.basename(opts.installer_path)
         ).casefold()
         if fusion_setup:
+            launcher = os.path.join(portable_dir, "App", "FusionLauncher.exe")
+            launcher_ini = launcher + ".ini"
+            if os.path.isfile(launcher) and (
+                    not os.path.isfile(launcher_ini)
+                    or os.path.getsize(launcher_ini) <= 0):
+                hints.append(
+                    "Обнаружен только Autodesk Fusion streaming-загрузчик, "
+                    "но рядом нет обязательного FusionLauncher.exe.ini. "
+                    "Такой результат неполон; Portablizer не будет создавать "
+                    "нерабочий Launch.bat."
+                )
             hints.append(
-                "Для Autodesk Fusion: включите «Разрешить окно мастера "
-                "установки» и повторите сборку — Fusion_360_Setup.exe может "
-                "быть сетевым загрузчиком, которому нужны подключение к "
-                "интернету и вход в Autodesk Account. После завершения "
-                "Portablizer попробует перенести Fusion Web Deploy из профиля "
-                "пользователя. Даже при успешном переносе автономная работа "
-                "не гарантируется: Fusion может требовать лицензию, службы "
-                "или компоненты Autodesk."
+                "Для Autodesk Fusion: окно с HTTP 403 означает, что Autodesk "
+                "CDN отказал в доступе к манифесту full.json; Portablizer не "
+                "может обойти запрет. Проверьте Autodesk Account, доступность "
+                "dl.appstreaming."
+                "autodesk.com и доменов Autodesk через выбранный прокси, "
+                "авторизацию/лицензию и дату/время Windows. Повторите запуск "
+                "с включённой опцией «Разрешить окно мастера установки», чтобы "
+                "пройти официальный онлайн-мастер. Ошибка WinError -2147024894 "
+                "означает, что установщик не нашёл "
+                "ожидаемый файл — обычно манифест или скачанный payload не "
+                "создался. Закройте мастер, удалите неполный результат и "
+                "повторите интерактивную установку при рабочем доступе к CDN. "
+                "Проверьте Autodesk Fusion Web Deploy и обязательный sidecar "
+                "INI до создания Launch.bat. Даже после успешной установки "
+                "Autodesk может требовать "
+                "службы, лицензию и онлайн-вход, поэтому автономная работа "
+                "портативной копии не гарантируется."
             )
 
         if opts.extra_install_args:
@@ -3373,6 +3401,26 @@ class Portablizer:
             if len(normalized) >= 2:
                 keys.add(normalized)
         return keys
+
+    @staticmethod
+    def _fusion_launcher_config_missing(installer_path: str, app_name: str,
+                                        main_exe: str) -> bool:
+        """Reject Autodesk's streaming stub when its required sidecar is absent.
+
+        ``FusionLauncher.exe`` is not the full app. Autodesk Application
+        Streaming requires a non-empty adjacent ``FusionLauncher.exe.ini``;
+        without it the generated Launch.bat points at a broken bootstrap stub.
+        """
+        identity = (str(app_name) + " " + os.path.basename(installer_path)).casefold()
+        if "fusion" not in identity:
+            return False
+        if os.path.basename(main_exe).casefold() != "fusionlauncher.exe":
+            return False
+        config = main_exe + ".ini"
+        try:
+            return not os.path.isfile(config) or os.path.getsize(config) <= 0
+        except OSError:
+            return True
 
     @staticmethod
     def _name_score(path: str, keys: Set[str]) -> int:
