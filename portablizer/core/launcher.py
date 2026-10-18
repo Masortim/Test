@@ -51,7 +51,7 @@ from .. import __version__
 from .redist import REDIST_DIR_NAME, SILENT_SCRIPT_NAME as REDIST_SCRIPT_NAME
 from .netstack import (NETSTACK_DIR_NAME, SETUP_SCRIPT_NAME,
                       TEARDOWN_SCRIPT_NAME, STATE_DIR_NAME,
-                      CREATED_SERVICES_FILE)
+                      CREATED_SERVICES_FILE, DRIVER_PACKAGES_FILE)
 
 #: Маркер портативной папки внутри захваченного .reg (см. core/registry.py).
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
@@ -387,8 +387,17 @@ def _netstack_impls(cfg: LauncherConfig) -> Tuple[str, str]:
         f'set "NETSTACK_SCRIPT=%PORTABLE_ROOT%\\{NETSTACK_DIR_NAME}'
         f'\\{TEARDOWN_SCRIPT_NAME}"',
         'if not exist "%NETSTACK_SCRIPT%" goto :eof',
-        f'if not exist "{teardown_state}" goto :eof',
-        "echo   Unregistering the services this portable created on this PC...",
+        "rem Teardown is owed something only while this PC still has OUR",
+        "rem leftovers: services we registered, or (isolation mode) driver",
+        "rem packages we published. The script re-reads both markers itself.",
+        f'set "NETSTACK_STATE=%PORTABLE_ROOT%\\{data_dir}\\{STATE_DIR_NAME}"',
+        'set "NETSTACK_TD=0"',
+        f'if exist "{teardown_state}" set "NETSTACK_TD=1"',
+        f'if exist "%NETSTACK_STATE%\\{DRIVER_PACKAGES_FILE}" '
+        'set "NETSTACK_TD=1"',
+        'if "%NETSTACK_TD%" == "0" goto :eof',
+        "echo   Removing the services and drivers this portable created"
+        " on this PC...",
         'call "%NETSTACK_SCRIPT%"',
         "goto :eof",
     ])

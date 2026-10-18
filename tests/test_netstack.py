@@ -246,6 +246,8 @@ class ProvisionTests(unittest.TestCase):
         manifest = json.loads((netstack_dir / "netstack.json")
                               .read_text(encoding="utf-8"))
         self.assertEqual(manifest["schema"], 1)
+        # Изоляция по умолчанию: сеанс владеет тем, что опубликовал.
+        self.assertEqual(manifest["isolation"], "session")
         self.assertEqual(manifest["drivers"][0]["service"], "tap0901")
         self.assertEqual(manifest["services"][0]["name"], "PlanetaVPNSvc")
         # Пакет в манифесте указывает уже на NetStack, а не на App
@@ -269,14 +271,61 @@ class ProvisionTests(unittest.TestCase):
         # json, а .cmd остаётся ASCII).
         self.assertIn("NetStackServices.ps1", setup)
         self.assertIn("--check", setup)
+        # Изолированный режим: Setup обязан вести учёт владения — снимки INF
+        # до/после публикации и hwid, которые портатив просил создать.
+        self.assertIn("dir /b", setup)
+        self.assertIn("ns_pre.tmp", setup)
+        self.assertIn("ns_post.tmp", setup)
+        self.assertIn("ns_ids.txt", setup)
+        self.assertIn("-Mode ownership", setup)
+        self.assertIn("echo tap0901>>", setup)
         teardown = (self.root / "NetStack" / "Teardown.cmd").read_bytes()\
             .decode("ascii")
         self.assertIn("created-services.txt", teardown)
         self.assertIn("NetStackServices.ps1", teardown)
-        # Ни один из скриптов не должен удалять драйвер без явного флага.
+        # Удаление драйвера живёт в .ps1 (там манифест и пути), cmd тонкий;
+        # Setup сам ничего не удаляет ни при каком флаге.
         self.assertNotIn("/delete-driver", setup)
-        self.assertIn("--remove-device", teardown)
+        self.assertIn("-Mode rollback", teardown)
+        self.assertIn("--keep-driver", teardown)
+        ps1 = (self.root / "NetStack" / "NetStackServices.ps1").read_bytes()\
+            .decode("utf-8-sig")
+        for needle in ("if ($Mode -eq 'ownership')", "if ($Mode -eq 'rollback')",
+                       "/delete-driver", "/uninstall /force", "pending-driver.txt",
+                       "driver-packages.txt", "/remove-device", "tapinstall"):
+            self.assertIn(needle.replace("tapinstall", "remove"), ps1, needle)
         self.assertTrue(report.to_config()["stop_on_exit"])
+        self.assertEqual(report.to_config()["isolation"], "session")
+
+    def test_shared_mode_keeps_old_politics(self):
+        report = netstack.provision_netstack(str(self.root), str(self.app),
+                                             self.packages, self.records,
+                                             isolated=False)
+        self.assertEqual(report.isolation, "shared")
+        setup = (self.root / "NetStack" / "Setup.cmd").read_text(
+            encoding="ascii")
+        # Никакого учёта владения там, где драйвер остаётся общим.
+        self.assertNotIn("ns_pre.tmp", setup)
+        self.assertNotIn("-Mode ownership", setup)
+        teardown = (self.root / "NetStack" / "Teardown.cmd").read_text(
+            encoding="ascii")
+        self.assertIn("--remove-device", teardown)
+        self.assertNotIn("-Mode rollback", teardown)
+        # Снимать по-прежнему нужно службы — для них стоп и включён.
+        self.assertTrue(report.to_config()["stop_on_exit"])
+
+    def test_isolation_stop_on_exit_without_services(self):
+        # Один только драйвер, опубликованный портативом, уже обязан быть
+        # убраным с хоста по завершении сеанса.
+        report = netstack.NetStackReport(
+            drivers=[{"kind": "tap-windows", "service": "tap0901",
+                      "device_id": "tap0901", "needs_install": "1",
+                      "inf": "NetStack/Drivers/tap-windows/OemVista.inf",
+                      "tool": "", "installer": ""}],
+            services=[], isolation="session")
+        self.assertTrue(report.to_config()["stop_on_exit"])
+        report.isolation = "shared"
+        self.assertFalse(report.to_config()["stop_on_exit"])
 
     def test_wintun_only_produces_info_note(self):
         app = self.root / "App2"
@@ -294,6 +343,10 @@ class ProvisionTests(unittest.TestCase):
         # install-команд для wintun нет — и driver_services в конфиге тоже.
         self.assertNotIn("pnputil /add-driver", setup)
         self.assertEqual(report.to_config()["driver_services"], [])
+        # Владеть нечем: единственного установщика у wintun нет, и тайм-аут
+        # снимков INF срабатывать не на что — hwid-записей в Setup нет.
+        self.assertNotIn("echo wintun>>", setup)
+        self.assertFalse(report.to_config()["stop_on_exit"])
 
     def test_nothing_found_no_bundle(self):
         other = self.root / "Empty"
@@ -313,6 +366,7 @@ class LauncherWiringTests(unittest.TestCase):
                 "driver_services": ["tap0901"],
                 "service_names": ["PlanetaVPNSvc"],
                 "stop_on_exit": True,
+                "isolation": "session",
             })
 
     def test_config_roundtrip(self):
@@ -336,6 +390,8 @@ class LauncherWiringTests(unittest.TestCase):
         self.assertIn("NetStack\\Setup.cmd", bat)
         self.assertIn("--check", bat)
         self.assertIn("created-services.txt", bat)
+        # гейт teardown в bat учитывает оба маркера изолированного сеанса
+        self.assertIn("driver-packages.txt", bat)
 
     def test_bat_without_netstack_is_a_noop(self):
         bat = render_bat(self._cfg(netstack_section={}))
@@ -383,6 +439,23 @@ class NetstackEntryRuntimeTests(unittest.TestCase):
                 notes = exe_launcher.stop_netstack(root, cfg)
                 self.assertEqual(fake.call_count, 1)
                 self.assertTrue(notes)
+
+    def test_driver_marker_alone_triggers_isolation_teardown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "PortableData" / "NetStack"
+            state.mkdir(parents=True)
+            (state / "driver-packages.txt").write_text(
+                "oem14.inf tap0901", encoding="utf-8")
+            cfg = {"netstack": {"teardown": "NetStack/Teardown.cmd",
+                                "stop_on_exit": True,
+                                "isolation": "session"}}
+            fake = mock.Mock(return_value=0)
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_run_netstack_script",
+                                      fake):
+                exe_launcher.stop_netstack(root, cfg)
+            self.assertEqual(fake.call_count, 1)
 
     def test_stop_can_be_switched_off(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -72,6 +72,18 @@ SERVICES_SCRIPT_NAME = "NetStackServices.ps1"
 STATE_DIR_NAME = "NetStack"
 CREATED_SERVICES_FILE = "created-services.txt"
 
+#: Маркеры изолированного сеанса (PortableData\\NetStack\\): какие пакеты
+#: опубликовал ЭТОТ портатив и что не удалось снять с системы по итогам.
+DRIVER_PACKAGES_FILE = "driver-packages.txt"
+PENDING_DRIVER_FILE = "pending-driver.txt"
+#: Временные снимки %SystemRoot%\\INF перед установкой и после (diff =
+#: наши опубликованные пакеты). Локальны для машины-сборки по смыслу.
+SNAPSHOT_PRE_FILE = "ns_pre.tmp"
+SNAPSHOT_POST_FILE = "ns_post.tmp"
+#: hwid устройств, которые портатив создаёт в этом сеансе: по нему
+#: .ps1 сопоставляет вновь опубликованные пакеты с адаптерами.
+SNAPSHOT_IDS_FILE = "ns_ids.txt"
+
 # --- виды драйверов -------------------------------------------------------------
 
 #: TAP-Windows (OpenVPN): классический NDIS-мини-порт ``tap0901``.
@@ -497,6 +509,10 @@ class NetStackReport:
     teardown_rel: str = f"{NETSTACK_DIR_NAME}/{TEARDOWN_SCRIPT_NAME}"
     #: Скрипты реально записаны (нет диска/прав — и у лончера работы нет).
     written: bool = False
+    #: "session" — изолированный портативный режим: пакет драйвера публикуется
+    #: только на время сеанса и снимается с системы по его завершении;
+    #: "shared" — драйвер остаётся общим системным компонентом (Redist-style).
+    isolation: str = "session"
 
     @property
     def needed(self) -> bool:
@@ -516,7 +532,14 @@ class NetStackReport:
                               for entry in self.services if entry.get("name")],
             # Портатив снимает «свои» службы по завершении сеанса: чистый
             # компьютер-носитель важнее пары секунд на переподключение.
-            "stop_on_exit": bool(self.services),
+            # В изолированном режиме teardown нужен и без служб — именно он
+            # убирает драйвер и адаптер с машины.
+            "stop_on_exit": bool(self.services) or (
+                self.isolation == "session" and any(
+                    d.get("needs_install") == "1" for d in self.drivers)),
+            # Секция для лончера/ENTRY: по ней решают, вызывать ли Teardown
+            # без маркера служб и чинить ли осевший после сбоя сеанс.
+            "isolation": self.isolation,
         }
 
 
@@ -535,14 +558,22 @@ def _entry_for_package(package: NetDriverPackage) -> Dict[str, str]:
 
 def provision_netstack(portable_dir: str, app_dir: str,
                        packages: Sequence[NetDriverPackage],
-                       services: Sequence[ServiceRecord]) -> Optional[NetStackReport]:
+                       services: Sequence[ServiceRecord],
+                       isolated: bool = True) -> Optional[NetStackReport]:
     """Собирает ``NetStack/``: копии пакетов, манифест, Setup/Teardown.
 
     Файлы **копируются** (не переносятся): программа ждёт свои драйверы внутри
     ``App/``, а портатив должен уметь чинить систему и после того, как его
     скопировали на другой компьютер.
+
+    ``isolated=True`` — изолированный портативный режим: драйвер публикуется
+    из папки портатива только на время сеанса, по завершении сеанса
+    ``Teardown`` снимает устройства адаптера и сам пакет из DriverStore, так
+    что хост возвращается в состояние «до запуска». ``isolated=False`` —
+    прошлое поведение «общего компонента»: драйвер остаётся в системе.
     """
     report = NetStackReport()
+    report.isolation = "session" if isolated else "shared"
     if not packages and not services:
         return None
 
@@ -614,6 +645,7 @@ def provision_netstack(portable_dir: str, app_dir: str,
         os.makedirs(netstack_dir, exist_ok=True)
         manifest = {
             "schema": 1,
+            "isolation": report.isolation,
             "root_token": ROOT_TOKEN,
             "drivers": report.drivers,
             "services": report.services,
@@ -720,6 +752,23 @@ def render_setup_cmd(report: NetStackReport) -> str:
         ")",
     ]
 
+    isolated = report.isolation == "session"
+    if isolated:
+        # Isolation bookkeeping: remember which oem*.inf packages EXIST before
+        # we publish anything, so the difference afterwards is exactly what
+        # this portable owns.  A driver that was already installed by another
+        # program is used but never claimed, hence never removed either.
+        lines += [
+            "",
+            "rem isolation: snapshot the driver store before publishing, so",
+            "rem Teardown can remove exactly the packages this portable added.",
+            'if /i not "%NETSTACK_MODE%" == "--check" (',
+            '  dir /b "%SystemRoot%\INF\oem*.inf" ',
+            '> "%NETSTACK_STATE\\' + SNAPSHOT_PRE_FILE + '" 2>nul',
+            '  del "%NETSTACK_STATE\\' + SNAPSHOT_IDS_FILE + '" >nul 2>&1',
+            ')',
+        ]
+
     for index, driver in enumerate(report.drivers, start=1):
         kind = _ascii_token(driver.get("kind", "net")) or "net"
         service = _ascii_token(driver.get("service", ""))
@@ -749,6 +798,9 @@ def render_setup_cmd(report: NetStackReport) -> str:
             '  set "NETSTACK_RC=2"',
             "  goto netstack_after_driver_" + str(index),
             ")",
+            *([f'echo {device}>> "%NETSTACK_STATE\\'
+               f'{SNAPSHOT_IDS_FILE}"']
+              if (isolated and device) else []),
             "rem 1) put the package into the driver store and let PnP install it",
             'if "%PNPMODERN%" == "1" (',
             f"  if exist {inf_path} pnputil /add-driver {inf_path} /install "
@@ -795,6 +847,21 @@ def render_setup_cmd(report: NetStackReport) -> str:
         ]
 
     services_script = f'"%NETSTACK_ROOT%{SERVICES_SCRIPT_NAME}"'
+    if isolated:
+        # Дифф снимков INF делает .ps1: свои пути он выводит из
+        # $PSScriptRoot, поэтому кириллица в имени папки портатива не
+        # зависит от кодовой страницы cmd, а содержимое снимков — ASCII.
+        lines += [
+            "",
+            "rem --- ownership: publish what is ours, keep what is not ---------",
+            'if /i not "%NETSTACK_MODE%" == "--check" (',
+            '  dir /b "%SystemRoot%\\INF\\oem*.inf" '
+            '> "%NETSTACK_STATE\\' + SNAPSHOT_POST_FILE + '" 2>nul',
+            "  powershell -NoProfile -ExecutionPolicy Bypass -File "
+            f"{services_script} -Mode ownership",
+            ")",
+        ]
+
     lines += [
         "",
         "rem --- companion services (registered from the portable folder) ------",
@@ -820,27 +887,54 @@ def render_setup_cmd(report: NetStackReport) -> str:
 
 
 def render_teardown_cmd(report: NetStackReport) -> str:
-    """``NetStack\\Teardown.cmd``: снять с регистрации службы портатива.
+    """``NetStack\\Teardown.cmd``: снять с регистрации службы и — в
+    изолированном режиме — устройства адаптеров и сами пакеты драйверов.
 
-    Драйверы не удаляются: пакет в DriverStore — общий системный компонент
-    (как распространяемые Visual C++), выдирать его после каждого сеанса —
-    значит ломать другие VPN-программы. Флаг ``--remove-device`` дополнительно
-    гасит корневые устройства адаптеров — для тех, кому нужен полностью
-    «чистый» хост.
+    * ``isolation == "session"`` (портативный изолированный режим по умолчанию):
+      всё, что портатив опубликовал на этом ПК, с этого ПК и уходит:
+      корневые устройства ``root\\<devid>`` снимаются, пакеты удаляются из
+      DriverStore (``pnputil /delete-driver <oem> /uninstall /force``), службы
+      снимаются с регистрации. Если драйвер ещё кем-то используется, удаление
+      откладывается: маркер ``pending-driver.txt`` остаётся, и следующий
+      выход из сеанса попробует снова. Чужие драйверы (уже установленные
+      другими программами) портатив не трогает — они ему не принадлежат.
+    * ``isolation == "shared"``: прошлое поведение — службы снимаются, пакет
+      остаётся общим системным компонентом (как распространяемые Visual C++);
+      флаг ``--remove-device`` дополнительно гасит корневые устройства.
     """
+    isolated = report.isolation == "session"
     lines = [
         "@echo off",
         "setlocal EnableExtensions",
         "rem NetStack teardown: stops and unregisters ONLY the services this",
         "rem portable created on this PC (PortableData\\NetStack\\"
         + CREATED_SERVICES_FILE + ").",
-        "rem Driver packages are shared system components and are kept.",
-        "rem Pass --remove-device to also delete the root-enumerated adapters.",
+    ]
+    if isolated:
+        lines += [
+            "rem Isolated session mode: adapter devices and the driver packages",
+            "rem THIS portable published go away too, so the host keeps nothing.",
+            "rem Pass --keep-driver to leave the driver installed (next session",
+            "rem starts without UAC); services are still unregistered.",
+        ]
+    else:
+        lines += [
+            "rem Driver packages are shared system components and are kept.",
+            "rem Pass --remove-device to also delete the root-enumerated adapters.",
+        ]
+    lines += [
         'set "NETSTACK_ROOT=%~dp0"',
+        'set "PORTABLE_ROOT=%NETSTACK_ROOT%.."',
+        'for %%I in ("%PORTABLE_ROOT%") do set "PORTABLE_ROOT=%%~fI"',
+        'set "NETSTACK_STATE=%PORTABLE_ROOT%\\PortableData\\'
+        + STATE_DIR_NAME + '"',
         "rem The flag is scanned in every argument, not just %~1: after the",
         "rem UAC re-run the first slot is taken by --elevated.",
         'set "TEARDOWN_MODE="',
-        'for %%A in (%*) do if /i "%%~A" == "--remove-device" set "TEARDOWN_MODE=--remove-device"',
+        ('for %%A in (%*) do if /i "%%~A" == "--keep-driver" '
+         'set "TEARDOWN_MODE=--keep-driver"' if isolated else
+         'for %%A in (%*) do if /i "%%~A" == "--remove-device" '
+         'set "TEARDOWN_MODE=--remove-device"'),
         ">nul 2>&1 net session || (",
         "  powershell -NoProfile -ExecutionPolicy Bypass -Command "
         "\"Start-Process -Verb RunAs -Wait -WindowStyle Hidden "
@@ -853,110 +947,226 @@ def render_teardown_cmd(report: NetStackReport) -> str:
         'powershell -NoProfile -ExecutionPolicy Bypass -File '
         '"%NETSTACK_ROOT%' + SERVICES_SCRIPT_NAME + '" -Mode teardown',
         "",
-        'if /i not "%TEARDOWN_MODE%" == "--remove-device" exit /b 0',
     ]
-    for driver in report.drivers:
-        device = _ascii_token(driver.get("device_id", ""))
-        service = _ascii_token(driver.get("service", ""))
-        if not service:
-            continue
+    if isolated:
         lines += [
-            "rem detach the adapter instance created for this package (best",
-            "rem effort: a busy adapter simply refuses and stays)",
-            f'reg query "HKLM\\SYSTEM\\CurrentControlSet\\Services\\{service}" '
-            ">nul 2>&1",
-            "if not errorlevel 1 (",
+            "rem --- rollback of what THIS portable published (devices first, ",
+            "rem then the packages; the .ps1 keeps only what is really ours) --",
+            'if "%TEARDOWN_MODE%" == "--keep-driver" exit /b 0',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File '
+            '"%NETSTACK_ROOT%' + SERVICES_SCRIPT_NAME + '" -Mode rollback',
+            "exit /b 0",
+            "",
         ]
-        if device:
+    else:
+        lines += [
+            'if /i not "%TEARDOWN_MODE%" == "--remove-device" exit /b 0',
+        ]
+        for driver in report.drivers:
+            device = _ascii_token(driver.get("device_id", ""))
+            service = _ascii_token(driver.get("service", ""))
+            if not service:
+                continue
             lines += [
-                f'  pnputil /remove-device "root\\{device}" >nul 2>&1',
+                "rem detach the adapter instance created for this package (best",
+                "rem effort: a busy adapter simply refuses and stays)",
+                f'reg query "HKLM\\SYSTEM\\CurrentControlSet\\Services\\{service}" '
+                ">nul 2>&1",
+                "if not errorlevel 1 (",
             ]
-        else:
-            lines += ["  rem no device id - nothing to detach"]
-        lines += [")"]
-    lines += ["exit /b 0", ""]
+            if device:
+                lines += [
+                    f'  pnputil /remove-device "root\\{device}" >nul 2>&1',
+                ]
+            else:
+                lines += ["  rem no device id - nothing to detach"]
+            lines += [")"]
+        lines += ["exit /b 0", ""]
     return "\r\n".join(lines)
 
 
-#: PowerShell-скрипт управления службами-компаньонами. Данные берутся из
-#: ``netstack.json`` (путь портатива раскрывается на месте, поэтому кириллица
-#: в путях не ломается), решения о том, что создавать, — из состояния машины.
+#: PowerShell-скрипт служб-компаньонов и изоляционного учёта драйверов.
+#: Данные берутся из ``netstack.json`` (путь портатива раскрывается на
+#: месте, поэтому кириллица в путях не ломается), решения о том, что
+#: создавать и что снимать, — из состояния машины и маркеров сеанса.
+_PS1_BODY = r'''
+# NetStack companion services and isolation bookkeeping. Generated by Portablizer.
+# Modes: ensure (default) | check | teardown | ownership | rollback.
+# Paths come from $PSScriptRoot, so a portable folder with a Russian name works:
+# the .cmd side stays ASCII, all Unicode lives in netstack.json.
+param([string]$Mode = 'ensure')
+$ErrorActionPreference = 'SilentlyContinue'
+$here = $PSScriptRoot
+$manifestPath = Join-Path $here 'netstack.json'
+if (-not (Get-Command ConvertFrom-Json)) { exit 5 }
+if (-not (Test-Path -LiteralPath $manifestPath)) { exit 0 }
+$cfg = Get-Content -Raw -LiteralPath $manifestPath |
+     ConvertFrom-Json
+$root = (Resolve-Path (Join-Path $here '..')).Path
+$token = '@@PORTABLE_ROOT@@'
+$stateDir = Join-Path $root 'PortableData\NetStack'
+if (-not (Test-Path -LiteralPath $stateDir)) {
+     New-Item -ItemType Directory -Path $stateDir | Out-Null }
+$createdPath = Join-Path $stateDir 'created-services.txt'
+$packagesPath = Join-Path $stateDir 'driver-packages.txt'
+# --- ownership: what THIS portable published into the driver store ----------
+# Setup snapshots %SystemRoot%\INF\oem*.inf before and after the install and
+# remembers every root device it tried to create (ns_ids.txt). Everything that
+# appeared in between belongs to this portable; drivers that already existed
+# are used but never claimed - and therefore never removed on another host.
+if ($Mode -eq 'ownership') {
+     $pre = Join-Path $stateDir 'ns_pre.tmp'
+     $post = Join-Path $stateDir 'ns_post.tmp'
+     $idsPath = Join-Path $stateDir 'ns_ids.txt'
+     if ((Test-Path -LiteralPath $pre) -and (Test-Path -LiteralPath $post)) {
+          $old = @(Get-Content -LiteralPath $pre |
+                 ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+          $new = @(Get-Content -LiteralPath $post |
+                 ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+          $added = @($new | Where-Object { $old -notcontains $_ })
+          $ids = @()
+          if (Test-Path -LiteralPath $idsPath) {
+               $ids = @(Get-Content -LiteralPath $idsPath |
+                      ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          }
+          $have = @()
+          if (Test-Path -LiteralPath $packagesPath) {
+               $have = @(Get-Content -LiteralPath $packagesPath |
+                      ForEach-Object { (($_ -split '\s+')[0]).ToLower() })
+          }
+          for ($i = 0; $i -lt $added.Count; $i++) {
+               if ($have -contains $added[$i]) { continue }
+               $dev = ''
+               if ($i -lt $ids.Count) { $dev = ' ' + $ids[$i] }
+               Add-Content -LiteralPath $packagesPath `
+                    -Value ($added[$i] + $dev) -Encoding ASCII
+          }
+     }
+     Remove-Item -LiteralPath $pre, $post, $idsPath -Force `
+          -ErrorAction SilentlyContinue
+     exit 0
+}
+# --- rollback: take the session's driver back off this host ------------------
+# Devices first (root-enumerated adapters belong to the package we published),
+# then the published packages themselves. If the driver is still busy, the
+# marker line stays and the next session end retries; a pending-driver.txt
+# note keeps the story honest in the log.
+if ($Mode -eq 'rollback') {
+     if (-not (Test-Path -LiteralPath $packagesPath)) { exit 0 }
+     $modern = ((& pnputil '/?' 2>$null) | Out-String) -match '/add-driver'
+     $tools = @{}
+     foreach ($d in @($cfg.drivers)) {
+          if ($d.tool -and $d.device_id) {
+               $tools[$d.device_id.ToLower()] =
+                    (Join-Path $root ($d.tool -replace '/', '\'))
+          }
+     }
+     $kept = @()
+     $failed = $false
+     foreach ($line in @(Get-Content -LiteralPath $packagesPath)) {
+          $parts = @($line -split '\s+' | Where-Object { $_ })
+          if ($parts.Count -lt 1) { continue }
+          $name = $parts[0]
+          $devid = ''
+          if ($parts.Count -gt 1) { $devid = $parts[1] }
+          $infNow = Join-Path $env:SystemRoot ('INF\' + $name)
+          if (-not (Test-Path -LiteralPath $infNow)) { continue }
+          if ($devid) {
+               $enum = "HKLM:\SYSTEM\CurrentControlSet\Enum\ROOT\$devid"
+               if (Test-Path $enum) {
+                    foreach ($inst in @(Get-ChildItem $enum)) {
+                         $id = "root\$devid\" + $inst.PSChildName
+                         if ($modern) {
+                              & pnputil /remove-device $id 2>&1 | Out-Null
+                         }
+                    }
+                    if (-not $modern -and $tools.ContainsKey($devid.ToLower()) `
+                         -and (Test-Path -LiteralPath $tools[$devid.ToLower()])) {
+                         & $tools[$devid.ToLower()] remove $devid 2>&1 | Out-Null
+                    }
+               }
+          }
+          if ($modern) {
+               & pnputil /delete-driver $name /uninstall /force 2>&1 | Out-Null
+          } else {
+               & pnputil -f -d $name 2>&1 | Out-Null
+          }
+          if ($LASTEXITCODE -ne 0) { $failed = $true; $kept += $line }
+     }
+     $pending = Join-Path $stateDir 'pending-driver.txt'
+     if ($failed) {
+          Set-Content -LiteralPath $packagesPath -Value $kept -Encoding ASCII
+          Set-Content -LiteralPath $pending `
+               -Value 'driver still in use: retried on next session end' `
+               -Encoding ASCII
+     } else {
+          Remove-Item -LiteralPath $packagesPath -Force
+          Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue
+     }
+     exit 0
+}
+$services = @($cfg.services)
+if ($services.Count -eq 0) { exit 0 }
+if ($Mode -eq 'check') {
+     foreach ($s in $services) {
+          if (-not (Get-Service -Name $s.name)) { exit 4 }
+     }
+     exit 0
+}
+if ($Mode -eq 'teardown') {
+     if (-not (Test-Path -LiteralPath $createdPath)) { exit 0 }
+     $names = @(Get-Content -LiteralPath $createdPath |
+               ForEach-Object { $_.Trim() } | Where-Object { $_ })
+     foreach ($n in $names) {
+          Stop-Service -Name $n -Force
+          sc.exe delete $n | Out-Null
+     }
+     Remove-Item -LiteralPath $createdPath -Force
+     exit 0
+}
+# ensure: create only what is absent, remember only what we created.
+$created = @()
+if (Test-Path -LiteralPath $createdPath) {
+     $created = @(Get-Content -LiteralPath $createdPath |
+                  ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+foreach ($s in $services) {
+     $svc = Get-Service -Name $s.name
+     if ($null -ne $svc) {
+          if ($svc.Status -ne 'Running') { Start-Service -Name $s.name }
+          continue
+     }
+     $image = $s.image.Replace($token, $root)
+     if ($s.args) { $image = $image + ' ' + $s.args }
+     $type = if ($s.start -eq 'auto') { 'Automatic' } else { 'Manual' }
+     try {
+          New-Service -Name $s.name -BinaryPathName $image `
+                -DisplayName $s.display -StartupType $type -ErrorAction Stop |
+            Out-Null
+          $created += $s.name
+     } catch {
+          # PS 5.1 на Win10 ругается на StartupType у уже существующих
+          # служб; сюда приходим только когда New-Service реально отказал.
+          sc.exe create $s.name binPath= "`"$image`"" start= demand DisplayName= "$($s.display)" obj= LocalSystem | Out-Null
+          if ($LASTEXITCODE -eq 0) { $created += $s.name }
+          continue
+     }
+     Start-Service -Name $s.name
+}
+$created = @($created | Select-Object -Unique)
+if ($created.Count -gt 0) {
+     Set-Content -LiteralPath $createdPath -Value $created -Encoding UTF8
+}
+exit 0
+'''
+
+
 def render_services_ps1() -> str:
-    """``NetStack\\NetStackServices.ps1`` — ensure | check | teardown.
+    """``NetStack\\NetStackServices.ps1`` — ensure | check | teardown |
+    ownership | rollback.
 
     Коды выхода: 0 — всё в порядке; 4 — чего-то не хватает (режим check);
     5 — PowerShell слишком стар (нет ConvertFrom-Json), трогать ничего не
     стали.
     """
-    return (
-        "# NetStack companion services: registered from the portable folder,\n"
-        "# never touching services that existed before. Generated by Portablizer.\n"
-        "param([string]$Mode = 'ensure')\n"
-        "$ErrorActionPreference = 'SilentlyContinue'\n"
-        "$here = $PSScriptRoot\n"
-        "$manifestPath = Join-Path $here 'netstack.json'\n"
-        "if (-not (Get-Command ConvertFrom-Json)) { exit 5 }\n"
-        "if (-not (Test-Path -LiteralPath $manifestPath)) { exit 0 }\n"
-        "$cfg = Get-Content -Raw -LiteralPath $manifestPath |\n"
-        "     ConvertFrom-Json\n"
-        "$root = (Resolve-Path (Join-Path $here '..')).Path\n"
-        "$token = '@@PORTABLE_ROOT@@'\n"
-        "$stateDir = Join-Path $root 'PortableData\\NetStack'\n"
-        "if (-not (Test-Path -LiteralPath $stateDir)) {\n"
-        "     New-Item -ItemType Directory -Path $stateDir | Out-Null }\n"
-        "$createdPath = Join-Path $stateDir 'created-services.txt'\n"
-        "$services = @($cfg.services)\n"
-        "if ($services.Count -eq 0) { exit 0 }\n"
-        "if ($Mode -eq 'check') {\n"
-        "     foreach ($s in $services) {\n"
-        "          if (-not (Get-Service -Name $s.name)) { exit 4 }\n"
-        "     }\n"
-        "     exit 0\n"
-        "}\n"
-        "if ($Mode -eq 'teardown') {\n"
-        "     if (-not (Test-Path -LiteralPath $createdPath)) { exit 0 }\n"
-        "     $names = @(Get-Content -LiteralPath $createdPath |\n"
-        "               ForEach-Object { $_.Trim() } | Where-Object { $_ })\n"
-        "     foreach ($n in $names) {\n"
-        "          Stop-Service -Name $n -Force\n"
-        "          sc.exe delete $n | Out-Null\n"
-        "     }\n"
-        "     Remove-Item -LiteralPath $createdPath -Force\n"
-        "     exit 0\n"
-        "}\n"
-        "# ensure: create only what is absent, remember only what we created.\n"
-        "$created = @()\n"
-        "if (Test-Path -LiteralPath $createdPath) {\n"
-        "     $created = @(Get-Content -LiteralPath $createdPath |\n"
-        "                  ForEach-Object { $_.Trim() } | Where-Object { $_ })\n"
-        "}\n"
-        "foreach ($s in $services) {\n"
-        "     $svc = Get-Service -Name $s.name\n"
-        "     if ($null -ne $svc) {\n"
-        "          if ($svc.Status -ne 'Running') { Start-Service -Name $s.name }\n"
-        "          continue\n"
-        "     }\n"
-        "     $image = $s.image.Replace($token, $root)\n"
-        "     if ($s.args) { $image = $image + ' ' + $s.args }\n"
-        "     $type = if ($s.start -eq 'auto') { 'Automatic' } else { 'Manual' }\n"
-        "     try {\n"
-        "          New-Service -Name $s.name -BinaryPathName $image `\n"
-        "                -DisplayName $s.display -StartupType $type -ErrorAction Stop |\n"
-        "            Out-Null\n"
-        "          $created += $s.name\n"
-        "     } catch {\n"
-        "          # PS 5.1 на Win10 ругается на StartupType у уже существующих\n"
-        "          # служб; сюда приходим только когда New-Service реально отказал.\n"
-        "          sc.exe create $s.name binPath= \"`\"$image`\"\" start= demand "
-        "DisplayName= \"$($s.display)\" obj= LocalSystem | Out-Null\n"
-        "          if ($LASTEXITCODE -eq 0) { $created += $s.name }\n"
-        "          continue\n"
-        "     }\n"
-        "     Start-Service -Name $s.name\n"
-        "}\n"
-        "$created = @($created | Select-Object -Unique)\n"
-        "if ($created.Count -gt 0) {\n"
-        "     Set-Content -LiteralPath $createdPath -Value $created -Encoding UTF8\n"
-        "}\n"
-        "exit 0\n"
-    )
+    return _PS1_BODY
