@@ -71,7 +71,15 @@ jobs:
           Get-Content test-output.log -Tail 160 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           if ($testStatus -ne 0) {
-            $diagnostic = (Get-Content test-output.log -Tail 80) -join "`n"
+            # GitHub annotations truncate long messages. Put concise per-module
+            # verdicts and unittest failure headers first, rather than the
+            # verbose tail (which can hide the actual failure past the limit).
+            $testLines = Get-Content test-output.log
+            $summary = @($testLines | Where-Object {
+              $_ -match '^(!! |-- |Ran \d+ tests|FAILED|OK$|FAIL:|ERROR:|Traceback|AssertionError|TimeoutError)'
+            })
+            if ($summary.Count -eq 0) { $summary = @($testLines | Select-Object -Last 12) }
+            $diagnostic = ($summary -join "`n")
             $diagnostic = $diagnostic.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Host "::error title=Windows unit tests failed::$diagnostic"
           }
