@@ -245,7 +245,8 @@ def _format_exit_code(rc: Optional[int]) -> str:
     return str(rc)
 
 
-def _exit_code_hint(rc: Optional[int]) -> str:
+def _exit_code_hint(rc: Optional[int],
+                    installer_type: Optional[InstallerType] = None) -> str:
     """Расшифровка кода возврата для журнала и итогового сообщения.
 
     Сначала проверяются коды аварийного завершения процесса: у них своя
@@ -259,6 +260,17 @@ def _exit_code_hint(rc: Optional[int]) -> str:
         return crash.hint
     if rc > 0x7FFFFFFF:
         return _NEGATIVE_EXIT_HINT
+    if installer_type == InstallerType.INNO:
+        return {
+            1: "не удалось инициализировать установщик",
+            2: "установка отменена до начала или пользователь отказался от продолжения",
+            3: "фатальная ошибка подготовки к следующему этапу установки",
+            4: "фатальная ошибка во время установки",
+            5: "установка отменена до начала установки файлов",
+            6: "установка отменена во время установки файлов",
+            7: "подготовка к установке завершилась неудачно; причина — в install.log",
+            8: "для завершения подготовки требуется перезагрузка компьютера",
+        }.get(rc, _EXIT_CODE_HINTS.get(rc, ""))
     return _EXIT_CODE_HINTS.get(rc, "")
 
 
@@ -1717,11 +1729,28 @@ class Portablizer:
                 "и портатив досоздаёт его сам на любом ПК."
             )
 
-        hints.append(
-            "Некоторые установщики требуют входа в аккаунт или активной "
-            "лицензии и в тихом режиме не работают в принципе — такую "
-            "программу портативной сделать нельзя."
-        )
+        if det.installer_type == InstallerType.INNO and rc in (7, 8):
+            hints.append(
+                f"Inno Setup: {_exit_code_hint(rc, InstallerType.INNO)}. "
+                "Откройте install.log в папке портатива и найдите сообщение "
+                "перед завершением подготовки (PrepareToInstall). "
+                "installer-output.log может содержать только команду и код "
+                "возврата — точная причина обычно в install.log."
+            )
+            hints.append(
+                "Код подготовки сам по себе не доказывает проблему с "
+                "лицензией, ключом /DIR или тихим режимом. Проверьте по "
+                "журналу требования установщика: перезагрузку, права, "
+                "службы и драйверы. Для VPN системный драйвер или служба "
+                "могут требоваться даже при хранении файлов в App; "
+                "распаковка файлов не заменяет их установку."
+            )
+        else:
+            hints.append(
+                "Если установщик требует аккаунт или лицензию, проверьте "
+                "его требования в документации разработчика. Сам код "
+                "ошибки не доказывает, что портативная сборка невозможна."
+            )
         return hints
 
     def _stall_hints(self) -> List[str]:
@@ -1814,7 +1843,7 @@ class Portablizer:
         if rc is None or rc in (0, 3010):
             rc_hint = ""
         else:
-            hint = _exit_code_hint(rc)
+            hint = _exit_code_hint(rc, det.installer_type)
             rc_hint = (
                 f" (код установщика: {_format_exit_code(rc)}"
                 + (f" — {hint}" if hint else "") + ")"
