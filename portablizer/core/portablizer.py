@@ -3276,7 +3276,28 @@ class Portablizer:
             temp = self._temp_dir_for(data_dir)
             user = os.path.join(data_dir, "User")
             programdata = os.path.join(data_dir, "ProgramData")
-            for d in (appdata, local, temp, user, programdata):
+            public = os.path.join(data_dir, "Public")
+            # Shell APIs used by installers resolve known folders from profile
+            # environment variables. Creating only the profile roots is not
+            # enough: Autodesk's streamer creates Start Menu shortcuts and can
+            # fail in SHGetKnownFolderPath if a redirected target is missing.
+            known_folders = (
+                os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs"),
+                os.path.join(user, "Desktop"),
+                os.path.join(user, "Documents"),
+                os.path.join(user, "Downloads"),
+                os.path.join(user, "Music"),
+                os.path.join(user, "Pictures"),
+                os.path.join(user, "Videos"),
+                os.path.join(user, "Saved Games"),
+                os.path.join(user, "AppData", "Roaming"),
+                os.path.join(user, "AppData", "Local"),
+                os.path.join(user, "AppData", "LocalLow"),
+                os.path.join(programdata, "Microsoft", "Windows", "Start Menu", "Programs"),
+                os.path.join(public, "Desktop"),
+            )
+            for d in (appdata, local, temp, user, programdata, public,
+                      *known_folders):
                 os.makedirs(d, exist_ok=True)
             env.update({
                 "APPDATA": appdata,
@@ -3284,6 +3305,9 @@ class Portablizer:
                 "TEMP": temp, "TMP": temp,
                 "USERPROFILE": user,
                 "PROGRAMDATA": programdata,
+                "PUBLIC": public,
+                "HOMEDRIVE": os.path.splitdrive(user)[0],
+                "HOMEPATH": os.path.splitdrive(user)[1],
             })
         for k, v in opts.extra_env.items():
             env[k] = os.path.expandvars(v)
@@ -3547,14 +3571,31 @@ class Portablizer:
                         "Найден Autodesk Fusion Web Deploy: "
                         f"{deployment.path}"
                     )
+                    # The launcher and payload are separate immutable
+                    # deployments in current Autodesk layouts. Stage the core
+                    # deployment plus sibling launcher deployments carrying
+                    # their required adjacent INI sidecar.
+                    deployment_paths = [deployment.path]
+                    for sibling in deployments:
+                        if (sibling.path == deployment.path
+                                or not sibling.is_dir(follow_symlinks=False)):
+                            continue
+                        launcher_exe = os.path.join(sibling.path,
+                                                    "FusionLauncher.exe")
+                        launcher_ini = launcher_exe + ".ini"
+                        if (os.path.isfile(launcher_exe)
+                                and os.path.isfile(launcher_ini)
+                                and os.path.getsize(launcher_ini) > 0):
+                            deployment_paths.append(sibling.path)
                     try:
-                        for item in os.scandir(deployment.path):
-                            destination = os.path.join(app_dir, item.name)
-                            if item.is_dir(follow_symlinks=False):
-                                shutil.copytree(item.path, destination,
-                                                dirs_exist_ok=True)
-                            elif item.is_file(follow_symlinks=False):
-                                shutil.copy2(item.path, destination)
+                        for source_dir in deployment_paths:
+                            for item in os.scandir(source_dir):
+                                destination = os.path.join(app_dir, item.name)
+                                if item.is_dir(follow_symlinks=False):
+                                    shutil.copytree(item.path, destination,
+                                                    dirs_exist_ok=True)
+                                elif item.is_file(follow_symlinks=False):
+                                    shutil.copy2(item.path, destination)
                     except OSError as exc:
                         self.log.warn(
                             f"Не удалось скопировать Fusion Web Deploy: {exc}"

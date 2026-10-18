@@ -323,6 +323,23 @@ class TempRelocationTests(unittest.TestCase):
         self.det = DetectionResult(installer_type=InstallerType.INNO,
                                    confidence=90, is_gog=True)
 
+    def test_isolated_env_creates_profile_known_folder_targets(self):
+        engine = Portablizer(Logger())
+        data = os.path.join(self.portable, "PortableData")
+        env = engine._build_isolated_env(self.opts, data)
+        expected = (
+            os.path.join(env["APPDATA"], "Microsoft", "Windows",
+                         "Start Menu", "Programs"),
+            os.path.join(env["USERPROFILE"], "Desktop"),
+            os.path.join(env["USERPROFILE"], "Documents"),
+            os.path.join(env["PROGRAMDATA"], "Microsoft", "Windows",
+                         "Start Menu", "Programs"),
+            os.path.join(env["PUBLIC"], "Desktop"),
+        )
+        for path in expected:
+            self.assertTrue(os.path.isdir(path), path)
+        self.assertTrue(env["PUBLIC"].startswith(data))
+
     def test_temp_moves_when_the_portable_drive_is_too_small(self):
         engine = Portablizer(Logger())
         with mock.patch.object(space_mod, "media_bytes",
