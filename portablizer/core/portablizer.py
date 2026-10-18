@@ -3476,9 +3476,35 @@ class Portablizer:
                     if not deployment.is_dir(follow_symlinks=False):
                         continue
                     fusion_exe = os.path.join(deployment.path, "Fusion360.exe")
-                    if os.path.isfile(fusion_exe):
-                        add_source(deployment.path, 500,
-                                   "Autodesk Fusion Web Deploy")
+                    if not os.path.isfile(fusion_exe):
+                        continue
+                    # Это точный продуктовый путь, поэтому восстанавливаем
+                    # его сразу, до общего обзора Program Files / AppData.
+                    # На рабочих машинах обход этих корней может включать
+                    # тысячи каталогов (и зависать в антивирусной проверке).
+                    self.log.info(
+                        "Найден Autodesk Fusion Web Deploy: "
+                        f"{deployment.path}"
+                    )
+                    try:
+                        for item in os.scandir(deployment.path):
+                            destination = os.path.join(app_dir, item.name)
+                            if item.is_dir(follow_symlinks=False):
+                                shutil.copytree(item.path, destination,
+                                                dirs_exist_ok=True)
+                            elif item.is_file(follow_symlinks=False):
+                                shutil.copy2(item.path, destination)
+                    except OSError as exc:
+                        self.log.warn(
+                            f"Не удалось скопировать Fusion Web Deploy: {exc}"
+                        )
+                        shutil.rmtree(app_dir, ignore_errors=True)
+                        os.makedirs(app_dir, exist_ok=True)
+                        continue
+                    if self._find_main_exe(app_dir, app_name):
+                        return True
+                    shutil.rmtree(app_dir, ignore_errors=True)
+                    os.makedirs(app_dir, exist_ok=True)
 
         # InstallLocation/DisplayIcon из новых записей реестра — самый точный
         # сигнал. Для DisplayIcon берём каталог исполняемого файла.
