@@ -1664,6 +1664,21 @@ class Portablizer:
                 "тишины."
             )
 
+        fusion_setup = "fusion" in (
+            (opts.app_name or "") + " " + os.path.basename(opts.installer_path)
+        ).casefold()
+        if fusion_setup:
+            hints.append(
+                "Для Autodesk Fusion: включите «Разрешить окно мастера "
+                "установки» и повторите сборку — Fusion_360_Setup.exe может "
+                "быть сетевым загрузчиком, которому нужны подключение к "
+                "интернету и вход в Autodesk Account. После завершения "
+                "Portablizer попробует перенести Fusion Web Deploy из профиля "
+                "пользователя. Даже при успешном переносе автономная работа "
+                "не гарантируется: Fusion может требовать лицензию, службы "
+                "или компоненты Autodesk."
+            )
+
         if opts.extra_install_args:
             hints.append(
                 "Сейчас передаются ваши аргументы: "

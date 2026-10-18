@@ -2223,6 +2223,18 @@ class FailureDiagnosticsTests(unittest.TestCase):
         self.assertIn("--accept-license-agreement", message)
         self.assertIn("zennolab.com", message)
 
+    def test_fusion_failure_explains_interactive_login_and_recovery(self):
+        engine = Portablizer(Logger())
+        hints = engine._failure_hints(
+            DetectionResult(InstallerType.UNKNOWN, 0.0), None,
+            PortableOptions(installer_path="Fusion_360_Setup.exe",
+                            output_dir=".", app_name="Fusion 360"),
+        )
+        advice = " ".join(hints)
+        self.assertIn("Разрешить окно мастера установки", advice)
+        self.assertIn("Autodesk Account", advice)
+        self.assertIn("Fusion Web Deploy", advice)
+
     def test_failure_reports_how_many_variants_were_tried(self):
         result = self._failed_result(
             CustomBootstrapperDetectionTests.ZENNO_PAYLOAD)
