@@ -674,6 +674,16 @@ def build_attempts(
         attempts.append(build_silent_plan(
             InstallerType.MSI, installer_path, target_dir, is_msi=True,
             log_file=log_path("install.log"), extra_args=extra))
+        if allow_assisted:
+            attempts.append(SilentPlan(
+                program=installer_path, output_dir=native_target,
+                label="Окно мастера установки (MSI)", interactive=True,
+                instructions=[
+                    "Пройдите мастер установки вручную. Если будет выбор "
+                    "папки, укажите папку App; после завершения Portablizer "
+                    "попробует найти и перенести установленные файлы.",
+                ],
+            ))
         return attempts
 
     if itype == InstallerType.CUSTOM_CLI:
@@ -753,6 +763,25 @@ def build_attempts(
                 output_dir=native_target,
             )
             attempts.append(plan)
+
+    # Последняя возможность для инсталляторов, которые требуют учётную запись,
+    # лицензии, выбора компонентов или интерактивного первичного входа. Не
+    # запускаем это автоматически: только при явном разрешении пользователя.
+    # Сам setup запускается видимо, без тихих ключей; после завершения обычный
+    # поиск/восстановление переносит результат в App.
+    if allow_assisted and not any(plan.interactive for plan in attempts):
+        attempts.append(SilentPlan(
+            program=installer_path,
+            output_dir=native_target,
+            label="Окно мастера установки (вручную)",
+            interactive=True,
+            instructions=[
+                "Пройдите мастер установки вручную. Если можно выбрать "
+                "папку назначения, укажите App внутри создаваемого портатива. "
+                "Некоторые установщики требуют входа или лицензии; "
+                "Portablizer попробует обнаружить результат после завершения.",
+            ],
+        ))
 
     if not attempts:
         attempts.append(build_silent_plan(
