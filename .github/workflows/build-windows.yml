@@ -79,6 +79,20 @@ jobs:
               $_ -match '^(!! |-- |Ran \d+ tests|FAILED|OK$|FAIL:|ERROR:|Traceback|AssertionError|TimeoutError)'
             })
             if ($summary.Count -eq 0) { $summary = @($testLines | Select-Object -Last 12) }
+            if (@($summary | Where-Object { $_ -match '^!! ' }).Count -gt 0) {
+              $activeTest = @($testLines | Where-Object {
+                $_ -match '^test_[A-Za-z0-9_]+\s+\.\.\.'
+              } | Select-Object -Last 1)
+              if ($activeTest.Count -gt 0) { $summary += "Last test in progress: $($activeTest[0])" }
+              $timeoutIndex = -1
+              for ($i = 0; $i -lt $testLines.Count; $i++) {
+                if ($testLines[$i] -match 'Timeout \(') { $timeoutIndex = $i }
+              }
+              if ($timeoutIndex -ge 0) {
+                $stackStart = [Math]::Max(0, $timeoutIndex - 2)
+                $summary += $testLines[$stackStart..([Math]::Min($testLines.Count - 1, $timeoutIndex + 14))]
+              }
+            }
             $diagnostic = ($summary -join "`n")
             $diagnostic = $diagnostic.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Host "::error title=Windows unit tests failed::$diagnostic"
