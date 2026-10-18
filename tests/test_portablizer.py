@@ -177,6 +177,29 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertTrue((app / "Type.exe").exists())
             self.assertTrue((app / "Type.dll").exists())
 
+    def test_recovers_fusion_from_deep_autodesk_webdeploy_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Fusion 360_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            deployment = Path(temp, "profile", "Autodesk", "webdeploy",
+                              "production", "version-id")
+            app.mkdir(parents=True)
+            data.mkdir()
+            deployment.mkdir(parents=True)
+            (deployment / "Fusion360.exe").write_bytes(b"MZ application")
+            (deployment / "Fusion360.dll").write_bytes(b"dependency")
+            with mock.patch.dict(os.environ,
+                                 {"LOCALAPPDATA": str(deployment.parents[3])}):
+                recovered = self.engine._recover_installed_app(
+                    app_dir=str(app), data_dir=str(data),
+                    app_name="Fusion 360",
+                    installer_path="Fusion_360_Setup.exe", before={},
+                )
+            self.assertTrue(recovered)
+            self.assertTrue((app / "Fusion360.exe").is_file())
+            self.assertTrue((app / "Fusion360.dll").is_file())
+
     def test_recovers_new_app_inside_existing_vendor_directory(self):
         with tempfile.TemporaryDirectory() as temp:
             portable = Path(temp, "Type_Portable")
