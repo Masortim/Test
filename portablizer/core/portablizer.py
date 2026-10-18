@@ -213,6 +213,35 @@ UNPACKABLE_TYPES = (
 #: лицензии) или запрет на запуск без UAC.
 _BAD_COMMAND_LINE_CODES = frozenset({0xFFFFFFFF, 0x80070057, 1639, 87})
 
+# -- «пустой успех»: установщик отработал, но программы в нём нет -------------
+#
+# Лестница сценариев рассчитана на одну причину неудачи: движок не понял ключи.
+# Есть и другая, которую ключами не вылечить, — в файле программы НЕТ. Так
+# устроены сетевые загрузчики (``Fusion_360_Setup.exe``, ``ChromeSetup.exe``):
+# заглушка на несколько мегабайт скачивает программу из сети уже во время
+# установки.
+#
+# В журнале это выглядит обманчиво благополучно: каждая команда завершается
+# кодом 0 за доли секунды, а в перенаправленном профиле появляется один
+# служебный файл на 4 КБ — журнал загрузчика. Шесть сценариев честно
+# отрабатывают все шесть, и пользователь получает вывод «установщик мог
+# проигнорировать ключ папки», хотя ключи здесь ни при чём.
+#
+# Отличить одно от другого можно по факту: попытка завершилась «успехом», шла
+# секунды и не оставила НИ ОДНОГО файла программы (журналы и недописанные
+# загрузки не в счёт — см. ``space.payload_files``). Два таких исхода подряд
+# разными командами — это доказательство, а не догадка.
+
+#: Сколько подряд «пустых успехов» нужно, чтобы остановить лестницу.
+#: Один — мало: так же выглядит загрузчик, который выделил работу отдельному
+#: процессу и вышел. Два разных команды подряд — уже закономерность.
+HOLLOW_ATTEMPTS_LIMIT = 2
+
+#: Потолок длительности попытки, которая ещё может считаться «пустой».
+#: Долгий выход с кодом 0 означает, что установщик что-то делал (качал,
+#: распаковывал, ждал сеть) — торопиться с выводом здесь некуда.
+HOLLOW_ATTEMPT_MAX_SECONDS = 120.0
+
 
 def is_elevated() -> bool:
     """True, если Portablizer запущен с правами администратора.
@@ -836,6 +865,14 @@ class Portablizer:
         self._unpacker_result = ""
         #: Каким распаковщиком воспользовались (пусто — ни одним).
         self._unpacked_with = ""
+        #: Результат определения типа: нужен лестнице попыток для формулировок
+        #: (сам метод ``_run_attempts`` его не получает).
+        self._detection: Optional[DetectionResult] = None
+        #: Сколько подряд попыток завершились «успехом» без единого файла
+        #: программы (см. ``HOLLOW_ATTEMPTS_LIMIT``).
+        self._hollow_streak = 0
+        #: Вывод «в установщике нет программы» — идёт в журнал и в подсказки.
+        self._hollow_note = ""
 
     # -- вспомогательное ------------------------------------------------------
     def progress(self, percent: int, stage: str) -> None:
@@ -1147,6 +1184,44 @@ class Portablizer:
                 "(Sleeping Dogs и другие) останется на английском."
             )
 
+    # -- сетевой загрузчик ----------------------------------------------------
+    def _warn_downloader_stub(self, det: DetectionResult) -> None:
+        """Говорит ДО первого запуска, что программы внутри файла может не быть.
+
+        Шесть одинаковых строк «код 0, но файлов в App не появилось» объясняют
+        причину куда хуже, чем одна честная строка в начале: у сетевого
+        загрузчика ключи тишины вообще ни при чём, переносить в папку нечего.
+        """
+        if not getattr(det, "is_downloader_stub", False):
+            return
+        size = redist_mod.format_size(det.media_size) if det.media_size else ""
+        product = det.online_product
+        if product is not None:
+            self.log.warn(
+                f"Это загрузчик {product.name}"
+                + (f" ({size})" if size else "")
+                + ", а не установщик: самой программы внутри файла нет, её "
+                  "скачивают из сети во время установки."
+            )
+            self.log.warn(product.reason)
+            self.log.info(product.offline_hint)
+            return
+        why = "; ".join(det.downloader_evidence) if det.downloader_evidence \
+            else "внутри есть API загрузки и URL раздачи файлов"
+        self.log.warn(
+            "Установщик похож на сетевой загрузчик"
+            + (f" ({size})" if size else "")
+            + f": {why}."
+        )
+        self.log.info(
+            "Портатив из такого файла соберётся, только если загрузчик сам "
+            "скачает программу и положит её в папку установки — для этого "
+            "нужны сеть и, у части продуктов, вход в аккаунт. Лестница "
+            "сценариев укорочена: перебор ключей тишины не добавит файлов, "
+            "которых внутри нет. Если у продукта есть автономный (офлайн) "
+            "дистрибутив — возьмите его."
+        )
+
     # -- шаги -----------------------------------------------------------------
     def run(self, opts: PortableOptions) -> PortableResult:
         result = PortableResult(success=False)
@@ -1171,6 +1246,9 @@ class Portablizer:
             self._last_install_seconds = 0.0
             self._unpacker_result = ""
             self._unpacked_with = ""
+            self._detection = None
+            self._hollow_streak = 0
+            self._hollow_note = ""
             self._installer_name = opts.installer_path
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
@@ -1193,9 +1271,15 @@ class Portablizer:
             self.progress(8, "Определение типа установщика")
             det = detect_installer(opts.installer_path)
             result.detection = det
+            self._detection = det
             self.log.ok(f"Тип установщика: {det.human}")
             for e in det.evidence:
                 self.log.debug(f"  • {e}")
+
+            # 1a. Сетевой загрузчик: предупреждаем ДО первого запуска, а не
+            # после шести пустых попыток. Диагноз здесь не про ключи тишины —
+            # внутри файла программы нет, и сказать об этом нужно сразу.
+            self._warn_downloader_stub(det)
 
             # 1b. Предупреждаем о нехватке прав ДО запуска: установщик с
             # requireAdministrator без повышения просто не стартует.
@@ -1601,6 +1685,11 @@ class Portablizer:
         именно сделать дальше. Подсказки упорядочены по вероятности решения.
         """
         hints: List[str] = []
+
+        # Программы внутри файла нет: это важнее всех остальных версий —
+        # подбор ключей тишины и права администратора здесь не помогают.
+        if self._hollow_note or getattr(det, "is_downloader_stub", False):
+            hints.extend(self._downloader_hints(det))
 
         if self._install_stalled:
             hints.extend(self._stall_hints())
@@ -2683,6 +2772,14 @@ class Portablizer:
                 )
                 break
 
+            # «Пустой успех»: код 0 за считанные секунды и ни одного файла
+            # программы. Две разные команды подряд с таким исходом означают,
+            # что устанавливать этому файлу нечего — он сам качает программу из
+            # сети (см. detect.downloader_stub_verdict).
+            if self._note_hollow_attempt(plan, rc, app_dir, data_dir,
+                                         queue, index):
+                break
+
             if index < total:
                 self.log.warn(
                     f"Сценарий «{plan.label}» не дал файлов в App — перехожу "
@@ -2691,6 +2788,139 @@ class Portablizer:
 
         self._collect_engine_log(opts, data_dir, portable_dir)
         return last_rc, None
+
+    # -- «пустой успех»: в установщике нет программы ---------------------------
+    def _attempt_payload(self, plan: SilentPlan, app_dir: str,
+                         data_dir: str) -> int:
+        """Сколько ФАЙЛОВ ПРОГРАММЫ оставила попытка.
+
+        Журналы установщика и недописанные загрузки не считаются: сетевой
+        загрузчик создаёт ровно такой файл (``autodesk.webdeploy.streamer.log``
+        и подобные) и завершается с кодом 0. Наблюдатель за ходом установки
+        честно докладывает «распаковано 4.0 КБ в 1 файлах», хотя программы там
+        нет — поэтому здесь работает :func:`space.payload_files`, а не подсчёт
+        всех байтов подряд.
+        """
+        files = 0
+        for root in self._install_watch_roots(plan, app_dir, data_dir):
+            found, _size = space_mod.payload_files(root)
+            files += found
+        return files
+
+    def _note_hollow_attempt(self, plan: SilentPlan, rc: Optional[int],
+                             app_dir: str, data_dir: str,
+                             queue: Sequence[SilentPlan] = (),
+                             index: int = 0) -> bool:
+        """Считает «пустые успехи» и решает, останавливать ли лестницу.
+
+        Возвращает ``True``, если продолжать перебор ключей незачем: две разные
+        команды подряд завершились кодом 0 за считанные секунды и не оставили
+        ни одного файла программы.
+        """
+        if any(step.extracts_only for step in queue[index:]):
+            # Впереди ещё сценарий, который ДОСТАЁТ файлы, а не устанавливает
+            # их (Burn ``/layout``, InstallShield ``/extract_all``,
+            # ``msiexec /a``). Для него пустые «успехи» обычных команд —
+            # штатная картина, а не признак заглушки: обрывать лестницу здесь
+            # значило бы отменить единственную команду, которая может сработать.
+            self._hollow_streak = 0
+            return False
+        if plan.interactive or plan.ignores_target_dir or plan.result_log:
+            # У этих сценариев свой диагноз, и пустая папка App здесь ещё
+            # ничего не доказывает: InstallScript пишет причину отказа в
+            # setup.log, а движок без целевой папки ставит программу в свой
+            # каталог по умолчанию (его проверяет recover()).
+            self._hollow_streak = 0
+            return False
+        if rc not in (0, 3010):
+            # Отказ — не «успех»: причину ищут по коду возврата, а не по
+            # отсутствию файлов.
+            self._hollow_streak = 0
+            return False
+        if self._last_install_seconds > HOLLOW_ATTEMPT_MAX_SECONDS:
+            # Долгая работа с кодом 0 означает, что установщик что-то делал
+            # (качал, распаковывал, ждал сеть). Торопиться с выводом некуда.
+            self._hollow_streak = 0
+            return False
+        if self._attempt_payload(plan, app_dir, data_dir):
+            self._hollow_streak = 0
+            return False
+
+        self._hollow_streak += 1
+        self.log.debug(
+            f"  • сценарий «{plan.label}» завершился кодом {rc} за "
+            f"{redist_mod.format_duration(self._last_install_seconds)} и не "
+            "оставил ни одного файла программы: журналы и недописанные "
+            "загрузки установщика файлами программы не считаются."
+        )
+        if self._hollow_streak < HOLLOW_ATTEMPTS_LIMIT:
+            return False
+        self._hollow_note = self._hollow_diagnosis()
+        self.log.warn(self._hollow_note)
+        return True
+
+    def _hollow_diagnosis(self) -> str:
+        """Формулировка вывода «программы внутри файла нет» для журнала."""
+        det = self._detection
+        product = getattr(det, "online_product", None) if det is not None \
+            else None
+        if product is not None:
+            return (
+                f"Повторять установку другими ключами не буду: {product.name} "
+                "устанавливается сетевым загрузчиком — программу он скачивает "
+                "из сети во время установки, а внутри самого файла её нет. "
+                "Значит, и переносить в App нечего."
+            )
+        if det is not None and getattr(det, "is_downloader_stub", False):
+            return (
+                "Повторять установку другими ключами не буду: установщик "
+                "похож на сетевой загрузчик, и две разные команды подряд "
+                "завершились «успешно», не оставив ни одного файла программы. "
+                "Ключи тишины на содержимое файла не влияют."
+            )
+        return (
+            "Повторять установку другими ключами не буду: две разные команды "
+            "подряд завершились кодом 0 за считанные секунды и не оставили ни "
+            "одного файла программы. Содержимого установки в этом файле, "
+            "похоже, нет вовсе: так ведут себя сетевые загрузчики (программу "
+            "качают из интернета) и заглушки, которым не хватает соседних "
+            "частей дистрибутива."
+        )
+
+    def _downloader_hints(self, det: DetectionResult) -> List[str]:
+        """Подсказки, когда программы внутри установщика нет.
+
+        Идут первыми: подбор ключей тишины в этом случае — занятие заведомо
+        бесполезное, и отправлять пользователя к «Доп. аргументам» было бы
+        обманом.
+        """
+        hints: List[str] = []
+        product = getattr(det, "online_product", None)
+        if product is not None:
+            hints.append(product.reason)
+            hints.append(product.offline_hint)
+            return hints
+        if self._hollow_note:
+            hints.append(
+                "Две разные команды подряд завершились кодом 0 за считанные "
+                "секунды и не оставили ни одного файла программы: ключи тишины "
+                "здесь ни при чём, подбирать их бесполезно."
+            )
+        hints.append(
+            "Скачайте автономный (офлайн) дистрибутив — тот, что содержит все "
+            "файлы программы, а не ссылку на них. Обычно он называется «offline "
+            "installer», «full installer», «standalone» или «enterprise bundle» "
+            "и весит во много раз больше загруженной заглушки."
+        )
+        installer = self._installer_name or ""
+        if installer and not space_mod.part_files(installer):
+            hints.append(
+                "Проверьте, все ли части дистрибутива лежат рядом с "
+                "установщиком: если программа распространяется несколькими "
+                "файлами (setup.exe + .bin/.cab/.msi), запуск одного setup.exe "
+                "без соседей тоже заканчивается кодом 0 и пустой папкой."
+            )
+        return hints
 
     def _queue_crash_recovery(self, plan: SilentPlan, rc: Optional[int],
                               app_dir: str, queue: List[SilentPlan],
@@ -3105,6 +3335,17 @@ class Portablizer:
         говорится в подсказках.
         """
         if not self._unpacker_worth_trying(det):
+            return False
+        product = getattr(det, "online_product", None)
+        if product is not None:
+            # Достать из загрузчика можно только сам загрузчик: сборка нашла бы
+            # в App исполняемый файл и выдала бы заглушку за готовое
+            # приложение. Честнее сказать, что распаковка здесь ни при чём.
+            self.log.info(
+                f"Содержимое {product.name} распаковщиком не достать: внутри "
+                "файла лежит загрузчик, а программа скачивается из сети уже во "
+                "время установки."
+            )
             return False
         unpacker = unpacker_mod.find_unpacker()
         if not unpacker:

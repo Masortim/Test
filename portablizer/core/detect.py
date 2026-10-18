@@ -14,7 +14,7 @@
   * InstallAware / Wise / install4j / BitRock / прочее -> эвристики
   * Собственный bootstrapper -> ключи вида ``--silent --installPath=...``
 
-Определение построено на четырёх независимых источниках:
+Определение построено на пяти независимых источниках:
 
 1. **Структура PE.** Настоящий WiX Burn-бандл всегда имеет секцию с именем
    ``.wixburn``. Одноимённая строка внутри файла ничего не доказывает: она
@@ -38,6 +38,15 @@
    синтаксис тихой установки опубликован в официальной документации. Если
    движок не опознан уверенно, а имя файла совпадает с профилем, ключи
    берутся из документации производителя.
+5. **Профиль сетевого загрузчика.** Есть класс файлов, для которого правильный
+   ключ тишины не существует: ``Fusion_360_Setup.exe``, ``ChromeSetup.exe`` и
+   тысячи им подобных — заглушки на несколько мегабайт, которые скачивают
+   программу из сети уже во время установки. Такие файлы узнаются по
+   стандартизованному имени продукта (:class:`OnlineOnlyProduct`) и по
+   сочетанию «малый вес + API загрузки из сети + URL раздачи файлов». Признак
+   не отменяет сборку — он заранее говорит правду и укорачивает лестницу
+   сценариев, потому что перебор ключей не добавит файлов, которых внутри нет
+   (см. ``downloader_stub_verdict``).
 """
 from __future__ import annotations
 
@@ -48,6 +57,8 @@ import zipfile
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple
+
+from . import space as space_mod
 
 
 class InstallShieldGeneration(str, Enum):
@@ -198,6 +209,199 @@ _ADMIN_MARKERS: Tuple[bytes, ...] = (
     b"requireadministrator",
     b"requireAdministrator".lower(),
 )
+
+
+# --- сетевые загрузчики: когда программы внутри файла нет ---------------------
+#
+# Отдельный класс установщиков, который нельзя вылечить ни одним ключом тишины.
+# «Fusion_360_Setup.exe», «ChromeSetup.exe», «SteamSetup.exe» и тысячи им
+# подобных — это ЗАГЛУШКА на несколько мегабайт: она скачивает настоящую
+# программу из сети уже во время установки. Портатив из неё не собирается не
+# потому, что ключи подобраны неверно, а потому, что переносить нечего.
+#
+# Журнал такой сборки выглядит обманчиво благополучно: каждая команда
+# завершается кодом 0 за доли секунды, а в папке появляется один служебный
+# файл на 4 КБ (журнал загрузчика). Лестница из шести сценариев честно
+# отрабатывает все шесть и сообщает, что «установщик мог проигнорировать ключ
+# папки» — диагноз неверный, и шесть запусков подряд только тратят время.
+#
+# Признаки, по которым заглушка узнаётся ДО запуска:
+#   * файл маленький, а частей дистрибутива (``.bin``/``.cab``) рядом нет;
+#   * внутри есть API загрузки из сети (WinINet/WinHTTP/BITS/curl);
+#   * внутри есть URL раздачи файлов (dl., cdn., appstreaming, …);
+#   * при этом своего архива с программой внутри нет (нет приклеенного ZIP).
+
+#: Вес, выше которого файл уже нельзя принять за заглушку: внутри может лежать
+#: программа целиком. Многие настоящие установщики небольших программ весят
+#: 2–20 МБ, поэтому сам по себе размер ничего не решает — он лишь один из
+#: признаков (см. ``downloader_stub_verdict``).
+DOWNLOADER_STUB_MAX_BYTES = 64 * 1024 * 1024
+
+#: API, которыми exe тянет данные из сети. Имена функций Windows ищутся в
+#: таблице импорта и в строках — они доказывают саму возможность загрузки.
+_DOWNLOAD_API_TOKENS: Tuple[str, ...] = (
+    "urldownloadtofile", "urldownloadtocachefile",
+    "internetopenurl", "internetreadfile", "internetconnect",
+    "winhttpopen", "winhttpsendrequest", "winhttpreaddata",
+    "httpopenrequest", "httpsendrequest",
+    "curl_easy_init", "libcurl",
+    "ibackgroundcopymanager", "backgroundcopymanager",
+)
+
+#: Признаки того, что URL ведёт на раздачу файлов, а не просто на сайт продукта.
+_DOWNLOAD_URL_HINTS: Tuple[str, ...] = (
+    "dl.", "/download", "cdn.", "appstreaming", "cloudfront", "akamai",
+    "azureedge", "fastly", "s3.amazonaws", "webdeploy", "streamer",
+    "edgesuite", "edgekey", "storage.googleapis",
+)
+
+
+@dataclass(frozen=True)
+class OnlineOnlyProduct:
+    """Продукт, который не переносится в папку ПО УСТРОЙСТВУ, а не из-за ключей.
+
+    От :class:`VendorProfile` отличается назначением: профиль производителя
+    помогает ПРАВИЛЬНО УСТАНОВИТЬ программу, а этот профиль — честно сказать,
+    что портатива не получится, и назвать причину словами разработчика, а не
+    догадкой по коду возврата. Заодно здесь лежат документированные ключи
+    тишины: у упакованных загрузчиков (Autodesk Fusion собран через PyInstaller)
+    строки внутри файла сжаты, и эвристика по ключам их не видит.
+    """
+
+    name: str                          # имя продукта (для журнала)
+    filename_re: re.Pattern            # стандартизованное имя файла-загрузчика
+    hosts: Tuple[str, ...]             # характерные домены внутри бинарника
+    reason: str                        # почему портатив не получится
+    offline_hint: str                  # что взять вместо этого файла
+    switches: Tuple[str, ...] = ()     # документированные ключи тишины
+
+
+_ONLINE_ONLY_PRODUCTS: Tuple[OnlineOnlyProduct, ...] = (
+    # Autodesk Fusion. Файл с сайта — это «Fusion Client Downloader»: потоковый
+    # загрузчик (streamer), который скачивает клиента и раскладывает его в
+    # ``%LOCALAPPDATA%\Autodesk\webdeploy\production\<хеш сборки>``. Докумен-
+    # тированные ключи: ``--quiet`` (тихо, в профиль пользователя) и
+    # ``--globalinstall`` (в ``Program Files`` этого ПК — для портатива НЕ
+    # подходит, поэтому здесь его нет). Журнал загрузчика:
+    # ``%LOCALAPPDATA%\Autodesk\autodesk.webdeploy.streamer.log``.
+    OnlineOnlyProduct(
+        name="Autodesk Fusion",
+        filename_re=re.compile(
+            r"fusion[\s_.\-]*(360)?[\s_.\-]*(setup|downloader|client|install)"
+            r"|fusion360|autodesk[\s_.\-]*fusion", re.IGNORECASE),
+        hosts=("autodesk.com", "appstreaming.autodesk.com", "autodesk360.com"),
+        reason=(
+            "Fusion устанавливается не из файла, а потоковым загрузчиком: он "
+            "скачивает клиента из сети и раскладывает его в "
+            "%LOCALAPPDATA%\\Autodesk\\webdeploy\\production\\<хеш сборки>. "
+            "При каждом запуске клиент сам себя обновляет и требует вход в "
+            "аккаунт Autodesk, а папка сборки меняется с каждым обновлением. "
+            "Перенесённый на другой ПК портатив работать не будет: и "
+            "обновление, и проверка лицензии идут через сеть и через профиль "
+            "пользователя, а не из папки программы."
+        ),
+        offline_hint=(
+            "Публичного офлайн-дистрибутива Fusion не существует. "
+            "Документированный ключ тишины у загрузчика — --quiet "
+            "(--globalinstall дополнительно ставит клиент в Program Files "
+            "этого компьютера, поэтому для портатива он не годится). Хотите "
+            "попробовать — добавьте --quiet в поле «Доп. аргументы "
+            "установки»: установка пойдёт, но её результат — зависящая от "
+            "сети и аккаунта папка, а не автономная программа."
+        ),
+        switches=("--quiet",),
+    ),
+    # Google Chrome: ChromeSetup.exe весит пару мегабайт и скачивает браузер с
+    # dl.google.com. Автономный корпоративный MSI содержит программу целиком.
+    OnlineOnlyProduct(
+        name="Google Chrome",
+        filename_re=re.compile(
+            r"^(chrome|googlechrome|chromesetup)[\s_.\-]*(setup|installer|"
+            r"downloader|online)", re.IGNORECASE),
+        hosts=("dl.google.com",),
+        reason=(
+            "Это загрузчик браузера, а не сам браузер: несколько мегабайт, "
+            "которые скачивают установщик с dl.google.com уже во время "
+            "работы. В файле программы нет, поэтому и переносить в App нечего."
+        ),
+        offline_hint=(
+            "Возьмите автономный корпоративный установщик "
+            "(GoogleChromeStandaloneEnterprise64.msi) — в нём браузер целиком, "
+            "и из него портатив собирается обычным порядком."
+        ),
+    ),
+)
+
+
+def match_online_product(path: str, scan: "ScanResult",
+                         media_size: int = 0) -> Optional[OnlineOnlyProduct]:
+    """Профиль «продукта-загрузчика» или ``None``.
+
+    Совпадение требует двух вещей: имени файла ИЛИ характерного домена внутри
+    бинарника — и небольшого веса. Размер здесь работает как защита от ложного
+    срабатывания на настоящем офлайн-дистрибутиве того же продукта: полный
+    установщик Chrome или Autodesk содержит те же домены, но весит сотни
+    мегабайт, и портатив из него собирается штатно.
+    """
+    if media_size > DOWNLOADER_STUB_MAX_BYTES:
+        return None
+    name = os.path.basename(path)
+    urls = [url.casefold() for url in scan.urls]
+    for product in _ONLINE_ONLY_PRODUCTS:
+        if not (product.filename_re.search(name)
+                or any(host in url for url in urls
+                       for host in product.hosts)):
+            continue
+        return product
+    return None
+
+
+def downloader_stub_verdict(path: str, scan: "ScanResult",
+                            media_size: int,
+                            has_zip_payload: bool) -> Tuple[bool, List[str]]:
+    """Похож ли файл на сетевой загрузчик, и чем это доказывается.
+
+    Возвращает ``(признак, список доказательств)``. Признак намеренно
+    консервативен: он НЕ отменяет установку и не объявляет программу
+    непереносимой, а лишь заранее предупреждает, что внутри файла программы
+    может не оказаться, и объясняет, почему лестница сценариев короче.
+
+    Одиночного признака мало. Настоящий установщик небольшой программы тоже
+    бывает маленьким и тоже может содержать ``URLDownloadToFile`` (движок
+    докачивает DirectX или VC++). Поэтому требуется и малый вес, и следы
+    загрузки из сети, и отсутствие собственного архива с программой.
+    """
+    evidence: List[str] = []
+    if media_size <= 0 or media_size > DOWNLOADER_STUB_MAX_BYTES:
+        return False, evidence
+    if has_zip_payload:
+        # Внутри уже есть архив с данными: это не заглушка, а контейнер,
+        # содержимое которого можно достать без запуска.
+        return False, evidence
+
+    apis = [token for token in _DOWNLOAD_API_TOKENS
+            if token.casefold() in {hit.casefold() for hit in scan.download_hits}]
+    hosts = sorted({url for url in scan.urls
+                    if any(hint in url.casefold() for hint in _DOWNLOAD_URL_HINTS)})
+    if not apis or not hosts:
+        # Одного признака мало. У настоящего установщика небольшой программы
+        # тоже бывает URLDownloadToFile (движок докачивает DirectX или VC++),
+        # а у офлайн-дистрибутива внутри лежит сайт производителя. Заглушку
+        # доказывает только пара: она УМЕЕТ качать и ЗНАЕТ, откуда.
+        return False, evidence
+    evidence.append("внутри есть API загрузки из сети: " + ", ".join(apis[:4]))
+    evidence.append("URL раздачи файлов внутри файла: "
+                    + ", ".join(hosts[:3])
+                    + (" …" if len(hosts) > 3 else ""))
+    evidence.insert(0, (
+        f"вес дистрибутива — {_human_mb(media_size)}: для программы целиком "
+        "этого мало, такие файлы обычно скачивают её во время установки"))
+    return True, evidence
+
+
+def _human_mb(size: int) -> str:
+    """Вес в мегабайтах одной строкой (без зависимости от redist)."""
+    return f"{size / (1024 * 1024):.1f} МБ"
 
 _URL_RE = re.compile(
     r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{6,180}"
@@ -382,6 +586,9 @@ class ScanResult:
     markers: Set[str] = field(default_factory=set)
     #: Маркеры GOG (gog.com, goggame- и т.п.).
     gog_hits: List[str] = field(default_factory=list)
+    #: API загрузки из сети (``_DOWNLOAD_API_TOKENS``): признак загрузчика,
+    #: который тянет программу из интернета во время установки.
+    download_hits: List[str] = field(default_factory=list)
     #: Имена языков Inno Setup, найденные внутри файла (``ru``, ``russian``).
     inno_language_names: List[str] = field(default_factory=list)
 
@@ -408,6 +615,17 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
     switch_needles = [(token, _needles(token)) for token in _SWITCH_TOKENS]
     marker_needles = [(token, _needles(token)) for token in _MARKER_TOKENS]
     gog_needles = [(token, _needles(token)) for token in _GOG_MARKERS]
+    # API загрузки из сети ищем только у небольших файлов: у офлайн-установщика
+    # большой игры (десятки гигабайт) этот признак ничего не решает — файл
+    # слишком велик, чтобы быть заглушкой, — а проход по всем чанкам стоит
+    # заметного времени.
+    try:
+        want_download = os.path.getsize(path) <= DOWNLOADER_STUB_MAX_BYTES
+    except OSError:
+        want_download = False
+    download_needles = ([(token, _needles(token))
+                         for token in _DOWNLOAD_API_TOKENS]
+                        if want_download else [])
     short_lang_needles: List[Tuple[str, bytes, bytes]] = []
     for code, english in _INNO_SHORT_LANG_PAIRS:
         ascii_pair = f"{code}\x00{english}".encode("ascii")
@@ -419,6 +637,7 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
     found_switches: Set[str] = set()
     found_markers: Set[str] = set()
     found_gog: Set[str] = set()
+    found_downloads: Set[str] = set()
     found_short_langs: Set[str] = set()
     found_long_langs: Set[str] = set()
     urls: List[str] = []
@@ -431,6 +650,7 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
         + [len(encoded) for _t, pair in switch_needles for encoded in pair]
         + [len(encoded) for _t, pair in marker_needles for encoded in pair]
         + [len(encoded) for _t, pair in gog_needles for encoded in pair]
+        + [len(encoded) for _t, pair in download_needles for encoded in pair]
         + [len(encoded) for _c, ascii_p, wide_p in short_lang_needles
            for encoded in (ascii_p, wide_p)]
         + [len(encoded) for _n, ascii_p, wide_p in long_lang_needles
@@ -474,6 +694,12 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
                     if ascii_sig in data or wide_sig in data:
                         found_gog.add(token)
 
+                for token, (ascii_sig, wide_sig) in download_needles:
+                    if token in found_downloads:
+                        continue
+                    if ascii_sig in data or wide_sig in data:
+                        found_downloads.add(token)
+
                 for code, ascii_sig, wide_sig in short_lang_needles:
                     if code in found_short_langs:
                         continue
@@ -506,6 +732,8 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
     result.markers = found_markers
     result.urls = urls
     result.gog_hits = [t for t in _GOG_MARKERS if t in found_gog]
+    result.download_hits = [t for t in _DOWNLOAD_API_TOKENS
+                            if t in found_downloads]
     # Короткая пара ``ru\\0Russian`` надёжнее голого ``russian\\0``: второе
     # совпадает с отображаемым именем рядом с кодом ``ru``.
     inno_names: List[str] = []
@@ -676,6 +904,16 @@ class DetectionResult:
     is_gog: bool = False
     #: Имена языков из секции [Languages] Inno Setup (``ru``, ``russian``).
     inno_language_names: List[str] = field(default_factory=list)
+    #: Файл похож на сетевой загрузчик: программы внутри него нет, её скачают
+    #: во время установки (см. ``downloader_stub_verdict``).
+    is_downloader_stub: bool = False
+    #: Чем доказывается признак загрузчика — идёт в журнал и в подсказки.
+    downloader_evidence: List[str] = field(default_factory=list)
+    #: Профиль продукта, который не переносится в папку по устройству
+    #: (Autodesk Fusion, загрузчик Chrome). ``None`` — продукт не опознан.
+    online_product: Optional["OnlineOnlyProduct"] = None
+    #: Вес дистрибутива вместе с частями (``space.media_bytes``).
+    media_size: int = 0
 
     @property
     def human(self) -> str:
@@ -685,6 +923,10 @@ class DetectionResult:
                 and self.installshield_generation
                 != InstallShieldGeneration.UNKNOWN):
             suffix = f", {self.installshield_generation.value}"
+        if self.is_downloader_stub:
+            # Главное, что нужно понять из этой строки: ключи тишины здесь ни
+            # при чём — внутри файла программы нет.
+            suffix += ", сетевой загрузчик"
         return (f"{prefix}{self.installer_type.value}{suffix} "
                 f"(уверенность {int(self.confidence * 100)}%)")
 
@@ -918,7 +1160,58 @@ def detect_installer(path: str) -> DetectionResult:
             + ", ".join(result.inno_language_names[:12])
             + (" …" if len(result.inno_language_names) > 12 else "")
         )
+
+    _mark_downloader_stub(path, scan, result)
     return result
+
+
+#: Движки, у которых «заглушка» вообще возможна. У уверенно опознанного Inno
+#: Setup или NSIS внутри лежит программа, а докачиваются максимум
+#: предусловия (DirectX, VC++) — объявлять такой установщик пустым нельзя.
+_STUB_CANDIDATE_TYPES: Tuple[InstallerType, ...] = (
+    InstallerType.SELF_EXTRACT, InstallerType.UNKNOWN,
+    InstallerType.SQUIRREL, InstallerType.CUSTOM_CLI,
+)
+
+
+def _mark_downloader_stub(path: str, scan: ScanResult,
+                          result: DetectionResult) -> None:
+    """Помечает файл как сетевой загрузчик, если на то есть основания.
+
+    Оснований два, и достаточно любого:
+
+    1. **Профиль продукта.** Имя файла стандартизовано
+       (``Fusion_360_Setup.exe``, ``ChromeSetup.exe``), а сам загрузчик
+       упакован: строки внутри сжаты, и ни API загрузки, ни URL раздачи
+       эвристика не увидит. Приём тот же, что у профилей производителей
+       (:class:`VendorProfile`).
+    2. **Признаки внутри файла.** Малый вес + API загрузки из сети + URL
+       раздачи файлов + отсутствие собственного архива с программой.
+
+    Профиль дополнительно защищён весом: полный офлайн-дистрибутив того же
+    продукта содержит те же домены, но весит сотни мегабайт, и портатив из
+    него собирается штатно.
+    """
+    if result.is_gog or result.is_msi:
+        return
+    if (result.confidence >= TRUSTED_CONFIDENCE
+            and result.installer_type not in _STUB_CANDIDATE_TYPES):
+        return
+
+    result.media_size = space_mod.media_bytes(path)
+    product = match_online_product(path, scan, result.media_size)
+    if product is not None:
+        result.online_product = product
+        result.evidence.append(
+            f"имя файла соответствует загрузчику {product.name}: программу "
+            "скачивает из сети сам установщик"
+        )
+    verdict, why = downloader_stub_verdict(
+        path, scan, result.media_size, result.has_zip_payload)
+    result.downloader_evidence = list(why)
+    if verdict:
+        result.evidence.extend(why)
+    result.is_downloader_stub = verdict or product is not None
 
 
 def _gog_filename(path: str) -> bool:
