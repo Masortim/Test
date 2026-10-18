@@ -38,6 +38,17 @@ from .languages import plan_language
 #: Больше попыток запускать бессмысленно: каждая стоит времени пользователя.
 MAX_ATTEMPTS = 6
 
+#: Сколько сценариев оставлять установщику, похожему на сетевой загрузчик.
+#: Программы внутри такого файла нет (её скачают во время установки), и
+#: перебор ключей тишины этого не изменит. Но и обрывать сборку по одной лишь
+#: эвристике нельзя — признак мог и ошибиться, поэтому несколько попыток
+#: остаётся: они же дают честное эмпирическое доказательство для подсказок.
+STUB_MAX_ATTEMPTS = 3
+
+#: Для продукта из профиля (``detect.OnlineOnlyProduct``) доказательств больше:
+#: стандартизованное имя файла плюс малый вес. Хватает двух запусков.
+ONLINE_PRODUCT_MAX_ATTEMPTS = 2
+
 
 @dataclass
 class SilentPlan:
@@ -639,6 +650,12 @@ def build_attempts(
     «правильной» команды: у одного и того же движка встречаются сборки с
     разным набором поддерживаемых ключей.
 
+    Исключение — установщик, в котором программы вообще нет (сетевой
+    загрузчик: ``detection.is_downloader_stub``). Для него лестница
+    укорачивается до :data:`STUB_MAX_ATTEMPTS` (для продукта из профиля —
+    до :data:`ONLINE_PRODUCT_MAX_ATTEMPTS`): перебор ключей не добавит файлов,
+    которых внутри нет.
+
     ``language`` — код языка из ``languages.LANGUAGES`` (пусто — язык по
     умолчанию установщика). Ключ выбора языка добавляется ко ВСЕМ попыткам
     движка, кроме универсального набора: тот не знает, какой движок на самом
@@ -770,14 +787,25 @@ def build_attempts(
         seen.add(key)
         unique.append(plan)
 
+    # Сетевой загрузчик: программы внутри файла нет, её скачают во время
+    # установки, и никакой ключ тишины этого не изменит. Лестницу укорачиваем —
+    # не до одной команды (признак мог и ошибиться, а обрывать сборку по одной
+    # эвристике нельзя), но и не до шести запусков подряд, каждый из которых
+    # честно сходит в сеть за одним и тем же.
+    limit = MAX_ATTEMPTS
+    if getattr(detection, "online_product", None) is not None:
+        limit = ONLINE_PRODUCT_MAX_ATTEMPTS
+    elif getattr(detection, "is_downloader_stub", False):
+        limit = STUB_MAX_ATTEMPTS
+
     # План с окном мастера требует человека у клавиатуры, поэтому он всегда
     # последний и не должен вытесняться автоматическими вариантами при
     # обрезке лестницы.
     silent = [p for p in unique if not p.interactive]
     interactive = [p for p in unique if p.interactive]
     if interactive:
-        return silent[:max(1, MAX_ATTEMPTS - len(interactive))] + interactive
-    return silent[:MAX_ATTEMPTS]
+        return silent[:max(1, limit - len(interactive))] + interactive
+    return silent[:limit]
 
 
 def candidate_silent_switches(installer_type: InstallerType) -> List[str]:
