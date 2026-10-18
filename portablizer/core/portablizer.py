@@ -1197,6 +1197,19 @@ class Portablizer:
             for e in det.evidence:
                 self.log.debug(f"  • {e}")
 
+            # Online Fusion bootstrapper has no trustworthy silent mode. Avoid
+            # launching six generic switches that merely reproduce its GUI
+            # failure; require explicit consent for exactly one visible run.
+            if ("fusion" in os.path.basename(opts.installer_path).casefold()
+                    and not opts.allow_assisted_install):
+                result.hints = self._failure_hints(
+                    det, None, opts, portable_dir)
+                raise RuntimeError(
+                    "Autodesk Fusion — сетевой установщик. Включите "
+                    "«Разрешить окно мастера установки» и повторите сборку; "
+                    "универсальные тихие ключи здесь не применяются."
+                )
+
             # 1b. Предупреждаем о нехватке прав ДО запуска: установщик с
             # requireAdministrator без повышения просто не стартует.
             if IS_WINDOWS and det.requires_admin and not is_elevated():

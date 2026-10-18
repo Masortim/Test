@@ -2122,6 +2122,18 @@ class AttemptLadderTests(unittest.TestCase):
         plans = build_attempts(det, "setup.exe", r"C:\\Portable\\App")
         self.assertFalse(any(plan.interactive for plan in plans))
 
+    def test_fusion_online_installer_never_gets_guessed_switches(self):
+        det = DetectionResult(InstallerType.UNKNOWN, 0.1)
+        self.assertEqual(build_attempts(
+            det, "Fusion_360_Setup.exe", r"C:\\Portable\\App"), [])
+        plans = build_attempts(
+            det, "Fusion_360_Setup.exe", r"C:\\Portable\\App",
+            allow_assisted=True)
+        self.assertEqual(len(plans), 1)
+        self.assertTrue(plans[0].interactive)
+        self.assertEqual(plans[0].args, [])
+        self.assertIn("Autodesk Fusion", plans[0].label)
+
     def _engine(self, succeed_on):
         class Fake(Portablizer):
             def __init__(self, *a, **kw):
@@ -2274,6 +2286,26 @@ class FailureDiagnosticsTests(unittest.TestCase):
         self.assertIn("Autodesk Account", advice)
         self.assertIn("Fusion Web Deploy", advice)
 
+    def test_fusion_without_consent_does_not_launch_six_silent_attempts(self):
+        class MustNotStart(Portablizer):
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                raise AssertionError("Fusion setup must wait for explicit consent")
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "portablizer.core.portablizer.IS_WINDOWS", False
+        ):
+            installer = Path(temp, "Fusion_360_Setup.exe")
+            installer.write_bytes(b"MZ dummy setup")
+            result = MustNotStart(Logger()).run(PortableOptions(
+                installer_path=str(installer), output_dir=temp,
+                app_name="Fusion 360", capture_registry=False,
+                cleanup_host=False, build_exe_launcher=False,
+            ))
+            self.assertFalse(result.success)
+            self.assertEqual(result.attempts_made, 0)
+            self.assertIn("универсальные тихие ключи",
+                          " ".join(result.messages).lower())
+
     def test_incomplete_fusion_streaming_stub_never_gets_a_launch_bat(self):
         class PartialFusion(Portablizer):
             def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
@@ -2289,6 +2321,7 @@ class FailureDiagnosticsTests(unittest.TestCase):
                 installer_path=str(installer), output_dir=temp,
                 app_name="Fusion 360", capture_registry=False,
                 cleanup_host=False, build_exe_launcher=False,
+                allow_assisted_install=True,
             ))
             portable = Path(temp, "Fusion 360_Portable")
             self.assertFalse(result.success)
