@@ -689,11 +689,14 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
 
 
 def stop_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
-    """Unregister the companion services created for this session.
+    """Undo on this PC what the portable created for the session.
 
-    Only the marker file (PortableData\\NetStack\\created-services.txt)
-    decides what is removed — a service that already existed on the PC is
-    never touched, and shared drivers stay installed on purpose.
+    Two per-machine markers decide everything
+    (PortableData\\NetStack\\created-services.txt for services,
+    driver-packages.txt for driver packages published in isolation mode):
+    a service or a driver that already existed on the PC was never claimed,
+    hence is never touched here.  Busy drivers stay pending and the next
+    session end retries them.
     """
     if not IS_WINDOWS:
         return []
@@ -701,9 +704,11 @@ def stop_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
     teardown = str(section.get("teardown") or "")
     if not teardown or not section.get("stop_on_exit", True):
         return []
-    marker = (root / str(cfg.get("data_dir_name", "PortableData"))
-              / "NetStack" / "created-services.txt")
-    if not marker.is_file():
+    state = (root / str(cfg.get("data_dir_name", "PortableData"))
+             / "NetStack")
+    claimed = (state / "created-services.txt").is_file() or (
+        state / "driver-packages.txt").is_file()
+    if not claimed:
         return []
     code = _run_netstack_script(root, teardown)
     return [f"NetStack teardown exit code {code}"]
