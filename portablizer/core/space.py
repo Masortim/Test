@@ -24,10 +24,6 @@ Portablizer перенаправляет ``TEMP`` внутрь портатив�
   * :func:`media_bytes` — сколько занимает дистрибутив целиком (exe плюс части
     ``.bin``/``.cab``): это честная оценка того, сколько данных установщику
     придётся развернуть;
-  * :func:`payload_files` — сколько ФАЙЛОВ ПРОГРАММЫ появилось в папке, без
-    служебных записей установщика (журналы, недописанные загрузки). По нему
-    лестница сценариев отличает «движок не понял ключи» от «в установщике
-    программы вообще нет» (сетевой загрузчик);
   * :func:`free_space` — сколько места свободно на нужном диске;
   * :func:`pick_temp_root` — на какой диск перенести ``TEMP`` установщика, если
     на диске портатива для него нет места. Перенос всегда временный: папка
@@ -42,8 +38,7 @@ import shutil
 import string
 import sys
 import tempfile
-import time
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence
 
 IS_WINDOWS = sys.platform.startswith("win")
 
@@ -229,73 +224,6 @@ def pick_temp_root(primary_dir: str, need_bytes: int,
     if chosen is None or chosen[0] <= max(primary_free, 0):
         return None
     return chosen[1]
-
-
-#: Расширения файлов, которые установщик пишет ПРО СЕБЯ, а не из дистрибутива:
-#: журналы (``dd_vcredist*.log``, ``setup.log``, ``install.log``) и недописанные
-#: загрузки (``*.tmp``, ``*.partial``). В подсчёте «а программа-то появилась?» они не
-#: должны учитываться: именно по ним легко принять служебную активность
-#: сетевого загрузчика за распаковку программы.
-SERVICE_FILE_EXTENSIONS = (".log", ".tmp", ".partial", ".crdownload")
-
-#: Файл крупнее этого почти наверняка не служебная запись, а данные
-#: дистрибутива (кабинет, архив, MSI). Ограничение нужно, чтобы «жирный»
-#: журнал загрузки не выглядел полезной нагрузкой.
-SERVICE_FILE_MAX_BYTES = 8 * 1024 * 1024
-
-
-def payload_files(root: str,
-                  skip_extensions: Sequence[str] = SERVICE_FILE_EXTENSIONS,
-                  max_service_bytes: int = SERVICE_FILE_MAX_BYTES,
-                  budget: float = 3.0) -> Tuple[int, int]:
-    """``(файлов, байт)`` внутри ``root``, НЕ считая служебных записей.
-
-    Зачем это нужно
-    ---------------
-    Размер папки сам по себе не отвечает на вопрос «установщик положил туда
-    программу или только поработал». Сетевой загрузчик (``Fusion_360_Setup.exe``
-    и тысячи ему подобных) за пару секунд создаёт в ``TEMP`` один файл на
-    4 КБ — свой журнал или обрывок загрузки — и завершается с кодом ``0``.
-    Наблюдатель за ходом установки честно докладывает «распаковано 4.0 КБ в
-    1 файлах», и лестница сценариев уходит на следующий круг: перебирать ключи
-    тишины для файла, который программу не содержит, бессмысленно.
-
-    Поэтому служебные записи (журналы ``*.log``, недописанные ``*.tmp``) здесь
-    исключаются, а всё остальное считается полезной нагрузкой. Обход ограничен
-    по времени так же, как в наблюдателе: папка может содержать сотни тысяч
-    файлов большой игры, и полный пересчёт стоил бы дороже самой установки.
-    """
-    files = 0
-    total = 0
-    if not root:
-        return files, total
-    skipped = {ext.casefold() for ext in skip_extensions if ext}
-    limit = time.monotonic() + max(0.1, budget)
-    stack = [root]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
-                            continue
-                        if not entry.is_file(follow_symlinks=False):
-                            continue
-                        info = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    extension = os.path.splitext(entry.name)[1].casefold()
-                    if extension in skipped and info.st_size <= max_service_bytes:
-                        continue
-                    files += 1
-                    total += info.st_size
-        except OSError:
-            continue
-        if time.monotonic() > limit:
-            break
-    return files, total
 
 
 def default_roots() -> List[str]:

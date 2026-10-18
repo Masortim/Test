@@ -648,14 +648,6 @@ class MainWindow(QMainWindow):
                 self._detected_type = det.installer_type
                 self._detected_is_gog = bool(getattr(det, "is_gog", False))
                 notes = []
-                if getattr(det, "is_downloader_stub", False):
-                    # Важнее остальных пометок: портатив из такого файла
-                    # скорее всего не соберётся вовсе — программы внутри нет,
-                    # её скачивает сам установщик.
-                    product = getattr(det, "online_product", None)
-                    notes.append("сетевой загрузчик"
-                                 + (f" ({product.name})" if product else "")
-                                 + " — программы внутри файла нет")
                 if det.requires_admin:
                     notes.append("нужны права администратора")
                 if det.license_url:

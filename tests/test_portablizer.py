@@ -2093,13 +2093,7 @@ class AttemptLadderTests(unittest.TestCase):
             self.assertEqual(rc, 4294967295)
 
     def test_zero_exit_code_with_empty_folder_is_not_success(self):
-        """Код 0 сам по себе ничего не значит — важны файлы на диске.
-
-        Лестница при этом останавливается раньше конца: две разные команды
-        подряд, «успешные» за секунды и без единого файла программы,
-        доказывают, что устанавливать этому файлу нечего (подробности — в
-        ``test_downloader_stub``).
-        """
+        """Код 0 сам по себе ничего не значит — важны файлы на диске."""
         class Liar(Portablizer):
             def __init__(self, *a, **kw):
                 super().__init__(*a, **kw)
@@ -2118,8 +2112,7 @@ class AttemptLadderTests(unittest.TestCase):
                 PortableOptions(installer_path="x", output_dir=temp),
                 str(app), str(Path(temp, "Data")), temp, "Type")
             self.assertIsNone(used)
-            self.assertEqual(len(engine.calls), 2)
-            self.assertTrue(engine._hollow_note)
+            self.assertEqual(len(engine.calls), 3)
 
 
 class ZipPayloadTests(unittest.TestCase):
