@@ -81,7 +81,7 @@ jobs:
             if ($summary.Count -eq 0) { $summary = @($testLines | Select-Object -Last 12) }
             if (@($summary | Where-Object { $_ -match '^!! ' }).Count -gt 0) {
               $activeTest = @($testLines | Where-Object {
-                $_ -match '^test_[A-Za-z0-9_]+\s+\.\.\.'
+                $_ -match '^test_[A-Za-z0-9_]+(?:\s+\(|\s+\.\.\.)'
               } | Select-Object -Last 1)
               if ($activeTest.Count -gt 0) { $summary += "Last test in progress: $($activeTest[0])" }
               $timeoutIndex = -1
