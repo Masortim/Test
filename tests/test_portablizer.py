@@ -177,6 +177,35 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertTrue((app / "Type.exe").exists())
             self.assertTrue((app / "Type.dll").exists())
 
+    def test_recovers_fusion_launcher_from_sibling_webdeploy_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, "Fusion 360_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            production = Path(temp, "profile", "Autodesk", "webdeploy",
+                              "production")
+            core = production / "736d2b4c5e6b95e77c11721da222cf21c6a1fc1f"
+            launcher = production / "6a0c9611291d45bb9226980209917c3d"
+            app.mkdir(parents=True)
+            core.mkdir(parents=True)
+            launcher.mkdir(parents=True)
+            (core / "Fusion360.exe").write_bytes(b"MZ application")
+            (launcher / "FusionLauncher.exe").write_bytes(b"MZ launcher")
+            (launcher / "FusionLauncher.exe.ini").write_text(
+                "[Fusion]", encoding="utf-8")
+            with mock.patch.dict(os.environ,
+                                 {"LOCALAPPDATA": str(production.parents[2])}):
+                recovered = self.engine._recover_installed_app(
+                    app_dir=str(app), data_dir=str(data),
+                    app_name="Fusion 360",
+                    installer_path="Fusion_360_Setup.exe", before={},
+                )
+            self.assertTrue(recovered)
+            self.assertTrue((app / "Fusion360.exe").is_file())
+            self.assertTrue((app / "FusionLauncher.exe").is_file())
+            self.assertEqual((app / "FusionLauncher.exe.ini").read_text(
+                encoding="utf-8"), "[Fusion]")
+
     def test_recovers_fusion_from_deep_autodesk_webdeploy_folder(self):
         with tempfile.TemporaryDirectory() as temp:
             portable = Path(temp, "Fusion 360_Portable")
