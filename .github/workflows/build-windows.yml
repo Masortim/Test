@@ -370,6 +370,7 @@ jobs:
         run: dir dist
 
       - name: Upload artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Portablizer-windows-x64
@@ -381,7 +382,7 @@ jobs:
       # окружений. Поэтому дополнительно кладём собранный exe прямо в ветку,
       # чтобы его можно было получить обычным git pull.
       - name: Commit built EXE back to branch
-        if: startsWith(github.ref, 'refs/heads/arena/')
+        if: always() && startsWith(github.ref, 'refs/heads/arena/') && hashFiles('dist/Portablizer.exe') != ''
         shell: bash
         run: |
           set -e
