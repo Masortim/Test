@@ -2046,6 +2046,20 @@ class FailureLogArtifactsTests(unittest.TestCase):
 class AttemptLadderTests(unittest.TestCase):
     """Оркестратор обязан идти по лестнице до фактического результата."""
 
+    def test_assisted_mode_adds_visible_installer_as_last_resort(self):
+        det = DetectionResult(InstallerType.UNKNOWN, 0.1)
+        plans = build_attempts(det, "setup.exe", r"C:\\Portable\\App",
+                               allow_assisted=True)
+        self.assertTrue(plans[-1].interactive)
+        self.assertEqual(plans[-1].args, [])
+        self.assertIn("мастер", plans[-1].label.lower())
+        self.assertTrue(any(not plan.interactive for plan in plans))
+
+    def test_assisted_mode_off_never_runs_installer_interactively(self):
+        det = DetectionResult(InstallerType.UNKNOWN, 0.1)
+        plans = build_attempts(det, "setup.exe", r"C:\\Portable\\App")
+        self.assertFalse(any(plan.interactive for plan in plans))
+
     def _engine(self, succeed_on):
         class Fake(Portablizer):
             def __init__(self, *a, **kw):
