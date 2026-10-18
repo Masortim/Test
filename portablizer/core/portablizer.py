@@ -1197,19 +1197,6 @@ class Portablizer:
             for e in det.evidence:
                 self.log.debug(f"  • {e}")
 
-            # Online Fusion bootstrapper has no trustworthy silent mode. Avoid
-            # launching six generic switches that merely reproduce its GUI
-            # failure; require explicit consent for exactly one visible run.
-            if ("fusion" in os.path.basename(opts.installer_path).casefold()
-                    and not opts.allow_assisted_install):
-                result.hints = self._failure_hints(
-                    det, None, opts, portable_dir)
-                raise RuntimeError(
-                    "Autodesk Fusion — сетевой установщик. Включите "
-                    "«Разрешить окно мастера установки» и повторите сборку; "
-                    "универсальные тихие ключи здесь не применяются."
-                )
-
             # 1b. Предупреждаем о нехватке прав ДО запуска: установщик с
             # requireAdministrator без повышения просто не стартует.
             if IS_WINDOWS and det.requires_admin and not is_elevated():
@@ -1394,14 +1381,6 @@ class Portablizer:
             self._check_cancel()
             self.progress(75, "Поиск главного исполняемого файла и лаунчеров")
             main_exe, targets = self._discover_app_executables(app_dir, name)
-            if main_exe and self._fusion_launcher_config_missing(
-                    opts.installer_path, name, main_exe):
-                self.log.warn(
-                    "FusionLauncher.exe найден, но FusionLauncher.exe.ini "
-                    "отсутствует или пуст. Это неполный Autodesk Web Deploy, "
-                    "а не готовый портатив."
-                )
-                main_exe, targets = "", []
             if not main_exe:
                 result.hints = self._failure_hints(det, install_rc, opts,
                                                    portable_dir)
@@ -1683,41 +1662,6 @@ class Portablizer:
                 "строку: лишний или неизвестный ключ. Попробуйте очистить "
                 "поле «Доп. аргументы установки» или указать только ключ "
                 "тишины."
-            )
-
-        fusion_setup = "fusion" in (
-            (opts.app_name or "") + " " + os.path.basename(opts.installer_path)
-        ).casefold()
-        if fusion_setup:
-            launcher = os.path.join(portable_dir, "App", "FusionLauncher.exe")
-            launcher_ini = launcher + ".ini"
-            if os.path.isfile(launcher) and (
-                    not os.path.isfile(launcher_ini)
-                    or os.path.getsize(launcher_ini) <= 0):
-                hints.append(
-                    "Обнаружен только Autodesk Fusion streaming-загрузчик, "
-                    "но рядом нет обязательного FusionLauncher.exe.ini. "
-                    "Такой результат неполон; Portablizer не будет создавать "
-                    "нерабочий Launch.bat."
-                )
-            hints.append(
-                "Для Autodesk Fusion: окно с HTTP 403 означает, что Autodesk "
-                "CDN отказал в доступе к манифесту full.json; Portablizer не "
-                "может обойти запрет. Проверьте Autodesk Account, доступность "
-                "dl.appstreaming."
-                "autodesk.com и доменов Autodesk через выбранный прокси, "
-                "авторизацию/лицензию и дату/время Windows. Повторите запуск "
-                "с включённой опцией «Разрешить окно мастера установки», чтобы "
-                "пройти официальный онлайн-мастер. Ошибка WinError -2147024894 "
-                "означает, что установщик не нашёл "
-                "ожидаемый файл — обычно манифест или скачанный payload не "
-                "создался. Закройте мастер, удалите неполный результат и "
-                "повторите интерактивную установку при рабочем доступе к CDN. "
-                "Проверьте Autodesk Fusion Web Deploy и обязательный sidecar "
-                "INI до создания Launch.bat. Даже после успешной установки "
-                "Autodesk может требовать "
-                "службы, лицензию и онлайн-вход, поэтому автономная работа "
-                "портативной копии не гарантируется."
             )
 
         if opts.extra_install_args:
@@ -3276,28 +3220,7 @@ class Portablizer:
             temp = self._temp_dir_for(data_dir)
             user = os.path.join(data_dir, "User")
             programdata = os.path.join(data_dir, "ProgramData")
-            public = os.path.join(data_dir, "Public")
-            # Shell APIs used by installers resolve known folders from profile
-            # environment variables. Creating only the profile roots is not
-            # enough: Autodesk's streamer creates Start Menu shortcuts and can
-            # fail in SHGetKnownFolderPath if a redirected target is missing.
-            known_folders = (
-                os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs"),
-                os.path.join(user, "Desktop"),
-                os.path.join(user, "Documents"),
-                os.path.join(user, "Downloads"),
-                os.path.join(user, "Music"),
-                os.path.join(user, "Pictures"),
-                os.path.join(user, "Videos"),
-                os.path.join(user, "Saved Games"),
-                os.path.join(user, "AppData", "Roaming"),
-                os.path.join(user, "AppData", "Local"),
-                os.path.join(user, "AppData", "LocalLow"),
-                os.path.join(programdata, "Microsoft", "Windows", "Start Menu", "Programs"),
-                os.path.join(public, "Desktop"),
-            )
-            for d in (appdata, local, temp, user, programdata, public,
-                      *known_folders):
+            for d in (appdata, local, temp, user, programdata):
                 os.makedirs(d, exist_ok=True)
             env.update({
                 "APPDATA": appdata,
@@ -3305,9 +3228,6 @@ class Portablizer:
                 "TEMP": temp, "TMP": temp,
                 "USERPROFILE": user,
                 "PROGRAMDATA": programdata,
-                "PUBLIC": public,
-                "HOMEDRIVE": os.path.splitdrive(user)[0],
-                "HOMEPATH": os.path.splitdrive(user)[1],
             })
         for k, v in opts.extra_env.items():
             env[k] = os.path.expandvars(v)
@@ -3440,26 +3360,6 @@ class Portablizer:
         return keys
 
     @staticmethod
-    def _fusion_launcher_config_missing(installer_path: str, app_name: str,
-                                        main_exe: str) -> bool:
-        """Reject Autodesk's streaming stub when its required sidecar is absent.
-
-        ``FusionLauncher.exe`` is not the full app. Autodesk Application
-        Streaming requires a non-empty adjacent ``FusionLauncher.exe.ini``;
-        without it the generated Launch.bat points at a broken bootstrap stub.
-        """
-        identity = (str(app_name) + " " + os.path.basename(installer_path)).casefold()
-        if "fusion" not in identity:
-            return False
-        if os.path.basename(main_exe).casefold() != "fusionlauncher.exe":
-            return False
-        config = main_exe + ".ini"
-        try:
-            return not os.path.isfile(config) or os.path.getsize(config) <= 0
-        except OSError:
-            return True
-
-    @staticmethod
     def _name_score(path: str, keys: Set[str]) -> int:
         stem = os.path.splitext(os.path.basename(path))[0]
         normalized = "".join(ch for ch in stem.casefold() if ch.isalnum())
@@ -3523,90 +3423,6 @@ class Portablizer:
                 previous = candidates.get(normalized)
                 if previous is None or exe_score > previous[0]:
                     candidates[normalized] = (exe_score, exe, reason, source)
-
-        # Autodesk Fusion Web Deploy хранит версии глубоко в профиле:
-        # %LOCALAPPDATA%\\Autodesk\\webdeploy\\production\\<id>. Это ниже
-        # обычного двухуровневого сканирования, а bootstrapper Fusion часто
-        # возвращает 0, ничего не кладя в целевую папку App. Если пользователь
-        # разрешил интерактивную установку и она создала Fusion360.exe,
-        # включаем весь неизменяемый deployment-пакет в кандидаты переноса.
-        # Не сканируем произвольный Autodesk-каталог: требуем ожидаемый путь
-        # и исполняемый файл продукта.
-        name_hint = (app_name + " " + os.path.basename(installer_path)).casefold()
-        if "fusion" in name_hint:
-            # При изоляции Portablizer меняет LOCALAPPDATA установщика на
-            # PortableData\\AppData\\Local. Ищем и там, и в профиле Windows:
-            # Autodesk bootstrapper'ы разных поколений по-разному уважают
-            # перенаправление, а прокси может позволить им пройти дальше
-            # скачивания и развернуть payload именно в изолированный профиль.
-            local_app_data_roots = [
-                os.environ.get("LOCALAPPDATA", ""),
-                os.path.join(data_dir, "AppData", "Local"),
-            ]
-            seen_local_roots: Set[str] = set()
-            for local_app_data in local_app_data_roots:
-                if not local_app_data:
-                    continue
-                production = os.path.join(
-                    local_app_data, "Autodesk", "webdeploy", "production")
-                production_key = os.path.normcase(os.path.abspath(production))
-                if production_key in seen_local_roots:
-                    continue
-                seen_local_roots.add(production_key)
-                try:
-                    deployments = list(os.scandir(production))
-                except OSError:
-                    deployments = []
-                for deployment in deployments:
-                    if not deployment.is_dir(follow_symlinks=False):
-                        continue
-                    fusion_exe = os.path.join(deployment.path, "Fusion360.exe")
-                    if not os.path.isfile(fusion_exe):
-                        continue
-                    # Это точный продуктовый путь, поэтому восстанавливаем
-                    # его сразу, до общего обзора Program Files / AppData.
-                    # На рабочих машинах обход этих корней может включать
-                    # тысячи каталогов (и зависать в антивирусной проверке).
-                    self.log.info(
-                        "Найден Autodesk Fusion Web Deploy: "
-                        f"{deployment.path}"
-                    )
-                    # The launcher and payload are separate immutable
-                    # deployments in current Autodesk layouts. Stage the core
-                    # deployment plus sibling launcher deployments carrying
-                    # their required adjacent INI sidecar.
-                    deployment_paths = [deployment.path]
-                    for sibling in deployments:
-                        if (sibling.path == deployment.path
-                                or not sibling.is_dir(follow_symlinks=False)):
-                            continue
-                        launcher_exe = os.path.join(sibling.path,
-                                                    "FusionLauncher.exe")
-                        launcher_ini = launcher_exe + ".ini"
-                        if (os.path.isfile(launcher_exe)
-                                and os.path.isfile(launcher_ini)
-                                and os.path.getsize(launcher_ini) > 0):
-                            deployment_paths.append(sibling.path)
-                    try:
-                        for source_dir in deployment_paths:
-                            for item in os.scandir(source_dir):
-                                destination = os.path.join(app_dir, item.name)
-                                if item.is_dir(follow_symlinks=False):
-                                    shutil.copytree(item.path, destination,
-                                                    dirs_exist_ok=True)
-                                elif item.is_file(follow_symlinks=False):
-                                    shutil.copy2(item.path, destination)
-                    except OSError as exc:
-                        self.log.warn(
-                            f"Не удалось скопировать Fusion Web Deploy: {exc}"
-                        )
-                        shutil.rmtree(app_dir, ignore_errors=True)
-                        os.makedirs(app_dir, exist_ok=True)
-                        continue
-                    if self._find_main_exe(app_dir, app_name):
-                        return True
-                    shutil.rmtree(app_dir, ignore_errors=True)
-                    os.makedirs(app_dir, exist_ok=True)
 
         # InstallLocation/DisplayIcon из новых записей реестра — самый точный
         # сигнал. Для DisplayIcon берём каталог исполняемого файла.

@@ -177,97 +177,6 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertTrue((app / "Type.exe").exists())
             self.assertTrue((app / "Type.dll").exists())
 
-    def test_recovers_fusion_launcher_from_sibling_webdeploy_directory(self):
-        with tempfile.TemporaryDirectory() as temp:
-            portable = Path(temp, "Fusion 360_Portable")
-            app = portable / "App"
-            data = portable / "PortableData"
-            production = Path(temp, "profile", "Autodesk", "webdeploy",
-                              "production")
-            core = production / "736d2b4c5e6b95e77c11721da222cf21c6a1fc1f"
-            launcher = production / "6a0c9611291d45bb9226980209917c3d"
-            app.mkdir(parents=True)
-            core.mkdir(parents=True)
-            launcher.mkdir(parents=True)
-            (core / "Fusion360.exe").write_bytes(b"MZ application")
-            (launcher / "FusionLauncher.exe").write_bytes(b"MZ launcher")
-            (launcher / "FusionLauncher.exe.ini").write_text(
-                "[Fusion]", encoding="utf-8")
-            with mock.patch.dict(os.environ,
-                                 {"LOCALAPPDATA": str(production.parents[2])}):
-                recovered = self.engine._recover_installed_app(
-                    app_dir=str(app), data_dir=str(data),
-                    app_name="Fusion 360",
-                    installer_path="Fusion_360_Setup.exe", before={},
-                )
-            self.assertTrue(recovered)
-            self.assertTrue((app / "Fusion360.exe").is_file())
-            self.assertTrue((app / "FusionLauncher.exe").is_file())
-            self.assertEqual((app / "FusionLauncher.exe.ini").read_text(
-                encoding="utf-8"), "[Fusion]")
-
-    def test_recovers_fusion_from_deep_autodesk_webdeploy_folder(self):
-        with tempfile.TemporaryDirectory() as temp:
-            portable = Path(temp, "Fusion 360_Portable")
-            app = portable / "App"
-            data = portable / "PortableData"
-            deployment = Path(temp, "profile", "Autodesk", "webdeploy",
-                              "production", "version-id")
-            app.mkdir(parents=True)
-            data.mkdir()
-            deployment.mkdir(parents=True)
-            (deployment / "Fusion360.exe").write_bytes(b"MZ application")
-            (deployment / "Fusion360.dll").write_bytes(b"dependency")
-            with mock.patch.dict(os.environ,
-                                 {"LOCALAPPDATA": str(deployment.parents[3])}):
-                recovered = self.engine._recover_installed_app(
-                    app_dir=str(app), data_dir=str(data),
-                    app_name="Fusion 360",
-                    installer_path="Fusion_360_Setup.exe", before={},
-                )
-            self.assertTrue(recovered)
-            self.assertTrue((app / "Fusion360.exe").is_file())
-            self.assertTrue((app / "Fusion360.dll").is_file())
-
-    def test_fusion_streaming_launcher_is_invalid_without_nonempty_ini(self):
-        with tempfile.TemporaryDirectory() as temp:
-            exe = Path(temp, "FusionLauncher.exe")
-            exe.write_bytes(b"MZ launcher")
-            self.assertTrue(self.engine._fusion_launcher_config_missing(
-                "Fusion_360_Setup.exe", "Fusion 360", str(exe)))
-            ini = Path(str(exe) + ".ini")
-            ini.write_text("[Fusion]", encoding="utf-8")
-            self.assertFalse(self.engine._fusion_launcher_config_missing(
-                "Fusion_360_Setup.exe", "Fusion 360", str(exe)))
-            ini.write_text("", encoding="utf-8")
-            self.assertTrue(self.engine._fusion_launcher_config_missing(
-                "Fusion_360_Setup.exe", "Fusion 360", str(exe)))
-            self.assertFalse(self.engine._fusion_launcher_config_missing(
-                "Other_Setup.exe", "Other", str(exe)))
-
-    def test_recovers_fusion_from_redirected_portable_localappdata(self):
-        with tempfile.TemporaryDirectory() as temp:
-            portable = Path(temp, "Fusion 360_Portable")
-            app = portable / "App"
-            data = portable / "PortableData"
-            deployment = (data / "AppData" / "Local" / "Autodesk"
-                          / "webdeploy" / "production" / "redirected-id")
-            app.mkdir(parents=True)
-            deployment.mkdir(parents=True)
-            (deployment / "Fusion360.exe").write_bytes(b"MZ application")
-            (deployment / "Fusion360.dll").write_bytes(b"dependency")
-            host_local = Path(temp, "host-profile", "AppData", "Local")
-            host_local.mkdir(parents=True)
-            with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(host_local)}):
-                recovered = self.engine._recover_installed_app(
-                    app_dir=str(app), data_dir=str(data),
-                    app_name="Fusion 360",
-                    installer_path="Fusion_360_Setup.exe", before={},
-                )
-            self.assertTrue(recovered)
-            self.assertTrue((app / "Fusion360.exe").is_file())
-            self.assertTrue((app / "Fusion360.dll").is_file())
-
     def test_recovers_new_app_inside_existing_vendor_directory(self):
         with tempfile.TemporaryDirectory() as temp:
             portable = Path(temp, "Type_Portable")
@@ -2137,32 +2046,6 @@ class FailureLogArtifactsTests(unittest.TestCase):
 class AttemptLadderTests(unittest.TestCase):
     """Оркестратор обязан идти по лестнице до фактического результата."""
 
-    def test_assisted_mode_adds_visible_installer_as_last_resort(self):
-        det = DetectionResult(InstallerType.UNKNOWN, 0.1)
-        plans = build_attempts(det, "setup.exe", r"C:\\Portable\\App",
-                               allow_assisted=True)
-        self.assertTrue(plans[-1].interactive)
-        self.assertEqual(plans[-1].args, [])
-        self.assertIn("мастер", plans[-1].label.lower())
-        self.assertTrue(any(not plan.interactive for plan in plans))
-
-    def test_assisted_mode_off_never_runs_installer_interactively(self):
-        det = DetectionResult(InstallerType.UNKNOWN, 0.1)
-        plans = build_attempts(det, "setup.exe", r"C:\\Portable\\App")
-        self.assertFalse(any(plan.interactive for plan in plans))
-
-    def test_fusion_online_installer_never_gets_guessed_switches(self):
-        det = DetectionResult(InstallerType.UNKNOWN, 0.1)
-        self.assertEqual(build_attempts(
-            det, "Fusion_360_Setup.exe", r"C:\\Portable\\App"), [])
-        plans = build_attempts(
-            det, "Fusion_360_Setup.exe", r"C:\\Portable\\App",
-            allow_assisted=True)
-        self.assertEqual(len(plans), 1)
-        self.assertTrue(plans[0].interactive)
-        self.assertEqual(plans[0].args, [])
-        self.assertIn("Autodesk Fusion", plans[0].label)
-
     def _engine(self, succeed_on):
         class Fake(Portablizer):
             def __init__(self, *a, **kw):
@@ -2302,78 +2185,6 @@ class FailureDiagnosticsTests(unittest.TestCase):
         self.assertIn("администратора", message)
         self.assertIn("--accept-license-agreement", message)
         self.assertIn("zennolab.com", message)
-
-    def test_fusion_failure_explains_interactive_login_and_recovery(self):
-        engine = Portablizer(Logger())
-        hints = engine._failure_hints(
-            DetectionResult(InstallerType.UNKNOWN, 0.0), None,
-            PortableOptions(installer_path="Fusion_360_Setup.exe",
-                            output_dir=".", app_name="Fusion 360"),
-        )
-        advice = " ".join(hints)
-        self.assertIn("Разрешить окно мастера установки", advice)
-        self.assertIn("Autodesk Account", advice)
-        self.assertIn("Fusion Web Deploy", advice)
-
-    def test_fusion_without_consent_does_not_launch_six_silent_attempts(self):
-        class MustNotStart(Portablizer):
-            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
-                raise AssertionError("Fusion setup must wait for explicit consent")
-
-        with tempfile.TemporaryDirectory() as temp, mock.patch(
-            "portablizer.core.portablizer.IS_WINDOWS", False
-        ):
-            installer = Path(temp, "Fusion_360_Setup.exe")
-            installer.write_bytes(b"MZ dummy setup")
-            result = MustNotStart(Logger()).run(PortableOptions(
-                installer_path=str(installer), output_dir=temp,
-                app_name="Fusion 360", capture_registry=False,
-                cleanup_host=False, build_exe_launcher=False,
-            ))
-            self.assertFalse(result.success)
-            self.assertEqual(result.attempts_made, 0)
-            self.assertIn("универсальные тихие ключи",
-                          " ".join(result.messages).lower())
-
-    def test_incomplete_fusion_streaming_stub_never_gets_a_launch_bat(self):
-        class PartialFusion(Portablizer):
-            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
-                Path(app_dir, "FusionLauncher.exe").write_bytes(b"MZ launcher")
-                return 0
-
-        with tempfile.TemporaryDirectory() as temp, mock.patch(
-            "portablizer.core.portablizer.IS_WINDOWS", False
-        ):
-            installer = Path(temp, "Fusion_360_Setup.exe")
-            installer.write_bytes(b"MZ dummy setup")
-            result = PartialFusion(Logger()).run(PortableOptions(
-                installer_path=str(installer), output_dir=temp,
-                app_name="Fusion 360", capture_registry=False,
-                cleanup_host=False, build_exe_launcher=False,
-                allow_assisted_install=True,
-            ))
-            portable = Path(temp, "Fusion 360_Portable")
-            self.assertFalse(result.success)
-            self.assertFalse((portable / "Launch.bat").exists())
-            self.assertIn("FusionLauncher.exe.ini", " ".join(result.messages))
-
-    def test_fusion_failure_explains_network_errors_and_incomplete_launcher(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app = Path(temp, "App")
-            app.mkdir()
-            (app / "FusionLauncher.exe").write_bytes(b"MZ")
-            engine = Portablizer(Logger())
-            hints = engine._failure_hints(
-                DetectionResult(InstallerType.UNKNOWN, 0.0), None,
-                PortableOptions(installer_path="Fusion_360_Setup.exe",
-                                output_dir=temp, app_name="Fusion 360"),
-                temp,
-            )
-            advice = " ".join(hints)
-            self.assertIn("FusionLauncher.exe.ini", advice)
-            self.assertIn("HTTP 403", advice)
-            self.assertIn("WinError -2147024894", advice)
-            self.assertIn("прокси", advice)
 
     def test_failure_reports_how_many_variants_were_tried(self):
         result = self._failed_result(
