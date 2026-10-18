@@ -1556,43 +1556,6 @@ _DIRECTX_WINDOW_TITLES = (
     "microsoft directx",
 )
 
-# Windows Security («Безопасность Windows») молча блокирует ТИХУЮ установку
-# VPN-клиента: установка пакета драйвера сетевого адаптера (TAP-Windows
-# Provider V9 от OpenVPN Technologies у Planeta VPN и любого клиента на
-# OpenVPN) требует согласия «Установить программное обеспечение для данного
-# устройства?». Пока на этом окне не нажали «Установить», установщик висит:
-# тихий режим с ним не согласуется вовсе — молчание тянется минутами и
-# выглядит как зависание. Portablizer нажимает «Установить» сам и предварительно
-# ставит галочку «Всегда доверять программному обеспечению <издателя>», чтобы
-# второе, третье и т. д. устройства того же издателя окна не показывали.
-# Окно принадлежит тому процессу, который мы же и запустили, — «установить»
-# здесь ровно то, что делает тихую установку тихой.
-_DEVICE_PROMPT_TITLES = (
-    "безопасность windows", "windows security",
-    "установщик устройств", "device installer",
-    "установка программного обеспечения", "device software installation",
-)
-#: Реплика самого окна — по-русски и по-английски (скриншот пользователя).
-_DEVICE_PROMPT_HINTS = (
-    "программное обеспечение для данного устройства",
-    "установить программное обеспечение для",
-    "install this device's software",
-    "install software for this device",
-    "you need to install software",
-    "the software that follows was published",
-    "изготовитель данного программного обеспечения",
-    "publisher of this device's software",
-)
-#: Признак «сетевой адаптер OpenVPN/TAP» — усилитель для generic-заголовка.
-_DEVICE_PROMPT_DEVICES = (
-    "tap-windows", "openvpn technologies", "tap adapter", "wintun",
-    "ovpn-dco", "сетевые адаптеры", "network adapters",
-)
-#: Галочка «Всегда доверять …».
-_TRUST_CHECKBOX_HINTS = (
-    "всегда доверять", "always trust", "immer vertrauen", "выполнять для всех",
-)
-
 
 def installer_button_is_confirm_all(title: str) -> bool:
     """True for the IExpress «Yes To All» (and localised) button caption."""
@@ -1609,29 +1572,6 @@ def installer_button_is_confirm(title: str) -> bool:
     return installer_button_is_confirm_all(title) or any(
         text == needle for needle in _CONFIRM_TITLES
     )
-
-
-def installer_button_is_device_install(title: str) -> bool:
-    """True for «Установить»/«Install» — and never for «Не устанавливать».
-
-    Окно Windows Security показывает две кнопки; правая — отказ, и она же
-    содержит подстроку «установить». Поэтому проверка идёт от отрицаний.
-    """
-    text = (title or "").replace("&", "").strip().lower()
-    if not text:
-        return False
-    if text.startswith("не ") or text.startswith("do not") or text.startswith("nicht"):
-        return False
-    if any(bad in text for bad in ("cancel", "отмена", "abort", "прервать")):
-        return False
-    return text in ("установить", "install") or text.startswith(
-        ("установить ", "install "))
-
-
-def installer_checkbox_is_trust(title: str) -> bool:
-    """True for the «Всегда доверять программному обеспечению …» checkbox."""
-    text = (title or "").replace("&", "").strip().lower()
-    return any(hint in text for hint in _TRUST_CHECKBOX_HINTS)
 
 
 def installer_prompt_looks_like_overwrite(title: str, body: str = "") -> bool:
@@ -1669,61 +1609,24 @@ def installer_prompt_looks_like_directx_notice(title: str, body: str = "") -> bo
     return any(needle in heading for needle in _DIRECTX_WINDOW_TITLES)
 
 
-def installer_prompt_looks_like_device_driver(title: str,
-                                              body: str = "") -> bool:
-    """Окно Windows Security «Установить ПО для данного устройства?».
-
-    Требуется совпадение заголовка с одной из форм диалога установки
-    устройств И реплики внутри — либо характерного текста (установка ПО для
-    устройства), либо упоминания сетевого адаптера OpenVPN/TAP/wintun.
-    Прогресс-полоса или любой другой диалог «Безопасность Windows» под это
-    не подпадает: без реплики окно не трогаем.
-    """
-    blob = f"{title or ''} {body or ''}".lower()
-    if not blob.strip():
-        return False
-    heading = (title or "").replace("&", "").strip().lower()
-    has_title = any(needle in heading for needle in _DEVICE_PROMPT_TITLES)
-    hint = any(hint in blob for hint in _DEVICE_PROMPT_HINTS)
-    device = any(hint in blob for hint in _DEVICE_PROMPT_DEVICES)
-    if has_title and (hint or device):
-        return True
-    # Заголовок мог быть потерян (окно принадлежит дочернему tapinstall);
-    # остаётся самый надёжный признак: реплика окна + имя адаптера.
-    return hint and device
-
-
 def installer_prompt_should_dismiss(title: str, body: str = "") -> bool:
     """True, если окно надо закрыть самим, не дожидаясь мышки."""
     if installer_prompt_looks_like_overwrite(title, body):
         return True
     if installer_prompt_looks_like_command_error(title, body):
         return True
-    if installer_prompt_looks_like_directx_notice(title, body):
-        return True
-    return installer_prompt_looks_like_device_driver(title, body)
+    return installer_prompt_looks_like_directx_notice(title, body)
 
 
-def _dismiss_installer_dialogs(
-        counter: "Optional[Dict[str, int]]" = None) -> int:
+def _dismiss_installer_dialogs() -> int:
     """Click through leftover installer MessageBoxes that block the build.
 
-    Three families, none of which CREATE_NO_WINDOW hides:
+    Two families, both of which CREATE_NO_WINDOW does not hide:
 
     * IExpress/wextract «Do you want to overwrite the file …?» — Yes To All;
     * DXSETUP / vcredist «Неверная операция командной строки» /
       «Invalid command line operation» / «Command line option syntax error»
-      — OK (the dialog from the user's screenshot);
-    * Windows Security «Установить программное обеспечение для данного
-      устройства?» — the device driver consent that OpenVPN-based VPN clients
-      (Planeta VPN and friends) pop up while installing the TAP-Windows
-      network adapter. The checkbox «always trust this publisher» is ticked
-      first, then — and only then — «Установить» is clicked. «Не устанавливать»
-      is never touched: dismissing this dialog the wrong way fails the
-      silent install.
-
-    ``counter`` (optional dict) receives per-family tallies: "device" counts
-    driver-consent dialogs answered, so the caller can log them honestly.
+      — OK (the dialog from the user's screenshot).
 
     Returns how many buttons (or WM_CLOSE) were posted (0 on non-Windows).
     """
@@ -1754,10 +1657,8 @@ def _dismiss_installer_dialogs(
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
-    device_prompts = 0
-
     def each_top(hwnd, _lparam):
-        nonlocal clicked, device_prompts
+        nonlocal clicked
         if not user32.IsWindowVisible(hwnd):
             return True
         title = window_text(hwnd)
@@ -1772,28 +1673,6 @@ def _dismiss_installer_dialogs(
 
         user32.EnumChildWindows(hwnd, WNDENUMPROC(collect), 0)
         body = " ".join(body_parts)
-        # --- Windows Security: driver consent. Handled BEFORE the generic
-        # pass, because here the ONLY acceptable click is «Установить».
-        if installer_prompt_looks_like_device_driver(title, body):
-            BM_GETCHECK = 0x00F0
-            BST_UNCHECKED = 0
-            for handle, caption in buttons:
-                if not installer_checkbox_is_trust(caption):
-                    continue
-                try:
-                    state = user32.SendMessageW(handle, BM_GETCHECK, 0, 0)
-                except Exception:  # noqa: BLE001 - cross-process probe
-                    state = BST_UNCHECKED + 1  # unknown: leave the box alone
-                if state == BST_UNCHECKED:
-                    user32.PostMessageW(handle, BM_CLICK, 0, 0)
-                    clicked += 1
-            for handle, caption in buttons:
-                if installer_button_is_device_install(caption):
-                    user32.PostMessageW(handle, BM_CLICK, 0, 0)
-                    clicked += 1
-                    device_prompts += 1
-                    break
-            return True
         if not installer_prompt_should_dismiss(title, body):
             return True
         overwrite = installer_prompt_looks_like_overwrite(title, body)
@@ -1819,11 +1698,7 @@ def _dismiss_installer_dialogs(
     try:
         user32.EnumWindows(WNDENUMPROC(each_top), 0)
     except Exception:  # noqa: BLE001
-        if counter is not None:
-            counter["device"] = counter.get("device", 0) + device_prompts
         return clicked
-    if counter is not None and device_prompts:
-        counter["device"] = counter.get("device", 0) + device_prompts
     return clicked
 
 

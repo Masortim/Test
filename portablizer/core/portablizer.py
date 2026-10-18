@@ -51,7 +51,6 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tupl
 from .. import __version__
 from . import crashinfo as crash_mod
 from . import launcher as launcher_mod
-from . import netstack as netstack_mod
 from . import procutil
 from . import redist as redist_mod
 from . import registry as reg_mod
@@ -245,8 +244,7 @@ def _format_exit_code(rc: Optional[int]) -> str:
     return str(rc)
 
 
-def _exit_code_hint(rc: Optional[int],
-                    installer_type: Optional[InstallerType] = None) -> str:
+def _exit_code_hint(rc: Optional[int]) -> str:
     """Расшифровка кода возврата для журнала и итогового сообщения.
 
     Сначала проверяются коды аварийного завершения процесса: у них своя
@@ -260,17 +258,6 @@ def _exit_code_hint(rc: Optional[int],
         return crash.hint
     if rc > 0x7FFFFFFF:
         return _NEGATIVE_EXIT_HINT
-    if installer_type == InstallerType.INNO:
-        return {
-            1: "не удалось инициализировать установщик",
-            2: "установка отменена до начала или пользователь отказался от продолжения",
-            3: "фатальная ошибка подготовки к следующему этапу установки",
-            4: "фатальная ошибка во время установки",
-            5: "установка отменена до начала установки файлов",
-            6: "установка отменена во время установки файлов",
-            7: "подготовка к установке завершилась неудачно; причина — в install.log",
-            8: "для завершения подготовки требуется перезагрузка компьютера",
-        }.get(rc, _EXIT_CODE_HINTS.get(rc, ""))
     return _EXIT_CODE_HINTS.get(rc, "")
 
 
@@ -472,19 +459,6 @@ class PortableOptions:
     # забрать из системы в портатив. Ставится только то, что опознано как
     # известный распространяемый пакет.
     silent_runtime_install: bool = True
-    # Переносить системные сетевые компоненты (драйверы TAP-Windows/wintun,
-    # службы-компаньоны) в папку NetStack портатива. Нужна VPN-клиентам
-    # (Planeta VPN и всем, что собрано вокруг OpenVPN): ядро Windows нельзя
-    # виртуализовать, поэтому портатив берёт пакеты драйверов с собой и на
-    # каждом ПК досоздаёт недостающее сам — один тихий UAC вместо окон
-    # «Установить программное обеспечение для данного устройства?».
-    netstack_components: bool = True
-    #: Изолированный режим NetStack: драйвер публикуется на время сеанса
-    #: и снимается с системы при выходе (хост не получает постоянного
-    #: следа). Снятие — по умолчанию: «портативный изолированный» важнее
-    #: пары секунд на переподключение; shared оставлен как осознанный
-    #: выбор для «своего» ПК, где UAC на каждый запуск — лишний шум.
-    netstack_isolated: bool = True
     # Сквозные портативные сохранения: одно хранилище сейвов для ВСЕХ
     # способов запуска. Без этого прямой запуск App\Game.exe пишет в
     # настоящий профиль Windows, а LaunchPortable.exe — в PortableData, и
@@ -524,9 +498,6 @@ class PortableResult:
     removed_from_installed_list: List[str] = field(default_factory=list)
     #: Осталось ли что-то вычистить вручную (не хватило прав).
     cleanup_pending: bool = False
-    #: Сетевые компоненты, перенесённые в NetStack (драйверы и службы).
-    netstack_drivers: List[str] = field(default_factory=list)
-    netstack_services: List[str] = field(default_factory=list)
     #: Сколько вариантов команды установки было запланировано.
     attempts_planned: int = 0
     #: Сколько вариантов реально выполнено.
@@ -828,10 +799,6 @@ class Portablizer:
         self._run_started: Optional[float] = None
         #: Сколько вариантов команды установки реально выполнено.
         self._attempts_made = 0
-        #: Сколько раз за сборку был закрыт диалог Windows Security
-        #: «Установить ПО для данного устройства?» (установка драйвера TAP).
-        #: Нужен для честных подсказок, когда установка всё же не удалась.
-        self._device_prompt_hits = 0
         #: История лестницы попыток: (название сценария, код возврата).
         self._attempt_history: List[Tuple[str, Optional[int]]] = []
         #: Последний ResultCode из setup.log классического InstallShield.
@@ -1187,7 +1154,6 @@ class Portablizer:
             self.log.info(f"Portablizer {__version__}")
             self._run_started = time.time()
             self._attempts_made = 0
-            self._device_prompt_hits = 0
             self._attempt_history = []
             self._installshield_result = None
             self._install_stalled = False
@@ -1452,24 +1418,13 @@ class Portablizer:
             save_setup = self._setup_shared_saves(
                 portable_dir, app_dir, name, targets, opts, result)
 
-            # 7г. Сетевые компоненты: драйверы (TAP-Windows и т. п.) и
-            # службы-компаньоны, которые нельзя виртуализовать, уезжают в
-            # NetStack/ и на целевом ПК досоздаются лончером. Делается ДО
-            # записи лончера (секция netstack в конфиге) и ДО снятия служб
-            # с этого компьютера (их конфигурация читается из реестра).
-            self._check_cancel()
-            self.progress(91, "Сетевые компоненты (драйверы TAP, службы)")
-            netstack_report = self._provision_netstack(
-                portable_dir, app_dir, opts, result)
-
             # 8. Генерация лончера и вспомогательных скриптов
             self._check_cancel()
             self.progress(92, "Генерация портативного лончера и меню")
             companion_files = self._write_launcher(
                 portable_dir, name, result.main_exe_rel,
                 opts, path_prepend, capture, targets,
-                runtime_report=runtime_report, save_setup=save_setup,
-                netstack_report=netstack_report)
+                runtime_report=runtime_report, save_setup=save_setup)
             result.companion_launchers = companion_files
             exe_launcher = os.path.join(
                 portable_dir, "App", APP_EXE_LAUNCHER_NAME)
@@ -1716,41 +1671,11 @@ class Portablizer:
                 + ". Если установка не идёт, попробуйте без них."
             )
 
-        if self._device_prompt_hits:
-            hints.append(
-                "Во время установки Windows спрашивал «Установить "
-                "программное обеспечение для данного устройства?» (окно "
-                "«Безопасность Windows», драйвер сетевого адаптера TAP) — "
-                f"Portablizer подтвердил установку {self._device_prompt_hits} "
-                "раз(а). Если сборка остановилась именно на драйвере: "
-                "запустите Portablizer от имени администратора и повторите — "
-                "для установки системных драйверов нужны повышенные права. "
-                "После успешной сборки пакет драйвера переезжает в NetStack\\ "
-                "и портатив досоздаёт его сам на любом ПК."
-            )
-
-        if det.installer_type == InstallerType.INNO and rc in (7, 8):
-            hints.append(
-                f"Inno Setup: {_exit_code_hint(rc, InstallerType.INNO)}. "
-                "Откройте install.log в папке портатива и найдите сообщение "
-                "перед завершением подготовки (PrepareToInstall). "
-                "installer-output.log может содержать только команду и код "
-                "возврата — точная причина обычно в install.log."
-            )
-            hints.append(
-                "Код подготовки сам по себе не доказывает проблему с "
-                "лицензией, ключом /DIR или тихим режимом. Проверьте по "
-                "журналу требования установщика: перезагрузку, права, "
-                "службы и драйверы. Для VPN системный драйвер или служба "
-                "могут требоваться даже при хранении файлов в App; "
-                "распаковка файлов не заменяет их установку."
-            )
-        else:
-            hints.append(
-                "Если установщик требует аккаунт или лицензию, проверьте "
-                "его требования в документации разработчика. Сам код "
-                "ошибки не доказывает, что портативная сборка невозможна."
-            )
+        hints.append(
+            "Некоторые установщики требуют входа в аккаунт или активной "
+            "лицензии и в тихом режиме не работают в принципе — такую "
+            "программу портативной сделать нельзя."
+        )
         return hints
 
     def _stall_hints(self) -> List[str]:
@@ -1843,7 +1768,7 @@ class Portablizer:
         if rc is None or rc in (0, 3010):
             rc_hint = ""
         else:
-            hint = _exit_code_hint(rc, det.installer_type)
+            hint = _exit_code_hint(rc)
             rc_hint = (
                 f" (код установщика: {_format_exit_code(rc)}"
                 + (f" — {hint}" if hint else "") + ")"
@@ -2125,74 +2050,6 @@ class Portablizer:
             f"администратора): {target}"
         )
 
-    def _provision_netstack(self, portable_dir: str, app_dir: str,
-                            opts: PortableOptions,
-                            result: PortableResult
-                            ) -> Optional["netstack_mod.NetStackReport"]:
-        """Переносит системные сетевые компоненты программы в ``NetStack/``.
-
-        Драйвер TAP-Windows и служба VPN-клиента живут вне папки: их нельзя
-        ни «подставить», как реестр, ни откатить, как ярлыки. Надёжность
-        портатива здесь измеряется тем, что он делает на ЧИСТОМ ПК: лончер
-        проверяет наличие драйвера/службы и досоздаёт недостающее из копий,
-        приложенных к портативу (один тихий UAC вместо окон «Безопасность
-        Windows»). На компьютере-сборщике после сборки остаётся чистота:
-        службы снимает шаг 9 (а их конфигурация уже уехала в манифест), а
-        сам пакет драйвера на ПК-сборщике остаётся следом ВЕНДОРСКОЙ
-        установки — его ставил настоящий установщик, а не портатив, и
-        отнимать чужое портатив не вправе.
-
-        На ЦЕЛЕВОМ ПК по умолчанию работает изолированный режим: драйвер
-        публикуется из NetStack только на время сеанса (один тихий UAC),
-        по завершении сеанса портатив снимает и свои службы, и корневые
-        устройства адаптера, и сам пакет из DriverStore — хост возвращается
-        в состояние «до запуска». Пакеты, которые на этом ПК поставили НЕ
-        портативом, он не трогает никогда (владение фиксируется диффом
-        %SystemRoot%\\INF при публикации). Режим shared («драйвер как
-        общий компонент, как Visual C++ из Redist») остаётся опцией.
-        """
-        if not opts.netstack_components or not app_dir:
-            return None
-        try:
-            packages = netstack_mod.scan_net_driver_packages(app_dir)
-            service_names: List[str] = []
-            if IS_WINDOWS:
-                try:
-                    service_names = procutil.services_in(portable_dir)
-                except Exception as exc:  # noqa: BLE001
-                    self.log.debug(f"Не удалось перечислить службы: {exc}")
-            records = netstack_mod.collect_companion_services(
-                app_dir, service_names) if service_names else []
-            report = netstack_mod.provision_netstack(
-                portable_dir, app_dir, packages, records,
-                isolated=opts.netstack_isolated)
-        except Exception as exc:  # noqa: BLE001 — компоненты не роняют сборку
-            self.log.warn(f"Сетевые компоненты не перенесены: {exc}")
-            return None
-        if report is None:
-            self.log.debug(
-                "Сетевые компонентов (TAP-Windows/wintun/ovpn-dco) в App не "
-                "найдено — NetStack не создаётся.")
-            return None
-        for note in report.notes:
-            self.log.debug(f"  • {note}")
-        result.netstack_drivers = sorted({
-            entry.get("service") or entry.get("kind", "")
-            for entry in report.drivers})
-        result.netstack_services = sorted({
-            entry.get("name", "") for entry in report.services
-            if entry.get("name")})
-        parts = []
-        if result.netstack_drivers:
-            parts.append("драйверы: " + ", ".join(result.netstack_drivers))
-        if result.netstack_services:
-            parts.append("службы: " + ", ".join(result.netstack_services))
-        if parts:
-            self.log.ok("Сетевые компоненты перенесены в NetStack — "
-                        + "; ".join(parts)
-                        + ". Лончер проверит и досоздаст их на любом ПК.")
-        return report
-
     def _remove_portable_services(self, portable_dir: str,
                                   opts: PortableOptions,
                                   result: PortableResult) -> None:
@@ -2236,14 +2093,7 @@ class Portablizer:
             return
         for name in services:
             procutil.stop_service(name, remove=True)
-            if name in (result.netstack_services or []):
-                self.log.ok(
-                    f"Служба {name} остановлена и снята с регистрации; её "
-                    "конфигурация перенесена в NetStack — лончер поднимет "
-                    "службу заново на любом компьютере.")
-            else:
-                self.log.ok(
-                    f"Служба {name} остановлена и снята с регистрации.")
+            self.log.ok(f"Служба {name} остановлена и снята с регистрации.")
         result.removed_services = list(services)
 
     # -- ярлыки ---------------------------------------------------------------
@@ -2599,9 +2449,7 @@ class Portablizer:
             # DXSETUP на /silent. Если перехват недоступен (нет прав),
             # закрываем оставшееся окно сами — не сбрасывая таймер паузы.
             try:
-                tally: Dict[str, int] = {}
-                clicked = redist_mod._dismiss_installer_dialogs(tally)
-                self._device_prompt_hits += int(tally.get("device", 0))
+                clicked = redist_mod._dismiss_installer_dialogs()
             except Exception:  # noqa: BLE001 — WinAPI не вправе ронять сборку
                 clicked = 0
             if clicked:
@@ -2611,8 +2459,7 @@ class Portablizer:
                     self.log.info(
                         "  Закрыл служебное окно установщика "
                         "(DirectX/VC++ «неверная операция командной "
-                        "строки», согласие Windows на установку драйвера "
-                        "устройства и подобные). Таких окон за эту попытку: "
+                        f"строки» и подобные). Таких окон за эту попытку: "
                         f"{dismissed}."
                     )
             if watchdog.poll(now):
@@ -4144,8 +3991,7 @@ class Portablizer:
                         capture: Optional[RegistryCapture] = None,
                         targets: Optional[List[launcher_mod.TargetInfo]] = None,
                         runtime_report: "Optional[redist_mod.ProvisionReport]" = None,
-                        save_setup: "Optional[saves_mod.SaveSetup]" = None,
-                        netstack_report: "Optional[netstack_mod.NetStackReport]" = None
+                        save_setup: "Optional[saves_mod.SaveSetup]" = None
                         ) -> List[str]:
         has_registry = bool(
             capture and (capture.reg_file or capture.machine_reg_file
@@ -4211,9 +4057,6 @@ class Portablizer:
             ),
             shared_saves=(save_setup.to_dict()
                           if save_setup is not None else {}),
-            netstack=(netstack_report.to_config()
-                      if netstack_report is not None and netstack_report.written
-                      else {}),
             language=opts.install_language.strip(),
         )
         # Launch.bat — CRLF, чистый ASCII и без BOM. cmd.exe читает .bat по
@@ -4366,54 +4209,6 @@ class Portablizer:
                         "делает это сам, когда\n"
                         "  видит, что библиотеки на этом компьютере нет.\n"
                     )
-        # Раздел о сетевых компонентах: без него пользователь портатива не
-        # узнает, зачем рядом папка NetStack и почему лончер просит права.
-        netstack_note = ""
-        netstack_section = ""
-        if netstack_report is not None and netstack_report.written:
-            netstack_note = (
-                "  NetStack\\            — системные сетевые компоненты "
-                "(драйверы, службы)\n")
-            items = []
-            if netstack_report.drivers:
-                items.append("драйверы: " + ", ".join(sorted({
-                    d.get("service") or d.get("kind", "")
-                    for d in netstack_report.drivers})))
-            if netstack_report.services:
-                items.append("службы: " + ", ".join(sorted(
-                    s.get("name", "") for s in netstack_report.services)))
-            netstack_section = (
-                "\nСетевые компоненты (" + "; ".join(items) + "):\n"
-                "  • часть программ (VPN-клиенты на OpenVPN: Planeta VPN и "
-                "подобные) требует\n"
-                "    системный сетевой драйвер (TAP-Windows) и/или службу; "
-                "Windows не умеет\n"
-                "    виртуализовать ядро, поэтому портатив несёт копии "
-                "пакетов в NetStack\\\n"
-                "    и при первом запуске на новом ПК досоздаёт недостающее "
-                "сам — лончер\n"
-                "    проверяет реестр/службы и показывает ОДИН запрос прав "
-                "(NetStack\\Setup.cmd);\n"
-                "  • если адаптер уже установлен другой программой — ничего "
-                "не переустанавливается;\n"
-                "  • изолированный режим: всё, что портатив создал на этом "
-                "ПК (службы,\n"
-                "    устройства адаптеров, сам пакет драйвера в "
-                "DriverStore), снимается по "
-                "завершении\n"
-                "    сеанса — на хосте не остаётся следа; драйвер "
-                "существовал ДО портатива — портатив "
-                "его не трогает;\n"
-                "  • UAC при этом просится на каждый первый запуск на ПК "
-                "после чистки (взамен —\n"
-                "    чистая машина). Не хотите снимать драйвер — запустите "
-                "NetStack\\Teardown.cmd \n"
-                "    вручную с флагом --keep-driver и удалите "
-                "PortableData\\NetStack\\driver-packages.txt\n"
-                "    перед следующим выходом;\n"
-                "  • вручную: NetStack\\Setup.cmd (поставить/проверить), "
-                "NetStack\\Teardown.cmd (снять всё).\n"
-            )
         # Раздел о сохранениях: пользователю важно знать, где они лежат и
         # почему их теперь видно при любом способе запуска.
         saves_section = ""
@@ -4455,8 +4250,6 @@ class Portablizer:
             _README.format(
                 app_name=name,
                 main_exe_rel=main_exe_rel,
-                netstack_note=netstack_note,
-                netstack_section=netstack_section,
                 saves_section=saves_section,
                 companion_section=companion_section,
                 companion_files_list=companion_files_list,
@@ -4518,7 +4311,7 @@ _README = """{app_name} — портативная версия
   StopPortable.cmd      — освободить папку, если что-то из неё осталось в фоне
   UpdatePortable.cmd    — обновить программу ВНУТРИ портатива (см. ниже)
 {companion_files_list}  launcher_config.json  — параметры лончера
-{registry_note}{runtime_note}{netstack_note}  install.log           — подробный журнал установщика (если он поддерживается)
+{registry_note}{runtime_note}  install.log           — подробный журнал установщика (если он поддерживается)
   portablizer.log       — журнал создания и диагностики портатива
 
 Ключи запуска (Launch.bat):
@@ -4536,7 +4329,7 @@ _README = """{app_name} — портативная версия
   --help            справка
   -- <аргументы>    передать аргументы самой программе
 
-{runtime_section}{netstack_section}{saves_section}
+{runtime_section}{saves_section}
 Как это работает:
   • стандартные каталоги профиля (AppData, Temp, Документы и др.) на время
     работы перенаправляются в PortableData — программа не пишет в C:\\Users;

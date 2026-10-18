@@ -540,180 +540,6 @@ def _warn_about_runtime(root: Path, missing: Sequence[Dict[str, Any]]) -> None:
     _show_warning(text)
 
 
-# --- netstack: сетевые компоненты (VPN-драйверы и службы-компаньоны) ----------
-#
-# Planeta VPN и все клиенты на OpenVPN не могут работать без системных
-# компонентов, которые нельзя виртуализовать: сетевой мини-порт TAP-Windows
-# (``tap0901``) и, у части вендоров, служба. Portablizer кладёт пакеты
-# драйверов в папку ``NetStack/`` рядом с ``App/``; здесь лончер проверяет,
-# есть ли нужное на ЭТОМ ПК, и если нет — один раз тихо запускает
-# ``NetStack\Setup.cmd`` (он сам просит UAC). По завершении сеанса
-# ``Teardown.cmd`` снимает с регистрации только те службы, которые создал
-# портатив (файл-маркер в PortableData\NetStack).
-
-#: Имя штампа «пользователь уже видел предупреждение про NetStack на этом
-#: ПК» — повторяем только когда состав недостающего реально изменился.
-_NETSTACK_STAMP = "netstack-warning.txt"
-
-
-def _netstack_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    section = cfg.get("netstack")
-    return section if isinstance(section, dict) else {}
-
-
-def _service_key_present(name: str) -> bool:
-    """Есть ли служба/драйвер на этом ПК (ключ Services\<name>).
-
-    Реестр читается без повышения: HKLM\SYSTEM\...\Services открыт на
-    чтение всем. На не-Windows считаем всё присутствующим — работы нет.
-    """
-    if not IS_WINDOWS or not name:
-        return True
-    try:
-        import winreg  # type: ignore
-
-        with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                "SYSTEM\\CurrentControlSet\\Services\\" + str(name)):
-            return True
-    except OSError:
-        return False
-
-
-def netstack_missing(root: Path, cfg: Dict[str, Any]
-                     ) -> "list[str]":
-    """Имена недостающих системных компонентов из секции ``netstack``."""
-    section = _netstack_section(cfg)
-    names: "list[str]" = []
-    for key in ("driver_services", "service_names"):
-        raw = section.get(key)
-        if isinstance(raw, list):
-            names.extend(str(n) for n in raw if str(n).strip())
-    if not names:
-        return []
-    return [name for name in dict.fromkeys(names)
-            if not _service_key_present(name)]
-
-
-def _netstack_warning_is_new(root: Path, cfg: Dict[str, Any],
-                             missing: Sequence[str]) -> bool:
-    """Одно предупреждение на состав недостающего (как для runtime-пакетов)."""
-    stamp = (root / str(cfg.get("data_dir_name", "PortableData"))
-             / _NETSTACK_STAMP)
-    current = ",".join(sorted(missing))
-    try:
-        if stamp.is_file() and stamp.read_text(
-                encoding="utf-8", errors="replace").strip() == current:
-            return False
-    except OSError:
-        return True
-    try:
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.write_text(current, encoding="utf-8")
-    except OSError:
-        pass
-    return True
-
-
-def _run_netstack_script(root: Path, relative: str, argument: str = ""
-                        ) -> "Optional[int]":
-    """Run one NetStack script; elevate only when the session is not elevated.
-
-    The scripts themselves re-launch through UAC when nobody granted rights
-    yet, so a plain ``cmd /c`` is enough here: when the launcher already runs
-    elevated (HKLM registry import path) the script sees admin and does no
-    second prompt.
-    """
-    relative = str(relative or "").replace("/", os.sep)
-    if not relative:
-        return None
-    path = root / relative
-    if not path.is_file():
-        path2 = root / "App" / relative
-        if not path2.is_file():
-            return None
-        path = path2
-    args = ["/c", str(path)] + ([argument] if argument else [])
-    if _is_elevated():
-        return _run_hidden(["cmd.exe", *args])
-    return _run_hidden_elevated("cmd.exe", args)
-
-
-def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
-    """Check/repair drivers and services BEFORE the program starts.
-
-    Returns human-readable notes for the run log.  Never raises: a laptop
-    without administrator consent must still be able to start the portable
-    (the VPN itself will complain about the missing adapter — with our note
-    in the log the user knows exactly why).
-    """
-    if not IS_WINDOWS:
-        return []
-    section = _netstack_section(cfg)
-    setup = str(section.get("setup") or "")
-    if not setup:
-        return []
-    notes: "list[str]" = []
-    missing = netstack_missing(root, cfg)
-    script = root / setup.replace("/", os.sep)
-    if not script.is_file():
-        script = root / "App" / setup.replace("/", os.sep)
-    if not script.is_file():
-        return []
-    # Дешёвая проверка без повышения: коды Setup.cmd --check честнее, чем
-    # один реестр (он видит и корневое устройство), но и без неё решаем.
-    if not missing:
-        code = _run_hidden(["cmd.exe", "/c", str(script), "--check"])
-        if code in (0, None):
-            return []
-        notes.append("Setup.cmd --check reported missing components")
-    code = _run_netstack_script(root, setup)
-    if code is None:
-        notes.append("UAC prompt was declined or unavailable - the driver "
-                     "and services were NOT installed")
-    else:
-        notes.append(f"NetStack setup exit code {code}")
-    still = netstack_missing(root, cfg)
-    if still:
-        notes.append("still missing: " + ", ".join(still))
-        if _netstack_warning_is_new(root, cfg, still):
-            _show_warning(
-                "Программе нужны системные сетевые компоненты, которых нет на "
-                "этом компьютере:\n\n  " + "\n  ".join(still)
-                + "\n\nПортатив пытается поставить их сам из папки NetStack "
-                "(один запрос прав администратора). Если окно UAC было "
-                "отклонено - запустите NetStack\\Setup.cmd вручную.")
-    else:
-        notes.append("all required components are present")
-    return notes
-
-
-def stop_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
-    """Undo on this PC what the portable created for the session.
-
-    Two per-machine markers decide everything
-    (PortableData\\NetStack\\created-services.txt for services,
-    driver-packages.txt for driver packages published in isolation mode):
-    a service or a driver that already existed on the PC was never claimed,
-    hence is never touched here.  Busy drivers stay pending and the next
-    session end retries them.
-    """
-    if not IS_WINDOWS:
-        return []
-    section = _netstack_section(cfg)
-    teardown = str(section.get("teardown") or "")
-    if not teardown or not section.get("stop_on_exit", True):
-        return []
-    state = (root / str(cfg.get("data_dir_name", "PortableData"))
-             / "NetStack")
-    claimed = (state / "created-services.txt").is_file() or (
-        state / "driver-packages.txt").is_file()
-    if not claimed:
-        return []
-    code = _run_netstack_script(root, teardown)
-    return [f"NetStack teardown exit code {code}"]
-
-
 def _write_error_log(root: Optional[Path], message: str) -> None:
     if root is None:
         return
@@ -5957,16 +5783,6 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     if missing_runtime and _runtime_warning_is_new(root, cfg, missing_runtime):
         _warn_about_runtime(root, missing_runtime)
 
-    # Сетевые компоненты (драйвер TAP-Windows, службы-компаньоны): проверка
-    # без повышения, UAC — только когда чего-то реально не хватает. Ошибки
-    # не должны срывать запуск: программа сама объяснит отсутствие адаптера,
-    # а журнал лончера скажет, пытался ли портатив это починить.
-    try:
-        for line in ensure_netstack(root, cfg):
-            _run_log(root, "netstack: " + line)
-    except Exception as exc:  # noqa: BLE001 - netstack must not block start
-        _run_log(root, f"netstack: ensure failed ({exc})")
-
     # Сейвы, сделанные мимо лончера (прямой запуск App\Game.exe), забираются
     # в портатив ПЕРЕД стартом: иначе программа их просто не увидит.
     for line in shared_saves.before():
@@ -6033,15 +5849,6 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             if waited:
                 _run_log(root, f"waited {waited}s for programs started from "
                                f"the portable folder to finish")
-            # Companion services first: a registered service whose binary
-            # lives in App/ keeps the whole folder locked no matter how the
-            # processes are closed. Teardown removes ONLY what this portable
-            # created here; then the usual leftover sweep runs.
-            try:
-                for line in stop_netstack(root, cfg):
-                    _run_log(root, "netstack: " + line)
-            except Exception as exc:  # noqa: BLE001
-                _run_log(root, f"netstack: teardown failed ({exc})")
             # Whatever still runs from this folder is a leftover (updater,
             # crash handler, silent helper).  It is closed down HERE, while
             # the sandbox is still in place: a helper saving its settings on
@@ -6060,10 +5867,6 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
         # a program that spawned something during shutdown): sweep again and
         # drop the job handle - Windows finishes off anything that ignored
         # us.  Only after this the folder can really be deleted.
-        try:
-            stop_netstack(root, cfg)
-        except Exception:  # noqa: BLE001 - already unwinding
-            pass
         release_portable_folder(root, shutdown)
         job.close()
         # Теперь, когда из портатива уже ничего не выполняется и все файлы
@@ -6100,14 +5903,6 @@ def stop(root: Optional[Path] = None) -> int:
         settings = shutdown_settings(cfg)
     except (OSError, ValueError):
         pass
-    # Службы-компаньоны (VPN), созданные этим портативом, держат свои exe из
-    # App даже после убийства процесса — SCM поднимет службу снова. Сначала
-    # снимаем их с регистрации (только свои, по маркеру PortableData), потом
-    # занимаемся процессами.
-    try:
-        stop_netstack(root, cfg)
-    except Exception as exc:  # noqa: BLE001 - stop не должен падать
-        _run_log(root, f"netstack: teardown failed ({exc})")
     stopped = release_portable_folder(root, settings)
     remaining = _portable_process_list(root)
     if remaining:

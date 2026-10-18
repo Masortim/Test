@@ -49,9 +49,6 @@ from typing import Dict, List, Optional, Sequence
 
 from .. import __version__
 from .redist import REDIST_DIR_NAME, SILENT_SCRIPT_NAME as REDIST_SCRIPT_NAME
-from .netstack import (NETSTACK_DIR_NAME, SETUP_SCRIPT_NAME,
-                      TEARDOWN_SCRIPT_NAME, STATE_DIR_NAME,
-                      CREATED_SERVICES_FILE, DRIVER_PACKAGES_FILE)
 
 #: Маркер портативной папки внутри захваченного .reg (см. core/registry.py).
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
@@ -160,11 +157,6 @@ class LauncherConfig:
     # следы родного апдейтера, ключи тихой установки (см. UPDATE_PROFILES).
     # Пустой словарь - значит «взять профиль программы, если он есть».
     update: Dict[str, object] = field(default_factory=dict)
-    # Сетевые компоненты (драйвер TAP-Windows и службы), перенесённые в
-    # папку NetStack/ портатива: {"manifest", "setup", "teardown",
-    # "driver_services", "service_names", "stop_on_exit"}. Пусто — компонентов
-    # нет; лончер тогда даже не дёргает NetStack-скрипты.
-    netstack: Dict[str, object] = field(default_factory=dict)
     # Код выбранного языка установки («ru», «en», ...), если задан.
     language: str = ""
 
@@ -347,61 +339,6 @@ def _runtime_check_block(cfg: LauncherConfig) -> str:
         "goto :eof",
     ]
     return "\n".join(lines)
-
-
-def _netstack_impls(cfg: LauncherConfig) -> Tuple[str, str]:
-    """Тексты подпрограмм :bat-label:`:portable_netstack_setup/_teardown`.
-
-    Идемпотентность держит сам ``NetStack\\Setup.cmd`` (реестр/``sc query``);
-    здесь лишь дешёвый пред-запуск ``--check`` без повышения: на компьютере,
-    где драйвер уже стоит, лончер вообще не покажет UAC.
-    """
-    if not cfg.netstack:
-        return (
-            "rem (this program carries no network drivers or services)\n"
-            "goto :eof",
-            "rem (no companion services to unregister)\n"
-            "goto :eof",
-        )
-    data_dir = _bat_set_value(cfg.data_dir_name)
-    if not is_ascii_safe(data_dir):
-        data_dir = "PortableData"
-    setup = (f'set "NETSTACK_SCRIPT=%PORTABLE_ROOT%\\{NETSTACK_DIR_NAME}'
-             f'\\{SETUP_SCRIPT_NAME}"')
-    teardown_state = (f'%PORTABLE_ROOT%\\{data_dir}\\{STATE_DIR_NAME}'
-                      f'\\{CREATED_SERVICES_FILE}')
-    setup_impl = "\n".join([
-        setup,
-        'if not exist "%NETSTACK_SCRIPT%" goto :eof',
-        'call "%NETSTACK_SCRIPT%" --check >nul 2>&1',
-        "rem 0 means every component is present; 2/3/4 mean driver/service",
-        "rem missing on this PC and Setup.cmd has to fix it once.",
-        "if not errorlevel 2 goto netstack_setup_done",
-        "echo   Network components (driver/service) are missing on this PC.",
-        "echo   Installing them now - one UAC prompt, then the program starts.",
-        'call "%NETSTACK_SCRIPT%"',
-        ":netstack_setup_done",
-        "goto :eof",
-    ])
-    teardown_impl = "\n".join([
-        f'set "NETSTACK_SCRIPT=%PORTABLE_ROOT%\\{NETSTACK_DIR_NAME}'
-        f'\\{TEARDOWN_SCRIPT_NAME}"',
-        'if not exist "%NETSTACK_SCRIPT%" goto :eof',
-        "rem Teardown is owed something only while this PC still has OUR",
-        "rem leftovers: services we registered, or (isolation mode) driver",
-        "rem packages we published. The script re-reads both markers itself.",
-        f'set "NETSTACK_STATE=%PORTABLE_ROOT%\\{data_dir}\\{STATE_DIR_NAME}"',
-        'set "NETSTACK_TD=0"',
-        f'if exist "{teardown_state}" set "NETSTACK_TD=1"',
-        f'if exist "%NETSTACK_STATE%\\{DRIVER_PACKAGES_FILE}" '
-        'set "NETSTACK_TD=1"',
-        'if "%NETSTACK_TD%" == "0" goto :eof',
-        "echo   Removing the services and drivers this portable created"
-        " on this PC...",
-        'call "%NETSTACK_SCRIPT%"',
-        "goto :eof",
-    ])
-    return setup_impl, teardown_impl
 
 
 def _env_lines(cfg: LauncherConfig) -> str:
@@ -1062,12 +999,6 @@ rem as error 14001 at start. The check below names the package instead and
 rem silently repairs what it can.
 call :portable_check_runtime
 
-rem --- Network components (VPN drivers and companion services) --------------
-rem Checked WITHOUT elevation; UAC appears only when this PC really lacks
-rem something (a clean PC, or a fresh Windows reinstall). Same driver that
-rem "the other" VPN app uses is never reinstalled or removed.
-call :portable_netstack_setup
-
 call :portable_saves_import
 call :portable_documents_load
 call :portable_registry_load
@@ -1083,10 +1014,6 @@ rem real program and exit immediately. Restoring the registry at that moment
 rem would pull the install keys out from under the program that is just
 rem starting, so wait while anything from this folder is still running.
 call :portable_wait_children
-
-rem The services this portable registered on THIS PC go away with the
-rem session; the shared driver package stays (like VC++ runtimes do).
-call :portable_netstack_teardown
 
 call :portable_registry_save
 call :portable_documents_restore
@@ -1148,12 +1075,6 @@ endlocal & exit /b 0
 
 :portable_check_runtime
 {runtime_check}
-
-:portable_netstack_setup
-{netstack_setup}
-
-:portable_netstack_teardown
-{netstack_teardown}
 
 :portable_need_dll
 rem %1 = library, %2 = package that provides it, %3 = where to get it,
@@ -1365,7 +1286,6 @@ def render_bat(cfg: LauncherConfig) -> str:
     menu_block = "\n".join(menu_lines) if len(all_targets) >= 2 else "goto portable_target_ready"
     list_items = "\n".join(list_lines) if list_lines else f"echo   * [MAIN] {title}: {_bat_echo(safe_main_rel)}"
 
-    netstack_setup, netstack_teardown = _netstack_impls(cfg)
     text = _BAT_TEMPLATE.format(
         title=_bat_echo(title),
         version=_bat_echo(__version__),
@@ -1388,8 +1308,6 @@ def render_bat(cfg: LauncherConfig) -> str:
         documents_load=_documents_load_block(cfg),
         documents_restore=_documents_restore_block(cfg),
         runtime_check=_runtime_check_block(cfg),
-        netstack_setup=netstack_setup,
-        netstack_teardown=netstack_teardown,
         redist_dir=REDIST_DIR_NAME,
         redist_script=REDIST_SCRIPT_NAME,
         idle_grace=int(max(1, round(cfg.shutdown_idle_grace))),
@@ -1508,8 +1426,6 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         launcher_aliases=mapping("launcher_aliases"),
         runtime_requirements=dict_list("runtime_requirements"),
         runtime_installers=dict_list("runtime_installers"),
-        netstack=(dict(data["netstack"])
-                  if isinstance(data.get("netstack"), dict) else {}),
         shutdown_spawn_grace=number("spawn_grace", 6.0),
         shutdown_idle_grace=number("idle_grace", 20.0),
         shutdown_close_grace=number("close_grace", 5.0),
@@ -2086,8 +2002,6 @@ def render_config_json(cfg: LauncherConfig) -> str:
             "handle_budget": cfg.shutdown_handle_budget,
             "purge_temp": cfg.shutdown_purge_temp,
         },
-        # Сетевые компоненты (TAP-драйвер, службы): папка NetStack рядом.
-        "netstack": cfg.netstack,
         "registry": {
             "enabled": cfg.apply_registry,
             "file": cfg.reg_file_name,

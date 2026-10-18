@@ -78,8 +78,6 @@ jobs:
           exit $testStatus
 
       - name: Smoke test portable App EXE
-        id: smoke-launcher
-        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $root = Join-Path $env:RUNNER_TEMP "Portable Launcher Smoke"
@@ -139,8 +137,6 @@ jobs:
           }
 
       - name: Smoke test - the portable folder must be deletable afterwards
-        id: smoke-deletable
-        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           # Регрессия на главную жалобу: программа закрыта, а папку удалить
@@ -214,8 +210,6 @@ jobs:
           }
 
       - name: Smoke test - a file locked from outside must be released
-        id: smoke-lock
-        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           # Регрессия на жалобу, ради которой всё затевалось: портатив НЕ
@@ -285,8 +279,6 @@ jobs:
           if (-not $holder.HasExited) { $holder.Kill() }
 
       - name: Smoke test - update inside the portable folder
-        id: smoke-update
-        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           function Fail([string]$why) {
@@ -371,8 +363,6 @@ jobs:
           }
 
       - name: Smoke test (import only)
-        id: smoke-import
-        if: ${{ !cancelled() }}
         run: |
           python -c "import portablizer, portablizer.core.portablizer, portablizer.gui.main_window; print('import OK')"
 
@@ -380,7 +370,6 @@ jobs:
         run: dir dist
 
       - name: Upload artifact
-        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: Portablizer-windows-x64
@@ -390,27 +379,12 @@ jobs:
 
       # Артефакты Actions хранятся на blob-хранилище, недоступном из некоторых
       # окружений. Поэтому дополнительно кладём собранный exe прямо в ветку,
-      # чтобы его можно было получить обычным git pull. Публикация не зависит
-      # от юнит-тестов (предсуществующий красный модуль не должен удерживать
-      # бинарники — статус проверки и так остаётся красным), но зависит от
-      # смоук-прогонов: непроверенный на живой Windows exe в ветку не едет.
+      # чтобы его можно было получить обычным git pull.
       - name: Commit built EXE back to branch
-        if: >-
-          ${{ !cancelled() && startsWith(github.ref, 'refs/heads/arena/')
-          && steps.smoke-launcher.outcome != 'failure'
-          && steps.smoke-deletable.outcome != 'failure'
-          && steps.smoke-lock.outcome != 'failure'
-          && steps.smoke-update.outcome != 'failure'
-          && steps.smoke-import.outcome != 'failure' }}
+        if: startsWith(github.ref, 'refs/heads/arena/')
         shell: bash
         run: |
           set -e
-          for f in dist/Portablizer.exe dist/PortableLauncher.exe; do
-            if [ ! -f "$f" ]; then
-              echo "::error title=Built EXE not committed::сборка не оставила $f — публиковать нечего"
-              exit 1
-            fi
-          done
           mkdir -p dist-windows
           cp dist/Portablizer.exe dist-windows/Portablizer.exe
           git config user.name "github-actions[bot]"
