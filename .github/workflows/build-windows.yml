@@ -75,6 +75,15 @@ jobs:
             $diagnostic = $diagnostic.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Host "::error title=Windows unit tests failed::$diagnostic"
           }
+          if ($testStatus -ne 0) {
+            # ВРЕМЕННАЯ диагностика: компактная аннотация только с ключевыми
+            # строками (аннотации срезаются GitHub до 4 КБ, хвост лога в неё
+            # не влезает, а именно там имена упавших тестов).
+            $keys = Select-String -Path test-output.log -Pattern "^(FAIL|ERROR):|^!! |^Модули с ошибками" |
+                    Select-Object -Last 24 | ForEach-Object { $_.Line }
+            $compact = ($keys -join "`n").Replace('%', '%25').Replace("`r", '%0D')
+            Write-Host "::error title=Failed tests (compact)::$compact"
+          }
           exit $testStatus
 
       - name: Smoke test portable App EXE
