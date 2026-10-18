@@ -32,12 +32,14 @@
    ``--silent``, ``--installPath``, ``--accept-license-agreement`` и хранят
    эти строки в бинарнике. Найдя их, мы можем построить корректную тихую
    команду даже для установщика, которого не знаем «в лицо».
-4. **Профиль производителя.** У некоторых вендоров (ZennoLab) свежие сборки
-   хранят строки упакованными — источники 2–3 молчат. Но имена файлов у их
-   продуктов стандартизованы (``ZennoPosterLite-RU-v7.9.2.0.exe``), а точный
-   синтаксис тихой установки опубликован в официальной документации. Если
-   движок не опознан уверенно, а имя файла совпадает с профилем, ключи
-   берутся из документации производителя.
+4. **Профиль производителя.** У некоторых вендоров (ZennoLab, Planeta VPN)
+   свежие сборки хранят строки упакованными — источники 2–3 молчат. Но имена
+   файлов у их продуктов стандартизованы (``ZennoPosterLite-RU-v7.9.2.0.exe``),
+   а точный синтаксис тихой установки опубликован в официальной документации
+   либо известен по движку продукта: профиль может задать ``installer_hint``
+   (например, NSIS для VPN-клиентов, у которых публикаций по тихой установке
+   нет вовсе). Если движок не опознан уверенно, а имя файла совпадает с
+   профилем, ключи берутся из документации производителя.
 """
 from __future__ import annotations
 
@@ -227,6 +229,11 @@ class VendorProfile:
     switches: Tuple[str, ...]          # ключи из официальной документации
     license_url: str                   # URL, который требует --accept-license
     fixed_args: Tuple[str, ...] = ()   # документированные фиксированные ключи
+    #: Движок, который вендор использует на самом деле, когда строки внутри
+    #: сборки упакованы и сигнатуру движка найти нельзя (Planeta VPN — NSIS).
+    #: Без него неопознанный установщик уехал бы в CUSTOM_CLI со «своими»
+    #: ключами, которых у вендора нет.
+    installer_hint: Optional[InstallerType] = None
 
 
 _VENDOR_PROFILES: Tuple[VendorProfile, ...] = (
@@ -246,6 +253,24 @@ _VENDOR_PROFILES: Tuple[VendorProfile, ...] = (
                   "--installPath", "--installType"),
         license_url="https://zennolab.com/terms-of-service/",
         fixed_args=("--installType=StandAlone",),
+    ),
+    # Planeta VPN (planetavpn.com): клиент собран на NSIS; безлюдная установка
+    # — «/S /D=<папка>». Отдельный профиль нужен вот чем: у свежих сборок
+    # строки упакованы, слабая подстрока «nsis» давала бы 55 % уверенности и
+    # одну команду с правом на ошибку, а имя файла стандартизовано
+    # (``planeta_installer*.exe`` / ``PlanetaVPN*.exe``). Публикаций по тихой
+    # установке вендор не ведёт — поэтому лицензионный URL не требуется, а
+    # движок задаётся явно (NSIS, не CUSTOM_CLI): лестница сразу строится по
+    # движку продукта, включая особый синтаксис ключа /D=.
+    VendorProfile(
+        name="Planeta VPN",
+        filename_re=re.compile(
+            r"planeta[\s._-]*(vpn|installer|setup|client)|planetavpn",
+            re.IGNORECASE),
+        hosts=("planetavpn.com",),
+        switches=("/S", "/D=", "/NCRC"),
+        license_url="",
+        installer_hint=InstallerType.NSIS,
     ),
 )
 
@@ -837,18 +862,24 @@ def detect_installer(path: str) -> DetectionResult:
             f"этого производителя; строки внутри сборки упакованы, поэтому "
             f"ключи взяты из официальной документации {profile.name}",
             "ключи из документации: " + ", ".join(profile.switches),
-            f"обязательное принятие лицензии: {profile.license_url}",
         ]
+        if profile.license_url:
+            vendor_evidence.append(
+                f"обязательное принятие лицензии: {profile.license_url}")
         if any(host in url for url in scan.urls for host in profile.hosts):
             vendor_evidence.append(
                 "внутри найден сайт производителя: "
                 + ", ".join(profile.hosts))
         scan_evidence = result.evidence
+        # Профиль может называть движок (NSIS у Planeta) — тогда лестница
+        # строится по движку; если движок не указан, остаёмся на собственном
+        # CLI-профиле с документированными ключами (ZennoLab).
+        hinted = profile.installer_hint or InstallerType.CUSTOM_CLI
         result = DetectionResult(
-            InstallerType.CUSTOM_CLI, 0.8,
+            hinted, 0.8,
             evidence=vendor_evidence + scan_evidence,
             switch_hints=list(profile.switches),
-            license_urls=[profile.license_url]
+            license_urls=([profile.license_url] if profile.license_url else [])
             + [u for u in scan.urls if u != profile.license_url],
             vendor_args=list(profile.fixed_args),
             vendor_name=profile.name)

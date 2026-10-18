@@ -340,7 +340,7 @@ class InstallWaitTests(unittest.TestCase):
         proc = _FakeProc()
         clicks = []
 
-        def fake_dismiss() -> int:
+        def fake_dismiss(counter=None) -> int:
             clicks.append(1)
             if len(clicks) >= 2:
                 proc.returncode = 0
