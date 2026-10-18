@@ -71,7 +71,36 @@ jobs:
           Get-Content test-output.log -Tail 160 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           if ($testStatus -ne 0) {
-            $diagnostic = (Get-Content test-output.log -Tail 80) -join "`n"
+            # GitHub annotations truncate long messages. Put concise per-module
+            # verdicts and unittest failure headers first, rather than the
+            # verbose tail (which can hide the actual failure past the limit).
+            $testLines = Get-Content test-output.log
+            $summary = @($testLines | Where-Object {
+              $_ -match '^(!! |-- |Ran \d+ tests|FAILED|OK$|FAIL:|ERROR:|Traceback|AssertionError|TimeoutError)'
+            })
+            if ($summary.Count -eq 0) { $summary = @($testLines | Select-Object -Last 12) }
+            if (@($summary | Where-Object { $_ -match '^!! test_portablizer:' }).Count -gt 0) {
+              $moduleStart = -1
+              $timeoutIndex = -1
+              for ($i = 0; $i -lt $testLines.Count; $i++) {
+                if ($testLines[$i] -eq '===== test_portablizer =====') { $moduleStart = $i }
+                if ($moduleStart -ge 0 -and $testLines[$i] -match '^Timeout \(') {
+                  $timeoutIndex = $i
+                  break
+                }
+              }
+              if ($moduleStart -ge 0) {
+                $end = if ($timeoutIndex -ge 0) { $timeoutIndex } else { $testLines.Count - 1 }
+                $activeTest = @($testLines[$moduleStart..$end] | Where-Object {
+                  $_ -match '^test_[A-Za-z0-9_]+(?:\s+\(|\s+\.\.\.)'
+                } | Select-Object -Last 1)
+                if ($activeTest.Count -gt 0) { $summary += "Timed out test: $($activeTest[0])" }
+              }
+              if ($timeoutIndex -ge 0) {
+                $summary += $testLines[$timeoutIndex..([Math]::Min($testLines.Count - 1, $timeoutIndex + 18))]
+              }
+            }
+            $diagnostic = ($summary -join "`n")
             $diagnostic = $diagnostic.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Host "::error title=Windows unit tests failed::$diagnostic"
           }
@@ -376,6 +405,15 @@ jobs:
           name: Portablizer-windows-x64
           path: dist/Portablizer.exe
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Preserve Windows test log for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-test-output-${{ github.run_id }}
+          path: test-output.log
+          if-no-files-found: ignore
           retention-days: 30
 
       # Артефакты Actions хранятся на blob-хранилище, недоступном из некоторых
