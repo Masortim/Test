@@ -90,7 +90,13 @@ jobs:
                 }
               }
               if ($moduleStart -ge 0) {
-                $end = if ($timeoutIndex -ge 0) { $timeoutIndex } else { $testLines.Count - 1 }
+                $end = $timeoutIndex
+                if ($end -lt 0) {
+                  $end = $testLines.Count - 1
+                  for ($i = $moduleStart + 1; $i -lt $testLines.Count; $i++) {
+                    if ($testLines[$i] -match '^===== test_') { $end = $i - 1; break }
+                  }
+                }
                 $activeTest = @($testLines[$moduleStart..$end] | Where-Object {
                   $_ -match '^test_[A-Za-z0-9_]+(?:\s+\(|\s+\.\.\.)'
                 } | Select-Object -Last 1)
