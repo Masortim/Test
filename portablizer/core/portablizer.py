@@ -3424,6 +3424,31 @@ class Portablizer:
                 if previous is None or exe_score > previous[0]:
                     candidates[normalized] = (exe_score, exe, reason, source)
 
+        # Autodesk Fusion Web Deploy хранит версии глубоко в профиле:
+        # %LOCALAPPDATA%\\Autodesk\\webdeploy\\production\\<id>. Это ниже
+        # обычного двухуровневого сканирования, а bootstrapper Fusion часто
+        # возвращает 0, ничего не кладя в целевую папку App. Если пользователь
+        # разрешил интерактивную установку и она создала Fusion360.exe,
+        # включаем весь неизменяемый deployment-пакет в кандидаты переноса.
+        # Не сканируем произвольный Autodesk-каталог: требуем ожидаемый путь
+        # и исполняемый файл продукта.
+        name_hint = (app_name + " " + os.path.basename(installer_path)).casefold()
+        if "fusion" in name_hint:
+            local_app_data = os.environ.get("LOCALAPPDATA", "")
+            production = os.path.join(
+                local_app_data, "Autodesk", "webdeploy", "production")
+            try:
+                deployments = list(os.scandir(production))
+            except OSError:
+                deployments = []
+            for deployment in deployments:
+                if not deployment.is_dir(follow_symlinks=False):
+                    continue
+                fusion_exe = os.path.join(deployment.path, "Fusion360.exe")
+                if os.path.isfile(fusion_exe):
+                    add_source(deployment.path, 500,
+                               "Autodesk Fusion Web Deploy")
+
         # InstallLocation/DisplayIcon из новых записей реестра — самый точный
         # сигнал. Для DisplayIcon берём каталог исполняемого файла.
         for location in registry_locations:
