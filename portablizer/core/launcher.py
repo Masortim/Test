@@ -1578,9 +1578,26 @@ exit /b %errorlevel%
 """
 
 
+_UPDATE_EXTERNAL_TARGET_TEMPLATE = r"""@echo off
+rem This app runs from outside App; the generic updater must not stage over it.
+echo {title} is launched from outside the App folder:
+echo   {target}
+echo.
+echo UpdatePortable only stages applications into App and is disabled here.
+echo Use the application's own supported updater, then test the portable again.
+exit /b 2
+"""
+
+
 def render_update_cmd(cfg: LauncherConfig,
                       exe_launcher_name: str = "LaunchPortable.exe") -> str:
-    """Скрипт «обновить программу в портативе» (перетащить установщик на него)."""
+    """Скрипт обновления; внешние webdeploy-клиенты не подменяются в App."""
+    target = _win_rel(cfg.target_exe_rel)
+    if not target.casefold().startswith("app\\"):
+        return ensure_ascii_bat(_UPDATE_EXTERNAL_TARGET_TEMPLATE.format(
+            title=_bat_echo(ascii_display(cfg.app_name)),
+            target=_bat_echo(ascii_display(target, fallback="external target")),
+        ))
     return ensure_ascii_bat(_UPDATE_TEMPLATE.format(
         title=_bat_echo(ascii_display(cfg.app_name)),
         exe_launcher=exe_launcher_name,

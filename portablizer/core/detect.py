@@ -233,6 +233,9 @@ class OnlineOnlyProduct:
     filename_re: re.Pattern
     switches: Tuple[str, ...]
     reason: str
+    #: Относительный каталог в перенаправленном LOCALAPPDATA, куда клиент
+    #: разворачивает содержимое. Пусто для профилей без известного пути.
+    profile_root: str = ""
 
 
 _ONLINE_ONLY_PRODUCTS: Tuple[OnlineOnlyProduct, ...] = (
@@ -249,6 +252,7 @@ _ONLINE_ONLY_PRODUCTS: Tuple[OnlineOnlyProduct, ...] = (
             "%LOCALAPPDATA%\\Autodesk\\webdeploy\\production, обновляется "
             "через Autodesk и требует входа в аккаунт"
         ),
+        profile_root="Autodesk/webdeploy/production",
     ),
 )
 

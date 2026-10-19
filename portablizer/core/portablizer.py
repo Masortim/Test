@@ -10,9 +10,10 @@
   2. plan            — построить ЛЕСТНИЦУ команд тихой установки (несколько
                        вариантов от самого точного к самому общему).
   3. snapshot(before)— снять состояние реестра (Windows).
-  4. install         — выполнять попытки по очереди, пока в App не появятся
-                       файлы программы. Долгая установка при этом не
-                       прерывается: предел ожидания относится к паузе в
+  4. install         — выполнять попытки по очереди, пока не появится
+                       запускаемый клиент в App или известном профиле.
+                       Долгая установка при этом не прерывается: предел
+                       ожидания относится к паузе в
                        работе установщика, а не ко времени установки (см.
                        _InstallWatchdog).
   5. snapshot(after) — снять состояние реестра и сохранить diff в portable.reg.
@@ -57,7 +58,7 @@ from . import registry as reg_mod
 from . import saves as saves_mod
 from . import space as space_mod
 from . import unpacker as unpacker_mod
-from .detect import DetectionResult, InstallerType, detect_installer
+from .detect import DetectionResult, InstallerType, detect_installer, read_pe_info
 from .logutil import Logger
 from .languages import find_language, plan_language
 from .silentargs import (
@@ -850,6 +851,11 @@ class Portablizer:
         self._hollow_note = ""
         #: Текущий результат распознавания, нужен и для диагностики лестницы.
         self._detection: Optional[DetectionResult] = None
+        #: Fusion может развернуться в перенаправленный LOCALAPPDATA, а не App.
+        self._online_profile_root = ""
+        self._online_profile_main_exe = ""
+        self._online_profile_targets: List[launcher_mod.TargetInfo] = []
+        self._online_profile_diagnostic = ""
 
     # -- вспомогательное ------------------------------------------------------
     def progress(self, percent: int, stage: str) -> None:
@@ -1172,6 +1178,124 @@ class Portablizer:
             + (f" Признаки: {evidence}." if evidence else "")
         )
 
+    @staticmethod
+    def _host_online_profile_note(parts: Sequence[str], portable_dir: str) -> str:
+        """Указывает на профиль Windows, но никогда не переносит его файлы."""
+        host_local = os.environ.get("LOCALAPPDATA", "")
+        if not host_local:
+            return ""
+        host_root = os.path.abspath(os.path.join(host_local, *parts))
+        portable_abs = os.path.abspath(portable_dir)
+        try:
+            if os.path.commonpath((portable_abs, host_root)) == portable_abs:
+                return ""
+        except ValueError:
+            pass
+        if os.path.isdir(host_root):
+            return (
+                f" В профиле Windows также существует {host_root}; "
+                "этот внешний каталог намеренно не копируется."
+            )
+        return ""
+
+    def _discover_online_profile_payload(
+        self, opts: PortableOptions, data_dir: str, portable_dir: str,
+        app_name: str,
+    ) -> bool:
+        """Ищет продукт внутри перенаправленного LOCALAPPDATA без копирования.
+
+        Fusion Client Downloader может штатно развернуть клиент в
+        ``%LOCALAPPDATA%\\Autodesk\\webdeploy\\production`` и оставить
+        ``App`` пустой. Если профиль изолирован внутри портатива, запускаем
+        найденный exe именно оттуда: так сохраняются исходные относительные
+        пути webdeploy, не дублируются гигабайты и остаётся тот же профиль
+        LOCALAPPDATA для обновлений.
+        """
+        product = getattr(self._detection, "online_product", None)
+        profile_rel = getattr(product, "profile_root", "") if product else ""
+        if not profile_rel:
+            return False
+        if not opts.redirect_userdirs:
+            self._online_profile_diagnostic = (
+                "Перенаправление пользовательских папок отключено; "
+                "переносимый LOCALAPPDATA не проверялся."
+            )
+            return False
+
+        parts = [part for part in re.split(r"[\\/]+", profile_rel) if part]
+        if not parts or any(part in (".", "..") for part in parts):
+            self._online_profile_diagnostic = (
+                "Профиль онлайн-продукта имеет небезопасный относительный путь."
+            )
+            return False
+        data_abs = os.path.abspath(data_dir)
+        profile_root = os.path.abspath(os.path.join(
+            data_abs, "AppData", "Local", *parts))
+        try:
+            if os.path.commonpath((data_abs, profile_root)) != data_abs:
+                self._online_profile_diagnostic = (
+                    "Путь webdeploy выходит за пределы PortableData; "
+                    "внешний профиль не будет перенесён."
+                )
+                return False
+        except ValueError:
+            return False
+        self._online_profile_root = profile_root
+        if not os.path.isdir(profile_root):
+            self._online_profile_diagnostic = (
+                "В перенаправленном профиле не найден каталог "
+                f"{os.path.relpath(profile_root, portable_dir)}. "
+                "Проверяйте, не развернул ли установщик Fusion в настоящий "
+                "LOCALAPPDATA этого компьютера."
+                + self._host_online_profile_note(parts, portable_dir)
+            )
+            return False
+
+        portable_prefix = os.path.relpath(profile_root, portable_dir).replace(
+            "\\", "/")
+        main_exe, targets = self._discover_app_executables(
+            profile_root, getattr(product, "name", app_name),
+            portable_prefix=portable_prefix)
+        eligible: List[launcher_mod.TargetInfo] = []
+        for target in targets:
+            if target.role not in ("main", "launcher"):
+                continue
+            candidate = os.path.join(
+                portable_dir, target.rel_path.replace("/", os.sep))
+            try:
+                if (os.path.getsize(candidate) >= 128 * 1024
+                        and read_pe_info(candidate).is_pe):
+                    eligible.append(target)
+            except OSError:
+                continue
+        if main_exe and eligible:
+            selected = eligible[0]
+            self._online_profile_main_exe = os.path.join(
+                portable_dir, selected.rel_path.replace("/", os.sep))
+            self._online_profile_targets = [launcher_mod.TargetInfo(
+                name=selected.name,
+                rel_path=selected.rel_path,
+                role="main",
+                description="Autodesk Fusion из перенаправленного webdeploy-профиля",
+                bat_name="Launch.bat",
+                vbs_name="LaunchHidden.vbs",
+            )]
+            self._online_profile_diagnostic = ""
+            self.log.ok(
+                "Клиент Autodesk найден в перенаправленном LOCALAPPDATA: "
+                f"{selected.rel_path}. Запускаю его с исходного webdeploy-пути, "
+                "не копируя 5+ ГБ в App."
+            )
+            return True
+
+        self._online_profile_diagnostic = (
+            "Каталог перенаправленного webdeploy найден, но подходящий "
+            "exe приложения не найден; путь "
+            f"{os.path.relpath(profile_root, portable_dir)}."
+            + self._host_online_profile_note(parts, portable_dir)
+        )
+        return False
+
     def _log_language_choice(self, det, opts: PortableOptions) -> None:
         """Пишет в журнал, какой язык установщика будет выбран и как."""
         if not opts.install_language.strip():
@@ -1223,6 +1347,10 @@ class Portablizer:
             self._unpacked_with = ""
             self._hollow_note = ""
             self._detection = None
+            self._online_profile_root = ""
+            self._online_profile_main_exe = ""
+            self._online_profile_targets = []
+            self._online_profile_diagnostic = ""
             self._installer_name = opts.installer_path
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
@@ -1345,9 +1473,10 @@ class Portablizer:
             try:
                 self._install_prerequisites(opts, result)
 
-                # 4. Тихая установка: идём по лестнице попыток, пока в App не
-                # появятся файлы программы. Снимок реестра «после» делается ниже —
-                # он накрывает все попытки сразу.
+                # 4. Тихая установка: идём по лестнице попыток, пока не
+                # появится запускаемый клиент в App или известном профиле.
+                # Снимок реестра «после» делается ниже — он накрывает все
+                # попытки сразу.
                 self._check_cancel()
                 self.progress(30, "Тихая установка в изолированном режиме")
 
@@ -1418,12 +1547,26 @@ class Portablizer:
                 online_product = getattr(det, "online_product", None)
                 if (getattr(det, "is_downloader_stub", False) is True
                         and online_product is not None):
-                    self.log.warn(
-                        f"Не копирую {online_product.name} из профиля Windows "
-                        "в App: это сетевой webdeploy-клиент, а не "
-                        "подтверждённый автономный установщик. Его перенос "
-                        "не доказывает работоспособность без входа/лицензии."
-                    )
+                    profile_found = bool(self._online_profile_main_exe)
+                    if not profile_found:
+                        profile_found = self._discover_online_profile_payload(
+                            opts, data_dir, portable_dir, name)
+                    if profile_found:
+                        self.log.warn(
+                            f"{online_product.name} найден в изолированном "
+                            "LOCALAPPDATA внутри PortableData. Не копирую "
+                            "webdeploy в App: сохранены исходная структура и "
+                            "путь для обновлений; вход и лицензия Autodesk "
+                            "всё ещё могут ограничить переносимость."
+                        )
+                    else:
+                        self.log.warn(
+                            f"Не копирую {online_product.name} из профиля "
+                            "Windows в App: это сетевой webdeploy-клиент, а "
+                            "не подтверждённый автономный установщик. "
+                            "Проверен только изолированный PortableData; "
+                            "системный профиль не переносится автоматически."
+                        )
                 else:
                     registry_locations = reg_mod.changed_install_locations(
                         before, after)
@@ -1460,6 +1603,17 @@ class Portablizer:
             self._check_cancel()
             self.progress(75, "Поиск главного исполняемого файла и лаунчеров")
             main_exe, targets = self._discover_app_executables(app_dir, name)
+            runtime_app_dir = app_dir
+            if not main_exe and self._online_profile_main_exe:
+                if os.path.isfile(self._online_profile_main_exe):
+                    main_exe = self._online_profile_main_exe
+                    targets = list(self._online_profile_targets)
+                    runtime_app_dir = self._online_profile_root
+                    self.log.warn(
+                        "Исполняемый файл находится в перенаправленном "
+                        "LOCALAPPDATA внутри PortableData; launcher будет "
+                        "запускать его непосредственно оттуда."
+                    )
             if not main_exe:
                 result.hints = self._failure_hints(det, install_rc, opts,
                                                    portable_dir)
@@ -1483,19 +1637,19 @@ class Portablizer:
             self._check_cancel()
             self.progress(82, "Распространяемые компоненты (VC++, DirectX)")
             runtime_report = self._provision_runtimes(
-                app_dir, portable_dir, opts, name, result,
+                runtime_app_dir, portable_dir, opts, name, result,
                 main_exe=main_exe, targets=targets)
 
             # 7b. Зависимости и переменные среды
             self.progress(87, "Учёт зависимостей и переменных среды")
-            path_prepend = self._collect_dep_dirs(app_dir, portable_dir)
+            path_prepend = self._collect_dep_dirs(runtime_app_dir, portable_dir)
 
             # 7в. Сквозные сохранения: один набор сейвов для прямого запуска
             # exe, лончера и комплектного launcher'а.
             self._check_cancel()
             self.progress(90, "Сквозные портативные сохранения")
             save_setup = self._setup_shared_saves(
-                portable_dir, app_dir, name, targets, opts, result)
+                portable_dir, runtime_app_dir, name, targets, opts, result)
 
             # 8. Генерация лончера и вспомогательных скриптов
             self._check_cancel()
@@ -1508,14 +1662,29 @@ class Portablizer:
             online_product = getattr(det, "online_product", None)
             if (getattr(det, "is_downloader_stub", False) is True
                     and online_product is not None):
+                profile_location = (
+                    result.main_exe_rel.replace("\\", "/")
+                    if result.main_exe_rel.startswith("PortableData") else ""
+                )
+                location_note = (
+                    "Клиент запускается прямо из перенаправленного "
+                    f"LOCALAPPDATA ({profile_location}), без копирования "
+                    "5+ ГБ в App. "
+                    if profile_location else ""
+                )
+                update_note = (
+                    "UpdatePortable.cmd намеренно отключён; штатное "
+                    "обновление Autodesk не проверено. "
+                    if profile_location else ""
+                )
                 portability_note = (
-                    f"{online_product.name}: файлы собраны, но автономная "
-                    "работа на другом ПК не подтверждена. "
+                    f"{online_product.name}: {location_note}{update_note}"
+                    "автономная работа на другом ПК не подтверждена. "
                     f"{online_product.reason}. Для запуска может потребоваться "
                     "интернет, вход в Autodesk-аккаунт и действующая лицензия; "
-                    "клиент может обновляться вне папки App. Проверьте на "
-                    "отдельном ПК — этот результат не является гарантией "
-                    "автономного portable."
+                    "Autodesk может обновить клиент или потребовать "
+                    "компоненты вне портатива. Проверьте на отдельном ПК — "
+                    "этот результат не является гарантией автономного portable."
                 )
                 result.hints.append(portability_note)
                 self.log.warn(portability_note)
@@ -1733,6 +1902,8 @@ class Portablizer:
                     "установщик и все части дистрибутива (.bin/.cab), а не "
                     "подбирайте дополнительные ключи тишины."
                 )
+            if self._online_profile_diagnostic:
+                hints.append(self._online_profile_diagnostic)
             if self._hollow_note:
                 hints.append(self._hollow_note)
             return hints
@@ -1919,7 +2090,14 @@ class Portablizer:
                 if outcome is None:
                     verdict = "не запускалась"
                 elif outcome in (0, 3010):
-                    verdict = f"код {outcome}, но файлов в App не появилось"
+                    if (getattr(det, "is_downloader_stub", False)
+                            and getattr(det, "online_product", None) is not None):
+                        verdict = (
+                            f"код {outcome}, но запускаемый exe не найден в "
+                            "App или перенаправленном профиле"
+                        )
+                    else:
+                        verdict = f"код {outcome}, но файлов в App не появилось"
                 elif outcome == redist_mod.TIMEOUT_EXIT_CODE:
                     verdict = ("снят по пределу ожидания — установщик "
                                "перестал подавать признаки работы")
@@ -2547,12 +2725,13 @@ class Portablizer:
                       portable_dir: str, name: str,
                       recover: Optional[Callable[[], bool]] = None,
                       ) -> Tuple[Optional[int], Optional[SilentPlan]]:
-        """Выполняет варианты установки, пока в ``App`` не появятся файлы.
+        """Выполняет сценарии, пока не появится запускаемый клиент.
 
         Возвращает ``(код последней попытки, сработавший план)``. Успехом
         считается только фактический результат на диске: код возврата ``0``
-        при пустой папке успехом не является, и наоборот — некоторые
-        установщики отдают ненулевой код, успев разложить файлы.
+        при отсутствии исполняемого файла в App и известном профиле успехом
+        не является; некоторые установщики отдают ненулевой код, успев
+        разложить файлы.
         """
         last_rc: Optional[int] = None
         span = max(1, 58 - 30)
@@ -2660,6 +2839,18 @@ class Portablizer:
                     )
                     return rc, plan
 
+            # Autodesk Fusion штатно оставляет webdeploy-клиент в
+            # %LOCALAPPDATA%, а не в App. Если загрузка завершилась и exe
+            # уже находится в изолированном профиле, не запускаем второй
+            # (часто интерактивный) сценарий установщика.
+            if rc in (0, 3010) and self._discover_online_profile_payload(
+                    opts, data_dir, portable_dir, name):
+                self.log.ok(
+                    "Загрузчик завершился; клиент найден в PortableData. "
+                    f"Сценарий: {plan.label}"
+                )
+                return rc, plan
+
             # Установщик замолчал, но уже успел распаковать часть данных.
             # Запускать поверх них следующий сценарий бессмысленно и вредно:
             # это те же гигабайты заново, только ещё и с риском получить
@@ -2720,10 +2911,16 @@ class Portablizer:
                 break
 
             if index < total:
-                self.log.warn(
-                    f"Сценарий «{plan.label}» не дал файлов в App — перехожу "
-                    "к следующему."
-                )
+                if getattr(self._detection, "online_product", None) is not None:
+                    self.log.warn(
+                        f"Сценарий «{plan.label}» не дал запускаемого exe в "
+                        "App или перенаправленном профиле — перехожу к следующему."
+                    )
+                else:
+                    self.log.warn(
+                        f"Сценарий «{plan.label}» не дал файлов в App — перехожу "
+                        "к следующему."
+                    )
 
         self._collect_engine_log(opts, data_dir, portable_dir)
         return last_rc, None
@@ -3573,10 +3770,14 @@ class Portablizer:
                 score += 80
         return min(100, score)
 
-    def _discover_app_executables(self, app_dir: str, app_name: str
-                                  ) -> Tuple[Optional[str], List[launcher_mod.TargetInfo]]:
-        """Сканирует App/ и находит все запускаемые программы.
+    def _discover_app_executables(
+        self, app_dir: str, app_name: str, portable_prefix: str = "App",
+    ) -> Tuple[Optional[str], List[launcher_mod.TargetInfo]]:
+        """Сканирует каталог продукта и находит все запускаемые программы.
 
+        ``portable_prefix`` — расположение ``app_dir`` относительно корня
+        портатива (обычно ``App``; у Fusion webdeploy это PortableData/...)
+        и используется при формировании root-relative путей лончера.
         Классифицирует файлы по ролям:
           - main: основной исполняемый файл (игра/приложение);
           - launcher: предустановленный официальный лаунчер;
@@ -3673,7 +3874,8 @@ class Portablizer:
         used_bat_names: Set[str] = set()
 
         for _score, path, stem, role, desc in non_ignored:
-            rel_path = os.path.join("App", os.path.relpath(path, app_dir)).replace("\\", "/")
+            rel_path = os.path.join(
+                portable_prefix, os.path.relpath(path, app_dir)).replace("\\", "/")
             is_main = (path == main_exe)
             actual_role = "main" if is_main else role
 
@@ -4283,11 +4485,52 @@ class Portablizer:
                     "  • свести вручную: App\\LaunchPortable.exe "
                     "--sync-saves.\n"
                 )
+        separator = chr(92)
+        main_rel_display = main_exe_rel.replace("/", separator)
+        if main_rel_display.casefold().startswith("portabledata" + separator):
+            profile_dir_display = main_rel_display.rsplit(separator, 1)[0]
+            program_location_line = chr(10).join((
+                f"  App{separator}                  — Fusion webdeploy-клиент находится ниже",
+                f"  {profile_dir_display}{separator} — клиент; основной exe: "
+                f"{main_rel_display.rsplit(separator, 1)[-1]}",
+            ))
+            update_portable_line = (
+                "  UpdatePortable.cmd    — отключён для webdeploy; штатное "
+                "обновление Autodesk не проверено"
+            )
+            update_section = chr(10).join((
+                f"Обновление {name} (webdeploy-профиль):",
+                "  • если клиент предлагает обновление, используйте только "
+                "штатный механизм Autodesk;",
+                "    ему могут потребоваться интернет, вход в аккаунт и "
+                "действующая лицензия;",
+                "    переносимость обновления не проверена;",
+                "  • UpdatePortable.cmd намеренно отказывает: общий механизм "
+                "Portablizer",
+                "    устанавливает новые версии в App, а этот клиент "
+                "запускается из",
+                f"    {profile_dir_display};",
+                "  • после обновления проверьте запуск и переносимость заново.",
+                "",
+            ))
+        else:
+            program_location_line = (
+                f"  App{separator}                  — установленная программа "
+                f"({main_exe_rel})"
+            )
+            update_portable_line = (
+                "  UpdatePortable.cmd    — обновить программу ВНУТРИ портатива "
+                "(см. ниже)"
+            )
+            update_section = _STANDARD_UPDATE_SECTION
         self._write_text(
             os.path.join(portable_dir, "README_PORTABLE.txt"),
             _README.format(
                 app_name=name,
                 main_exe_rel=main_exe_rel,
+                program_location_line=program_location_line,
+                update_portable_line=update_portable_line,
+                update_section=update_section,
                 saves_section=saves_section,
                 companion_section=companion_section,
                 companion_files_list=companion_files_list,
@@ -4324,6 +4567,22 @@ class Portablizer:
             fh.write(text)
 
 
+_STANDARD_UPDATE_SECTION = """Обновление программы (новая версия вышла):
+  • кнопка «перезапустить для обновления» внутри самой программы на портативе
+    не нужна: лончер перехватывает её и сам ставит новую версию в App\\ —
+    данные в PortableData не затрагиваются;
+  • то же самое вручную: перетащите новый установщик на UpdatePortable.cmd
+    (или запустите его без аргументов — он скачает актуальную версию сам);
+  • новая версия сначала ставится во временную папку Updates\\stage и только
+    после проверки подменяет файлы в App\\. Прежняя версия остаётся в
+    Updates\\backup: «UpdatePortable.cmd --rollback» вернёт её, а саму папку
+    можно удалить, чтобы освободить место на флешке;
+  • если обновление прервали (зависло, закрыли через диспетчер задач),
+    при следующем запуске лончер сам вернёт прежнюю версию или предложит
+    доустановить новую. Ход работы — PortableData\\launcher-update.log.
+"""
+
+
 _README = """{app_name} — портативная версия
 ================================================================
 
@@ -4344,12 +4603,12 @@ _README = """{app_name} — портативная версия
 портативный каталог Documents, поэтому выбранные настройки применятся в игре.
 
 Что внутри:
-  App\\                  — установленная программа ({main_exe_rel})
+{program_location_line}
 {exe_launcher_file}  PortableData\\         — все пользовательские данные (AppData, Temp, настройки)
   Launch.bat            — запуск через EXE-лончер; --bat-fallback для консоли
   LaunchHidden.vbs      — запуск без окна консоли
   StopPortable.cmd      — освободить папку, если что-то из неё осталось в фоне
-  UpdatePortable.cmd    — обновить программу ВНУТРИ портатива (см. ниже)
+{update_portable_line}
 {companion_files_list}  launcher_config.json  — параметры лончера
 {registry_note}{runtime_note}  install.log           — подробный журнал установщика (если он поддерживается)
   portablizer.log       — журнал создания и диагностики портатива
@@ -4389,20 +4648,7 @@ _README = """{app_name} — портативная версия
 Полной виртуализации Windows лончер не выполняет: отдельные программы могут
 обращаться к системным каталогам напрямую.
 
-Обновление программы (новая версия вышла):
-  • кнопка «перезапустить для обновления» внутри самой программы на портативе
-    не нужна: лончер перехватывает её и сам ставит новую версию в App\\ —
-    данные в PortableData не затрагиваются;
-  • то же самое вручную: перетащите новый установщик на UpdatePortable.cmd
-    (или запустите его без аргументов — он скачает актуальную версию сам);
-  • новая версия сначала ставится во временную папку Updates\\stage и только
-    после проверки подменяет файлы в App\\. Прежняя версия остаётся в
-    Updates\\backup: «UpdatePortable.cmd --rollback» вернёт её, а саму папку
-    можно удалить, чтобы освободить место на флешке;
-  • если обновление прервали (зависло, закрыли через диспетчер задач),
-    при следующем запуске лончер сам вернёт прежнюю версию или предложит
-    доустановить новую. Ход работы — PortableData\\launcher-update.log.
-
+{update_section}
 Если папка не удаляется («файл открыт в другой программе»):
   • обычно этого не бывает: после выхода лончер сам закрывает всё, что было
     запущено из папки, — и программу, и её фоновых помощников (апдейтер,
