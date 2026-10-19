@@ -236,6 +236,9 @@ class OnlineOnlyProduct:
     #: Относительный каталог в перенаправленном LOCALAPPDATA, куда клиент
     #: разворачивает содержимое. Пусто для профилей без известного пути.
     profile_root: str = ""
+    #: Исполняемые файлы, которые являются подтверждёнными точками входа.
+    #: Не подменять их произвольным EXE из многотысячного webdeploy payload.
+    entrypoint_exe_names: Tuple[str, ...] = ()
 
 
 _ONLINE_ONLY_PRODUCTS: Tuple[OnlineOnlyProduct, ...] = (
@@ -253,6 +256,7 @@ _ONLINE_ONLY_PRODUCTS: Tuple[OnlineOnlyProduct, ...] = (
             "через Autodesk и требует входа в аккаунт"
         ),
         profile_root="Autodesk/webdeploy/production",
+        entrypoint_exe_names=("FusionLauncher.exe",),
     ),
 )
 
