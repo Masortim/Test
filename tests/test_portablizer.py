@@ -77,6 +77,29 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertFalse((portable / "cleanup_host.reg").exists())
             self.assertTrue((data / "settings.json").exists())
 
+    def test_detection_failure_does_not_clear_existing_output(self):
+        """Старый App удаляется только после успешного распознавания входа."""
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "ExampleSetup.exe")
+            installer.write_bytes(b"not a real installer")
+            portable = Path(temp, "ExampleSetup_Portable")
+            app = portable / "App"
+            app.mkdir(parents=True)
+            (portable / "PortableData").mkdir()
+            existing = app / "ExistingApp.exe"
+            existing.write_bytes(b"keep this build")
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp)
+
+            with mock.patch(
+                "portablizer.core.portablizer.detect_installer",
+                side_effect=RuntimeError("synthetic detection failure"),
+            ):
+                result = self.engine.run(opts)
+
+            self.assertFalse(result.success)
+            self.assertEqual(existing.read_bytes(), b"keep this build")
+
     def test_prepare_output_frees_the_folder_before_deleting_anything(self):
         """Живой процесс из прошлого запуска не должен ронять пересборку.
 

@@ -356,6 +356,17 @@ class TempRelocationTests(unittest.TestCase):
         engine._cleanup_install_temp()
         self.assertEqual(engine._install_temp_dir, os.path.join(self.data, "Temp"))
 
+    def test_redirected_profile_precreates_user_pinned_known_folder(self):
+        """Autodesk CREATE_LAUNCH_ITEMS must resolve FOLDERID_UserPinned."""
+        engine = Portablizer(Logger())
+        env = engine._build_isolated_env(self.opts, self.data)
+        pinned = os.path.join(
+            env["APPDATA"], "Microsoft", "Internet Explorer",
+            "Quick Launch", "User Pinned",
+        )
+        self.assertTrue(os.path.isdir(pinned))
+        self.assertEqual(os.path.commonpath([self.data, pinned]), self.data)
+
     def test_shortage_without_another_disk_is_explained(self):
         engine = Portablizer(Logger())
         with mock.patch.object(space_mod, "media_bytes",
