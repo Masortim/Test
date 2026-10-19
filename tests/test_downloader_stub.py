@@ -40,8 +40,10 @@
     программы не считаются;
   * итоговые подсказки называют причину словами и ведут к офлайн-дистрибутиву,
     а не к подбору ключей тишины;
-  * настоящий PE-клиент в перенаправленном webdeploy-профиле запускается из
-    PortableData без дублирования гигабайтов, но без обещания автономности.
+  * Fusion запускается из webdeploy только через настроенный
+    FusionLauncher.exe.ini, указывающий на существующий Fusion360.exe;
+    FusionDocTest.exe и placeholder .ini не становятся ложным успехом, а
+    живой финализатор Streamer не останавливается преждевременно.
 """
 import json
 import os
@@ -133,6 +135,8 @@ class DownloaderStubDetectionTests(unittest.TestCase):
             self.assertIn("webdeploy", det.online_product.reason)
             self.assertEqual(det.online_product.profile_root,
                              "Autodesk/webdeploy/production")
+            self.assertEqual(det.online_product.entrypoint_exe_names,
+                             ("FusionLauncher.exe",))
 
     def test_documented_switch_is_user_scope_only(self):
         """--globalinstall ставит клиент в Program Files ЭТОГО ПК — его нет."""
@@ -443,6 +447,52 @@ class HollowLadderTests(unittest.TestCase):
         self.assertFalse(engine._hollow_note)
 
 
+class FusionLauncherIniValidationTests(unittest.TestCase):
+    """Launcher считается клиентом только при полной и согласованной INI."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.production = Path(self.temp.name, "production")
+        self.launcher_dir = self.production / "launcher-hash"
+        self.client_dir = self.production / "client-hash"
+        self.launcher_dir.mkdir(parents=True)
+        self.client_dir.mkdir(parents=True)
+        self.launcher = self.launcher_dir / "FusionLauncher.exe"
+        _fake_pe(str(self.launcher), [".text", ".rsrc"], size=256 * 1024)
+        self.application = self.client_dir / "Fusion360.exe"
+
+    def _write_ini(self, target):
+        Path(str(self.launcher) + ".ini").write_text(
+            "[Launcher]\n"
+            "stream = production\n"
+            f'cmd = ""{target.as_posix()}""\n',
+            encoding="utf-8")
+
+    def _validate(self):
+        return Portablizer._validate_fusion_launcher_ini(
+            str(self.launcher), str(self.production), self.temp.name)
+
+    def test_ini_requires_existing_fusion360_not_an_arbitrary_pe(self):
+        _fake_pe(str(self.application), [".text", ".rsrc"], size=512 * 1024)
+        self._write_ini(self.application)
+        resolved, reason = self._validate()
+        self.assertEqual(resolved, str(self.application))
+        self.assertFalse(reason)
+
+        self.application.unlink()
+        resolved, reason = self._validate()
+        self.assertFalse(resolved)
+        self.assertIn("не найден", reason)
+
+        helper = self.client_dir / "FusionDocTest.exe"
+        _fake_pe(str(helper), [".text", ".rsrc"], size=512 * 1024)
+        self._write_ini(helper)
+        resolved, reason = self._validate()
+        self.assertFalse(resolved)
+        self.assertIn("Fusion360.exe", reason)
+
+
 class DownloaderHintsTests(unittest.TestCase):
     """Итоговые подсказки ведут к офлайн-дистрибутиву, а не к ключам тишины."""
 
@@ -510,6 +560,27 @@ class DownloaderHintsTests(unittest.TestCase):
         # клиент в Program Files этого компьютера.
         self.assertNotIn("--globalinstall --quiet", lines)
 
+    def test_incomplete_profile_does_not_kill_live_autodesk_finalizer(self):
+        engine = Portablizer(Logger())
+        engine._detection = self.det
+        data_dir = os.path.join(self.portable, "PortableData")
+        with mock.patch.object(
+                engine, "_discover_online_profile_payload", return_value=False
+        ) as discover, mock.patch.object(
+                engine_mod.procutil, "processes_in",
+                return_value=[(123, os.path.join(
+                    data_dir, "AppData", "Local", "Autodesk",
+                    "FusionLauncher.exe"))]
+        ), mock.patch.object(engine, "_release_portable_dir") as release:
+            engine._release_after_install(
+                self.det, self.opts, data_dir, self.portable, "Fusion")
+
+        discover.assert_called_once()
+        release.assert_not_called()
+        self.assertIn("не останавливаю процессы PortableData",
+                      engine.log.text)
+        self.assertIn("финализацию Autodesk Streamer", engine.log.text)
+
     def test_run_does_not_repackage_the_host_webdeploy_client(self):
         class TrackingEngine(Portablizer):
             def __init__(inner):  # noqa: D107
@@ -549,8 +620,23 @@ class DownloaderHintsTests(unittest.TestCase):
     def test_online_product_success_is_caveated_in_readme_and_result(self):
         class FilesEngine(Portablizer):
             def _run_install(inner, plan, opts, app_dir, data_dir, **kwargs):
-                Path(app_dir, "Fusion.exe").write_bytes(b"MZ fake app")
-                inner._last_install_seconds = 0.4
+                production = Path(
+                    data_dir, "AppData", "Local", "Autodesk", "webdeploy",
+                    "production")
+                launcher_dir = production / "launcher-hash"
+                client_dir = production / "client-hash"
+                launcher_dir.mkdir(parents=True, exist_ok=True)
+                client_dir.mkdir(parents=True, exist_ok=True)
+                launcher = launcher_dir / "FusionLauncher.exe"
+                application = client_dir / "Fusion360.exe"
+                _fake_pe(str(launcher), [".text", ".rsrc"], size=256 * 1024)
+                _fake_pe(str(application), [".text", ".rsrc"], size=512 * 1024)
+                Path(str(launcher) + ".ini").write_text(
+                    "[Launcher]\n"
+                    "stream = production\n"
+                    f'cmd = ""{application.as_posix()}""\n',
+                    encoding="utf-8")
+                inner._last_install_seconds = 8 * 60
                 return 0
 
         engine = FilesEngine(Logger())
@@ -574,18 +660,32 @@ class DownloaderHintsTests(unittest.TestCase):
         self.assertIn("Autodesk-аккаунт", readme_text)
         self.assertNotIn(b"\r\r\n", readme.read_bytes())
 
-    def test_fusion_webdeploy_payload_is_launched_from_redirected_profile(self):
+    def test_fusion_webdeploy_uses_configured_launcher_not_doc_test(self):
         class FilesEngine(Portablizer):
             def _run_install(inner, plan, opts, app_dir, data_dir, **kwargs):
-                version_dir = Path(
+                production = Path(
                     data_dir, "AppData", "Local", "Autodesk", "webdeploy",
-                    "production", "0123456789abcdef")
-                version_dir.mkdir(parents=True, exist_ok=True)
-                executable = version_dir / "Fusion.exe"
-                _fake_pe(str(executable), [".text", ".rsrc"],
-                         size=256 * 1024)
-                # Mimic the user's long download: a successful first attempt
-                # must stop the ladder instead of opening a second installer.
+                    "production")
+                launcher_dir = production / "6a0c9611291d45bb9226980209917c3d"
+                app_dir = production / "736d2b4c5e6b95e77c11721da222cf21c6a1fc1f"
+                test_dir = production / "test-helper-hash"
+                launcher_dir.mkdir(parents=True, exist_ok=True)
+                app_dir.mkdir(parents=True, exist_ok=True)
+                test_dir.mkdir(parents=True, exist_ok=True)
+                launcher = launcher_dir / "FusionLauncher.exe"
+                application = app_dir / "Fusion360.exe"
+                _fake_pe(str(launcher), [".text", ".rsrc"], size=256 * 1024)
+                _fake_pe(str(application), [".text", ".rsrc"], size=512 * 1024)
+                # This PE used to win generic scoring despite being a test tool.
+                _fake_pe(str(test_dir / "FusionDocTest.exe"),
+                         [".text", ".rsrc"], size=512 * 1024)
+                Path(str(launcher) + ".ini").write_text(
+                    "[Launcher]\n"
+                    "stream = production\n"
+                    "auid = AutodeskInc.Fusion360\n"
+                    f'cmd = "{application.as_posix()}"\n',
+                    encoding="utf-8")
+                # Mimic the user's long download: do not rerun the downloader.
                 inner._last_install_seconds = 8 * 60
                 return 0
 
@@ -602,14 +702,16 @@ class DownloaderHintsTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.attempts_made, 1)
         target = result.main_exe_rel.replace("\\", "/")
-        self.assertTrue(target.startswith(
-            "PortableData/AppData/Local/Autodesk/webdeploy/production/"))
+        self.assertTrue(target.endswith(
+            "/6a0c9611291d45bb9226980209917c3d/FusionLauncher.exe"))
+        self.assertNotIn("FusionDocTest.exe", target)
         config = json.loads(Path(
             result.portable_dir, "launcher_config.json").read_text(
                 encoding="utf-8"))
         self.assertEqual(config["target_exe_rel"], target)
         self.assertIn("запускать его непосредственно оттуда",
                       engine.log.text)
+        self.assertIn("Fusion360.exe", engine.log.text)
         self.assertIn("без копирования 5+ ГБ", " ".join(result.hints))
         readme_text = Path(
             result.portable_dir, "README_PORTABLE.txt").read_text(
@@ -622,6 +724,48 @@ class DownloaderHintsTests(unittest.TestCase):
             result.portable_dir, "UpdatePortable.cmd").read_text(
                 encoding="ascii")
         self.assertIn("disabled here", update_script)
+
+    def test_incomplete_launcher_ini_rejects_fusiondoc_test_false_positive(self):
+        class FilesEngine(Portablizer):
+            def _run_install(inner, plan, opts, app_dir, data_dir, **kwargs):
+                production = Path(
+                    data_dir, "AppData", "Local", "Autodesk", "webdeploy",
+                    "production")
+                launcher_dir = production / "launcher-hash"
+                client_dir = production / "client-hash"
+                helper_dir = production / "doc-test-hash"
+                for directory in (launcher_dir, client_dir, helper_dir):
+                    directory.mkdir(parents=True, exist_ok=True)
+                launcher = launcher_dir / "FusionLauncher.exe"
+                _fake_pe(str(launcher), [".text", ".rsrc"], size=256 * 1024)
+                _fake_pe(str(client_dir / "Fusion360.exe"),
+                         [".text", ".rsrc"], size=512 * 1024)
+                _fake_pe(str(helper_dir / "FusionDocTest.exe"),
+                         [".text", ".rsrc"], size=512 * 1024)
+                Path(str(launcher) + ".ini").write_text(
+                    "This is a placeholder file which is intended to be "
+                    "updated by the streamer.\n", encoding="utf-8")
+                inner._last_install_seconds = 8 * 60
+                return 0
+
+        engine = FilesEngine(Logger())
+        with mock.patch.object(engine_mod, "IS_WINDOWS", False):
+            result = engine.run(PortableOptions(
+                installer_path=self.installer,
+                output_dir=self.temp.name,
+                app_name="Fusion",
+                capture_registry=False,
+                cleanup_host=False,
+            ))
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.main_exe_rel)
+        self.assertTrue(any("placeholder Streamer" in hint
+                            for hint in result.hints))
+        self.assertIn("FusionDocTest.exe", engine.log.text)
+        self.assertIn("Не выбираю FusionDocTest.exe", engine.log.text)
+        self.assertNotIn("Главный exe:", engine.log.text)
+        self.assertNotIn("успешно создан", engine.log.text)
 
     def test_no_warning_for_a_normal_installer(self):
         engine = Portablizer(Logger())

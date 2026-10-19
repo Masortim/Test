@@ -37,6 +37,7 @@
 """
 from __future__ import annotations
 
+import configparser
 import math
 import os
 import re
@@ -852,8 +853,9 @@ class Portablizer:
         #: Текущий результат распознавания, нужен и для диагностики лестницы.
         self._detection: Optional[DetectionResult] = None
         #: Fusion может развернуться в перенаправленный LOCALAPPDATA, а не App.
-        self._online_profile_root = ""
         self._online_profile_main_exe = ""
+        self._online_profile_checked = False
+        self._online_profile_deferred = False
         self._online_profile_targets: List[launcher_mod.TargetInfo] = []
         self._online_profile_diagnostic = ""
 
@@ -931,6 +933,51 @@ class Portablizer:
                 "Остановлены процессы, запущенные из папки портатива"
                 f"{tail}: " + ", ".join(sorted(set(stopped))))
         return stopped
+
+    def _release_after_install(
+        self, det: DetectionResult, opts: PortableOptions, data_dir: str,
+        portable_dir: str, app_name: str,
+    ) -> None:
+        """Не убивает незавершённый Autodesk Streamer после выхода bootstrapper.
+
+        Fusion может завершить родительский downloader раньше дочернего
+        процесса, который заменяет placeholder FusionLauncher.exe.ini. Сначала
+        проверяем именно штатную точку входа. Если конфигурация ещё неполная,
+        но в PortableData остались живые процессы, оставляем их завершить
+        настройку; иначе release_folder мог бы сам создать этот placeholder-
+        сбой, приняв финализатор за «Запустить программу сейчас».
+        """
+        product = getattr(det, "online_product", None)
+        if (not getattr(det, "is_downloader_stub", False)
+                or product is None
+                or not getattr(product, "entrypoint_exe_names", ())):
+            self._release_portable_dir(portable_dir, reason="после установки")
+            return
+
+        configured = self._discover_online_profile_payload(
+            opts, data_dir, portable_dir, app_name)
+        if not configured:
+            try:
+                running = procutil.processes_in(data_dir)
+                process_scan_ok = True
+            except Exception as exc:  # noqa: BLE001 - безопаснее не убивать finalizer
+                self.log.debug(
+                    f"Не удалось проверить процессы Autodesk Streamer: {exc}")
+                running = []
+                process_scan_ok = False
+            if running or not process_scan_ok:
+                self._online_profile_deferred = True
+                names = sorted({os.path.basename(image) or str(pid)
+                                for pid, image in running})
+                detail = ", ".join(names) if names else "состояние неизвестно"
+                self.log.warn(
+                    "FusionLauncher.exe.ini пока не подтверждает готовую "
+                    "установку; не останавливаю процессы PortableData, чтобы "
+                    "не прервать финализацию Autodesk Streamer: "
+                    + detail + "."
+                )
+                return
+        self._release_portable_dir(portable_dir, reason="после установки")
 
     def _verify_folder_is_free(self, portable_dir: str,
                                result: "PortableResult") -> bool:
@@ -1198,6 +1245,112 @@ class Portablizer:
             )
         return ""
 
+    @staticmethod
+    def _validate_fusion_launcher_ini(
+        launcher_exe: str, profile_root: str, local_appdata: str,
+    ) -> Tuple[str, str]:
+        """Возвращает путь app-exe из настроенного FusionLauncher.ini.
+
+        Само наличие FusionLauncher.exe недостаточно: Streamer сначала кладёт
+        рядом placeholder ``FusionLauncher.exe.ini``, а в конце установки
+        заменяет его конфигурацией с командой запуска Fusion. Placeholder и
+        конфиг без существующего app-exe означают незавершённую установку.
+        """
+        ini_path = launcher_exe + ".ini"
+        if not os.path.isfile(ini_path):
+            return "", "FusionLauncher.exe.ini отсутствует"
+        try:
+            with open(ini_path, "rb") as stream:
+                raw = stream.read(1024 * 1024 + 1)
+        except OSError as exc:
+            return "", f"FusionLauncher.exe.ini не читается ({exc})"
+        if len(raw) > 1024 * 1024:
+            return "", "FusionLauncher.exe.ini превышает ожидаемый размер"
+        if not raw:
+            return "", "FusionLauncher.exe.ini пуст"
+
+        try:
+            if raw.startswith((bytes((0xff, 0xfe)), bytes((0xfe, 0xff)))):
+                text = raw.decode("utf-16")
+            elif len(raw) > 1 and raw[1:2] == bytes((0,)):
+                text = raw.decode("utf-16-le")
+            elif raw[:1] == bytes((0,)):
+                text = raw.decode("utf-16-be")
+            else:
+                text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1252", errors="replace")
+        if "placeholder file which is intended to be updated by the streamer" \
+                in text.casefold():
+            return "", "FusionLauncher.exe.ini всё ещё является placeholder Streamer"
+
+        parser = configparser.ConfigParser(interpolation=None, strict=False)
+        try:
+            parser.read_string(text)
+        except configparser.Error:
+            return "", "FusionLauncher.exe.ini не содержит корректную INI-конфигурацию"
+        if not parser.has_section("Launcher"):
+            return "", "в FusionLauncher.exe.ini отсутствует секция [Launcher]"
+        settings = parser["Launcher"]
+        command = settings.get("cmd", "").replace('""', '"').strip()
+        if not command:
+            return "", "в [Launcher] отсутствует команда cmd"
+        if settings.get("stream", "production").casefold() != "production":
+            return "", "FusionLauncher.ini указывает на неизвестный webdeploy stream"
+
+        command = command.strip().strip(chr(34) + chr(39))
+        command = re.sub(r"%LOCALAPPDATA%", lambda _match: local_appdata,
+                         command, flags=re.IGNORECASE)
+        executable_end = command.casefold().find(".exe")
+        if executable_end < 0:
+            return "", "команда cmd не содержит путь к исполняемому файлу"
+        executable_end += len(".exe")
+        executable_command = command[:executable_end]
+        drive_start = -1
+        for index in range(max(0, len(executable_command) - 2)):
+            if (executable_command[index].isalpha()
+                    and executable_command[index + 1] == ":"
+                    and executable_command[index + 2] in (chr(92), "/")):
+                drive_start = index
+                break
+        if drive_start >= 0:
+            path_start = drive_start
+        elif executable_command.startswith("/"):
+            path_start = 0
+        else:
+            quote_start = executable_command.rfind(chr(34))
+            if quote_start >= 0:
+                path_start = quote_start + 1
+            else:
+                path_start = executable_command.rfind(" ") + 1
+        target = executable_command[path_start:].strip().strip(chr(34) + chr(39))
+        if not target:
+            return "", "команда cmd не содержит путь к исполняемому файлу"
+        if not os.path.isabs(target):
+            target = os.path.join(os.path.dirname(launcher_exe), target)
+        target = os.path.abspath(os.path.normpath(target))
+        if os.path.basename(target).casefold() != "fusion360.exe":
+            return "", (
+                "команда FusionLauncher.ini должна указывать на "
+                "Fusion360.exe, а не на вспомогательный EXE"
+            )
+        profile_abs = os.path.abspath(profile_root)
+        try:
+            common = os.path.commonpath((profile_abs, target))
+            contained = os.path.normcase(common) == os.path.normcase(profile_abs)
+        except ValueError:
+            contained = False
+        if not contained:
+            return "", "команда FusionLauncher указывает за пределы PortableData/webdeploy"
+        if not os.path.isfile(target):
+            return "", f"app-exe из FusionLauncher.ini не найден: {os.path.relpath(target, profile_abs)}"
+        try:
+            if os.path.getsize(target) < 128 * 1024 or not read_pe_info(target).is_pe:
+                return "", "app-exe из FusionLauncher.ini неполный или не является PE"
+        except OSError as exc:
+            return "", f"app-exe из FusionLauncher.ini не читается ({exc})"
+        return target, ""
+
     def _discover_online_profile_payload(
         self, opts: PortableOptions, data_dir: str, portable_dir: str,
         app_name: str,
@@ -1211,6 +1364,7 @@ class Portablizer:
         пути webdeploy, не дублируются гигабайты и остаётся тот же профиль
         LOCALAPPDATA для обновлений.
         """
+        self._online_profile_checked = True
         product = getattr(self._detection, "online_product", None)
         profile_rel = getattr(product, "profile_root", "") if product else ""
         if not profile_rel:
@@ -1240,7 +1394,6 @@ class Portablizer:
                 return False
         except ValueError:
             return False
-        self._online_profile_root = profile_root
         if not os.path.isdir(profile_root):
             self._online_profile_diagnostic = (
                 "В перенаправленном профиле не найден каталог "
@@ -1253,6 +1406,81 @@ class Portablizer:
 
         portable_prefix = os.path.relpath(profile_root, portable_dir).replace(
             "\\", "/")
+        entrypoint_names = tuple(
+            name.casefold() for name in
+            (getattr(product, "entrypoint_exe_names", ()) or ()))
+        if entrypoint_names:
+            launcher_candidates: List[Tuple[str, str]] = []
+            invalid_configs: List[str] = []
+            for root, _dirs, files in os.walk(profile_root):
+                for filename in sorted(files, key=str.casefold):
+                    if filename.casefold() not in entrypoint_names:
+                        continue
+                    launcher_path = os.path.join(root, filename)
+                    try:
+                        if (os.path.getsize(launcher_path) < 128 * 1024
+                                or not read_pe_info(launcher_path).is_pe):
+                            invalid_configs.append(
+                                f"{os.path.relpath(launcher_path, profile_root)}: "
+                                "launcher EXE неполный или не является PE")
+                            continue
+                    except OSError as exc:
+                        invalid_configs.append(
+                            f"{os.path.relpath(launcher_path, profile_root)}: {exc}")
+                        continue
+                    app_exe, why_invalid = self._validate_fusion_launcher_ini(
+                        launcher_path, profile_root,
+                        os.path.join(data_abs, "AppData", "Local"))
+                    if app_exe:
+                        launcher_candidates.append((launcher_path, app_exe))
+                    elif why_invalid:
+                        invalid_configs.append(
+                            f"{os.path.relpath(launcher_path, profile_root)}: "
+                            f"{why_invalid}")
+
+            if launcher_candidates:
+                launcher_path, app_exe = max(
+                    launcher_candidates,
+                    key=lambda item: os.path.getmtime(item[0] + ".ini"))
+                selected_rel = os.path.relpath(
+                    launcher_path, portable_dir).replace("\\", "/")
+                selected = launcher_mod.TargetInfo(
+                    name=os.path.basename(launcher_path),
+                    rel_path=selected_rel,
+                    role="main",
+                    description=(
+                        "Autodesk Fusion через настроенный FusionLauncher "
+                        "из перенаправленного webdeploy-профиля"),
+                    bat_name="Launch.bat",
+                    vbs_name="LaunchHidden.vbs",
+                )
+                self._online_profile_main_exe = launcher_path
+                self._online_profile_targets = [selected]
+                self._online_profile_diagnostic = ""
+                self.log.ok(
+                    "Настроенный FusionLauncher найден: "
+                    f"{selected.rel_path}; его INI указывает на существующий "
+                    f"Fusion app-exe: "
+                    f"{os.path.relpath(app_exe, profile_root)}."
+                )
+                return True
+
+            if not invalid_configs:
+                invalid_configs.append(
+                    "FusionLauncher.exe в webdeploy-профиле не найден")
+            details = "; ".join(invalid_configs[:3])
+            self._online_profile_diagnostic = (
+                "Fusion webdeploy найден, но установка не сконфигурирована "
+                "для запуска: " + details + ". Не выбираю FusionDocTest.exe "
+                "или другой вспомогательный EXE вместо настоящей точки входа. "
+                "Проверьте завершение Autodesk Streamer и [Launcher]/cmd в "
+                "FusionLauncher.exe.ini; cmd должен указывать на существующий "
+                "Fusion app-exe внутри production."
+                + self._host_online_profile_note(parts, portable_dir)
+            )
+            self.log.warn(self._online_profile_diagnostic)
+            return False
+
         main_exe, targets = self._discover_app_executables(
             profile_root, getattr(product, "name", app_name),
             portable_prefix=portable_prefix)
@@ -1347,8 +1575,9 @@ class Portablizer:
             self._unpacked_with = ""
             self._hollow_note = ""
             self._detection = None
-            self._online_profile_root = ""
             self._online_profile_main_exe = ""
+            self._online_profile_checked = False
+            self._online_profile_deferred = False
             self._online_profile_targets = []
             self._online_profile_diagnostic = ""
             self._installer_name = opts.installer_path
@@ -1512,7 +1741,8 @@ class Portablizer:
             # или оставить свой фоновый помощник. Закрываем их ДО снимка
             # реестра: так программа успевает записать свои настройки (они
             # уедут в портатив), а файлы App перестают быть занятыми.
-            self._release_portable_dir(portable_dir, reason="после установки")
+            self._release_after_install(
+                det, opts, data_dir, portable_dir, name)
 
             # 4b. Установщик не отдал файлы ни одной командой. Последний
             # honest-шанс: распаковать приклеенный к exe ZIP — так устроены
@@ -1548,9 +1778,12 @@ class Portablizer:
                 if (getattr(det, "is_downloader_stub", False) is True
                         and online_product is not None):
                     profile_found = bool(self._online_profile_main_exe)
-                    if not profile_found:
+                    if (not profile_found
+                            and (not self._online_profile_checked
+                                 or self._online_profile_deferred)):
                         profile_found = self._discover_online_profile_payload(
                             opts, data_dir, portable_dir, name)
+                        self._online_profile_deferred = False
                     if profile_found:
                         self.log.warn(
                             f"{online_product.name} найден в изолированном "
@@ -1602,13 +1835,25 @@ class Portablizer:
             # 6. Поиск главного exe и обнаружение всех вспомогательных программ
             self._check_cancel()
             self.progress(75, "Поиск главного исполняемого файла и лаунчеров")
-            main_exe, targets = self._discover_app_executables(app_dir, name)
+            online_product = getattr(det, "online_product", None)
+            profile_only_product = bool(
+                getattr(det, "is_downloader_stub", False)
+                and online_product is not None
+                and getattr(online_product, "entrypoint_exe_names", ()))
+            if profile_only_product:
+                # Не разрешать общий PE-скоринг выбрать FusionDocTest.exe
+                # или bootstrapper из App, если webdeploy не сконфигурирован.
+                main_exe, targets = "", []
+            else:
+                main_exe, targets = self._discover_app_executables(app_dir, name)
             runtime_app_dir = app_dir
             if not main_exe and self._online_profile_main_exe:
                 if os.path.isfile(self._online_profile_main_exe):
                     main_exe = self._online_profile_main_exe
                     targets = list(self._online_profile_targets)
-                    runtime_app_dir = self._online_profile_root
+                    # Сканируем зависимости только рядом с выбранным launcher,
+                    # а не тысячи вспомогательных EXE во всём webdeploy.
+                    runtime_app_dir = os.path.dirname(main_exe)
                     self.log.warn(
                         "Исполняемый файл находится в перенаправленном "
                         "LOCALAPPDATA внутри PortableData; launcher будет "
