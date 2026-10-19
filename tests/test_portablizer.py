@@ -684,56 +684,23 @@ class PortableExeLauncherTests(unittest.TestCase):
                 root, cfg, app / "game.exe", {"SystemRoot": str(windir)})
             self.assertEqual(missing, [])
 
-    def test_silent_install_is_accepted_once_winsxs_folder_appears(self):
+    def test_runtime_install_helper_never_runs_system_installer(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp, "Game_Portable")
-            redist_dir = root / "Redist"
-            redist_dir.mkdir(parents=True)
-            (redist_dir / "vcredist_x86.exe").write_bytes(b"MZ")
-            windir = Path(temp, "Windows")
-            cfg = {"runtime_installers": [
-                {"file": "Redist/vcredist_x86.exe", "title": "VC++ 2005",
-                 "kind": "vcredist_legacy", "args": "/q",
-                 "dlls": "msvcr80.dll", "arch": "x86"}]}
+            root.mkdir()
+            cfg = {"runtime_installers": [{
+                "file": "Redist/vcredist_x86.exe", "title": "VC++ 2005",
+                "kind": "vcredist_legacy", "args": "/q",
+                "dlls": "msvcr80.dll", "arch": "x86"}]}
+            missing = [self.SXS_ITEM]
 
-            def run_and_plant(_command, timeout=900):
-                family = windir / "WinSxS" / (
-                    "x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_"
-                    "8.0.50727.6195_none_4ff29c7c0b2f2a62")
-                family.mkdir(parents=True)
-                return 0
+            with mock.patch.object(exe_launcher.subprocess, "run",
+                                   side_effect=AssertionError("must not run")) as run:
+                still = exe_launcher.install_missing_runtime(root, cfg, missing)
 
-            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
-                    mock.patch.object(exe_launcher, "_run_hidden",
-                                      side_effect=run_and_plant), \
-                    mock.patch.dict(os.environ,
-                                    {"SystemRoot": str(windir)}):
-                still = exe_launcher.install_missing_runtime(
-                    root, cfg, [self.SXS_ITEM])
-            self.assertEqual(still, [])
-
-    def test_silent_install_that_changed_nothing_keeps_the_warning(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp, "Game_Portable")
-            redist_dir = root / "Redist"
-            redist_dir.mkdir(parents=True)
-            (redist_dir / "vcredist_x86.exe").write_bytes(b"MZ")
-            windir = Path(temp, "Windows")
-            cfg = {"runtime_installers": [
-                {"file": "Redist/vcredist_x86.exe", "title": "VC++ 2005",
-                 "kind": "vcredist_legacy", "args": "/q",
-                 "dlls": "msvcr80.dll", "arch": "x86"}]}
-
-            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
-                    mock.patch.object(exe_launcher, "_run_hidden",
-                                      return_value=0), \
-                    mock.patch.dict(os.environ,
-                                    {"SystemRoot": str(windir)}):
-                still = exe_launcher.install_missing_runtime(
-                    root, cfg, [self.SXS_ITEM])
-            # Установщик завершился «успешно», но сборки нигде нет (UAC был
-            # отменён внутри /q, пакет повреждён): предупреждение остаётся.
-            self.assertEqual([item["dll"] for item in still], ["msvcr80.dll"])
+            self.assertEqual(still, missing)
+            run.assert_not_called()
+            self.assertTrue((root / "PortableData" / "launcher-run.log").is_file())
 
     def test_uppercase_env_keys_do_not_leak_the_real_windows(self):
         # dict(os.environ) на Windows хранит ключи в ВЕРХНЕМ регистре:
@@ -1179,7 +1146,33 @@ class RegistryPortabilityTests(unittest.TestCase):
         self.assertIn(r"HKEY_CURRENT_USER\Software\Vendor\MyApp", text)
         self.assertNotIn("Uninstall", text)
 
-    def test_host_cleanup_removes_created_keys_and_restores_changed(self):
+    def test_activation_office_and_edge_webview2_keys_are_protected(self):
+        protected = {
+            r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform\Activation": {},
+            r"HKCU\Software\Microsoft\Windows NT\CurrentVersion\SL\Activation": {},
+            r"HKLM\Software\Microsoft\Office\16.0\Common\Licensing": {},
+            r"HKCU\Software\Microsoft\OfficeSoftwareProtectionPlatform": {},
+            r"HKCU\Software\Microsoft\EdgeWebView\BLBeacon": {},
+            r"HKLM\Software\Microsoft\EdgeUpdate\Clients\{1234}": {},
+        }
+        diff = registry.compute_diff({}, protected)
+        self.assertEqual(diff.touched_keys, [])
+        for key, values in protected.items():
+            self.assertTrue(registry.is_protected(key, values), key)
+
+    def test_taskbar_pins_and_file_associations_are_not_app_settings(self):
+        pins = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
+        file_exts = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.pdf\UserChoice"
+        association = r"HKCU\Software\Classes\.example"
+        after = {key: {"Setting": (registry.REG_SZ, repr("x"))}
+                 for key in (pins, file_exts, association)}
+        diff = registry.compute_diff({}, after)
+        portable_keys = diff.keys_of(registry.CATEGORY_APP)
+        self.assertEqual(portable_keys, [])
+        self.assertEqual(registry.categorize(association),
+                         registry.CATEGORY_INTEGRATION)
+
+    def test_host_cleanup_only_deletes_a_confirmed_app_uninstall_entry(self):
         before = {r"HKCU\Software\Vendor\Existing": {
             "Theme": (registry.REG_SZ, repr("dark"))}}
         after = {
@@ -1189,15 +1182,19 @@ class RegistryPortabilityTests(unittest.TestCase):
             },
             r"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\MyApp": {
                 "DisplayName": (registry.REG_SZ, repr("My Application")),
+                "InstallLocation": (registry.REG_SZ, repr(r"C:\P\App")),
             },
         }
         diff = registry.compute_diff(before, after)
-        text = registry.render_host_cleanup(diff, diff.touched_keys)
+        text = registry.render_host_cleanup(
+            diff, after, app_name="My Application", portable_dir=r"C:\P")
         self.assertIn(
             r"[-HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion"
             r"\Uninstall\MyApp]", text)
-        self.assertIn('"New"=-', text)          # добавленное значение убираем
-        self.assertIn('"Theme"="dark"', text)   # прежнее возвращаем
+        # Changed app settings are never restored/deleted by host cleanup.
+        self.assertNotIn("Vendor\\\\Existing", text)
+        self.assertNotIn('"New"=-', text)
+        self.assertNotIn('"Theme"="dark"', text)
 
     def test_cleanup_cmd_self_elevates_and_imports_the_reg(self):
         cmd = registry.render_host_cleanup_cmd("cleanup_host.reg")
@@ -1298,6 +1295,8 @@ class RegistryCaptureIntegrationTests(unittest.TestCase):
             },
             r"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\MyApp": {
                 "DisplayName": (registry.REG_SZ, repr("My Application")),
+                "InstallLocation": (registry.REG_SZ,
+                                    repr(str(portable / "App"))),
             },
             r"HKLM\Software\Classes\.myext": {
                 "": (registry.REG_SZ, repr("MyApp.File")),
@@ -1305,7 +1304,8 @@ class RegistryCaptureIntegrationTests(unittest.TestCase):
         }
         capture = engine._capture_registry(
             str(portable), before, after,
-            PortableOptions(installer_path="x", output_dir=temp, **opts))
+            PortableOptions(installer_path="x", output_dir=temp,
+                            app_name="My Application", **opts))
         files = {p.name: p.read_text(encoding="utf-16")
                  for p in portable.glob("*.reg")}
         return capture, files
@@ -1320,13 +1320,20 @@ class RegistryCaptureIntegrationTests(unittest.TestCase):
             if name != "cleanup_host.reg":
                 self.assertNotIn("Uninstall", text, name)
 
-    def test_cleanup_file_removes_the_uninstall_entry_from_this_pc(self):
+    def test_cleanup_file_is_not_generated_without_explicit_opt_in(self):
         capture, files = self._capture()
+        self.assertNotIn("cleanup_host.reg", files)
+        self.assertFalse(capture.cleanup_file)
+        self.assertFalse(capture.cleanup_cmd_file)
+
+    def test_cleanup_file_only_removes_the_confirmed_uninstall_entry(self):
+        capture, files = self._capture(cleanup_host=True)
         self.assertIn("cleanup_host.reg", files)
         self.assertIn("Uninstall", files["cleanup_host.reg"])
+        self.assertNotIn("Classes", files["cleanup_host.reg"])
 
     def test_self_elevating_cleanup_cmd_is_written_next_to_the_reg(self):
-        capture, _files = self._capture()
+        capture, _files = self._capture(cleanup_host=True)
         self.assertTrue(capture.cleanup_cmd_file.endswith("cleanup_host.cmd"))
         text = Path(capture.cleanup_cmd_file).read_text(encoding="ascii")
         self.assertIn("-Verb RunAs", text)
@@ -3452,21 +3459,19 @@ class FolderLockDiagnosticsTests(unittest.TestCase):
         for raw, expected in cases.items():
             self.assertEqual(procutil.service_image_path(raw), expected, raw)
 
-    def test_release_folder_stops_services_before_killing_processes(self):
-        """Убивать процесс службы бесполезно: SCM поднимет его снова."""
-        order = []
+    def test_release_folder_leaves_registered_services_untouched(self):
+        """A path match alone is not permission to stop or delete a service."""
         with mock.patch.object(procutil, "IS_WINDOWS", True), \
                 mock.patch.object(procutil, "services_in",
                                   return_value=["GameGuard"]), \
-                mock.patch.object(
-                    procutil, "stop_service",
-                    side_effect=lambda name, **_k: order.append(f"stop:{name}")), \
+                mock.patch.object(procutil, "stop_service",
+                                  side_effect=AssertionError("must not stop")) as stop, \
                 mock.patch.object(procutil, "processes_in",
-                                  return_value=[]):
+                                  side_effect=AssertionError("must not kill")):
             stopped = procutil.release_folder(self.ROOT)
 
-        self.assertEqual(order, ["stop:GameGuard"])
-        self.assertEqual(stopped, ["служба GameGuard"])
+        self.assertEqual(stopped, [])
+        stop.assert_not_called()
 
 
 class BuildFolderVerdictTests(unittest.TestCase):
@@ -3506,37 +3511,20 @@ class BuildFolderVerdictTests(unittest.TestCase):
         # Системный процесс — подсказываем закрыть окна, а не убивать его.
         self.assertIn("окно проводника", self.engine.log.text)
 
-    def test_service_from_the_portable_folder_is_unregistered(self):
+    def test_registered_service_is_reported_without_stopping_or_removing_it(self):
         result = self._result()
-        removed = []
         with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
-                mock.patch("portablizer.core.portablizer.is_elevated",
-                           return_value=True), \
                 mock.patch.object(procutil, "services_in",
                                   return_value=["GameGuard"]), \
-                mock.patch.object(
-                    procutil, "stop_service",
-                    side_effect=lambda name, **_k: removed.append(name)):
-            self.engine._remove_portable_services(
-                r"C:\P", PortableOptions(installer_path="s", output_dir="o"),
-                result)
+                mock.patch.object(procutil, "stop_service",
+                                  side_effect=AssertionError("must not stop")) as stop:
+            self.engine._report_portable_services(r"C:\P", result)
 
-        self.assertEqual(removed, ["GameGuard"])
-        self.assertEqual(result.removed_services, ["GameGuard"])
-
-    def test_service_without_admin_rights_is_reported_not_ignored(self):
-        result = self._result()
-        with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
-                mock.patch("portablizer.core.portablizer.is_elevated",
-                           return_value=False), \
-                mock.patch.object(procutil, "services_in",
-                                  return_value=["GameGuard"]):
-            self.engine._remove_portable_services(
-                r"C:\P", PortableOptions(installer_path="s", output_dir="o"),
-                result)
-
-        self.assertTrue(result.cleanup_pending)
+        self.assertEqual(result.registered_services, ["GameGuard"])
+        self.assertEqual(result.removed_services, [])
         self.assertIn("GameGuard", self.engine.log.text)
+        self.assertIn("не останавливает и не удаляет", self.engine.log.text)
+        stop.assert_not_called()
 
 
 class LauncherFolderVerdictTests(unittest.TestCase):

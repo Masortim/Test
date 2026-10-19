@@ -911,8 +911,8 @@ class RuntimeLauncherTests(unittest.TestCase):
         return batsim.run_batch(bat, rf"{self.ROOT}\Launch.bat", fs,
                                 argv=list(argv) + ["--nopause"])
 
-    def test_bat_installs_the_missing_package_silently_when_it_can(self):
-        """Вместо «нажмите OK» — тихая установка из папки Redist."""
+    def test_bat_never_runs_a_missing_runtime_installer_automatically(self):
+        """Target-Windows runtime changes require an explicit manual launch."""
         cfg = self._cfg()
         cfg.runtime_installers = [
             {"file": "Redist/vcredist_x86.exe", "title": "Visual C++ 2012",
@@ -921,22 +921,20 @@ class RuntimeLauncherTests(unittest.TestCase):
         ]
         fs = self._fs()
         fs.add_file(rf"{self.ROOT}\Redist\{redist.SILENT_SCRIPT_NAME}",
-                    "@echo off\r\necho redist installed silently\r\n")
+                    "@echo off\r\necho redist script unexpectedly ran\r\n")
         result = self._run(cfg, fs)
 
-        self.assertIn("Installing the missing packages silently", result.text)
-        self.assertIn("redist installed silently", result.text)
+        self.assertNotIn("redist script unexpectedly ran", result.text)
+        self.assertIn("No packages were installed automatically", result.text)
+        self.assertIn("manually", result.text)
         self.assertTrue(result.launched)
 
-    def test_without_the_script_the_user_is_told_what_to_install(self):
+    def test_without_a_bundled_script_the_user_gets_official_links(self):
         cfg = self._cfg()
-        cfg.runtime_installers = [
-            {"file": "Redist/vcredist_x86.exe", "title": "Visual C++ 2012",
-             "kind": "vcredist_legacy", "args": "/q /norestart",
-             "dlls": "msvcp110.dll", "arch": "x86"},
-        ]
+        cfg.runtime_installers = []
         result = self._run(cfg, self._fs())
         self.assertIn("redistributables.txt", result.text)
+        self.assertIn("No packages were installed automatically", result.text)
         self.assertTrue(result.launched)
 
     def test_bat_with_runtime_check_is_still_pure_ascii(self):
@@ -1032,31 +1030,24 @@ class RuntimeLauncherTests(unittest.TestCase):
         self.assertNotIn("missing Microsoft runtime", result.text)
         self.assertTrue(result.launched)
 
-    def test_sxs_repair_is_reverified_after_the_silent_install(self):
-        # Тихий Install-Redist.cmd «поставил» пакет — признак: папка сборки
-        # появилась в WinSxS. Проверка повторяется и пускает программу без
-        # ссылки на redistributables.txt.
+    def test_sxs_runtime_is_not_installed_automatically_by_the_bat(self):
         fs = self._fs(present=("msvcr80.dll",))
         fs.add_file(
             rf"{self.ROOT}\Redist\{redist.SILENT_SCRIPT_NAME}",
-            ("@echo off\r\n"
-             "echo redist installed silently\r\n"
-             'md "%SystemRoot%\\WinSxS\\x86_microsoft.vc80.crt_'
-             '1fc8b3b9a1e18e3b_8.0.50727.6195_none_4ff29c7c0b2f2a62"\r\n'))
+            "@echo off\r\necho redist script unexpectedly ran\r\n")
         bat = render_bat(self._cfg(requirements=[self.SXS_REQUIREMENT]))
         fs.add_file(rf"{self.ROOT}\Launch.bat", bat)
         result = batsim.run_batch(bat, rf"{self.ROOT}\Launch.bat", fs,
                                   argv=["--nopause"],
                                   env={"SystemRoot": r"C:\Windows"})
-        self.assertIn("installed silently", result.text)
-        self.assertIn("The packages are in place now", result.text)
-        self.assertNotIn("redistributables.txt", result.text)
+        self.assertNotIn("redist script unexpectedly ran", result.text)
+        self.assertIn("No packages were installed automatically", result.text)
+        self.assertIn("redistributables.txt", result.text)
         self.assertTrue(result.launched)
 
     def test_sxs_probe_still_names_the_package_when_repair_failed(self):
-        # Скрипт «отработал», но файлы не появились (UAC отклонён, пакет
-        # сломан): повторная проверка честно снова называет пакет и путь —
-        # вместо того чтобы молча пойти в ошибку 14001.
+        # Наличие скрипта не означает согласия на установку: он остаётся
+        # нетронутым, а launcher сообщает о недостающем runtime.
         fs = self._fs(present=("msvcr80.dll",))
         fs.add_file(
             rf"{self.ROOT}\Redist\{redist.SILENT_SCRIPT_NAME}",
@@ -1066,7 +1057,8 @@ class RuntimeLauncherTests(unittest.TestCase):
         result = batsim.run_batch(bat, rf"{self.ROOT}\Launch.bat", fs,
                                   argv=["--nopause"],
                                   env={"SystemRoot": r"C:\Windows"})
-        self.assertIn("redist installer ran", result.text)
+        self.assertNotIn("redist installer ran", result.text)
+        self.assertIn("No packages were installed automatically", result.text)
         self.assertIn("Visual C++ 2005", result.text)
         self.assertIn("redistributables.txt", result.text)
         self.assertTrue(result.launched)
@@ -2251,161 +2243,82 @@ class PackageExtractionTests(unittest.TestCase):
             self.assertTrue(started[0][0].lower().endswith("dxsetup.exe"))
             self.assertEqual(started[0][1:], ["/silent"])
 
-    def test_launcher_runtime_commands_for_dxsetup_is_only_silent(self):
-        """DXSETUP.exe в лончере получает ровно /silent, без пагубных /quiet и /S."""
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            dx = root / "Redist" / "DXSETUP.exe"
-            dx.parent.mkdir(parents=True)
-            dx.write_bytes(b"MZ")
-            commands = exe_launcher._runtime_install_commands(
-                root, {"file": "Redist/DXSETUP.exe", "kind": "dxsetup"})
-            self.assertEqual(len(commands), 1)
-            self.assertEqual(commands[0][1:], ["/silent"])
-
-    def test_launcher_runtime_commands_for_directx_bundle(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            bundle = root / "Redist" / "directx_Jun2010_redist.exe"
-            bundle.parent.mkdir(parents=True)
-            bundle.write_bytes(b"MZ")
-            commands = exe_launcher._runtime_install_commands(
-                root, {"file": "Redist/directx_Jun2010_redist.exe",
-                       "kind": "directx_bundle"})
-            self.assertEqual(len(commands), 1)
-            line = commands[0][-1]
-            self.assertIn("DXSETUP.exe", line)
-            self.assertIn("/silent", line)
-            self.assertNotIn("/quiet", line)
 
 
-class LauncherSilentInstallTests(unittest.TestCase):
-    """LaunchPortable.exe: сначала поставить молча, и только потом жаловаться."""
+class LauncherRuntimeInstallSafetyTests(unittest.TestCase):
+    """Runtime-пакеты не меняют целевую Windows без ручного действия."""
 
     ROOT_NAME = "Game_Portable"
+    SXS_ITEM = {
+        "dll": "msvcr80.dll", "title": "Microsoft Visual C++ 2005",
+        "url": "https://example.invalid/vcredist_x86.exe", "arch": "x86",
+    }
 
-    def _portable(self, temp, *, with_script=True):
+    def _portable(self, temp):
         root = Path(temp, self.ROOT_NAME)
         (root / "App").mkdir(parents=True)
         (root / "App" / "game.exe").write_bytes(b"MZ")
         (root / "Redist").mkdir()
         (root / "Redist" / "vcredist_x86.exe").write_bytes(b"MZ")
-        if with_script:
-            (root / "Redist" / redist.SILENT_SCRIPT_NAME).write_text(
-                "@echo off\r\n", encoding="ascii")
+        (root / "Redist" / redist.SILENT_SCRIPT_NAME).write_text(
+            "@echo off\r\n", encoding="ascii")
         return root
 
-    def _cfg(self, with_script=True):
-        return {
-            "runtime_requirements": [
-                {"dll": "msvcp110.dll", "title": "Visual C++ 2012",
-                 "url": "https://example.invalid/vcredist_x86.exe",
-                 "arch": "x86"},
-            ],
-            "runtime_installers": [
-                {"file": "Redist/vcredist_x86.exe", "title": "Visual C++ 2012",
-                 "kind": "vcredist_legacy", "args": "/q /norestart",
-                 "dlls": "msvcp110.dll", "arch": "x86"},
-            ],
-            "runtime_install_script": (
-                f"Redist/{redist.SILENT_SCRIPT_NAME}" if with_script else ""),
-            "data_dir_name": "PortableData",
-        }
-
-    def test_silent_script_is_used_before_any_message_box(self):
+    def test_missing_runtimes_are_reported_without_running_or_elevating(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self._portable(temp)
-            calls = []
-
-            def fake_hidden(command, timeout=900):
-                calls.append(list(command))
-                # «Установка»: библиотека появляется рядом с программой.
-                (root / "App" / "msvcp110.dll").write_bytes(b"MZ")
-                return 0
-
-            missing = [{"dll": "msvcp110.dll", "title": "Visual C++ 2012"}]
-            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
-                    mock.patch.object(exe_launcher, "_run_hidden", fake_hidden), \
-                    mock.patch.object(exe_launcher, "_is_elevated",
-                                      lambda: True):
-                left = exe_launcher.install_missing_runtime(
+            missing = [self.SXS_ITEM]
+            with mock.patch.object(exe_launcher.subprocess, "run",
+                                   side_effect=AssertionError("must not run")) as run:
+                remaining = exe_launcher.install_missing_runtime(
                     root, self._cfg(), missing)
 
-            self.assertEqual(left, [])
-            self.assertEqual(len(calls), 1)
-            self.assertIn(redist.SILENT_SCRIPT_NAME, calls[0][-1])
+            self.assertEqual(remaining, missing)
+            run.assert_not_called()
+            self.assertFalse((root / "App" / "msvcr80.dll").exists())
 
-    def test_without_the_script_each_package_is_still_installed_quietly(self):
+    def test_warning_describes_only_a_manual_redist_action(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = self._portable(temp, with_script=False)
-            calls = []
+            root = Path(temp, self.ROOT_NAME)
+            shown = []
+            with mock.patch.object(exe_launcher, "_show_warning",
+                                   side_effect=shown.append):
+                exe_launcher._warn_about_runtime(root, [self.SXS_ITEM])
+            self.assertTrue(shown)
+            self.assertIn("Автоматическая установка отключена", shown[0])
+            self.assertIn("Install-Redist.cmd", shown[0])
+            self.assertIn("UAC", shown[0])
 
-            def fake_hidden(command, timeout=900):
-                calls.append(list(command))
-                (root / "App" / "msvcp110.dll").write_bytes(b"MZ")
-                return 0
-
-            missing = [{"dll": "msvcp110.dll", "title": "Visual C++ 2012"}]
-            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
-                    mock.patch.object(exe_launcher, "_run_hidden", fake_hidden), \
-                    mock.patch.object(exe_launcher, "_is_elevated",
-                                      lambda: True):
-                left = exe_launcher.install_missing_runtime(
-                    root, self._cfg(with_script=False), missing)
-
-            self.assertEqual(left, [])
-            self.assertEqual(len(calls), 1)
-            # Extract the IExpress payload, then msiexec /qn — never run the
-            # wrapper with /q (that shows the "Windows configures" progress).
-            self.assertEqual(calls[0][0], "cmd.exe")
-            line = calls[0][-1]
-            self.assertIn("vcredist_x86.exe", line)
-            self.assertIn("/Q /C /T:", line)
-            self.assertIn("vc_red.msi", line)
-            self.assertIn("msiexec", line)
-            self.assertIn("/qn", line)
-            self.assertNotIn("/q /norestart", line)
-
-    def test_failed_installation_still_warns_the_user_once(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = self._portable(temp)
-            missing = [{"dll": "msvcp110.dll", "title": "Visual C++ 2012"}]
-            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
-                    mock.patch.object(exe_launcher, "_run_hidden",
-                                      lambda command, timeout=900: 1603), \
-                    mock.patch.object(exe_launcher, "_is_elevated",
-                                      lambda: True):
-                left = exe_launcher.install_missing_runtime(
-                    root, self._cfg(), missing)
-            self.assertEqual([item["dll"] for item in left], ["msvcp110.dll"])
-
-    def test_bat_launcher_runs_the_silent_script_instead_of_nagging(self):
-        cfg = LauncherConfig(
-            app_name="Game", target_exe_rel="App/game.exe",
-            apply_registry=False,
-            runtime_requirements=[{"dll": "msvcp110.dll",
-                                   "title": "Visual C++ 2012",
-                                   "url": "https://example.invalid/x.exe",
-                                   "arch": "x86"}],
-            runtime_installers=[{"file": "Redist/vcredist_x86.exe",
-                                 "title": "Visual C++ 2012",
-                                 "kind": "vcredist_legacy",
-                                 "args": "/q /norestart",
-                                 "dlls": "msvcp110.dll", "arch": "x86"}],
-        )
+    def test_bat_runtime_check_does_not_call_redist_script(self):
+        cfg = self._cfg()
         bat = render_bat(cfg)
         self.assertTrue(bat.isascii())
         ensure_ascii_bat(bat)
-        self.assertIn(redist.SILENT_SCRIPT_NAME, bat)
+        calls = [line.strip().casefold() for line in bat.splitlines()
+                 if line.strip().casefold().startswith("call")]
+        self.assertFalse(any(redist.SILENT_SCRIPT_NAME.casefold() in line
+                             for line in calls))
+        self.assertIn("No packages were installed automatically", bat)
+        self.assertIn(f"{redist.REDIST_DIR_NAME}\\"
+                      f"{redist.SILENT_SCRIPT_NAME}", bat)
         config = json.loads(render_config_json(cfg))
         self.assertEqual(config["runtime_install_script"],
                          f"Redist/{redist.SILENT_SCRIPT_NAME}")
-        self.assertEqual(config["runtime_installers"][0]["args"],
-                         "/q /norestart")
+
+    def _cfg(self):
+        return LauncherConfig(
+            app_name="Game", target_exe_rel="App/game.exe",
+            runtime_requirements=[self.SXS_ITEM],
+            runtime_installers=[
+                {"file": "Redist/vcredist_x86.exe", "title": "VC++ 2005",
+                 "kind": "vcredist_legacy", "args": "/q",
+                 "dlls": "msvcr80.dll", "arch": "x86"},
+            ],
+        )
 
 
 class PrerequisiteStageTests(unittest.TestCase):
-    """Предусловия ставятся ДО основного установщика и без единого окна."""
+    """Preinstalling prerequisites is opt-in and happens before the app."""
 
     def test_prerequisites_run_before_the_installer(self):
         order = []
@@ -2429,19 +2342,28 @@ class PrerequisiteStageTests(unittest.TestCase):
             prereq = Path(temp, "_CommonRedist", "vcredist", "2010")
             prereq.mkdir(parents=True)
             (prereq / "vcredist_x86.exe").write_bytes(b"MZ")
+            log = Logger()
             with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
                     mock.patch("portablizer.core.portablizer.is_elevated",
                                lambda: True), \
                     mock.patch.object(redist, "install_prerequisites",
-                                      fake_prerequisites):
-                result = Engine(Logger()).run(PortableOptions(
+                                      fake_prerequisites), \
+                    mock.patch(
+                        "portablizer.core.portablizer.redist_mod.DxsetupSilentGuard"
+                    ) as guard_cls:
+                result = Engine(log).run(PortableOptions(
                     installer_path=str(installer), output_dir=temp,
                     app_name="Game", capture_registry=False,
-                    cleanup_host=False, redirect_userdirs=False))
+                    cleanup_host=False, redirect_userdirs=False,
+                    silent_runtime_install=True))
 
             self.assertTrue(result.success, result.messages)
             self.assertEqual(order, ["prerequisites", "installer"])
             self.assertIn("Visual C++ 2010", result.runtime_installed)
+            self.assertIn("не является песочницей", log.text)
+            guard_cls.assert_called_once_with(log=mock.ANY)
+            guard_cls.return_value.install.assert_called_once_with()
+            guard_cls.return_value.remove.assert_called_once_with()
 
     def test_prerequisites_are_looked_for_inside_a_single_exe_installer(self):
         """Нет ``_CommonRedist`` рядом \u2014 значит, встроенный DXSETUP ищем
@@ -2470,7 +2392,8 @@ class PrerequisiteStageTests(unittest.TestCase):
                 Engine(Logger()).run(PortableOptions(
                     installer_path=str(installer), output_dir=temp,
                     app_name="Game", capture_registry=False,
-                    cleanup_host=False, redirect_userdirs=False))
+                    cleanup_host=False, redirect_userdirs=False,
+                    silent_runtime_install=True))
 
         self.assertEqual(seen_kwargs.get("installer_path"), str(installer))
 
@@ -2489,13 +2412,17 @@ class PrerequisiteStageTests(unittest.TestCase):
                                lambda: True), \
                     mock.patch.object(
                         redist, "install_prerequisites",
-                        lambda *a, **k: called.append(a) or []):
+                        lambda *a, **k: called.append(a) or []), \
+                    mock.patch(
+                        "portablizer.core.portablizer.redist_mod.DxsetupSilentGuard"
+                    ) as guard_cls:
                 Engine(Logger()).run(PortableOptions(
                     installer_path=str(installer), output_dir=temp,
                     app_name="Game", capture_registry=False,
                     cleanup_host=False, redirect_userdirs=False,
                     silent_runtime_install=False))
         self.assertEqual(called, [])
+        guard_cls.assert_not_called()
 
 
 class GuiWiringTests(unittest.TestCase):
@@ -2525,10 +2452,9 @@ class GuiWiringTests(unittest.TestCase):
         # должны быть закрыты заранее, а не после жалобы.
         self.assertIn("self.cb_full_runtimes = QCheckBox(", self.source)
         self.assertIn("self.cb_full_runtimes.setChecked(True)", self.source)
-        # Тихая установка redistributables — тоже сразу: ради неё всё и
-        # затевалось, никаких окон с «OK» по ходу сборки.
+        # Системная установка redistributables — только opt-in.
         self.assertIn("self.cb_silent_redist = QCheckBox(", self.source)
-        self.assertIn("self.cb_silent_redist.setChecked(True)", self.source)
+        self.assertIn("self.cb_silent_redist.setChecked(False)", self.source)
 
     def test_options_are_passed_to_the_builder(self):
         self.assertIn("bundle_runtimes=self.cb_runtimes.isChecked()",
@@ -2553,7 +2479,7 @@ class GuiWiringTests(unittest.TestCase):
         self.assertTrue(defaults.full_runtimes)
         self.assertFalse(defaults.download_runtimes)
         self.assertIn("silent_runtime_install", names)
-        self.assertTrue(defaults.silent_runtime_install)
+        self.assertFalse(defaults.silent_runtime_install)
 
     def test_result_of_the_build_is_shown_to_the_user(self):
         for name in ("result.runtime_provided", "result.runtime_missing",
@@ -3118,10 +3044,14 @@ class ProgressWiringTests(unittest.TestCase):
         self.assertIn("progress=self._stage_progress(82, 87)",
                       PROGRESS_SOURCE)
 
-    def test_build_rewrites_dxsetup_command_line_instead_of_clicking(self):
-        """Сборка включает IFEO-перехват DXSETUP, а не только клик OK."""
+    def test_build_enables_system_ifeo_guard_only_with_explicit_opt_in(self):
+        """IFEO touches Windows, so the build must gate it with opt-in."""
         self.assertIn("DxsetupSilentGuard", PROGRESS_SOURCE)
+        self.assertIn(
+            "if opts.bundle_runtimes and opts.silent_runtime_install:",
+            PROGRESS_SOURCE)
         self.assertIn("dx_guard.install()", PROGRESS_SOURCE)
+        self.assertIn("if dx_guard is not None:", PROGRESS_SOURCE)
 
 
 class DxsetupCommandTests(unittest.TestCase):

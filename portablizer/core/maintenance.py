@@ -11,11 +11,10 @@
 Поэтому здесь две операции, которые применимы к любой существующей папке:
 
 ``release``
-    «Я хочу удалить эту папку прямо сейчас». Останавливает службы, чьи
-    бинарники лежат внутри, вежливо закрывает и затем завершает процессы из
-    папки, проверяет результат пробным переименованием и, если папка всё
-    ещё занята, называет виновника по имени — включая чужие программы,
-    подгрузившие оттуда DLL.
+    «Я хочу удалить эту папку прямо сейчас». Вежливо закрывает и затем
+    завершает процессы из папки, проверяет результат пробным переименованием
+    и, если папка всё ещё занята, называет виновника — включая службы и
+    чужие программы, подгрузившие оттуда DLL. Системные службы не удаляются.
 
 ``refresh``
     «Пусть этот портатив ведёт себя правильно». Перевыпускает лончеры
@@ -60,8 +59,10 @@ class MaintenanceReport:
 
     folder: str = ""
     success: bool = False
-    #: Что было остановлено (процессы, службы).
+    #: Какие процессы из папки были остановлены (службы не удаляются).
     stopped: List[str] = field(default_factory=list)
+    #: Службы, которые указывают внутрь папки и поэтому требуют ручной проверки.
+    registered_services: List[str] = field(default_factory=list)
     #: Кто держит папку, если освободить её не удалось.
     holders: List[str] = field(default_factory=list)
     #: Какие файлы портатива перевыпущены.
@@ -81,7 +82,7 @@ def looks_like_portable(folder: str) -> bool:
 
 
 def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
-    """Освобождает папку: службы, процессы, проверка, поиск виновника."""
+    """Освобождает папку без снятия регистрации системных служб."""
     log = log or Logger()
     report = MaintenanceReport(folder=folder)
     if not folder or not os.path.isdir(folder):
@@ -97,7 +98,20 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
             "портатив, собранный Portablizer. Останавливаю только то, что "
             "запущено из неё, и ничего не меняю.")
 
-    report.stopped = procutil.release_folder(folder)
+    try:
+        report.registered_services = procutil.services_in(folder)
+    except Exception as exc:  # noqa: BLE001 - диагностика не блокирует обслуживание
+        log.debug(f"Не удалось проверить службы папки: {exc}")
+    if report.registered_services:
+        message = (
+            "Обнаружены службы, указывающие внутрь папки: "
+            + ", ".join(report.registered_services)
+            + ". Они не останавливались и не удалялись; удаление папки может "
+              "не пройти, пока служба активна.")
+        log.warn(message)
+        report.messages.append(message)
+
+    report.stopped = procutil.release_folder(folder, stop_services=False)
     for name in report.stopped:
         log.ok(f"Остановлено: {name}")
 

@@ -113,11 +113,10 @@ class LauncherConfig:
     # чего не хватает, вместо системного окна «отсутствует MSVCR110.dll».
     # Каждая запись: {"dll", "title", "url", "arch"}.
     runtime_requirements: List[Dict[str, str]] = field(default_factory=list)
-    # Установщики этих пакетов, положенные в папку Redist портатива. Если
-    # библиотеки на целевом ПК действительно нет, лончер ставит пакет
-    # МОЛЧА (один запрос UAC, никаких окон с «OK»), а не забрасывает
-    # пользователя сообщениями. Каждая запись: {"file", "title", "kind",
-    # "args", "dlls", "arch"}.
+    # Установщики пакетов, положенные в папку Redist. Лончер только сообщает
+    # о недостающей библиотеке; пакет запускается пользователем вручную,
+    # чтобы системная установка не происходила без отдельного действия.
+    # Каждая запись: {"file", "title", "kind", "args", "dlls", "arch"}.
     runtime_installers: List[Dict[str, str]] = field(default_factory=list)
     # --- завершение сеанса ---------------------------------------------------
     # Сколько секунд лончер ждёт запуска настоящей программы, если сначала
@@ -262,15 +261,11 @@ def _ascii_token(value: str) -> str:
 
 
 def _runtime_check_block(cfg: LauncherConfig) -> str:
-    """Предстартовая проверка распространяемых компонентов.
+    """Проверяет зависимости и только показывает инструкции по установке.
 
-    Список формируется при сборке: в него попадает то, что Portablizer НЕ
-    смог принести в портатив, плюс зонды работоспособности доставленных
-    сборок VC++ 2005/2008. Если на целевом ПК библиотеки нет, пользователь
-    увидит название пакета и ссылку, а не системное окно «Запуск программы
-    невозможен: отсутствует MSVCR110.dll» — а после тихой установки пакета
-    проверка повторяется, так что «установлено» не объявляется, пока файлы
-    реально не появились.
+    Runtime-пакеты могут менять общесистемные компоненты и требуют UAC.
+    Поэтому лончер никогда не запускает их автоматически: пользователь сам
+    решает, доверяет ли пакету и хочет ли запускать Install-Redist.cmd.
     """
     calls: List[str] = []
     has_sxs = False
@@ -278,9 +273,8 @@ def _runtime_check_block(cfg: LauncherConfig) -> str:
         dll = _ascii_token(item.get("dll", ""))
         if not dll:
             continue
-        # api-ms-win-crt-* is an API Set contract, not a file.  Looking for
-        # it in System32 always fails on Windows 10/11 and pops a false
-        # "install Visual C++ 2015-2022" warning.  ucrtbase.dll is the payload.
+        # api-ms-win-crt-* is an API Set contract, not a file. Looking for it
+        # in System32 always fails on Windows 10/11; ucrtbase.dll is payload.
         if dll.lower().startswith("api-ms-win-crt-"):
             continue
         title = ascii_display(item.get("title", ""),
@@ -299,47 +293,36 @@ def _runtime_check_block(cfg: LauncherConfig) -> str:
     if not calls:
         return ("rem (this program needs no extra Microsoft runtime "
                 "components)\ngoto :eof")
-    script = f"%PORTABLE_ROOT%\\{REDIST_DIR_NAME}\\{REDIST_SCRIPT_NAME}"
-    lines = ['set "PORTABLE_RUNTIME_MISSING="']
-    lines += calls
+
+    lines = ['set "PORTABLE_RUNTIME_MISSING="'] + calls
     lines += [
         "if not defined PORTABLE_RUNTIME_MISSING goto :eof",
-        # Пакеты лежат рядом - ставим их молча: один запрос прав вместо
-        # череды окон установщика с кнопкой OK.
-        f'if not exist "{script}" goto portable_runtime_manual',
-        "echo   Installing the missing packages silently from the "
-        f"{REDIST_DIR_NAME} folder...",
-        f'call "{script}"',
-        # Молчаливой установке install-скрипт сообщить о результате не может
-        # (его повторный запуск с UAC - отдельный процесс), поэтому итог
-        # проверяем самым надёжным способом: ищем файлы ещё раз. Только
-        # появившиеся реально библиотеки позволяют сказать «готово».
-        'set "PORTABLE_RUNTIME_MISSING="',
+        "echo   No packages were installed automatically.",
     ]
-    lines += calls
-    lines += [
-        "if defined PORTABLE_RUNTIME_MISSING goto portable_runtime_manual",
-        "echo   The packages are in place now - starting the program.",
-        "echo.",
-        "goto :eof",
-        ":portable_runtime_manual",
-        "echo   Details and download links: redistributables.txt",
-    ]
+    if cfg.runtime_installers:
+        lines += [
+            "echo   If you trust these packages and want to install them,",
+            f"echo   run {REDIST_DIR_NAME}\\{REDIST_SCRIPT_NAME} manually.",
+            "echo   It may request administrator permission and change Windows.",
+        ]
+    else:
+        lines += [
+            "echo   Review redistributables.txt and use its official download links.",
+            "echo   Installing a package may request administrator permission",
+            "echo   and change Windows.",
+        ]
     if has_sxs:
         lines += [
-            "echo   The missing parts are Visual C++ 2005/2008 side-by-side",
-            "echo   assemblies. Windows error 14001 - side-by-side",
-            "echo   configuration is incorrect - means exactly this problem:",
-            "echo   install the package above, or run "
-            f"{REDIST_DIR_NAME}\\{REDIST_SCRIPT_NAME} manually.",
+            "echo   Missing Visual C++ 2005/2008 side-by-side assemblies can",
+            "echo   cause Windows error 14001. Install the package manually",
+            "echo   only if you have decided to allow that system change.",
         ]
     lines += [
-        "echo   The program may still start: some components load on demand.",
+        "echo   The program will still be attempted; some components are optional.",
         "echo.",
         "goto :eof",
     ]
     return "\n".join(lines)
-
 
 def _env_lines(cfg: LauncherConfig) -> str:
     lines: List[str] = []
@@ -985,8 +968,8 @@ rem --- Captured HKLM data: elevation FIRST, before anything that needs it ---
 rem Old games read their install folder from HKLM and quit silently when it is
 rem missing, and VirtualStore does not help manifest-aware programs. When the
 rem captured machine keys really are absent here, this run is relaunched once
-rem through UAC - and the elevated copy then performs every privileged step
-rem (silent runtime install included) with no second prompt.
+rem through UAC for the explicitly configured machine-registry import.
+rem Runtime packages are never installed automatically by the launcher.
 call :portable_elevate_for_machine
 if defined PORTABLE_RELAUNCHED (
   endlocal & exit /b %PORTABLE_RELAUNCH_RC%
@@ -995,8 +978,8 @@ if defined PORTABLE_RELAUNCHED (
 rem --- Microsoft runtime components (VC++, DirectX, ...) ---------------------
 rem Windows only reports "the program can't start because MSVCR110.dll is
 rem missing" after the fact; an invalid side-by-side setup reports even later,
-rem as error 14001 at start. The check below names the package instead and
-rem silently repairs what it can.
+rem as error 14001 at start. Name missing packages and explain the manual fix;
+rem do not install anything without the user's explicit action.
 call :portable_check_runtime
 
 call :portable_saves_import
@@ -1984,7 +1967,7 @@ def render_config_json(cfg: LauncherConfig) -> str:
         # Чего не хватает на чужом ПК: лончер проверяет этот список перед
         # стартом и называет пакет вместо системной ошибки про DLL.
         "runtime_requirements": cfg.runtime_requirements,
-        # Чем это лечится прямо на месте: тихая установка из папки Redist.
+        # Пакеты для Redist/Install-Redist.cmd; запускаются только вручную.
         "runtime_installers": cfg.runtime_installers,
         "runtime_install_script": (
             f"{REDIST_DIR_NAME}/{REDIST_SCRIPT_NAME}"

@@ -241,249 +241,21 @@ def missing_runtime_components(root: Path, cfg: Dict[str, Any], target: Path,
     return missing
 
 
-#: Exit codes meaning "the package is in place": installed, already there
-#: (1638/5100/0x80070666) or installed but asking for a reboot (3010/1641).
-RUNTIME_OK_CODES = frozenset({0, 1638, 5100, 3010, 1641, 0x80070666})
-
-
-def _directx_scratch_dir() -> Path:
-    """A writable folder for unpacking the DirectX bundle into."""
-    candidates = [Path(os.environ.get("SystemRoot") or r"C:\Windows") / "Temp",
-                  Path(tempfile.gettempdir())]
-    for base in candidates:
-        try:
-            base.mkdir(parents=True, exist_ok=True)
-            probe = base / "pblz_dx.tmp"
-            probe.write_bytes(b"")
-            probe.unlink()
-            return base / "pblz_dx"
-        except OSError:
-            continue
-    return candidates[-1] / "pblz_dx"
-
-
-def _directx_commands(path: Path) -> list[list[str]]:
-    """Unpack directx_*_redist.exe, then run DXSETUP.exe /silent.
-
-    The bundle is an IExpress archive, not an installer: any silent switch
-    reaches DXSETUP, and DXSETUP knows exactly one ("/silent") - anything
-    else pops up "Invalid command line operation" and waits for a click.
-    Both steps go into one hidden cmd line so the exit code of DXSETUP is
-    the exit code of the whole package.
-    """
-    scratch = _directx_scratch_dir()
-    line = (
-        f'rd /s /q "{scratch}" 2>nul & md "{scratch}" 2>nul & '
-        f'"{path}" /Q /C /T:{scratch} & '
-        f'if not exist "{scratch}\\DXSETUP.exe" (rd /s /q "{scratch}" 2>nul '
-        f'& exit /b 1) & '
-        f'"{scratch}\\DXSETUP.exe" /silent & set DXRC=!ERRORLEVEL! & '
-        f'rd /s /q "{scratch}" 2>nul & exit /b !DXRC!'
-    )
-    return [["cmd.exe", "/v:on", "/c", line]]
-
-
-def _vcredist_scratch_dir() -> Path:
-    """Writable folder for unpacking a VC++ 2005/2008/2010 IExpress wrapper."""
-    windir = Path(os.environ.get("SystemRoot") or r"C:\\Windows")
-    candidates = [windir / "Temp", Path(tempfile.gettempdir())]
-    for base in candidates:
-        try:
-            base.mkdir(parents=True, exist_ok=True)
-            probe = base / "pblz_vc.tmp"
-            probe.write_bytes(b"")
-            probe.unlink()
-            return base / "pblz_vc"
-        except OSError:
-            continue
-    return candidates[-1] / "pblz_vc"
-
-
-def _vcredist_legacy_commands(path: Path) -> list[list[str]]:
-    """Unpack vcredist_*.exe, then msiexec /qn the nested vc_red.msi.
-
-    The IExpress wrapper's `/q` is only "quiet": Windows Installer still
-    shows the "configures Visual C++ 2005 Redistributable" progress bar
-    (and `/norestart` is a syntax error).  Extract first; install the MSI
-    with `/qn`; fall back to bare `/q` only if the payload is missing.
-    """
-    scratch = _vcredist_scratch_dir()
-    line = (
-        f'rd /s /q "{scratch}" 2>nul & md "{scratch}" 2>nul & '
-        f'"{path}" /Q /C /T:{scratch} & '
-        f'if exist "{scratch}\\\\vc_red.msi" ('
-        f'msiexec /i "{scratch}\\\\vc_red.msi" /qn /norestart & set VCRC=!ERRORLEVEL!'
-        f') else if exist "{scratch}\\\\vcredist.msi" ('
-        f'msiexec /i "{scratch}\\\\vcredist.msi" /qn /norestart & set VCRC=!ERRORLEVEL!'
-        f') else ("{path}" /q & set VCRC=!ERRORLEVEL!) & '
-        f'rd /s /q "{scratch}" 2>nul & exit /b !VCRC!'
-    )
-    return [["cmd.exe", "/v:on", "/c", line]]
-
-
-def _runtime_install_commands(root: Path,
-                              entry: Dict[str, Any]) -> list[list[str]]:
-    """Command line that installs one package without showing anything."""
-    relative = str(entry.get("file", "")).replace("/", os.sep)
-    if not relative:
-        return []
-    path = root / relative
-    if not path.is_file():
-        return []
-    kind = str(entry.get("kind", "")).lower()
-    lower_name = path.name.lower()
-    if kind == "msi" or path.suffix.lower() in (".msi", ".msp"):
-        return [["msiexec", "/i", str(path), "/qn", "/norestart"]]
-    if kind == "msu" or path.suffix.lower() == ".msu":
-        return [["wusa", str(path), "/quiet", "/norestart"]]
-    if kind == "dxsetup" or lower_name == "dxsetup.exe":
-        # DXSETUP understands only /silent; any other switch pops up
-        # "Invalid command line operation".
-        return [[str(path), "/silent"]]
-    if (kind == "directx_bundle" or lower_name.startswith("directx_")
-            or lower_name.startswith("directx") or lower_name.startswith("dx_")
-            or lower_name.startswith("dxredist")):
-        # directx_*_redist.exe only unpacks itself; every silent switch is
-        # handed over to DXSETUP, which answers with a modal "Invalid
-        # command line operation" box.  Unpack first, then DXSETUP /silent.
-        return _directx_commands(path)
-    if kind == "vcredist_legacy":
-        # `/q` on the IExpress wrapper still shows "Please wait while Windows
-        # configures Microsoft Visual C++ 2005 Redistributable".  `/q
-        # /norestart` additionally pops a syntax-error dialog.  Extract the
-        # payload, then run the nested MSI with /qn (no UI at all).
-        return _vcredist_legacy_commands(path)
-    args = str(entry.get("args", "")).split()
-    commands = [[str(path), *args]] if args else []
-    for fallback in (["/quiet", "/norestart"], ["/q", "/norestart"],
-                     ["/S"], ["/silent"]):
-        candidate = [str(path), *fallback]
-        if candidate not in commands:
-            commands.append(candidate)
-    return commands
-
-
-def _run_hidden(command: Sequence[str], timeout: int = 900) -> Optional[int]:
-    """Run an installer with no console and no window at all."""
-    try:
-        completed = subprocess.run(
-            [str(part) for part in command], timeout=timeout,
-            creationflags=NO_WINDOW, check=False,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return int(completed.returncode)
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def _run_hidden_elevated(program: str,
-                         arguments: Sequence[str]) -> Optional[int]:
-    """Run a program through UAC with no window, and wait for it.
-
-    One prompt for the whole batch of runtime packages: after the user has
-    confirmed it, nothing else appears on screen.
-    """
-    if not IS_WINDOWS:
-        return None
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        SEE_MASK_NOCLOSEPROCESS = 0x00000040
-        SEE_MASK_NO_CONSOLE = 0x00008000
-        SW_HIDE = 0
-
-        class SHELLEXECUTEINFOW(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong),
-                ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
-                ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
-                ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
-                ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
-                ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
-                ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
-                ("hProcess", wintypes.HANDLE),
-            ]
-
-        info = SHELLEXECUTEINFOW()
-        info.cbSize = ctypes.sizeof(info)
-        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE
-        info.lpVerb = "runas"
-        info.lpFile = str(program)
-        info.lpParameters = subprocess.list2cmdline(
-            [str(part) for part in arguments])
-        info.nShow = SW_HIDE
-        shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
-        if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
-            return None
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
-        code = wintypes.DWORD()
-        kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
-        kernel32.CloseHandle(info.hProcess)
-        return int(code.value)
-    except Exception:  # noqa: BLE001 - UAC refusal must not break the launch
-        return None
-
-
 def install_missing_runtime(root: Path, cfg: Dict[str, Any],
                             missing: Sequence[Dict[str, Any]]
-                            ) -> list[Dict[str, str]]:
-    """Install the packages this PC lacks - silently, without any dialog.
+                            ) -> list[Dict[str, Any]]:
+    """Compatibility shim: never install system runtimes during launch.
 
-    Portablizer ships the installers it could not unpack in the ``Redist``
-    folder.  Instead of throwing one message box after another at the user
-    ("MSVCR110.dll is missing - press OK"), the launcher runs them with the
-    silent switches recorded at build time.  Everything that really got
-    installed disappears from the warning; only genuine failures are
-    reported, once.
+    Older launchers silently ran bundled Microsoft redistributables and could
+    elevate through UAC on first run. That changes the host outside the
+    portable folder. Keep this helper for existing callers, but only report
+    the missing packages; the user can explicitly run Redist/Install-Redist.cmd.
     """
-    entries = cfg.get("runtime_installers") or []
-    if not IS_WINDOWS or not isinstance(entries, list) or not entries:
-        return list(missing)
-
-    # Installing a runtime needs administrator rights.  The generated
-    # Redist\Install-Redist.cmd puts every package behind a SINGLE UAC
-    # prompt and stays hidden, which is far better than one dialog per
-    # package - or per missing DLL.
-    script = str(cfg.get("runtime_install_script") or "")
-    if script:
-        path = root / script.replace("/", os.sep)
-        if path.is_file():
-            command = ["cmd.exe", "/c", str(path)]
-            code = (_run_hidden(command) if _is_elevated()
-                    else _run_hidden_elevated("cmd.exe",
-                                              ["/c", str(path)]))
-            _run_log(root, f"silent runtime install script -> {code}")
-            still = [item for item in missing
-                     if not _requirement_satisfied(root, None, dict(os.environ),
-                                                   None, item)]
-            if not still:
-                return still
-
-    wanted = {str(item.get("dll", "")).lower() for item in missing}
-    installed: list[str] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        covered = {name.strip().lower()
-                   for name in str(entry.get("dlls", "")).split(",")
-                   if name.strip()}
-        if covered and not (covered & wanted):
-            continue
-        for command in _runtime_install_commands(root, entry):
-            code = _run_hidden(command)
-            _run_log(root, f"silent runtime install: "
-                           f"{subprocess.list2cmdline(command)} -> {code}")
-            if code is not None and (code & 0xFFFFFFFF) in RUNTIME_OK_CODES:
-                installed.append(str(entry.get("title") or entry.get("file")))
-                break
-    if installed:
-        _run_log(root, "installed silently: " + ", ".join(installed))
-    # Re-check every requirement properly: for a VC++ 2005/2008 assembly the
-    # proof of installation is a WinSxS family folder, not a System32 file.
-    env = dict(os.environ)
-    return [item for item in missing
-            if not _requirement_satisfied(root, None, env, None, item)]
+    del cfg
+    if missing:
+        _run_log(root, "automatic runtime installation skipped; "
+                        "manual user action is required")
+    return list(missing)
 
 
 def _runtime_warning_is_new(root: Path, cfg: Dict[str, Any],
@@ -526,10 +298,13 @@ def _warn_about_runtime(root: Path, missing: Sequence[Dict[str, Any]]) -> None:
             lines.append(f"      {url}")
     lines += [
         "",
-        "Поставить их молча, без единого окна, можно файлом "
+        "Автоматическая установка отключена, чтобы не менять Windows без "
+        "вашего действия.",
+        "Если вы доверяете пакетам и хотите установить их, запустите "
         "Redist\\Install-Redist.cmd",
-        "рядом с портативной папкой (если он там есть).",
-        "Подробности и ссылки — в файле redistributables.txt рядом с "
+        "вручную рядом с портативной папкой (если файл там есть); он может "
+        "запросить UAC.",
+        "Подробности и официальные ссылки — в redistributables.txt рядом с "
         "портативной папкой.",
         "Программа всё равно будет запущена: часть компонентов нужна не "
         "всегда.",
@@ -3947,17 +3722,23 @@ def sweep_stale_session(root: Path, cfg: "Dict[str, Any]") -> "list[str]":
 #   * файл-маркер ``upgraded`` и недоустановленный OllamaSetup.exe остаются
 #     лежать, и программа при следующем старте снова лезет в «обновление».
 #
-# Поэтому лончер перехватывает обновление и делает его сам, по правилам
-# портатива: (1) не даёт родному установщику что-либо менять; (2) ставит
-# новую версию во ВРЕМЕННУЮ папку Updates\stage; (3) проверяет, что программа
-# там действительно появилась; (4) только после этого подменяет файлы в App,
-# сохранив старую версию в Updates\backup. Любой сбой откатывается, а журнал
-# Updates\journal.json позволяет довести откат до конца даже после
-# принудительного завершения лончера.
+# Поэтому лончер перехватывает запуск обновления и просит установщик писать
+# в Updates\stage: затем проверяет payload и подменяет файлы в App, сохраняя
+# прежнюю версию в Updates\backup. Это защищает файлы самого портатива, но
+# НЕ изолирует сторонний установщик от Windows: тот всё ещё может менять
+# реестр, службы, ярлыки и профиль. Такие изменения автоматически не удаляются;
+# для недоверенного установщика используйте Sandbox/виртуальную машину.
+# Журнал Updates\journal.json помогает восстановить только состояние файлов
+# портатива после прерывания.
 
 UPDATE_DIR_NAME = "Updates"
 UPDATE_JOURNAL_NAME = "journal.json"
 UPDATE_LOG_NAME = "launcher-update.log"
+UPDATE_HOST_CHANGE_WARNING = (
+    "Важно: сторонний установщик выполняется без полной изоляции от Windows; "
+    "он может менять системный реестр, службы, ярлыки и профиль. Portablizer "
+    "не откатывает такие изменения. Для недоверенного файла используйте "
+    "Windows Sandbox или виртуальную машину.")
 
 #: Коды возврата установщиков, означающие успех.
 UPDATE_OK_CODES = (0, 3010, 1641)
@@ -4338,11 +4119,11 @@ class UpdateWatch:
                     return
                 time.sleep(0.1)
         finally:
-            traces = guard.restore()
-            traces.extend(remove_host_app_shortcuts(self.root, self.cfg))
-            if traces:
-                _update_log(self.root, "removed installer traces from this PC: "
-                            + ", ".join(traces))
+            guard.restore()
+            _update_log(
+                self.root,
+                "automatic host-trace cleanup is disabled; any Windows "
+                "changes made by the third-party updater require manual review")
 
     def finish(self, timeout: float = 15.0) -> None:
         """Дожимает перехват после выхода программы."""
@@ -4610,258 +4391,37 @@ def remove_host_app_shortcuts(root: Path, cfg: Dict[str, Any],
                               folders: "Optional[Iterable[Path]]" = None,
                               resolver: "Optional[Any]" = None,
                               programs_dir: Optional[Path] = None) -> "list[str]":
-    """Убирает ярлыки на программу, которые оставил установщик ВНЕ портатива.
+    """Совместимый no-op: обновление не удаляет ярлыки с компьютера.
 
-    Обновление внутри портатива не должно оставлять на рабочем столе чужого ПК
-    ярлык на программу: он не нужен (запуск идёт через ``Launch.bat``) и ведёт
-    не туда. Удаляются только ярлыки на главный exe этой программы, чья цель
-    лежит (а) во временной папке обновления ``Updates\\stage`` или (б) в
-    стандартной пользовательской папке Programs, куда установщики ставят
-    программу на этот ПК. Ярлыки, указывающие внутрь портатива или в другие
-    папки пользователя, не трогаются.
+    Даже ярлык на exe обновляемого приложения может быть создан/закреплён
+    самим пользователем; старый обход Start Menu/Desktop не мог это надёжно
+    отличить. Параметры сохранены для совместимости, но не используются.
     """
-    app_names = _app_exe_names(cfg)
-    if not app_names:
-        return []
-    read_target = resolver or _lnk_target
-    programs = Path(programs_dir) if programs_dir is not None \
-        else _user_programs_dir()
-    try:
-        programs_key = programs.resolve()
-    except OSError:
-        programs_key = programs
-    try:
-        stage_key = (root / UPDATE_DIR_NAME / "stage").resolve()
-    except OSError:
-        stage_key = root / UPDATE_DIR_NAME / "stage"
-    try:
-        root_key = root.resolve()
-    except OSError:
-        root_key = root
-    done: "list[str]" = []
-    for folder in (list(folders) if folders is not None else shortcut_folders()):
-        try:
-            candidates = sorted(folder.glob("*.lnk"))
-        except OSError:
-            continue
-        for link in candidates:
-            target_text = read_target(link)
-            if not target_text:
-                continue
-            target = Path(str(target_text).strip().strip('"'))
-            if target.name.casefold() not in app_names:
-                continue
-            try:
-                resolved = target.resolve()
-            except OSError:
-                resolved = target
-            under_stage = stage_key in resolved.parents or resolved == stage_key
-            under_programs = (programs_key in resolved.parents
-                              or resolved == programs_key)
-            inside_portable = root_key in resolved.parents or resolved == root_key
-            if under_stage or (under_programs and not inside_portable):
-                if _remove_file(link):
-                    done.append(str(link))
-    return done
+    del root, cfg, folders, resolver, programs_dir
+    return []
 
 
 class HostTraceGuard:
-    """Возвращает компьютеру то, что установщик в нём изменил.
+    """Совместимый no-op для старых путей обновления.
 
-    Установка во временную папку - всё равно установка: Inno Setup пишет
-    запись в «Установленные программы», ярлык автозапуска и дописывает
-    ``PATH`` пользователя, NSIS (OpenCode и т.п.) добавляет ярлыки на рабочий
-    стол и в меню «Пуск» и ставит программу в пользовательские Programs.
-    Папка Updates\\stage вскоре исчезнет, а след остался бы навсегда. Поэтому
-    до установки запоминается состояние, а после - всё НОВОЕ откатывается.
-    Существующее никогда не удаляется.
+    Предыдущая версия снимала HKCU, а затем без разбора удаляла новые записи
+    Uninstall/Run, переменные окружения, ярлыки и новые папки Programs. Такой
+    откат мог затронуть изменения пользователя или системных компонентов,
+    поэтому автоматическое восстановление отключено. Снимок/откат реестра не
+    является песочницей: установщик обновления всё ещё может менять Windows.
     """
 
     def __init__(self) -> None:
-        self.active = IS_WINDOWS
-        self._uninstall: "set[str]" = set()
-        self._run: "dict[str, Any]" = {}
-        self._env: "dict[str, tuple]" = {}
-        self._shortcuts: "set[str]" = set()
-        self._programs: "dict[str, set[str]]" = {}
+        self.active = False
         self.removed: "list[str]" = []
 
-    @staticmethod
-    def _shortcut_folders() -> "list[Path]":
-        return shortcut_folders()
-
-    @staticmethod
-    def _program_roots() -> "list[Path]":
-        """Пользовательские Programs, куда установщики ставят программу."""
-        root = _user_programs_dir()
-        return [root] if root.is_dir() else []
-
-    def _program_entries(self) -> "dict[str, set[str]]":
-        entries: "dict[str, set[str]]" = {}
-        for root in self._program_roots():
-            try:
-                entries[str(root)] = {item.name for item in root.iterdir()}
-            except OSError:
-                continue
-        return entries
-
-    def _lnk_files(self) -> "set[str]":
-        found: "set[str]" = set()
-        for folder in self._shortcut_folders():
-            try:
-                for item in folder.rglob("*.lnk"):
-                    found.add(str(item))
-            except OSError:
-                continue
-        return found
-
-    @staticmethod
-    def _values(subkey: str) -> "dict[str, tuple]":
-        import winreg
-
-        values: "dict[str, tuple]" = {}
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey, 0,
-                                winreg.KEY_QUERY_VALUE) as key:
-                index = 0
-                while True:
-                    try:
-                        name, value, kind = winreg.EnumValue(key, index)
-                    except OSError:
-                        break
-                    values[name] = (value, kind)
-                    index += 1
-        except OSError:
-            pass
-        return values
-
-    @staticmethod
-    def _subkeys(subkey: str) -> "set[str]":
-        import winreg
-
-        names: "set[str]" = set()
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey, 0,
-                                winreg.KEY_ENUMERATE_SUB_KEYS) as key:
-                index = 0
-                while True:
-                    try:
-                        names.add(winreg.EnumKey(key, index))
-                    except OSError:
-                        break
-                    index += 1
-        except OSError:
-            pass
-        return names
-
     def snapshot(self) -> None:
-        if not self.active:
-            return
-        try:
-            self._uninstall = self._subkeys(_UNINSTALL_KEY)
-            self._run = self._values(_RUN_KEY)
-            self._env = self._values(_ENV_KEY)
-            self._shortcuts = self._lnk_files()
-            self._programs = self._program_entries()
-        except Exception:  # noqa: BLE001 - без снимка просто нечего откатывать
-            self.active = False
-
-    @classmethod
-    def _delete_tree(cls, root: Any, subkey: str) -> bool:
-        """Удаляет ключ реестра вместе с подключами (иначе DeleteKey падает)."""
-        import winreg
-
-        try:
-            with winreg.OpenKey(root, subkey, 0,
-                                winreg.KEY_READ | winreg.KEY_WRITE) as key:
-                while True:
-                    try:
-                        child = winreg.EnumKey(key, 0)
-                    except OSError:
-                        break
-                    cls._delete_tree(root, subkey + "\\" + child)
-            winreg.DeleteKey(root, subkey)
-            return True
-        except OSError:
-            return False
+        """Ничего не меняет и намеренно не снимает общий снимок системы."""
+        return None
 
     def restore(self) -> "list[str]":
-        if not self.active:
-            return []
-        try:
-            import winreg
-
-            for name in sorted(self._subkeys(_UNINSTALL_KEY)
-                               - self._uninstall):
-                if self._delete_tree(winreg.HKEY_CURRENT_USER,
-                                     _UNINSTALL_KEY + "\\" + name):
-                    self.removed.append("Uninstall\\" + name)
-            now = self._values(_RUN_KEY)
-            for name in set(now) - set(self._run):
-                try:
-                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
-                                        winreg.KEY_SET_VALUE) as key:
-                        winreg.DeleteValue(key, name)
-                    self.removed.append("Run\\" + name)
-                except OSError:
-                    pass
-            env_changed = False
-            now_env = self._values(_ENV_KEY)
-            for name, (value, kind) in self._env.items():
-                if now_env.get(name) != (value, kind):
-                    try:
-                        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _ENV_KEY,
-                                            0, winreg.KEY_SET_VALUE) as key:
-                            winreg.SetValueEx(key, name, 0, kind, value)
-                        self.removed.append("Environment\\" + name)
-                        env_changed = True
-                    except OSError:
-                        pass
-            for name in set(now_env) - set(self._env):
-                try:
-                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _ENV_KEY, 0,
-                                        winreg.KEY_SET_VALUE) as key:
-                        winreg.DeleteValue(key, name)
-                    self.removed.append("Environment\\" + name)
-                    env_changed = True
-                except OSError:
-                    pass
-            if env_changed:
-                self._broadcast_environment()
-            for path in sorted(self._lnk_files() - self._shortcuts):
-                if _remove_file(Path(path)):
-                    self.removed.append(path)
-            # Программа, которую установщик успел положить в пользовательские
-            # Programs (родной апдейтер, проигравший гонку с перехватом), -
-            # тоже временный след: папка Updates\\stage заменит её собой.
-            for root_text, before in self._programs.items():
-                root_path = Path(root_text)
-                for name in sorted(self._program_entries().get(root_text, set())
-                                   - before):
-                    created = root_path / name
-                    try:
-                        if created.is_dir() and not created.is_symlink():
-                            shutil.rmtree(created, ignore_errors=True)
-                        else:
-                            _remove_file(created)
-                        self.removed.append(str(created))
-                    except OSError:
-                        pass
-        except Exception:  # noqa: BLE001 - откат следов не должен ронять обновление
-            pass
-        return self.removed
-
-    @staticmethod
-    def _broadcast_environment() -> None:
-        try:
-            import ctypes
-
-            result = ctypes.c_ulong()
-            ctypes.windll.user32.SendMessageTimeoutW(  # type: ignore[attr-defined]
-                0xFFFF, 0x001A, 0, "Environment", 0x0002, 2000,
-                ctypes.byref(result))
-        except Exception:  # noqa: BLE001
-            pass
+        """Не удаляет записи, ярлыки, окружение и каталоги пользователя."""
+        return []
 
 
 # --- окно «идёт обновление» --------------------------------------------------
@@ -5265,11 +4825,14 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
             _clear_dir(stage)
             stage.mkdir(parents=True, exist_ok=True)
     finally:
-        result.traces = guard.restore()
-        result.traces.extend(remove_host_app_shortcuts(root, cfg))
-        if result.traces:
-            _update_log(root, "removed installer traces from this PC: "
-                        + ", ".join(result.traces))
+        # The legacy cleanup hook is intentionally a no-op: third-party
+        # installer changes must not be removed based on broad snapshots.
+        guard.restore()
+        result.traces = []
+        _update_log(
+            root,
+            "automatic host-trace cleanup is disabled; review Windows "
+            "changes made by the third-party installer manually")
 
     if payload is None:
         journal["state"] = "failed"
@@ -5452,7 +5015,8 @@ def run_update(root: Path, cfg: Dict[str, Any], source: str = "",
             f"Скачать новую версию программы с адреса\n{url}\n"
             "и установить её внутрь портатива?\n\n"
             "Данные и настройки (PortableData) не затрагиваются, прежняя "
-            "версия сохраняется для отката."):
+            "версия сохраняется для отката.\n\n"
+            + UPDATE_HOST_CHANGE_WARNING):
         return result.fail("Обновление отменено.")
 
     notice = _BusyNotice(
@@ -5534,7 +5098,6 @@ def offer_recovery(root: Path, cfg: Dict[str, Any],
 
     stop_stray_installers(root, cfg)
     kept, clean = quarantine_staged_update(root, cfg)
-    stray = remove_host_app_shortcuts(root, cfg)
     installer = kept or pending
     # Прерванным обновление считается, если остались следы ЗАПУСКА установщика
     # (метка, рабочая копия) или перехват не довёл дело до конца. Просто
@@ -5545,8 +5108,9 @@ def offer_recovery(root: Path, cfg: Dict[str, Any],
         or (pending and pending_interrupted and not declined))
     _update_log(root, "found traces of the program's own update: "
                 f"markers={len(markers)}, started installers={len(leftovers)}, "
-                f"downloaded={len(staged)}, stray shortcuts={len(stray)}; cleaned"
-                + ("" if clean else " (not completely)"))
+                f"downloaded={len(staged)}; portable staging cleanup "
+                + ("complete" if clean else "incomplete")
+                + "; host registry, shortcuts and environment are not cleaned")
     if installer is not None and declined and not interrupted_update:
         return "\n".join(notes) or None
     if installer is None and not interrupted_update:
@@ -5558,7 +5122,8 @@ def offer_recovery(root: Path, cfg: Dict[str, Any],
             f"остался скачанный установщик ({installer.name}).\n\n"
             "Установить новую версию сейчас - правильно, внутрь портатива? "
             "Это займёт несколько минут. Данные и настройки не "
-            "затрагиваются, прежняя версия сохранится для отката.")
+            "затрагиваются, прежняя версия сохранится для отката.\n\n"
+            + UPDATE_HOST_CHANGE_WARNING)
     elif installer is not None:
         question = (
             "Программа скачала новую версию "
@@ -5566,18 +5131,22 @@ def offer_recovery(root: Path, cfg: Dict[str, Any],
             "Это займёт несколько минут. Данные и настройки не "
             "затрагиваются, прежняя версия сохранится для отката.\n\n"
             "Если отказаться, файл останется в папке Updates: поставить его "
-            "можно в любой момент через UpdatePortable.cmd.")
+            "можно в любой момент через UpdatePortable.cmd.\n\n"
+            + UPDATE_HOST_CHANGE_WARNING)
     else:
         question = (
             "Прошлое обновление программы было прервано: часть файлов могла "
             "остаться недоустановленной, и из-за этого программа вылетает при "
             "запуске.\n\nСкачать актуальную версию и переустановить её "
-            "внутрь портатива? Данные и настройки не затрагиваются.")
+            "внутрь портатива? Данные и настройки не затрагиваются.\n\n"
+            + UPDATE_HOST_CHANGE_WARNING)
         if not settings["source_url"]:
             _show_info(question.split("\n\n")[0]
-                       + "\n\nСледы прерванного обновления убраны. Если "
+                       + "\n\nВременные файлы обновления внутри портатива "
+                         "убраны. Изменения Windows, которые мог внести "
+                         "установщик, автоматически не откатываются. Если "
                          "программа всё равно не запускается, поставьте её "
-                         "заново: перетащите установщик на UpdatePortable.cmd.")
+                         "заново через UpdatePortable.cmd.")
             return "\n".join(notes) or None
     was_interrupted = interrupted_update or pending_interrupted
     if installer is not None:
@@ -5771,12 +5340,9 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
 
     # Предстартовая проверка распространяемых компонентов: лучше назвать
     # пакет, чем оставить пользователя наедине с окном Windows
-    # «отсутствует MSVCR110.dll».
-    # Предстартовая проверка распространяемых компонентов. Если нужного
-    # пакета на этом ПК нет, сначала пробуем поставить его МОЛЧА из папки
-    # Redist — пользователь не должен закрывать окна с «OK» ни во время
-    # сборки, ни при запуске. Сообщение остаётся только на тот случай,
-    # когда тихая установка невозможна (нет установщика, отказ UAC).
+    # «отсутствует MSVCR110.dll». Запуск системного установщика при старте
+    # запрещён; лончер сообщает о недостающем пакете и оставляет решение
+    # пользователю.
     missing_runtime = missing_runtime_components(root, cfg, target, env)
     if missing_runtime:
         missing_runtime = install_missing_runtime(root, cfg, missing_runtime)
@@ -5832,10 +5398,11 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                     "а на этом компьютере его нет. Это не проблема прав "
                     "или реестра — без пакета программа не запустится "
                     "вообще.\n\n"
-                    "Чинится один раз: запустите Redist\\Install-Redist.cmd "
-                    "из портативной папки — он поставит нужные пакеты молча, "
-                    "с одним UAC-запросом. Подробности и ссылки — в файле "
-                    "redistributables.txt.")
+                    "Исправить можно вручную: если вы доверяете пакету и "
+                    "согласны на системное изменение, запустите "
+                    "Redist\\Install-Redist.cmd из портативной папки. Он "
+                    "установит компоненты в тихом режиме и может запросить "
+                    "UAC. Подробности и ссылки — в redistributables.txt.")
                 return 14001
             _run_log(root, f"{target.name} exited with code {code}")
             # The official launcher usually starts the game and exits at once.

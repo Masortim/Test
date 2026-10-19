@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import ast
+import ntpath
 import os
 import re
 import sys
@@ -110,6 +111,39 @@ _VOLATILE_PREFIXES: Tuple[str, ...] = (
     r"software\microsoft\edgeupdate",
 )
 
+# Ключи, которые нельзя ни переносить в портатив, ни откатывать по снимку.
+# Это не «настройки приложения»: здесь живут лицензирование Windows/Office,
+# компоненты Windows и регистрации Microsoft Edge/WebView2. Их восстановление
+# по старому снимку способно деактивировать продукты или нарушить обновление.
+_PROTECTED_PREFIXES: Tuple[str, ...] = (
+    r"software\microsoft\windows nt\currentversion\softwareprotectionplatform",
+    r"software\microsoft\windows nt\currentversion\sl",
+    r"software\microsoft\windows nt\currentversion\licensemanager",
+    r"software\microsoft\windows\currentversion\activation",
+    r"software\microsoft\windows\currentversion\licensing",
+    r"software\microsoft\windows\currentversion\appx",
+    r"software\microsoft\windows\currentversion\windowsupdate",
+    r"software\microsoft\office",
+    r"software\microsoft\officesoftwareprotectionplatform",
+    r"software\microsoft\edge",
+    r"software\microsoft\edgewebview",
+    r"software\microsoft\edgeupdate",
+)
+
+# Отдельные записи «Программы и компоненты» могут иметь случайный GUID вместо
+# понятного пути ключа. Отсекаем их по DisplayName, чтобы не удалить запись
+# WebView2/Office при попытке очистить следы устанавливаемого приложения.
+_PROTECTED_UNINSTALL_MARKERS: Tuple[str, ...] = (
+    "microsoft office",
+    "microsoft 365",
+    "office software protection",
+    "microsoft edge",
+    "edge webview2",
+    "windows 10",
+    "windows 11",
+    "microsoft windows",
+)
+
 # Интеграция с оболочкой: перенос возможен, но по умолчанию выключен.
 _INTEGRATION_PREFIXES: Tuple[str, ...] = (
     r"software\classes",
@@ -171,9 +205,46 @@ def _matches(path: str, prefixes: Sequence[str]) -> bool:
     return False
 
 
+def _path_variants(key_path: str) -> List[str]:
+    """Путь реестра без hive и эквивалент без WOW6432Node."""
+    path = _strip_hive(key_path)
+    variants = [path]
+    wow = "software\\wow6432node\\"
+    if path.startswith(wow):
+        variants.append("software\\" + path[len(wow):])
+    return variants
+
+
 def is_volatile(key_path: str) -> bool:
     """Ветка, которую постоянно меняет сама Windows (в расчёт не берём)."""
-    return _matches(_strip_hive(key_path), _VOLATILE_PREFIXES)
+    return any(_matches(path, _VOLATILE_PREFIXES)
+               for path in _path_variants(key_path))
+
+
+def is_protected(key_path: str,
+                 values: Optional[Mapping[str, object]] = None) -> bool:
+    """Ветка/продукт с системным состоянием, которое Portablizer не трогает.
+
+    Помимо явных веток Windows/Office/Edge учитывает записи с произвольным
+    GUID в ``Uninstall``: там название продукта известно только из
+    ``DisplayName``. Параметр ``values`` имеет формат снимка реестра.
+    """
+    if any(_matches(path, _PROTECTED_PREFIXES)
+           for path in _path_variants(key_path)):
+        return True
+    if not values or not is_uninstall_entry(key_path):
+        return False
+    for name, entry in values.items():
+        if str(name).casefold() != "displayname":
+            continue
+        try:
+            display_name = str(_entry_value(entry)).strip().casefold()
+        except Exception:  # noqa: BLE001 - повреждённая запись не должна ломать сбор
+            continue
+        if any(marker in display_name
+               for marker in _PROTECTED_UNINSTALL_MARKERS):
+            return True
+    return False
 
 
 def categorize(key_path: str) -> str:
@@ -209,8 +280,9 @@ def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
     if depth > max_depth:
         return
     full = f"{prefix}\\{subkey}" if subkey else prefix
-    if depth and is_volatile(full):
-        # Пропускаем всё поддерево: оно шумит и не относится к установке.
+    if depth and (is_volatile(full) or is_protected(full)):
+        # Не снимаем системное состояние, лицензии, Shell/Taskbar и компоненты
+        # Microsoft: устаревший снимок не должен иметь возможность их стереть.
         return
     try:
         key = winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ)  # type: ignore
@@ -230,7 +302,6 @@ def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
             except Exception:  # noqa: BLE001 - экзотические типы пропускаем
                 pass
             i += 1
-        out[full] = values
         j = 0
         while True:
             try:
@@ -240,6 +311,11 @@ def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
                 break
     finally:
         winreg.CloseKey(key)  # type: ignore
+    if is_protected(full, values):
+        # Некоторые Microsoft-компоненты используют GUID-подключи в Uninstall;
+        # проверяем DisplayName после чтения ключа и не обходим его потомков.
+        return
+    out[full] = values
     for sk in subkeys:
         _walk(hive, f"{subkey}\\{sk}" if subkey else sk, prefix, out,
               max_depth, depth + 1)
@@ -289,9 +365,10 @@ def compute_diff(before: Mapping[str, Mapping[str, object]],
     """Сравнивает снимки, отбрасывая заведомо «шумные» ветки."""
     diff = RegistryDiff()
     for key, values in after.items():
-        if is_volatile(key):
-            continue
         old = before.get(key)
+        if (is_volatile(key) or is_protected(key, values)
+                or is_protected(key, old)):
+            continue
         if old is None:
             diff.new_keys.append(key)
             continue
@@ -575,32 +652,19 @@ def render_launcher_undo(diff: RegistryDiff, keys: Iterable[str]) -> str:
     return _render(lines)
 
 
-def render_host_cleanup(diff: RegistryDiff, keys: Iterable[str]) -> str:
-    """Полный откат для компьютера, на котором создавался портатив.
+def render_host_cleanup(diff: RegistryDiff,
+                        after: Mapping[str, Mapping[str, object]],
+                        *, app_name: str, portable_dir: str) -> str:
+    """Создаёт откат только для точно опознанной записи приложения.
 
-    Удаляет созданные ключи и возвращает прежние значения изменённым.
+    Записи из общего diff больше не восстанавливаются: откат изменённых ключей
+    небезопасен для лицензий, ассоциаций и системных настроек. Удаляется лишь
+    новая запись Uninstall, для которой совпали имя приложения и путь.
     """
-    wanted = set(keys)
+    entries = safe_uninstall_entries(
+        diff, after, app_name=app_name, portable_dir=portable_dir)
     lines: List[str] = []
-    # Сначала восстановление значений, затем удаление ключей: так удаление
-    # родителя не отменяет только что восстановленные данные потомка.
-    for key in sorted(k for k in diff.changed_keys if k in wanted):
-        hive = _hive_name(key)
-        if not hive:
-            continue
-        previous = diff.previous_values.get(key, {})
-        added = diff.added_values.get(key, [])
-        if not previous and not added:
-            continue
-        lines.append(f"[{hive}\\{key.split(chr(92), 1)[1]}]")
-        for name in added:
-            quoted = "@" if name == "" else f'"{_escape_sz(name)}"'
-            lines.append(f"{quoted}=-")
-        for name, entry in sorted(previous.items()):
-            typ, _raw = _as_entry(entry)
-            lines.append(format_value(name, typ, _entry_value(entry)))
-        lines.append("")
-    for key in sorted(k for k in diff.new_keys if k in wanted):
+    for key, _display in entries:
         hive = _hive_name(key)
         if hive:
             lines.append(f"[-{hive}\\{key.split(chr(92), 1)[1]}]")
@@ -614,21 +678,12 @@ def has_entries(reg_text: str) -> bool:
 
 
 def render_host_cleanup_cmd(reg_file_name: str = "cleanup_host.reg") -> str:
-    """Самоповышающийся .cmd для надёжного применения ``cleanup_host.reg``.
+    """Опциональный UAC-хелпер для точечной записи из ``cleanup_host.reg``.
 
-    Двойной клик по самому ``.reg`` запускает regedit **без** прав
-    администратора, поэтому ветки ``HKLM`` (запись «Установленные программы»,
-    службы и т.п.) записать не удаётся, и Windows показывает пугающее «Не все
-    данные были успешно записаны в реестр». Этот скрипт:
-
-    * сам запрашивает права администратора через UAC;
-    * импортирует ``.reg`` уже с нужными правами (``reg import`` возвращает код,
-      а не показывает модальное окно regedit);
-    * молча пропускает ключи, которых уже нет, и сообщает об итоге понятным
-      текстом.
-
-    Файл строго ASCII — по той же причине, что и ``Launch.bat`` (см. модуль
-    ``core/launcher``): cmd.exe читает .bat по байтовым смещениям.
+    Импорт запускается только если пользователь сам открыл этот скрипт.
+    Создаваемый Portablizer файл содержит лишь одну подтверждённую запись
+    приложения в Uninstall; системные настройки и прежние значения не
+    восстанавливаются. Файл строго ASCII, как и остальные cmd-скрипты.
     """
     # ``if errorlevel N`` (не ``%ERRORLEVEL%``) читается во время исполнения,
     # поэтому корректно работает и внутри блоков; переходы по меткам избавляют
@@ -637,9 +692,8 @@ def render_host_cleanup_cmd(reg_file_name: str = "cleanup_host.reg") -> str:
     return (
         "@echo off\r\n"
         "setlocal EnableExtensions\r\n"
-        "rem Removes the registry traces the installer left on THIS computer.\r\n"
-        "rem It self-elevates so HKLM entries (the Add/Remove Programs record,\r\n"
-        "rem services, etc.) can be removed without the scary regedit warning.\r\n"
+        "rem Removes only the confirmed app uninstall entry from THIS computer.\r\n"
+        "rem No activation, associations, services or other registry settings are touched.\r\n"
         "\r\n"
         "net session >nul 2>&1\r\n"
         "if not errorlevel 1 goto do_cleanup\r\n"
@@ -664,7 +718,7 @@ def render_host_cleanup_cmd(reg_file_name: str = "cleanup_host.reg") -> str:
         "\r\n"
         f'reg import "{name}" >nul 2>&1\r\n'
         "echo.\r\n"
-        "echo Cleanup finished. The install traces were removed from this PC.\r\n"
+        "echo The confirmed app entry was removed from this PC.\r\n"
         "echo Entries that were already gone are simply skipped - that is fine.\r\n"
         "timeout /t 5 >nul 2>&1\r\n"
         "exit /b 0\r\n"
@@ -685,7 +739,10 @@ def changed_install_locations(before: Mapping[str, Mapping[str, object]],
     locations: List[str] = []
     seen: Set[str] = set()
     for key, values in after.items():
-        if key in before and dict(values) == dict(before[key]):
+        if is_volatile(key) or is_protected(key, values):
+            continue
+        if key in before and (is_protected(key, before[key])
+                              or dict(values) == dict(before[key])):
             continue
         for value_name in ("InstallLocation", "DisplayIcon"):
             entry = values.get(value_name)
@@ -723,6 +780,8 @@ def installed_program_entries(diff: RegistryDiff,
         if not is_uninstall_entry(key):
             continue
         values = after.get(key, {})
+        if is_protected(key, values):
+            continue
         display = ""
         for name, entry in values.items():
             if name.casefold() == "displayname":
@@ -732,6 +791,69 @@ def installed_program_entries(diff: RegistryDiff,
                 break
         entries.append((key, display or key.rsplit("\\", 1)[-1]))
     return entries
+
+
+def _normalised_product_name(value: str) -> str:
+    """Сопоставляет имена без пробелов/версии пунктуации, но без fuzzy-match."""
+    return "".join(ch for ch in str(value).casefold() if ch.isalnum())
+
+
+def _registry_path_is_inside(value: str, root: str) -> bool:
+    """Windows-путь из реестра расположен внутри указанной папки портатива."""
+    candidate = str(value).strip().strip('"')
+    # DisplayIcon часто хранится как ``"C:\\App\\app.exe",0``.
+    candidate = re.sub(r",\s*-?\d+\s*$", "", candidate).strip().strip('"')
+    if not candidate or not root:
+        return False
+    candidate = os.path.expandvars(candidate).replace("/", "\\")
+    root = os.path.expandvars(str(root)).replace("/", "\\")
+    candidate = ntpath.normcase(ntpath.normpath(candidate)).rstrip("\\")
+    root = ntpath.normcase(ntpath.normpath(root)).rstrip("\\")
+    return candidate == root or candidate.startswith(root + "\\")
+
+
+def safe_uninstall_entries(
+        diff: RegistryDiff,
+        after: Mapping[str, Mapping[str, object]],
+        *, app_name: str, portable_dir: str,
+) -> List[Tuple[str, str]]:
+    """Возвращает только новые uninstall-записи точно этого портатива.
+
+    Это единственная автоматическая правка реестра хоста, которую может
+    выполнить Portablizer. Удаление разрешено, только если запись новая,
+    DisplayName совпадает с именем выбранного приложения, а InstallLocation
+    или DisplayIcon указывает внутрь созданной папки. Никакие изменённые
+    настройки, ассоциации, ключи лицензирования и сторонние prereq-записи не
+    откатываются.
+    """
+    expected = _normalised_product_name(app_name)
+    if not expected or not portable_dir:
+        return []
+    safe: List[Tuple[str, str]] = []
+    for key in diff.new_keys:
+        if not is_uninstall_entry(key):
+            continue
+        values = after.get(key, {})
+        if is_protected(key, values):
+            continue
+        display_name = ""
+        paths: List[str] = []
+        for value_name, entry in values.items():
+            name = str(value_name).casefold()
+            value = _entry_value(entry)
+            if name == "displayname" and isinstance(value, str):
+                display_name = value.strip()
+            elif name in {
+                    "installdir", "installdirectory", "installfolder",
+                    "installlocation", "displayicon"} and isinstance(value, str):
+                paths.append(value)
+        if _normalised_product_name(display_name) != expected:
+            continue
+        if not any(_registry_path_is_inside(path, portable_dir)
+                   for path in paths):
+            continue
+        safe.append((key, display_name or key.rsplit("\\", 1)[-1]))
+    return safe
 
 
 # --- разбор .reg, зеркалирование WOW6432Node и языковая настройка -------------

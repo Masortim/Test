@@ -1075,8 +1075,8 @@ class ProvisionReport:
     packages: List[str] = field(default_factory=list)
     #: Пакеты, установленные в систему этого ПК в тихом режиме по ходу сборки.
     installed: List["SilentInstall"] = field(default_factory=list)
-    #: Установщики, положенные в ``Redist`` портатива: если библиотеки всё же
-    #: не хватит на целевом ПК, лончер поставит их оттуда — тоже молча.
+    #: Установщики, положенные в ``Redist`` портатива: если библиотеки не
+    #: хватит на целевом ПК, пользователь может запустить их вручную.
     installers: List[Dict[str, str]] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     #: Полный комплект включён: часть требований взята из каталога всех
@@ -2755,8 +2755,9 @@ def render_silent_install_script(entries: Sequence[Dict[str, str]]) -> str:
     """``Install-Redist.cmd``: ставит всё из ``Redist`` молча, за один UAC.
 
     Скрипт сам просит повышение прав (один раз), после чего каждый пакет
-    ставится с ключами тихого режима: никаких мастеров и кнопок «OK». Его
-    запускает лончер, но пользователь может выполнить файл и вручную.
+    ставится с ключами тихого режима: никаких мастеров и кнопок «OK». Он не
+    запускается лончером; пользователь может выполнить файл вручную после
+    проверки источников и согласия на изменения Windows.
     """
     lines = [
         "@echo off",
@@ -4212,9 +4213,10 @@ class RuntimeProvisioner:
           установщик рядом — гарантированный путь починки: он ставит настоящую
           сборку в WinSxS целевого ПК.
 
-        Установщик рядом с портативом позволяет лончеру поставить пакет
-        **молча**, одним запросом UAC, вместо череды окон с «OK» — или
-        обойтись вовсе без интернета, если пакет уже скачан.
+        Установщик рядом с портативом позволяет пользователю поставить пакет
+        вручную в тихом режиме одним запросом UAC, вместо череды окон с «OK»,
+        или обойтись без интернета, если пакет уже скачан. Лончер файл не
+        запускает.
         """
         repair: List[RuntimeRequirement] = list(report.missing)
         repair += [
@@ -4271,7 +4273,7 @@ class RuntimeProvisioner:
             self.log.ok(
                 f"В папку {REDIST_DIR_NAME} положены установщики "
                 f"({len(report.installers)} шт.) и {SILENT_SCRIPT_NAME}: "
-                "на целевом ПК недостающее ставится молча, без окон.")
+                "пользователь сможет запустить их вручную на целевом ПК.")
 
     def _place_next_to_importers(self, requirement: RuntimeRequirement,
                                  app_dir: str) -> None:
@@ -4493,7 +4495,7 @@ def _requirement_entry(requirement: RuntimeRequirement) -> Dict[str, str]:
 
 def launcher_installers(report: ProvisionReport, limit: int = 12
                         ) -> List[Dict[str, str]]:
-    """Установщики из ``Redist``, которые лончер вправе запустить молча."""
+    """Список пакетов для диагностики лаунчера и ручной установки."""
     out: List[Dict[str, str]] = []
     for entry in report.installers[:limit]:
         if not entry.get("file"):
@@ -4611,11 +4613,12 @@ def render_report(report: ProvisionReport) -> str:
         lines.append("-" * 40)
         lines.append("  Библиотеки из них принести не удалось, но сами пакеты "
                      "уже лежат рядом:")
-        lines.append(f"  запустите {REDIST_DIR_NAME}\\{SILENT_SCRIPT_NAME} — "
-                     "он поставит всё молча, за один")
-        lines.append("  запрос прав администратора, и интернет не "
-                     "понадобится. Лончер делает это")
-        lines.append("  сам, когда видит, что библиотеки на этом ПК нет.")
+        lines.append(f"  Если вы доверяете пакетам и согласны на изменения Windows, "
+                     f"запустите {REDIST_DIR_NAME}\\{SILENT_SCRIPT_NAME} "
+                     "вручную.")
+        lines.append("  Он установит компоненты в тихом режиме; для этого может "
+                     "потребоваться UAC.")
+        lines.append("  Лончер не запускает этот файл автоматически.")
         for name in report.packages:
             lines.append(f"  • {REDIST_DIR_NAME}\\{name}")
         lines.append("")
