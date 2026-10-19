@@ -1593,7 +1593,6 @@ class Portablizer:
                 os.path.join(opts.output_dir, f"{name}_Portable"))
             app_dir = os.path.join(portable_dir, "App")
             data_dir = os.path.join(portable_dir, "PortableData")
-            self._prepare_output(portable_dir, app_dir, data_dir)
             result.portable_dir = portable_dir
             self.log.info(f"Портативная папка: {portable_dir}")
 
@@ -1607,6 +1606,11 @@ class Portablizer:
             for e in det.evidence:
                 self.log.debug(f"  • {e}")
             self._warn_downloader_stub(det)
+
+            # Не очищаем старую сборку, пока не закончилось распознавание:
+            # анализ повреждённого/неподдерживаемого установщика не должен
+            # удалять уже имеющийся App и запускатели.
+            self._prepare_output(portable_dir, app_dir, data_dir)
 
             if IS_WINDOWS:
                 self.log.warn(
@@ -3716,6 +3720,22 @@ class Portablizer:
             })
         for k, v in opts.extra_env.items():
             env[k] = os.path.expandvars(v)
+        if opts.redirect_userdirs:
+            # Autodesk Streamer выполняет CREATE_LAUNCH_ITEMS и запрашивает
+            # FOLDERID_UserPinned (9E3995AB-1F9C-4F13-B827-48B24B6C7174).
+            # При перенаправленном APPDATA его путь —
+            # ``Microsoft/Internet Explorer/Quick Launch/User Pinned``;
+            # SHGetKnownFolderPath возвращает ERROR_FILE_NOT_FOUND, если
+            # каталог ещё не создан. Тогда Streamer падает до записи рабочего
+            # FusionLauncher.exe.ini и оставляет файл-заглушку. Создаём всё
+            # дерево в portable-профиле заранее.
+            appdata = env.get("APPDATA", "")
+            if appdata:
+                pinned_folder = os.path.join(
+                    appdata, "Microsoft", "Internet Explorer", "Quick Launch",
+                    "User Pinned",
+                )
+                os.makedirs(pinned_folder, exist_ok=True)
         return env
 
     # -- поиск результата установки вне App ---------------------------------
