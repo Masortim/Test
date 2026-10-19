@@ -33,6 +33,7 @@ Windows или пользовательский профиль. Это не по
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -63,6 +64,82 @@ _PART_NAME_PREFIX = 8
 #: Сколько частей вообще смотрим: больше не бывает, а обход большой сетевой
 #: папки не должен стоить секунд.
 MAX_PART_FILES = 128
+
+#: Маленькие журналы/временные маркеры сами по себе не доказывают, что
+#: установщик принёс файлы приложения. Крупный журнал уже может содержать
+#: полезный payload (или хотя бы существенный результат установки), поэтому
+#: его не отбрасываем.
+SERVICE_FILE_MAX_BYTES = 64 * 1024
+_SMALL_SERVICE_FILE_EXTENSIONS = {".log"}
+_ALWAYS_SERVICE_FILE_EXTENSIONS = {
+    ".tmp", ".part", ".partial", ".download", ".crdownload",
+}
+_TEMP_DIR_NAMES = {"temp", "tmp", "temporary"}
+
+
+def _iter_payload_files(root: str):
+    """Перечисляет содержательные файлы, пропуская TEMP и мелкий служебный шум."""
+    if not root or not os.path.isdir(root):
+        return
+    for current, dirs, files in os.walk(root, followlinks=False):
+        # TEMP — scratch space загрузчика/установщика, а не установленная
+        # программа. Убираем каталог из обхода, чтобы не считать и его файлы.
+        dirs[:] = sorted(name for name in dirs
+                         if name.casefold() not in _TEMP_DIR_NAMES)
+        for filename in sorted(files):
+            path = os.path.join(current, filename)
+            try:
+                stat = os.stat(path, follow_symlinks=False)
+            except OSError:
+                continue
+            extension = os.path.splitext(filename)[1].casefold()
+            if extension in _ALWAYS_SERVICE_FILE_EXTENSIONS:
+                continue
+            if (extension in _SMALL_SERVICE_FILE_EXTENSIONS
+                    and stat.st_size <= SERVICE_FILE_MAX_BYTES):
+                continue
+            relative = os.path.relpath(path, root).replace("\\", "/")
+            yield relative, int(stat.st_size), int(
+                getattr(stat, "st_mtime_ns", stat.st_mtime * 1_000_000_000))
+
+
+def payload_files(root: str) -> tuple[int, int]:
+    """Число и общий размер содержательных файлов под ``root``.
+
+    Мелкие журналы/обрывки загрузки не должны заставлять Portablizer
+    продолжать перебирать ключи так, будто программа уже установилась.
+    TEMP полностью исключён; ``.tmp``/``.part``/``.download`` не считаются
+    payload независимо от размера, маленький ``.log`` тоже служебный. Большие
+    журналы сохраняются в подсчёте, чтобы не скрыть полезный результат.
+    """
+    count = total = 0
+    for _relative, size, _mtime_ns in _iter_payload_files(root):
+        count += 1
+        total += size
+    return count, total
+
+
+def has_payload(root: str) -> bool:
+    """Есть ли хотя бы один содержательный файл, с коротким выходом."""
+    return next(_iter_payload_files(root), None) is not None
+
+
+def payload_signature(root: str) -> bytes:
+    """Компактный снимок содержательных файлов для сравнения до/после.
+
+    Используется внутри лестницы установщика, в том числе у игр с сотнями
+    тысяч файлов. Хеш не держит весь список путей в памяти, но меняется при
+    создании, удалении, переименовании или обычной перезаписи payload-файла.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for relative, size, mtime_ns in _iter_payload_files(root):
+        digest.update(relative.encode("utf-8", "surrogatepass"))
+        digest.update(b"\0")
+        digest.update(str(size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(mtime_ns).encode("ascii"))
+        digest.update(b"\n")
+    return digest.digest()
 
 
 def _name_key(path: str) -> str:

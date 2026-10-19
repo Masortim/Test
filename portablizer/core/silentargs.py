@@ -38,6 +38,11 @@ from .languages import plan_language
 #: Больше попыток запускать бессмысленно: каждая стоит времени пользователя.
 MAX_ATTEMPTS = 6
 
+#: Сетевые загрузчики не должны получать все шесть случайных ключей: два
+#: коротких успеха с пустым App обычно означают «это только downloader».
+STUB_MAX_ATTEMPTS = 3
+ONLINE_PRODUCT_MAX_ATTEMPTS = 2
+
 
 @dataclass
 class SilentPlan:
@@ -675,6 +680,60 @@ def build_attempts(
             InstallerType.MSI, installer_path, target_dir, is_msi=True,
             log_file=log_path("install.log"), extra_args=extra))
         return attempts
+
+    if getattr(detection, "is_downloader_stub", False) is True:
+        product = getattr(detection, "online_product", None)
+        if product is not None:
+            documented = list(getattr(product, "switches", ()) or ())
+            if not documented:
+                documented = ["--quiet"]
+            product_name = getattr(product, "name", "онлайн-продукт")
+            reason = getattr(product, "reason", "")
+            attempts = [SilentPlan(
+                program=installer_path,
+                args=documented + user_extra,
+                notes=[
+                    f"{product_name}: используем только документированный "
+                    "пользовательский режим без --globalinstall. " + reason,
+                ],
+                label=f"{product_name}: " + " ".join(documented),
+                output_dir=native_target,
+            )]
+            # Если тихая команда лишь скачивает bootstrapper и ничего не
+            # кладёт в App, один видимый запуск может показать обязательный
+            # вход/ошибку сети. Не подменяем его ещё четырьмя случайными ключами.
+            attempts.append(SilentPlan(
+                program=installer_path,
+                args=user_extra,
+                notes=[
+                    f"{product_name}: диагностический запуск с интерфейсом; "
+                    "сам по себе вход в аккаунт не делает приложение портативным.",
+                ],
+                label=f"{product_name}: запуск с интерфейсом",
+                output_dir=native_target,
+                interactive=True,
+                instructions=[
+                    "Если загрузчик попросит войти в аккаунт, завершите "
+                    "вход только если доверяете установщику. Клиент может "
+                    "остаться привязанным к этому компьютеру и не стать портативным.",
+                ],
+            ))
+            return attempts[:ONLINE_PRODUCT_MAX_ATTEMPTS]
+
+        # Общий downloader: три аккуратных варианта, но без чужих аргументов
+        # от Inno/NSIS и без запуска распаковщика как будто это payload.
+        for switches in (("/S",), ("/quiet",), ("--silent",)):
+            attempts.append(SilentPlan(
+                program=installer_path,
+                args=list(switches) + user_extra,
+                notes=[
+                    "Небольшой сетевой загрузчик: пробуем ограниченный "
+                    "набор ключей, затем проверяем, появились ли реальные файлы.",
+                ],
+                label="Загрузчик: " + " ".join(switches),
+                output_dir=native_target,
+            ))
+        return attempts[:STUB_MAX_ATTEMPTS]
 
     if itype == InstallerType.CUSTOM_CLI:
         attempts.append(build_custom_cli_plan(

@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple
 
+from . import space as space_mod
+
 
 class InstallShieldGeneration(str, Enum):
     """Поколение InstallShield.
@@ -205,6 +207,50 @@ _URL_RE = re.compile(
 
 #: URL считается «ссылкой на лицензию», если содержит один из этих кусков.
 _LICENSE_HINTS = ("terms", "license", "licence", "eula", "agreement", "legal")
+
+#: Малый EXE может быть не установщиком программы, а сетевой «заглушкой».
+#: Порог отделяет компактный downloader от полного дистрибутива в сотни МБ.
+DOWNLOADER_STUB_MAX_BYTES = 128 * 1024 * 1024
+
+#: Признаки того, что bootstrapper умеет скачивать содержимое из сети.
+#: Требуем одновременно API загрузки и адрес раздачи: наличие одного URL
+#: поддержки или WinHTTP само по себе не делает обычный установщик заглушкой.
+_DOWNLOAD_API_TOKENS: Tuple[str, ...] = (
+    "URLDownloadToFile", "WinHttpOpen", "WinHttpReadData",
+    "InternetOpenUrl", "InternetReadFile", "BackgroundCopyManager",
+)
+_DOWNLOAD_URL_HINTS = (
+    "download", "downloads", "cdn.", "dl.", "/installers/", "/packages/",
+    "/production/", ".exe", ".msi", ".zip", ".7z", ".cab",
+)
+
+
+@dataclass(frozen=True)
+class OnlineOnlyProduct:
+    """Профиль продукта, чей маленький файл — лишь сетевой загрузчик."""
+
+    name: str
+    filename_re: re.Pattern
+    switches: Tuple[str, ...]
+    reason: str
+
+
+_ONLINE_ONLY_PRODUCTS: Tuple[OnlineOnlyProduct, ...] = (
+    OnlineOnlyProduct(
+        name="Autodesk Fusion",
+        filename_re=re.compile(
+            r"^(?=.*fusion)(?=.*(?:360|setup|downloader)).*\.exe$",
+            re.IGNORECASE),
+        # Документирован только тихий режим. --globalinstall не добавляем:
+        # он регистрирует клиент в Program Files текущего компьютера.
+        switches=("--quiet",),
+        reason=(
+            "это потоковый клиентский загрузчик: клиент разворачивается в "
+            "%LOCALAPPDATA%\\Autodesk\\webdeploy\\production, обновляется "
+            "через Autodesk и требует входа в аккаунт"
+        ),
+    ),
+)
 
 _RESOURCE_SECTION = ".wixburn"
 
@@ -384,6 +430,8 @@ class ScanResult:
     gog_hits: List[str] = field(default_factory=list)
     #: Имена языков Inno Setup, найденные внутри файла (``ru``, ``russian``).
     inno_language_names: List[str] = field(default_factory=list)
+    #: Сигнатуры API загрузки — только один из двух признаков сетевой заглушки.
+    download_apis: List[str] = field(default_factory=list)
 
 
 def _needles(text: str) -> Tuple[bytes, bytes]:
@@ -408,6 +456,8 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
     switch_needles = [(token, _needles(token)) for token in _SWITCH_TOKENS]
     marker_needles = [(token, _needles(token)) for token in _MARKER_TOKENS]
     gog_needles = [(token, _needles(token)) for token in _GOG_MARKERS]
+    download_api_needles = [
+        (token, _needles(token)) for token in _DOWNLOAD_API_TOKENS]
     short_lang_needles: List[Tuple[str, bytes, bytes]] = []
     for code, english in _INNO_SHORT_LANG_PAIRS:
         ascii_pair = f"{code}\x00{english}".encode("ascii")
@@ -419,6 +469,7 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
     found_switches: Set[str] = set()
     found_markers: Set[str] = set()
     found_gog: Set[str] = set()
+    found_download_apis: Set[str] = set()
     found_short_langs: Set[str] = set()
     found_long_langs: Set[str] = set()
     urls: List[str] = []
@@ -431,6 +482,8 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
         + [len(encoded) for _t, pair in switch_needles for encoded in pair]
         + [len(encoded) for _t, pair in marker_needles for encoded in pair]
         + [len(encoded) for _t, pair in gog_needles for encoded in pair]
+        + [len(encoded) for _t, pair in download_api_needles
+           for encoded in pair]
         + [len(encoded) for _c, ascii_p, wide_p in short_lang_needles
            for encoded in (ascii_p, wide_p)]
         + [len(encoded) for _n, ascii_p, wide_p in long_lang_needles
@@ -474,6 +527,12 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
                     if ascii_sig in data or wide_sig in data:
                         found_gog.add(token)
 
+                for token, (ascii_sig, wide_sig) in download_api_needles:
+                    if token in found_download_apis:
+                        continue
+                    if ascii_sig in data or wide_sig in data:
+                        found_download_apis.add(token)
+
                 for code, ascii_sig, wide_sig in short_lang_needles:
                     if code in found_short_langs:
                         continue
@@ -506,6 +565,8 @@ def scan_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> ScanResult:
     result.markers = found_markers
     result.urls = urls
     result.gog_hits = [t for t in _GOG_MARKERS if t in found_gog]
+    result.download_apis = [t for t in _DOWNLOAD_API_TOKENS
+                            if t in found_download_apis]
     # Короткая пара ``ru\\0Russian`` надёжнее голого ``russian\\0``: второе
     # совпадает с отображаемым именем рядом с кодом ``ru``.
     inno_names: List[str] = []
@@ -676,10 +737,23 @@ class DetectionResult:
     is_gog: bool = False
     #: Имена языков из секции [Languages] Inno Setup (``ru``, ``russian``).
     inno_language_names: List[str] = field(default_factory=list)
+    #: Установщик оказался маленьким сетевым загрузчиком, а не самим продуктом.
+    is_downloader_stub: bool = False
+    #: Что подтвердило признаки загрузчика (API, URL, размер пакета).
+    downloader_evidence: List[str] = field(default_factory=list)
+    #: Вес установщика вместе с подходящими файлами-частями.
+    media_size: int = 0
+    #: Профиль онлайн-продукта с известной причиной, почему stub не портативен.
+    online_product: Optional[OnlineOnlyProduct] = None
 
     @property
     def human(self) -> str:
-        prefix = f"{self.vendor_name}: " if self.vendor_name else ""
+        if self.is_downloader_stub:
+            name = (self.online_product.name if self.online_product
+                    else "программы")
+            prefix = f"сетевой загрузчик {name}: "
+        else:
+            prefix = f"{self.vendor_name}: " if self.vendor_name else ""
         suffix = ""
         if (self.installer_type == InstallerType.INSTALLSHIELD
                 and self.installshield_generation
@@ -725,6 +799,31 @@ def _has_zip_payload(path: str) -> bool:
         return zipfile.is_zipfile(path)
     except (OSError, zipfile.BadZipFile):
         return False
+
+
+def _online_product_profile(path: str) -> Optional[OnlineOnlyProduct]:
+    basename = os.path.basename(path)
+    return next((profile for profile in _ONLINE_ONLY_PRODUCTS
+                 if profile.filename_re.search(basename)), None)
+
+
+def _is_download_url(url: str) -> bool:
+    """Отличает URL раздачи файлов от обычной ссылки поддержки/лицензии."""
+    lowered = url.casefold()
+    return any(hint in lowered for hint in _DOWNLOAD_URL_HINTS)
+
+
+def _downloader_evidence(scan: ScanResult, media_size: int) -> List[str]:
+    evidence: List[str] = []
+    if scan.download_apis:
+        evidence.append("найдены API загрузки из сети: "
+                        + ", ".join(scan.download_apis))
+    urls = [url for url in scan.urls if _is_download_url(url)]
+    if urls:
+        evidence.append("найден URL раздачи файлов: " + ", ".join(urls[:3]))
+    if media_size:
+        evidence.append(f"вес дистрибутива — {media_size} байт")
+    return evidence
 
 
 def detect_installer(path: str) -> DetectionResult:
@@ -917,6 +1016,47 @@ def detect_installer(path: str) -> DetectionResult:
             "языки Inno Setup внутри файла: "
             + ", ".join(result.inno_language_names[:12])
             + (" …" if len(result.inno_language_names) > 12 else "")
+        )
+
+    result.media_size = space_mod.media_bytes(path)
+    result.downloader_evidence = _downloader_evidence(scan, result.media_size)
+    online_profile = _online_product_profile(path)
+    small_package = 0 < result.media_size <= DOWNLOADER_STUB_MAX_BYTES
+    can_be_stub = (
+        small_package and not result.has_zip_payload and not result.is_gog
+        and not result.is_msi
+    )
+    if can_be_stub and online_profile is not None:
+        # Стандартизованное имя + малый размер сильнее общей эвристики:
+        # Fusion_360_Setup.exe — веб-загрузчик, а не полный client payload.
+        result.is_downloader_stub = True
+        result.online_product = online_profile
+        result.downloader_evidence.extend((
+            f"имя файла соответствует профилю {online_profile.name}",
+            online_profile.reason,
+        ))
+        result.evidence.append(
+            f"распознан сетевой загрузчик {online_profile.name}: "
+            f"{online_profile.reason}; документированный ключ — "
+            + ", ".join(online_profile.switches)
+        )
+    elif (can_be_stub
+          and result.installer_type in (InstallerType.UNKNOWN,
+                                        InstallerType.SELF_EXTRACT,
+                                        InstallerType.SQUIRREL)
+          and scan.download_apis
+          and any(_is_download_url(url) for url in scan.urls)):
+        # Не объявляем обычный Inno/MSI/Burn установщик заглушкой лишь потому,
+        # что он содержит WinHTTP и ссылку поддержки. Нужны одновременно
+        # сигнатура загрузки, адрес раздачи и небольшой пакет.
+        result.is_downloader_stub = True
+        result.downloader_evidence.append(
+            "установщик содержит API загрузки и URL раздачи, но сам файл "
+            "слишком мал, чтобы быть автономным дистрибутивом"
+        )
+        result.evidence.append(
+            "похоже, это сетевой загрузчик: обнаружены API загрузки и "
+            "URL раздачи, но внутри нет полного payload"
         )
     return result
 

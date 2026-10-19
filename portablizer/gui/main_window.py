@@ -940,13 +940,19 @@ class MainWindow(QMainWindow):
         self._on_detail(0, "")
         if result.success:
             self.progress.setFormat("Готово — 100%")
-            self.status_label.setText(
-                f"✔ Портатив создан: {result.portable_dir}")
+            if result.hints:
+                self.status_label.setText(
+                    "⚠ Файлы собраны, переносимость не подтверждена: "
+                    f"{result.portable_dir}")
+            else:
+                self.status_label.setText(
+                    f"✔ Портатив создан: {result.portable_dir}")
             self.status_label.setObjectName("StatusOk")
             self.open_btn.setEnabled(True)
 
             details = [
-                "Портативное приложение создано!",
+                ("Файлы программы собраны, но автономность не подтверждена."
+                 if result.hints else "Портативное приложение создано!"),
                 "",
                 f"Папка: {result.portable_dir}",
             ]
@@ -1050,11 +1056,22 @@ class MainWindow(QMainWindow):
                     details.append(
                         "В общее хранилище перенесено файлов сохранений и "
                         f"настроек: {result.saves_migrated}.")
-            details += [
-                "",
-                "Скопируйте папку целиком на флешку — установка на другом "
-                "компьютере не потребуется.",
-            ]
+            if result.hints:
+                details += [
+                    "",
+                    "⚠ Важное ограничение:",
+                    *[f"  • {hint}" for hint in result.hints],
+                    "",
+                    "Скопируйте папку целиком, но сначала проверьте запуск "
+                    "на отдельном ПК: для онлайн-продукта могут понадобиться "
+                    "интернет, аккаунт и лицензия.",
+                ]
+            else:
+                details += [
+                    "",
+                    "Скопируйте папку целиком на флешку — установка на другом "
+                    "компьютере не потребуется.",
+                ]
             if result.registered_services:
                 details += [
                     "",

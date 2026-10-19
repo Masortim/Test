@@ -246,9 +246,14 @@ def cmd_build(ns: argparse.Namespace) -> int:
     result = engine.run(opts)
     print()
     if result.success:
-        print(f"Портатив готов: {result.portable_dir}")
+        if result.hints:
+            print(f"Файлы собраны (переносимость не подтверждена): {result.portable_dir}")
+        else:
+            print(f"Портатив готов: {result.portable_dir}")
         if result.main_exe_rel:
             print(f"Запуск:        {os.path.join(result.portable_dir, result.main_exe_rel)}")
+        for hint in result.hints or []:
+            print(f"Внимание:      {hint}")
         if not result.folder_is_free and result.folder_holders:
             print(f"Внимание: папку держат {', '.join(result.folder_holders)}")
         return 0

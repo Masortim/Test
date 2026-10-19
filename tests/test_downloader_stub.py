@@ -228,6 +228,14 @@ class PayloadCountingTests(unittest.TestCase):
             _touch(str(data), "Temp/download.tmp", 8192)
             files, total = space_mod.payload_files(str(data))
             self.assertEqual((files, total), (0, 0))
+            self.assertFalse(space_mod.has_payload(str(data)))
+
+    def test_large_partial_download_is_still_not_payload(self):
+        """Размер незавершённой загрузки не превращает её в App-файл."""
+        with tempfile.TemporaryDirectory() as temp:
+            _touch(temp, "download.bin.part",
+                   space_mod.SERVICE_FILE_MAX_BYTES * 4)
+            self.assertEqual(space_mod.payload_files(temp), (0, 0))
 
     def test_program_files_are_payload(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -237,6 +245,7 @@ class PayloadCountingTests(unittest.TestCase):
             files, total = space_mod.payload_files(str(app))
             self.assertEqual(files, 2)
             self.assertEqual(total, 6144)
+            self.assertTrue(space_mod.has_payload(str(app)))
 
     def test_oversized_log_counts_as_data(self):
         """Журнал размером с дистрибутив — уже не служебная запись."""
@@ -495,6 +504,70 @@ class DownloaderHintsTests(unittest.TestCase):
         # Ключ машины (--globalinstall) сборке не предлагается: он ставит
         # клиент в Program Files этого компьютера.
         self.assertNotIn("--globalinstall --quiet", lines)
+
+    def test_run_does_not_repackage_the_host_webdeploy_client(self):
+        class TrackingEngine(Portablizer):
+            def __init__(inner):  # noqa: D107
+                super().__init__(Logger())
+                inner.recovery_calls = 0
+                inner.warning_seen_at_attempt = []
+
+            def _run_install(inner, plan, opts, app_dir, data_dir, **kwargs):
+                inner.warning_seen_at_attempt.append(
+                    "Обнаружен сетевой загрузчик Autodesk Fusion"
+                    in inner.log.text)
+                inner._last_install_seconds = 0.4
+                return 0
+
+            def _recover_installed_app(inner, **kwargs):
+                inner.recovery_calls += 1
+                return False
+
+        engine = TrackingEngine()
+        with mock.patch.object(engine_mod, "IS_WINDOWS", False):
+            result = engine.run(PortableOptions(
+                installer_path=self.installer,
+                output_dir=self.temp.name,
+                app_name="Fusion",
+                capture_registry=False,
+                cleanup_host=False,
+            ))
+        self.assertFalse(result.success)
+        self.assertEqual(engine.recovery_calls, 0)
+        self.assertEqual(engine.warning_seen_at_attempt, [True, True])
+        self.assertIn("Обнаружен сетевой загрузчик Autodesk Fusion",
+                      engine.log.text)
+        self.assertIn("Не копирую Autodesk Fusion из профиля Windows",
+                      engine.log.text)
+        self.assertIn("webdeploy", " ".join(result.hints))
+
+    def test_online_product_success_is_caveated_in_readme_and_result(self):
+        class FilesEngine(Portablizer):
+            def _run_install(inner, plan, opts, app_dir, data_dir, **kwargs):
+                Path(app_dir, "Fusion.exe").write_bytes(b"MZ fake app")
+                inner._last_install_seconds = 0.4
+                return 0
+
+        engine = FilesEngine(Logger())
+        with mock.patch.object(engine_mod, "IS_WINDOWS", False):
+            result = engine.run(PortableOptions(
+                installer_path=self.installer,
+                output_dir=self.temp.name,
+                app_name="Fusion",
+                capture_registry=False,
+                cleanup_host=False,
+            ))
+        self.assertTrue(result.success)
+        self.assertIn("не является гарантией автономного portable",
+                      " ".join(result.hints))
+        readme = Path(result.portable_dir, "README_PORTABLE.txt")
+        readme_text = readme.read_text(encoding="utf-8")
+        self.assertIn("Fusion — переносимость не подтверждена", readme_text)
+        self.assertNotIn("Fusion — портативная версия", readme_text)
+        self.assertIn("ВАЖНОЕ ОГРАНИЧЕНИЕ ДЛЯ ОНЛАЙН-ПРОДУКТА",
+                      readme_text)
+        self.assertIn("Autodesk-аккаунт", readme_text)
+        self.assertNotIn(b"\r\r\n", readme.read_bytes())
 
     def test_no_warning_for_a_normal_installer(self):
         engine = Portablizer(Logger())
