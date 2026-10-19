@@ -110,6 +110,12 @@ INSTALL_DIR_SCAN_SECONDS = 20.0
 #: внешние сценарии переопределяют это значение, а не обходят его.
 INSTALL_IDLE_FLOOR = 30.0
 
+#: Короткие быстрые «успехи» без payload обычно означают, что команда
+#: проигнорирована либо перед нами web-downloader. Двух подряд достаточно,
+#: чтобы не запускать остальные случайные ключи (и не менять систему лишний раз).
+HOLLOW_ATTEMPTS_LIMIT = 2
+HOLLOW_ATTEMPT_MAX_SECONDS = 15.0
+
 # Имя готового EXE-лончера внутри App/. Сам бинарник собирается из
 # portable_launcher_entry.py, встраивается в Portablizer.exe как ресурс и не
 # требует Python на компьютере, где запускают готовый портатив.
@@ -840,6 +846,10 @@ class Portablizer:
         self._unpacker_result = ""
         #: Каким распаковщиком воспользовались (пусто — ни одним).
         self._unpacked_with = ""
+        #: Диагноз последовательно пустых быстрых запусков установщика.
+        self._hollow_note = ""
+        #: Текущий результат распознавания, нужен и для диагностики лестницы.
+        self._detection: Optional[DetectionResult] = None
 
     # -- вспомогательное ------------------------------------------------------
     def progress(self, percent: int, stage: str) -> None:
@@ -1137,6 +1147,31 @@ class Portablizer:
         except OSError:
             pass
 
+    def _warn_downloader_stub(self, det: DetectionResult) -> None:
+        """До запуска объясняет, если выбран только сетевой загрузчик."""
+        if getattr(det, "is_downloader_stub", False) is not True:
+            return
+        size = redist_mod.format_size(getattr(det, "media_size", 0))
+        product = getattr(det, "online_product", None)
+        if product is not None:
+            switches = ", ".join(getattr(product, "switches", ()) or ())
+            self.log.warn(
+                f"Обнаружен сетевой загрузчик {product.name} ({size}), а не "
+                f"полный дистрибутив. {product.reason}. Документированный "
+                f"тихий ключ: {switches or '--quiet'}. Ключ --globalinstall "
+                "не используется: он устанавливает клиент в Program Files "
+                "этого компьютера. Даже при успешной загрузке вход в аккаунт "
+                "и привязка к профилю могут помешать переносимости."
+            )
+            return
+        evidence = "; ".join(getattr(det, "downloader_evidence", ()) or ())
+        self.log.warn(
+            f"Похоже, выбран сетевой загрузчик ({size}), а не полный "
+            "дистрибутив. Если он завершится без файлов программы, не буду "
+            "перебирать все ключи: нужен автономный пакет со всеми частями."
+            + (f" Признаки: {evidence}." if evidence else "")
+        )
+
     def _log_language_choice(self, det, opts: PortableOptions) -> None:
         """Пишет в журнал, какой язык установщика будет выбран и как."""
         if not opts.install_language.strip():
@@ -1186,6 +1221,8 @@ class Portablizer:
             self._last_install_seconds = 0.0
             self._unpacker_result = ""
             self._unpacked_with = ""
+            self._hollow_note = ""
+            self._detection = None
             self._installer_name = opts.installer_path
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
@@ -1208,9 +1245,11 @@ class Portablizer:
             self.progress(8, "Определение типа установщика")
             det = detect_installer(opts.installer_path)
             result.detection = det
+            self._detection = det
             self.log.ok(f"Тип установщика: {det.human}")
             for e in det.evidence:
                 self.log.debug(f"  • {e}")
+            self._warn_downloader_stub(det)
 
             if IS_WINDOWS:
                 self.log.warn(
@@ -1376,17 +1415,28 @@ class Portablizer:
             # в перенаправленном профиле и в новых каталогах Program Files.
             if not self._find_main_exe(app_dir, name):
                 self.progress(72, "Поиск файлов, созданных установщиком")
-                registry_locations = reg_mod.changed_install_locations(before, after)
-                recovered = self._recover_installed_app(
-                    app_dir=app_dir,
-                    data_dir=data_dir,
-                    app_name=name,
-                    installer_path=opts.installer_path,
-                    before=install_locations_before,
-                    registry_locations=registry_locations,
-                )
-                if recovered:
-                    self.log.ok("Файлы программы перенесены в папку App.")
+                online_product = getattr(det, "online_product", None)
+                if (getattr(det, "is_downloader_stub", False) is True
+                        and online_product is not None):
+                    self.log.warn(
+                        f"Не копирую {online_product.name} из профиля Windows "
+                        "в App: это сетевой webdeploy-клиент, а не "
+                        "подтверждённый автономный установщик. Его перенос "
+                        "не доказывает работоспособность без входа/лицензии."
+                    )
+                else:
+                    registry_locations = reg_mod.changed_install_locations(
+                        before, after)
+                    recovered = self._recover_installed_app(
+                        app_dir=app_dir,
+                        data_dir=data_dir,
+                        app_name=name,
+                        installer_path=opts.installer_path,
+                        before=install_locations_before,
+                        registry_locations=registry_locations,
+                    )
+                    if recovered:
+                        self.log.ok("Файлы программы перенесены в папку App.")
 
             if opts.capture_registry and (IS_WINDOWS or opts.install_language.strip()):
                 capture = self._capture_registry(
@@ -1455,6 +1505,37 @@ class Portablizer:
                 opts, path_prepend, capture, targets,
                 runtime_report=runtime_report, save_setup=save_setup)
             result.companion_launchers = companion_files
+            online_product = getattr(det, "online_product", None)
+            if (getattr(det, "is_downloader_stub", False) is True
+                    and online_product is not None):
+                portability_note = (
+                    f"{online_product.name}: файлы собраны, но автономная "
+                    "работа на другом ПК не подтверждена. "
+                    f"{online_product.reason}. Для запуска может потребоваться "
+                    "интернет, вход в Autodesk-аккаунт и действующая лицензия; "
+                    "клиент может обновляться вне папки App. Проверьте на "
+                    "отдельном ПК — этот результат не является гарантией "
+                    "автономного portable."
+                )
+                result.hints.append(portability_note)
+                self.log.warn(portability_note)
+                readme_path = os.path.join(
+                    portable_dir, "README_PORTABLE.txt")
+                try:
+                    with open(readme_path, "r", encoding="utf-8") as readme:
+                        readme_text = readme.read()
+                    readme_text = readme_text.replace(
+                        f"{name} — портативная версия",
+                        f"{name} — переносимость не подтверждена", 1)
+                    self._write_text(
+                        readme_path,
+                        readme_text.rstrip() +
+                        "\n\nВАЖНОЕ ОГРАНИЧЕНИЕ ДЛЯ ОНЛАЙН-ПРОДУКТА\n"
+                        + portability_note + "\n",
+                    )
+                except OSError as exc:
+                    self.log.warn(
+                        f"Не удалось записать ограничение в README: {exc}")
             exe_launcher = os.path.join(
                 portable_dir, "App", APP_EXE_LAUNCHER_NAME)
             if os.path.isfile(exe_launcher):
@@ -1628,6 +1709,33 @@ class Portablizer:
         именно сделать дальше. Подсказки упорядочены по вероятности решения.
         """
         hints: List[str] = []
+
+        if getattr(det, "is_downloader_stub", False) is True:
+            product = getattr(det, "online_product", None)
+            if product is not None:
+                switches = ", ".join(getattr(product, "switches", ()) or ())
+                hints.append(
+                    f"{product.name} использует сетевой загрузчик и "
+                    f"разворачивает клиент не в App. Из этого файла нельзя "
+                    f"подтвердить автономный portable. {product.reason}. "
+                    f"Ключ {switches or '--quiet'} "
+                    "лишь запускает загрузку: нужны доступ к серверам и вход "
+                    "в Autodesk-аккаунт; клиент может оставаться привязанным "
+                    "к этому ПК и обновляться вне портатива. Надёжный путь — "
+                    "официальный полный/автономный дистрибутив или поддерживаемая "
+                    "Autodesk процедура развёртывания; не добавляйте --globalinstall."
+                )
+            else:
+                hints.append(
+                    "Это небольшой сетевой загрузчик, а не автономный "
+                    "дистрибутив: после успешного кода установщика не появилось "
+                    "ни одного файла программы. Возьмите полный автономный "
+                    "установщик и все части дистрибутива (.bin/.cab), а не "
+                    "подбирайте дополнительные ключи тишины."
+                )
+            if self._hollow_note:
+                hints.append(self._hollow_note)
+            return hints
 
         if self._install_stalled:
             hints.extend(self._stall_hints())
@@ -2453,6 +2561,13 @@ class Portablizer:
         # добавляются сценарии, которых в обычной лестнице нет (повтор той же
         # команды и запуск с окном прогресса). См. _queue_crash_recovery.
         queue: List[SilentPlan] = list(attempts)
+        self._hollow_note = ""
+        hollow_successes = 0
+        payload_before = (
+            space_mod.payload_signature(app_dir),
+            space_mod.payload_signature(data_dir),
+        )
+        payload_seen = False
         index = 0
         while index < len(queue):
             plan = queue[index]
@@ -2557,6 +2672,51 @@ class Portablizer:
                     "новая только займёт место и время. Что успело "
                     "установиться — оставлено на месте для проверки."
                 )
+                break
+
+            # Мгновенный код 0 без payload — это не успех установки.
+            # Загрузчики могут написать несколько КБ журнала в PortableData\\Temp;
+            # сравниваем содержательные файлы и игнорируем TEMP/мелкие логи.
+            payload_now = (
+                space_mod.payload_signature(app_dir),
+                space_mod.payload_signature(data_dir),
+            )
+            if payload_now != payload_before:
+                payload_seen = True
+
+            is_hollow_candidate = (
+                rc in (0, 3010)
+                and 0 < self._last_install_seconds <= HOLLOW_ATTEMPT_MAX_SECONDS
+                and not payload_seen
+                and not plan.interactive
+                and not plan.extracts_only
+                and not plan.result_log
+                and not plan.ignores_target_dir
+            )
+            if is_hollow_candidate:
+                hollow_successes += 1
+            else:
+                hollow_successes = 0
+
+            has_extraction_fallback = any(
+                pending.extracts_only for pending in queue[index:])
+            if (hollow_successes >= HOLLOW_ATTEMPTS_LIMIT
+                    and not has_extraction_fallback):
+                product = getattr(self._detection, "online_product", None)
+                if product is not None:
+                    self._hollow_note = (
+                        "Повторять установку другими ключами не буду: "
+                        f"{product.name} — сетевой загрузчик, который может "
+                        "лишь записать журнал/загрузить файлы в webdeploy, "
+                        "но не положить приложение в App."
+                    )
+                else:
+                    self._hollow_note = (
+                        "Повторять установку другими ключами не буду: "
+                        "несколько быстрых команд завершились кодом 0, но "
+                        "не создали ни одного содержательного файла программы."
+                    )
+                self.log.warn(self._hollow_note)
                 break
 
             if index < total:
@@ -2981,6 +3141,12 @@ class Portablizer:
         не должна молча тянуть из сети исполняемые файлы. Не нашлось — так и
         говорится в подсказках.
         """
+        if getattr(det, "is_downloader_stub", False) is True:
+            self.log.info(
+                "Распаковщик не запускаю: файл распознан как сетевой "
+                "загрузчик, а не как контейнер с файлами программы."
+            )
+            return False
         if not self._unpacker_worth_trying(det):
             return False
         unpacker = unpacker_mod.find_unpacker()
@@ -3550,17 +3716,15 @@ class Portablizer:
 
     @staticmethod
     def _app_has_payload(app_dir: str) -> bool:
-        """Есть ли в ``App`` хоть один файл (неполная установка).
+        """Есть ли в ``App`` содержательный файл (неполная установка).
 
         Нужно, чтобы отличить два разных исхода тайм-аута: «движок не понял
         ключи и не сделал ничего» (тогда перебор сценариев продолжается) и
         «установка шла, но не дошла до конца» (тогда повторять её поверх
-        недописанных гигабайтов нельзя).
+        недописанных гигабайтов нельзя). Маленький лог, TEMP или частичный
+        download не считаются payload.
         """
-        for _current, _dirs, files in os.walk(app_dir):
-            if files:
-                return True
-        return False
+        return space_mod.has_payload(app_dir)
 
     def _find_main_exe(self, app_dir: str, name: str) -> Optional[str]:
         main_exe, _ = self._discover_app_executables(app_dir, name)
