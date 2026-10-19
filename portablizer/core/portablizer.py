@@ -3723,19 +3723,26 @@ class Portablizer:
         if opts.redirect_userdirs:
             # Autodesk Streamer выполняет CREATE_LAUNCH_ITEMS и запрашивает
             # FOLDERID_UserPinned (9E3995AB-1F9C-4F13-B827-48B24B6C7174).
-            # При перенаправленном APPDATA его путь —
-            # ``Microsoft/Internet Explorer/Quick Launch/User Pinned``;
-            # SHGetKnownFolderPath возвращает ERROR_FILE_NOT_FOUND, если
-            # каталог ещё не создан. Тогда Streamer падает до записи рабочего
-            # FusionLauncher.exe.ini и оставляет файл-заглушку. Создаём всё
-            # дерево в portable-профиле заранее.
-            appdata = env.get("APPDATA", "")
-            if appdata:
+            # В 1.14.16 каталог под APPDATA был создан, но GetKnownFolderPath
+            # всё ещё завершился ERROR_FILE_NOT_FOUND. У нас APPDATA и
+            # USERPROFILE намеренно имеют разные корни; Shell может разрешать
+            # этот Known Folder через User Shell Folders как
+            # ``%USERPROFILE%/AppData/Roaming``, а не через переменную APPDATA.
+            # Создаём User Pinned в обоих эквивалентных portable-путях, чтобы
+            # не менять реестр или каталоги профиля хоста.
+            profile = env.get("USERPROFILE", "")
+            roaming_roots = (
+                env.get("APPDATA", ""),
+                os.path.join(profile, "AppData", "Roaming") if profile else "",
+            )
+            for roaming in dict.fromkeys(root for root in roaming_roots if root):
                 pinned_folder = os.path.join(
-                    appdata, "Microsoft", "Internet Explorer", "Quick Launch",
+                    roaming, "Microsoft", "Internet Explorer", "Quick Launch",
                     "User Pinned",
                 )
                 os.makedirs(pinned_folder, exist_ok=True)
+                self.log.debug(
+                    f"Подготовлен Known Folder UserPinned: {pinned_folder}")
         return env
 
     # -- поиск результата установки вне App ---------------------------------
