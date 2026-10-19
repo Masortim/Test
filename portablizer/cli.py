@@ -12,9 +12,8 @@ exe покрывает то, до чего окно интерфейса не д
   существует: запуск из cmd прицепляет родительскую консоль
   (:func:`attach_console`), а если цеплять нечего — весь вывод всё равно
   уходит в ``portablizer-cli.log`` рядом с папкой результата;
-* права: сборка просит их сама ровно один раз (тот же ``core/elevate``, что
-  и GUI). ``--no-elevate`` — работать без UAC вовсе (так запускают CI и
-  «заведомо чистые» прогоны).
+* повышение прав — только при явном ``--elevate``. По умолчанию CLI
+  работает без UAC; ``--no-elevate`` оставлен как совместимый флаг.
 
 Выход: 0 — успех; 1 — сборка не удалась (подсказки движка печатаются);
 2 — ошибка в командной строке.
@@ -93,8 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
                          help="не захватывать изменения реестра")
     toggles.add_argument("--no-userdirs", action="store_true",
                          help="не изолировать AppData/Temp в PortableData")
+    toggles.add_argument("--cleanup-app-entry", action="store_true",
+                         help="по согласию удалить только точную новую запись "
+                              "этого приложения из списка установленных")
     toggles.add_argument("--no-cleanup", action="store_true",
-                         help="не убирать следы установки с этого ПК")
+                         help="совместимый флаг: не удалять даже эту запись "
+                              "(по умолчанию очистка уже выключена)")
     toggles.add_argument("--shell-integration", action="store_true",
                          help="перенести и ассоциации файлов/COM (по умолчанию "
                               "нет: чужому ПК они не нужны)")
@@ -108,25 +111,24 @@ def build_parser() -> argparse.ArgumentParser:
     toggles.add_argument("--download-runtimes", action="store_true",
                          help="разрешить докачку недостающих пакетов с сайта "
                               "Microsoft (по умолчанию сеть не трогает)")
+    toggles.add_argument("--silent-redist", action="store_true",
+                         help="установить опознанные runtime-пакеты на этом ПК "
+                              "(системное изменение; по умолчанию выключено)")
     toggles.add_argument("--no-silent-redist", action="store_true",
-                         help="не ставить распространяемые пакеты на этом ПК "
-                              "молча")
+                         help="совместимый флаг: не устанавливать runtime-пакеты "
+                              "на этом ПК")
     toggles.add_argument("--no-shared-saves", action="store_true",
                          help="выключить сквозные портативные сохранения")
-    toggles.add_argument("--no-netstack", action="store_true",
-                         help="не переносить сетевые компоненты (VPN) в "
-                              "NetStack")
-    toggles.add_argument("--shared-netstack", action="store_true",
-                         help="NetStack в режиме общего компонента: драйвер "
-                              "остаётся в системе (по умолчанию — изоляция "
-                              "полного сеанса)")
     toggles.add_argument("--assisted", action="store_true",
                          help="разрешить окно мастера (старые InstallShield)")
     toggles.add_argument("--assisted-timeout", type=int, default=0,
                          metavar="SEC",
                          help="сколько ждать человека в мастере")
+    b.add_argument("--elevate", action="store_true",
+                   help="явно запросить UAC перед сборкой (по умолчанию "
+                        "работать без повышения прав)")
     b.add_argument("--no-elevate", action="store_true",
-                   help="не просить UAC (режим как в CI)")
+                   help="совместимый флаг: не просить UAC")
     b.add_argument("--dry-run", action="store_true",
                    help="показать разбор задачи и план и выйти, ничего не "
                         "устанавливая")
@@ -162,16 +164,15 @@ def options_from_args(ns: argparse.Namespace) -> "object":
         redirect_userdirs=not ns.no_userdirs,
         capture_registry=not ns.no_registry,
         build_exe_launcher=not ns.no_exe_launcher,
-        cleanup_host=not ns.no_cleanup,
+        cleanup_host=bool(ns.cleanup_app_entry and not ns.no_cleanup),
         include_shell_integration=bool(ns.shell_integration),
         allow_assisted_install=bool(ns.assisted),
         bundle_runtimes=bundle,
         full_runtimes=bundle and not ns.lean_runtimes,
         download_runtimes=bundle and bool(ns.download_runtimes),
-        silent_runtime_install=bundle and not ns.no_silent_redist,
+        silent_runtime_install=(bundle and bool(ns.silent_redist)
+                               and not ns.no_silent_redist),
         shared_saves=not ns.no_shared_saves,
-        netstack_components=not ns.no_netstack,
-        netstack_isolated=not ns.shared_netstack,
         extra_install_args=[str(a) for a in (ns.extra_args or [])],
         install_language=(ns.lang or "").strip(),
         extra_env=_parse_env(ns.env or []),
@@ -215,7 +216,7 @@ def cmd_build(ns: argparse.Namespace) -> int:
                          indent=2, sort_keys=True))
         return 0
 
-    if not ns.no_elevate:
+    if ns.elevate and not ns.no_elevate:
         from .core import elevate
         if elevate.ensure_elevated():
             # Повышенная копия печатает свою версию этой команды; здесь
@@ -248,15 +249,6 @@ def cmd_build(ns: argparse.Namespace) -> int:
         print(f"Портатив готов: {result.portable_dir}")
         if result.main_exe_rel:
             print(f"Запуск:        {os.path.join(result.portable_dir, result.main_exe_rel)}")
-        if result.netstack_drivers or result.netstack_services:
-            net = []
-            if result.netstack_drivers:
-                net.append("драйверы: " + ", ".join(result.netstack_drivers))
-            if result.netstack_services:
-                net.append("службы: " + ", ".join(result.netstack_services))
-            print("NetStack:      " + "; ".join(net)
-                  + (" (изоляция)" if opts.netstack_isolated
-                     else " (общий компонент)"))
         if not result.folder_is_free and result.folder_holders:
             print(f"Внимание: папку держат {', '.join(result.folder_holders)}")
         return 0

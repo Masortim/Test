@@ -381,8 +381,8 @@ class OpenCodeInterceptTests(unittest.TestCase):
         self.assertTrue(staged.exists())
 
 
-class HostShortcutCleanupTests(unittest.TestCase):
-    """Ярлыки, оставленные установщиком на этом ПК, убираются."""
+class HostShortcutSafetyTests(unittest.TestCase):
+    """Обновление не удаляет пользовательские ярлыки на этом ПК."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -402,18 +402,19 @@ class HostShortcutCleanupTests(unittest.TestCase):
             resolver=lambda p: targets.get(str(p)),
             programs_dir=self.programs)
 
-    def test_host_install_shortcut_is_removed(self):
+    def test_host_install_shortcut_is_preserved(self):
         link = _write(self.desktop / "OpenCode.lnk", "x")
         target = self.programs / "OpenCode" / "OpenCode.exe"
         removed = self._cleanup({str(link): str(target)})
-        self.assertEqual(removed, [str(link)])
-        self.assertFalse(link.exists())
+        self.assertEqual(removed, [])
+        self.assertTrue(link.exists())
 
-    def test_shortcut_into_the_stage_folder_is_removed(self):
+    def test_shortcut_into_the_stage_folder_is_preserved(self):
         link = _write(self.desktop / "OpenCode.lnk", "x")
         target = self.root / "Updates" / "stage" / "OpenCode.exe"
         removed = self._cleanup({str(link): str(target)})
-        self.assertEqual(removed, [str(link)])
+        self.assertEqual(removed, [])
+        self.assertTrue(link.exists())
 
     def test_shortcut_into_the_portable_folder_is_kept(self):
         link = _write(self.desktop / "OpenCode.lnk", "x")
@@ -433,6 +434,14 @@ class HostShortcutCleanupTests(unittest.TestCase):
         target = Path("D:/Apps/opencode/OpenCode.exe")
         removed = self._cleanup({str(link): str(target)})
         self.assertEqual(removed, [])
+
+
+class HostTraceGuardSafetyTests(unittest.TestCase):
+    def test_legacy_guard_restore_is_a_noop(self):
+        guard = exe_launcher.HostTraceGuard()
+        guard.snapshot()
+        self.assertEqual(guard.restore(), [])
+        self.assertFalse(guard.active)
 
 
 class ApplyUpdateTests(unittest.TestCase):

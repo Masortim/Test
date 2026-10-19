@@ -413,9 +413,10 @@ class PortableOptions:
     # теми же переносимыми AppData/реестром, что и Launch.bat, но обычным
     # двойным кликом по EXE и без установленного Python.
     build_exe_launcher: bool = True
-    # Удалять следы установки (в т.ч. запись в «Установленные программы») с
-    # компьютера, на котором создаётся портатив.
-    cleanup_host: bool = True
+    # Опционально удалить только новую запись «Установленные программы»,
+    # если имя совпало с приложением и InstallLocation указывает внутрь
+    # портатива. Общий откат реестра/ярлыков/служб отключён и не выполняется.
+    cleanup_host: bool = False
     # Переносить ассоциации файлов/COM. По умолчанию выключено: чужому ПК это
     # не нужно, а портативность от этого только страдает.
     include_shell_integration: bool = False
@@ -451,14 +452,11 @@ class PortableOptions:
     # Докачивать недостающие пакеты с сайта Microsoft. По умолчанию выключено:
     # сборка не должна молча ходить в сеть.
     download_runtimes: bool = False
-    # Ставить распространяемые пакеты (vcredist, DXSETUP, OpenAL, PhysX…) в
-    # ТИХОМ режиме. Установщики игр запускают их сами и показывают окно за
-    # окном с кнопкой «OK» — так ведёт себя, например, первый «Ведьмак».
-    # Portablizer ставит предусловия заранее и молча: мастер основной
-    # установки их пропускает, а недостающие библиотеки после этого можно
-    # забрать из системы в портатив. Ставится только то, что опознано как
-    # известный распространяемый пакет.
-    silent_runtime_install: bool = True
+    # Устанавливать распространяемые пакеты (vcredist, DXSETUP, OpenAL,
+    # PhysX…) в тихом режиме НА ХОСТЕ. Это изменяет Windows и требует UAC,
+    # поэтому выключено по умолчанию; в портатив библиотеки по возможности
+    # копируются из установщика/системы, а пакеты ставятся только по согласию.
+    silent_runtime_install: bool = False
     # Сквозные портативные сохранения: одно хранилище сейвов для ВСЕХ
     # способов запуска. Без этого прямой запуск App\Game.exe пишет в
     # настоящий профиль Windows, а LaunchPortable.exe — в PortableData, и
@@ -481,6 +479,7 @@ class RegistryCapture:
     #: Самоповышающийся .cmd, применяющий cleanup_host.reg с правами админа.
     cleanup_cmd_file: str = ""
     cleanup_keys: List[str] = field(default_factory=list)
+    cleanup_entries: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -494,6 +493,8 @@ class PortableResult:
     messages: List[str] = field(default_factory=list)
     #: Ключи реестра, которые обслуживает лончер.
     registry_keys: List[str] = field(default_factory=list)
+    #: Новые записи установщика, которые увидели в «Установленных программах».
+    installed_entries_detected: List[str] = field(default_factory=list)
     #: Записи, убранные из списка «Установленные программы» этого ПК.
     removed_from_installed_list: List[str] = field(default_factory=list)
     #: Осталось ли что-то вычистить вручную (не хватило прав).
@@ -546,7 +547,10 @@ class PortableResult:
     #: Распаковщик, которым достали содержимое установщика БЕЗ его запуска
     #: (пусто — не потребовался).
     unpacked_with: str = ""
-    #: Службы Windows, снятые с регистрации (их бинарник лежал в портативе).
+    #: Найденные службы, указывающие внутрь портатива. Они только сообщаются;
+    #: Portablizer не останавливает и не удаляет системные службы автоматически.
+    registered_services: List[str] = field(default_factory=list)
+    #: Устаревшее поле: службы больше не снимаются с регистрации сборщиком.
     removed_services: List[str] = field(default_factory=list)
     #: Режим сквозных сохранений: ``inplace`` | ``mirror`` | ``off``.
     saves_mode: str = "off"
@@ -889,7 +893,7 @@ class Portablizer:
 
     def _release_portable_dir(self, portable_dir: str,
                               reason: str = "") -> List[str]:
-        """Останавливает всё, что запущено из папки результата.
+        """Закрывает процессы из папки результата, не меняя регистрацию служб.
 
         Вызывается трижды за сборку: перед очисткой старого результата,
         сразу после установки (установщики любят закончить галочкой
@@ -901,7 +905,7 @@ class Portablizer:
         if not portable_dir or not os.path.isdir(portable_dir):
             return []
         try:
-            stopped = procutil.release_folder(portable_dir)
+            stopped = procutil.release_folder(portable_dir, stop_services=False)
         except Exception as exc:  # noqa: BLE001 - уборка не ломает сборку
             self.log.debug(f"Не удалось опросить процессы папки: {exc}")
             return []
@@ -1022,6 +1026,17 @@ class Portablizer:
         установщику — иначе старый exe маскирует неудачную установку.
         """
         os.makedirs(portable_dir, exist_ok=True)
+        if IS_WINDOWS:
+            try:
+                existing_services = procutil.services_in(portable_dir)
+            except Exception:  # noqa: BLE001 - ниже безопасное поведение по умолчанию
+                existing_services = []
+            if existing_services:
+                raise RuntimeError(
+                    "В указанной папке уже зарегистрированы службы Windows "
+                    "(" + ", ".join(existing_services) + "). Portablizer "
+                    "не будет останавливать их или удалять файлы под ними; "
+                    "выберите другую папку либо проверьте службы вручную.")
 
         # Пересборка поверх работающего портатива — самая частая причина
         # «не удалось очистить старый файл результата»: прошлый запуск
@@ -1197,6 +1212,16 @@ class Portablizer:
             for e in det.evidence:
                 self.log.debug(f"  • {e}")
 
+            if IS_WINDOWS:
+                self.log.warn(
+                    "Важно: сторонний установщик запускается без полной "
+                    "виртуализации — Portablizer не является песочницей. "
+                    "Перенаправление профиля не блокирует изменения реестра, "
+                    "служб, драйверов, ассоциаций, активации Windows/Office "
+                    "или Edge/WebView2. Portablizer не может надёжно отменить "
+                    "неизвестные изменения установщика; для недоверенного "
+                    "файла остановитесь и используйте Windows Sandbox или VM.")
+
             # 1b. Предупреждаем о нехватке прав ДО запуска: установщик с
             # requireAdministrator без повышения просто не стартует.
             if IS_WINDOWS and det.requires_admin and not is_elevated():
@@ -1259,21 +1284,24 @@ class Portablizer:
             # установщики игнорируют /DIR и пишут в LocalAppData/Program Files;
             # после завершения попробуем безопасно перенести созданный каталог.
             install_locations_before = self._snapshot_install_locations(data_dir)
-            # Ярлыки в меню «Пуск» и на рабочем столе создаются через
-            # shell-папки и не подчиняются переменным окружения, поэтому их
-            # приходится отслеживать отдельно.
-            shortcuts_before = self._snapshot_shortcuts()
+            # Не снимем глобальный diff ярлыков: такие снимки могут захватить
+            # созданный пользователем .lnk/закрепление во время сборки. Сборщик
+            # намеренно не удаляет ярлыки, ассоциации или закрепления оболочки.
 
-            # 3b. Предусловия дистрибутива (vcredist, DirectX, OpenAL,
-            # PhysX…). Их надо поставить ДО основного установщика: иначе он
-            # сделает это сам — с окном и кнопкой «OK» на каждый пакет.
+            # 3b. Тихая установка предусловий (vcredist, DirectX, OpenAL,
+            # PhysX…) — только отдельное opt-in: она меняет систему.
+            # Без него пакеты остаются на усмотрение основного установщика;
+            # он может показать собственные окна.
             self._check_cancel()
-            self.progress(26, "Распространяемые компоненты (тихая установка)")
-            # Пока ставятся предусловия и идёт основной установщик, любой
-            # DXSETUP.exe (наш или вложенный) получает только /silent:
-            # иначе — «Неверная операция командной строки».
-            dx_guard = redist_mod.DxsetupSilentGuard(log=self.log)
-            dx_guard.install()
+            self.progress(26, "Распространяемые компоненты")
+            # IFEO-перехват DXSETUP меняет системный реестр, пусть и
+            # временно. Включаем его только вместе с явным opt-in на тихую
+            # установку runtime; по умолчанию вложенный установщик остаётся
+            # видимым и Portablizer не трогает IFEO.
+            dx_guard = None
+            if opts.bundle_runtimes and opts.silent_runtime_install:
+                dx_guard = redist_mod.DxsetupSilentGuard(log=self.log)
+                dx_guard.install()
             install_rc, used_plan = None, None
             try:
                 self._install_prerequisites(opts, result)
@@ -1300,7 +1328,8 @@ class Portablizer:
                     attempts, opts, app_dir, data_dir, portable_dir, name,
                     recover=recover)
             finally:
-                dx_guard.remove()
+                if dx_guard is not None:
+                    dx_guard.remove()
             # Лестница закончилась на 58 %, а следующий этап ниже сам по себе
             # полосу не двигает (закрытие процессов, распаковка без запуска).
             # Честно подписываем переход, иначе выглядит как зависание.
@@ -1365,7 +1394,7 @@ class Portablizer:
                 )
                 result.reg_file = capture.reg_file
                 result.registry_keys = capture.keys
-                result.removed_from_installed_list = capture.uninstall_entries
+                result.installed_entries_detected = capture.uninstall_entries
             elif opts.install_language.strip():
                 updated_inis = reg_mod.apply_language_to_ini_files(
                     app_dir, opts.install_language)
@@ -1432,14 +1461,12 @@ class Portablizer:
                 result.portable_launcher_exe_rel = os.path.relpath(
                     exe_launcher, portable_dir)
 
-            # 9. Уборка следов установки с ЭТОГО компьютера: программа не
-            # должна остаться в списке «Установленные программы».
-            self.progress(97, "Удаление следов установки с этого ПК")
-            self._remove_portable_services(portable_dir, opts, result)
+            # 9. Только безопасная уборка, выбранная пользователем:
+            # не откатываем произвольный реестр и не трогаем ярлыки/службы.
+            self.progress(97, "Проверка изменений на этом ПК")
+            self._report_portable_services(portable_dir, result)
             if capture is not None:
                 self._cleanup_host(capture, opts, result)
-            if opts.cleanup_host:
-                self._cleanup_shortcuts(shortcuts_before, result)
 
             # 10. Папка результата должна быть свободна: её сразу копируют
             # на флешку, переносят и удаляют. Ничего запущенного из неё
@@ -1960,32 +1987,40 @@ class Portablizer:
             + virtual_keys
         )
 
-        # Всё, что установщик наследил на этом ПК: и следы, и перенесённые в
-        # портатив настройки — на исходной машине они больше не нужны.
-        raw_portable_keys = raw_diff.keys_of(*wanted)
-        capture.cleanup_keys = sorted(
-            set(trace_keys) | set(raw_portable_keys) | set(skipped_integration)
+        # Безопасный режим не пытается «вернуть весь реестр как было»:
+        # сравнение двух снимков не доказывает, что любое изменение вызвано
+        # установщиком, и откат способен затронуть активацию/ассоциации,
+        # сделанные параллельно. По явному согласию удаляем только НОВУЮ запись
+        # самого приложения, подтверждённую DisplayName и путём в портатив.
+        safe_entries = reg_mod.safe_uninstall_entries(
+            raw_diff, after,
+            app_name=(opts.app_name.strip() or self._safe_name(opts)),
+            portable_dir=portable_dir,
         )
-        cleanup_text = reg_mod.render_host_cleanup(raw_diff, capture.cleanup_keys)
-        if reg_mod.has_entries(cleanup_text):
-            cleanup_path = os.path.join(portable_dir, "cleanup_host.reg")
-            reg_mod.write_reg_file(cleanup_path, cleanup_text)
-            capture.cleanup_file = cleanup_path
-            # Самоповышающийся .cmd: двойной клик по .reg импортирует его без
-            # прав администратора и роняет ветки HKLM с ошибкой «не все данные
-            # были записаны». Скрипт сам запрашивает права и делает это чисто.
-            cleanup_cmd_path = os.path.join(portable_dir, "cleanup_host.cmd")
-            self._write_text(
-                cleanup_cmd_path,
-                reg_mod.render_host_cleanup_cmd("cleanup_host.reg"),
-                encoding="ascii", newline="",
-            )
-            capture.cleanup_cmd_file = cleanup_cmd_path
-
+        capture.cleanup_keys = [key for key, _display in safe_entries]
+        capture.cleanup_entries = [display for _key, display in safe_entries]
         capture.uninstall_entries = [
             name for _key, name
             in reg_mod.installed_program_entries(raw_diff, after)
         ]
+        if opts.cleanup_host:
+            cleanup_text = reg_mod.render_host_cleanup(
+                raw_diff, after,
+                app_name=(opts.app_name.strip() or self._safe_name(opts)),
+                portable_dir=portable_dir,
+            )
+            if reg_mod.has_entries(cleanup_text):
+                cleanup_path = os.path.join(portable_dir, "cleanup_host.reg")
+                reg_mod.write_reg_file(cleanup_path, cleanup_text)
+                capture.cleanup_file = cleanup_path
+                # Скрипт сам повышается только если пользователь его запустит.
+                cleanup_cmd_path = os.path.join(portable_dir, "cleanup_host.cmd")
+                self._write_text(
+                    cleanup_cmd_path,
+                    reg_mod.render_host_cleanup_cmd("cleanup_host.reg"),
+                    encoding="ascii", newline="",
+                )
+                capture.cleanup_cmd_file = cleanup_cmd_path
 
         if capture.reg_file or capture.machine_reg_file:
             self.log.ok(
@@ -2008,65 +2043,42 @@ class Portablizer:
 
     def _cleanup_host(self, capture: RegistryCapture, opts: PortableOptions,
                       result: PortableResult) -> None:
-        """Возвращает реестр этого ПК в состояние «до установки»."""
-        entries = capture.uninstall_entries
-        if not opts.cleanup_host:
-            if entries:
-                result.cleanup_pending = True
-                self.log.warn(
-                    "Очистка отключена: программа осталась в списке "
-                    f"«Установленные программы» ({', '.join(entries)}). "
-                    "Запустите cleanup_host.cmd, чтобы убрать её (он сам "
-                    "запросит права администратора)."
-                )
-            return
-        if not capture.cleanup_file or not IS_WINDOWS:
+        """При согласии удаляет только подтверждённую запись приложения.
+
+        Никакой общий diff реестра не импортируется: устаревший снимок не
+        должен сбрасывать активацию, ассоциации и настройки, изменённые другим
+        процессом. Для единственной разрешённой записи требуется отдельная
+        галочка и её точное подтверждение при создании портатива.
+        """
+        if not opts.cleanup_host or not capture.cleanup_file or not IS_WINDOWS:
             return
 
         rc = self._reg_import(capture.cleanup_file)
-        # Часть следов (запись «Установленные программы», службы) лежит в HKLM
-        # и без прав администратора не удаляется. Если Portablizer запущен без
-        # повышения — сразу пробуем импорт через UAC, а не сдаёмся с ошибкой.
-        if rc != 0 and not is_elevated():
-            elevated = self._reg_import_elevated(capture.cleanup_file)
-            if elevated is not None:
-                rc = elevated
         if rc == 0:
-            if entries:
+            result.removed_from_installed_list = list(capture.cleanup_entries)
+            if capture.cleanup_entries:
                 self.log.ok(
-                    "Из списка «Установленные программы» удалено: "
-                    + ", ".join(entries)
+                    "Удалена только новая запись приложения из списка "
+                    "«Установленные программы»: "
+                    + ", ".join(capture.cleanup_entries)
                 )
-            self.log.ok(
-                "Следы установки удалены — этот компьютер остался чистым."
-            )
             return
 
         result.cleanup_pending = True
         target = capture.cleanup_cmd_file or capture.cleanup_file
         self.log.warn(
-            "Не удалось полностью удалить следы установки (обычно нужны права "
-            "администратора). Запустите cleanup_host.cmd (он сам запросит права "
-            f"администратора): {target}"
+            "Не удалось удалить подтверждённую запись приложения "
+            "(возможно, нужны права администратора). Никакие другие ключи "
+            f"реестра не менялись. При необходимости проверьте: {target}"
         )
 
-    def _remove_portable_services(self, portable_dir: str,
-                                  opts: PortableOptions,
+    def _report_portable_services(self, portable_dir: str,
                                   result: PortableResult) -> None:
-        """Снимает службы Windows, чей бинарник оказался внутри портатива.
+        """Обнаруживает службы, но не останавливает и не снимает их.
 
-        Установщики игр и «тяжёлых» программ регистрируют службы: защита от
-        копирования, обновлятор, вспомогательный драйвер. После сборки такая
-        служба указывает уже в папку портатива и делает сразу две гадости:
-
-        * держит файлы открытыми, поэтому папка не удаляется и не копируется
-          (убивать её процесс бесполезно — диспетчер служб поднимет его
-          снова);
-        * остаётся следом установки на этом компьютере, хотя программа
-          «не устанавливалась».
-
-        Поэтому служба останавливается и снимается с регистрации. Для этого
-        нужны права администратора — Portablizer запрашивает их при старте.
+        Служба может принадлежать антивирусу, лицензированию или другому
+        установленному компоненту. Автоматическое ``sc delete`` по пути
+        бинарника потенциально разрушительно, поэтому здесь только отчёт.
         """
         if not IS_WINDOWS or not portable_dir:
             return
@@ -2077,89 +2089,12 @@ class Portablizer:
             return
         if not services:
             return
-        if not opts.cleanup_host:
-            result.cleanup_pending = True
-            self.log.warn(
-                "Очистка отключена: на этом ПК осталась зарегистрирована "
-                "служба из папки портатива (" + ", ".join(services) + "). "
-                "Пока она работает, папку нельзя ни удалить, ни перенести.")
-            return
-        if not is_elevated():
-            result.cleanup_pending = True
-            self.log.warn(
-                "Служба из папки портатива (" + ", ".join(services) + ") "
-                "требует прав администратора для снятия. Запустите "
-                "Portablizer от имени администратора и повторите сборку.")
-            return
-        for name in services:
-            procutil.stop_service(name, remove=True)
-            self.log.ok(f"Служба {name} остановлена и снята с регистрации.")
-        result.removed_services = list(services)
-
-    # -- ярлыки ---------------------------------------------------------------
-    @staticmethod
-    def _shortcut_roots() -> List[str]:
-        """Каталоги, куда установщики кладут ярлыки (меню «Пуск», рабочий стол)."""
-        if not IS_WINDOWS:
-            return []
-        roots: List[str] = []
-        for base, tail in (
-            ("APPDATA", os.path.join("Microsoft", "Windows", "Start Menu", "Programs")),
-            ("PROGRAMDATA", os.path.join("Microsoft", "Windows", "Start Menu", "Programs")),
-            ("USERPROFILE", "Desktop"),
-            ("PUBLIC", "Desktop"),
-        ):
-            value = os.environ.get(base, "")
-            if value:
-                roots.append(os.path.join(value, tail))
-        return roots
-
-    def _snapshot_shortcuts(self) -> Set[str]:
-        """Запоминает существующие ярлыки, чтобы найти созданные установщиком."""
-        found: Set[str] = set()
-        for root in self._shortcut_roots():
-            for current, _dirs, files in os.walk(root):
-                for filename in files:
-                    if filename.lower().endswith((".lnk", ".url")):
-                        found.add(os.path.normcase(
-                            os.path.join(current, filename)))
-        return found
-
-    def _cleanup_shortcuts(self, before: Set[str],
-                           result: PortableResult) -> None:
-        """Удаляет ярлыки, созданные установщиком на этом компьютере."""
-        if not IS_WINDOWS:
-            return
-        removed: List[str] = []
-        for root in self._shortcut_roots():
-            for current, _dirs, files in os.walk(root):
-                for filename in files:
-                    if not filename.lower().endswith((".lnk", ".url")):
-                        continue
-                    path = os.path.join(current, filename)
-                    if os.path.normcase(path) in before:
-                        continue
-                    try:
-                        os.remove(path)
-                        removed.append(filename)
-                    except OSError:
-                        result.cleanup_pending = True
-        # Пустые папки меню «Пуск», оставшиеся после удаления ярлыков.
-        for root in self._shortcut_roots():
-            for current, dirs, _files in os.walk(root, topdown=False):
-                for name in dirs:
-                    path = os.path.join(current, name)
-                    try:
-                        if not os.listdir(path):
-                            os.rmdir(path)
-                    except OSError:
-                        pass
-        if removed:
-            self.log.ok(
-                f"Удалены созданные установщиком ярлыки ({len(removed)}): "
-                + ", ".join(sorted(removed)[:5])
-                + (" …" if len(removed) > 5 else "")
-            )
+        result.registered_services = list(services)
+        self.log.warn(
+            "Обнаружены зарегистрированные службы, указывающие внутрь "
+            "портатива: " + ", ".join(services) + ". Portablizer их не "
+            "останавливает и не удаляет. Такая сборка может быть не полностью "
+            "переносимой; проверьте службы вручную, не удаляя незнакомые.")
 
     @staticmethod
     def _reg_import(path: str) -> int:
@@ -2173,65 +2108,6 @@ class Portablizer:
             return proc.returncode
         except OSError:
             return 1
-
-    @staticmethod
-    def _reg_import_elevated(path: str) -> Optional[int]:
-        """Импортирует .reg с правами администратора через UAC (ShellExecute).
-
-        Возвращает код возврата ``reg import`` или ``None``, если запустить
-        повышенный процесс не удалось (пользователь отклонил UAC, нет Windows).
-        Это позволяет автоматически убрать следы в HKLM без ручного запуска.
-        """
-        if not IS_WINDOWS:
-            return None
-        try:
-            import ctypes  # локальный импорт: модуль грузится и на Linux
-            from ctypes import wintypes
-
-            shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
-            SEE_MASK_NOCLOSEPROCESS = 0x00000040
-            SEE_MASK_NO_CONSOLE = 0x00008000
-
-            class SHELLEXECUTEINFOW(ctypes.Structure):
-                _fields_ = [
-                    ("cbSize", wintypes.DWORD),
-                    ("fMask", ctypes.c_ulong),
-                    ("hwnd", wintypes.HWND),
-                    ("lpVerb", wintypes.LPCWSTR),
-                    ("lpFile", wintypes.LPCWSTR),
-                    ("lpParameters", wintypes.LPCWSTR),
-                    ("lpDirectory", wintypes.LPCWSTR),
-                    ("nShow", ctypes.c_int),
-                    ("hInstApp", wintypes.HINSTANCE),
-                    ("lpIDList", ctypes.c_void_p),
-                    ("lpClass", wintypes.LPCWSTR),
-                    ("hkeyClass", wintypes.HKEY),
-                    ("dwHotKey", wintypes.DWORD),
-                    ("hIcon", wintypes.HANDLE),
-                    ("hProcess", wintypes.HANDLE),
-                ]
-
-            info = SHELLEXECUTEINFOW()
-            info.cbSize = ctypes.sizeof(info)
-            info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE
-            info.lpVerb = "runas"  # запрос повышения прав через UAC
-            info.lpFile = "reg.exe"
-            info.lpParameters = subprocess.list2cmdline(["import", path])
-            info.nShow = 0  # SW_HIDE
-
-            if not shell32.ShellExecuteExW(ctypes.byref(info)):
-                return None
-            if not info.hProcess:
-                return None
-
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-            kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
-            code = wintypes.DWORD()
-            kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
-            kernel32.CloseHandle(info.hProcess)
-            return int(code.value)
-        except Exception:  # noqa: BLE001 - отказ UAC/любой сбой -> ручной путь
-            return None
 
     # -- установка ------------------------------------------------------------
     def _run_install(self, plan: SilentPlan, opts: PortableOptions,
@@ -2887,9 +2763,10 @@ class Portablizer:
         распаковывают данные СНАЧАЛА во временную папку и только потом
         переносят их в целевую. Значит, на диске должны одновременно
         уместиться дистрибутив, распакованная копия и результат. Portablizer
-        перенаправляет TEMP внутрь портативной папки — это правильно для
-        чистоты компьютера, но на флешке или небольшом разделе установщику
-        места не хватает, и он **падает** (типичный код 0xC000041D —
+        перенаправляет TEMP внутрь портативной папки — это удерживает эти
+        временные файлы, но не блокирует другие записи установщика в Windows.
+        На флешке или небольшом разделе места может не хватить, и он **падает**
+        (типичный код 0xC000041D —
         исключение в обработчике прогресса, когда распаковка оборвалась).
 
         Поэтому место проверяется заранее, а если его нет — TEMP установщика
@@ -2971,7 +2848,7 @@ class Portablizer:
             if not os.path.isdir(path):
                 continue
             try:
-                procutil.release_folder(path)
+                procutil.release_folder(path, stop_services=False)
             except Exception as exc:  # noqa: BLE001 - уборка не ломает сборку
                 self.log.debug(f"  • не удалось опросить процессы временной "
                                f"папки: {exc}")
@@ -3713,14 +3590,12 @@ class Portablizer:
     # -- предусловия дистрибутива --------------------------------------------
     def _install_prerequisites(self, opts: PortableOptions,
                                result: PortableResult) -> None:
-        """Ставит предусловия дистрибутива молча — ДО основного установщика.
+        """При opt-in ставит предусловия молча ДО основного установщика.
 
-        Так выглядит проблема без этого шага: установщик первого «Ведьмака»
-        доходит до шага «установка компонентов», по очереди запускает
-        ``vcredist``, ``DXSETUP`` и компанию — и каждый показывает своё окно,
-        которое надо закрыть кнопкой «OK». Портативная сборка обязана идти
-        без человека, поэтому пакеты ставятся заранее и в тихом режиме:
-        мастер видит их уже установленными и молча проходит этот шаг.
+        Эти установщики меняют систему. Поэтому вызывающий код проверяет
+        ``silent_runtime_install`` (выключено по умолчанию); без opt-in
+        Portablizer оставляет решение основному установщику, который может
+        показать собственные окна.
 
         Запускается только то, что опознано белым списком
         (``vcredist_x86.exe``, ``DXSETUP.exe``, ``oalinst.exe``, PhysX,
@@ -3871,10 +3746,10 @@ class Portablizer:
                 result.runtime_installed.append(item.title or item.name)
         if report.installers:
             self.log.ok(
-                "Недостающие пакеты положены в папку "
+                "Недостающие пакеты сохранены в папке "
                 f"{redist_mod.REDIST_DIR_NAME} вместе со скриптом "
-                f"{redist_mod.SILENT_SCRIPT_NAME}: на целевом ПК лончер "
-                "поставит их молча, без окон с «OK».")
+                f"{redist_mod.SILENT_SCRIPT_NAME}. Лончер только предупредит; "
+                "установка начнётся лишь после ручного запуска скрипта.")
 
         if report.missing:
             self.log.warn(
@@ -4201,13 +4076,12 @@ class Portablizer:
                 )
                 if runtime_report.installers:
                     runtime_section += (
-                        "  Проще всего запустить "
-                        f"{redist_mod.REDIST_DIR_NAME}\\"
-                        f"{redist_mod.SILENT_SCRIPT_NAME}: он поставит всё "
-                        "молча,\n"
-                        "  за один запрос прав администратора. Лончер "
-                        "делает это сам, когда\n"
-                        "  видит, что библиотеки на этом компьютере нет.\n"
+                        "  Если вы доверяете пакетам и хотите установить их, "
+                        "запустите вручную\n"
+                        f"  {redist_mod.REDIST_DIR_NAME}\\"
+                        f"{redist_mod.SILENT_SCRIPT_NAME}. Он работает тихо "
+                        "и может запросить UAC;\n"
+                        "  лончер никогда не запускает установку сам.\n"
                     )
         # Раздел о сохранениях: пользователю важно знать, где они лежат и
         # почему их теперь видно при любом способе запуска.
@@ -4292,10 +4166,12 @@ _README = """{app_name} — портативная версия
 Как пользоваться:
   1. Скопируйте ВСЮ эту папку на флешку, другой ПК или в любое место.
 {exe_launcher_step}{companion_section}
-Устанавливать ничего не нужно: программа не появляется в списке
-«Установленные программы». Обычный запуск не требует прав администратора;
-старый комплектный launcher/configurator может один раз показать UAC, чтобы
-временно применить обязательный InstallFolder из HKLM.
+На целевом компьютере ничего устанавливать не нужно: сам портатив не
+создаёт запись в списке «Установленные программы». Установщик при создании
+портатива может изменить исходный компьютер — Portablizer не является полной
+песочницей Windows. Обычный запуск не требует прав администратора; старый
+комплектный launcher/configurator может один раз показать UAC, чтобы временно
+применить обязательный InstallFolder из HKLM.
 
 Если есть Launch_Configurator.exe (или его запасной Launch_Configurator.bat),
 сначала запустите его, выберите графику, язык и разрешение, сохраните настройки
@@ -4338,10 +4214,11 @@ _README = """{app_name} — портативная версия
     тот же набор файлов внутри портатива;
   • Windows Known Folder Documents тоже временно направляется в PortableData,
     поэтому Configurator.exe и сама игра используют один файл настроек;
-  • если программе нужны записи реестра, лончер перед стартом сохраняет
-    прежнее состояние чужого ПК, подставляет настройки из портатива (включая
-    UAC VirtualStore для бесправного доступа к machine-ключам), а после выхода
-    выгружает изменения обратно в папку и возвращает реестр как было;
+  • если программе нужны настройки реестра, лончер подставляет только
+    отобранные для портатива ключи приложения и после выхода сохраняет их
+    изменения в PortableData. Это не общий откат Windows: активация, Office,
+    ассоциации, закрепления, Edge/WebView2 и другие системные ветки не входят
+    в этот снимок;
   • путь портативной папки внутри настроек хранится маркером, поэтому смена
     буквы диска или компьютера ничего не ломает.
 
@@ -4413,13 +4290,19 @@ error 0x06: System error!» у игр со Steam-эмулятором):
     системным каталогам — тогда запустите Launch.bat без изоляции профиля
     (см. portablizer.log) или обратитесь к разработчику Portablizer.
 
-Очистка следов на ЭТОМ компьютере (где собирался портатив):
-  • cleanup_host.cmd убирает записи установки из реестра этого ПК (запись в
-    списке «Установленные программы» и т.п.). Он сам запрашивает права
-    администратора — двойного клика по cleanup_host.reg недостаточно, потому
-    что ветки HKLM без прав администратора не удаляются и Windows пишет
-    «Не все данные были успешно записаны в реестр»;
-  • на другом ПК этот файл не нужен — портатив ничего туда не устанавливает.
+Безопасность компьютера-сборщика:
+  • Portablizer не откатывает общий снимок реестра: активация Windows/Office,
+    ассоциации, закреплённые значки панели задач, службы и Microsoft Edge
+    WebView2 не очищаются и не восстанавливаются из устаревшего снимка;
+  • если перед сборкой пользователь включил точечную очистку и в папке есть
+    cleanup_host.cmd, он удалит только новую запись этого приложения из
+    «Установленных программ», когда совпали имя и путь. Скрипт просит UAC
+    только при ручном запуске; прочие ключи реестра не меняются;
+  • ярлыки и службы Portablizer автоматически не удаляет. Runtime-пакеты на
+    компьютер-сборщик устанавливаются только при отдельном opt-in; если он был
+    включён, эти изменения остаются и не откатываются. При запуске портатива
+    пакеты автоматически не устанавливаются. Сам установщик всё ещё может
+    менять Windows — для незнакомых файлов используйте Sandbox или виртуальную машину.
 
 Сгенерировано Portablizer.
 """

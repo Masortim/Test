@@ -3,8 +3,8 @@
 CLI — это второе «лицо» того же exe: без аргументов окно, с аргументами —
 сборка из консоли. Проверяется то, за что стоит держать отдельный режим:
 
-* разбор аргументов в PortableOptions один-в-один с настройками окна
-  (включая NetStack: изоляция по умолчанию, shared — по флагу);
+* разбор аргументов в PortableOptions соответствует безопасным настройкам окна:
+  очистка хоста, установка runtime-пакетов и повышение прав — opt-in;
 * ``--dry-run``: план (папка результата по правилам движка, абсолютные пути,
   окружение запуска) печатается JSON, и НИЧЕГО не устанавливается;
 * коды выхода: 0 — успех/версия, 1 — сборка не удалась, 2 — ошибка в
@@ -57,23 +57,20 @@ class ParserMappingTests(unittest.TestCase):
         self.assertTrue(opts.redirect_userdirs)
         self.assertTrue(opts.capture_registry)
         self.assertTrue(opts.build_exe_launcher)
-        self.assertTrue(opts.cleanup_host)
+        self.assertFalse(opts.cleanup_host)
         self.assertFalse(opts.include_shell_integration)
         self.assertTrue(opts.bundle_runtimes)
         self.assertTrue(opts.full_runtimes)
         self.assertFalse(opts.download_runtimes)
-        self.assertTrue(opts.silent_runtime_install)
+        self.assertFalse(opts.silent_runtime_install)
         self.assertTrue(opts.shared_saves)
-        # VPN-компоненты — да; изоляция — по умолчанию.
-        self.assertTrue(opts.netstack_components)
-        self.assertTrue(opts.netstack_isolated)
         self.assertFalse(opts.allow_assisted_install)
 
     def test_toggles(self):
         opts = self._opts([
             "--no-registry", "--no-userdirs", "--no-cleanup",
             "--shell-integration", "--no-exe-launcher", "--no-runtimes",
-            "--no-shared-saves", "--no-netstack", "--assisted",
+            "--no-shared-saves", "--assisted",
             "--extra-args", "/FOO", "/BAR", "--env", "A=1", "--env", "B=x=y",
             "--idle-timeout", "77", "--hard-timeout", "9999",
             "--assisted-timeout", "120", "--lang", "ru", "--name", "Planeta VPN",
@@ -88,7 +85,6 @@ class ParserMappingTests(unittest.TestCase):
         self.assertFalse(opts.download_runtimes)      # и он
         self.assertFalse(opts.silent_runtime_install)
         self.assertFalse(opts.shared_saves)
-        self.assertFalse(opts.netstack_components)
         self.assertTrue(opts.allow_assisted_install)
         self.assertEqual(opts.extra_install_args, ["/FOO", "/BAR"])
         self.assertEqual(opts.extra_env, {"A": "1", "B": "x=y"})
@@ -97,11 +93,6 @@ class ParserMappingTests(unittest.TestCase):
         self.assertEqual(opts.assisted_timeout, 120)
         self.assertEqual(opts.install_language, "ru")
         self.assertEqual(opts.app_name, "Planeta VPN")
-
-    def test_shared_netstack_keeps_components_on(self):
-        opts = self._opts(["--shared-netstack"])
-        self.assertTrue(opts.netstack_components)
-        self.assertFalse(opts.netstack_isolated)
 
     def test_lean_runtimes_only_trims_the_full_set(self):
         opts = self._opts(["--lean-runtimes", "--download-runtimes"])
@@ -145,11 +136,10 @@ class MainExitCodeTests(unittest.TestCase):
         out_dir = self.root / "o"
         code, out, err = _run(["build", str(self.installer), "--out",
                                str(out_dir), "--name", "Планета VPN",
-                               "--shared-netstack", "--dry-run"])
+                               "--dry-run"])
         self.assertEqual(code, 0, err)
         plan = json.loads(out)
         self.assertEqual(plan["app_name"], "Планета VPN")
-        self.assertEqual(plan["netstack_isolated"], False)
         # Папка результата — тем же правилом, что и у движка: <имя>_Portable.
         self.assertEqual(Path(plan["portable_dir"]).name,
                          "Планета VPN_Portable")
