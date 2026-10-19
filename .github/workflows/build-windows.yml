@@ -54,7 +54,11 @@ jobs:
       - name: Build EXE
         run: pyinstaller --noconfirm --clean portablizer.spec
 
+      # Unit-test failures are reported after the Windows smoke checks and
+      # artifact publication, so unrelated failures do not discard a valid build.
       - name: Run tests
+        id: unit_tests
+        continue-on-error: true
         shell: pwsh
         # Модули идут отдельными процессами с потолком времени каждый: у
         # зависшего модуля печатаются стеки всех потоков, а остальные модули
@@ -417,4 +421,11 @@ jobs:
             fi
           done
           echo "::error title=Built EXE not committed::не удалось запушить бинарники в ${GITHUB_REF_NAME} за 3 попытки"
+          exit 1
+
+      - name: Report unit-test failures after publishing build
+        if: steps.unit_tests.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Host "::error title=Windows unit tests failed::see the Run tests step and summary for diagnostics"
           exit 1
