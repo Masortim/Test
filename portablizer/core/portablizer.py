@@ -3844,6 +3844,12 @@ class Portablizer:
             # ``%USERPROFILE%/AppData/Roaming``, а не через переменную APPDATA.
             # Создаём User Pinned в обоих эквивалентных portable-путях, чтобы
             # не менять реестр или каталоги профиля хоста.
+            #
+            # Autodesk документирует и второй уровень: Streamer закрепляет
+            # ярлык Fusion на панели задач и без существующего
+            # ``User Pinned\TaskBar`` падает с тем же
+            # ``[WinError -2147024894]`` («The system cannot find the file
+            # specified»). Поэтому создаём и TaskBar, а не только User Pinned.
             profile = env.get("USERPROFILE", "")
             roaming_roots = (
                 env.get("APPDATA", ""),
@@ -3855,6 +3861,8 @@ class Portablizer:
                     "User Pinned",
                 )
                 os.makedirs(pinned_folder, exist_ok=True)
+                os.makedirs(os.path.join(pinned_folder, "TaskBar"),
+                            exist_ok=True)
                 self.log.debug(
                     f"Подготовлен Known Folder UserPinned: {pinned_folder}")
         return env

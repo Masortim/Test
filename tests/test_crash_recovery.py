@@ -373,6 +373,9 @@ class TempRelocationTests(unittest.TestCase):
         for pinned in pinned_paths:
             with self.subTest(pinned=pinned):
                 self.assertTrue(os.path.isdir(pinned))
+                # Autodesk закрепляет ярлык Fusion на панели задач: без
+                # User Pinned\TaskBar Streamer падает с WinError -2147024894.
+                self.assertTrue(os.path.isdir(os.path.join(pinned, "TaskBar")))
                 self.assertEqual(os.path.commonpath([self.data, pinned]),
                                  self.data)
 
