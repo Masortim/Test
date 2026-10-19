@@ -39,8 +39,11 @@
     программы) останавливают лестницу, а служебные записи установщика за файлы
     программы не считаются;
   * итоговые подсказки называют причину словами и ведут к офлайн-дистрибутиву,
-    а не к подбору ключей тишины.
+    а не к подбору ключей тишины;
+  * настоящий PE-клиент в перенаправленном webdeploy-профиле запускается из
+    PortableData без дублирования гигабайтов, но без обещания автономности.
 """
+import json
 import os
 import struct
 import sys
@@ -128,6 +131,8 @@ class DownloaderStubDetectionTests(unittest.TestCase):
             self.assertEqual(det.media_size, 10 * 1024 * 1024)
             self.assertIn("сетевой загрузчик", det.human)
             self.assertIn("webdeploy", det.online_product.reason)
+            self.assertEqual(det.online_product.profile_root,
+                             "Autodesk/webdeploy/production")
 
     def test_documented_switch_is_user_scope_only(self):
         """--globalinstall ставит клиент в Program Files ЭТОГО ПК — его нет."""
@@ -568,6 +573,55 @@ class DownloaderHintsTests(unittest.TestCase):
                       readme_text)
         self.assertIn("Autodesk-аккаунт", readme_text)
         self.assertNotIn(b"\r\r\n", readme.read_bytes())
+
+    def test_fusion_webdeploy_payload_is_launched_from_redirected_profile(self):
+        class FilesEngine(Portablizer):
+            def _run_install(inner, plan, opts, app_dir, data_dir, **kwargs):
+                version_dir = Path(
+                    data_dir, "AppData", "Local", "Autodesk", "webdeploy",
+                    "production", "0123456789abcdef")
+                version_dir.mkdir(parents=True, exist_ok=True)
+                executable = version_dir / "Fusion.exe"
+                _fake_pe(str(executable), [".text", ".rsrc"],
+                         size=256 * 1024)
+                # Mimic the user's long download: a successful first attempt
+                # must stop the ladder instead of opening a second installer.
+                inner._last_install_seconds = 8 * 60
+                return 0
+
+        engine = FilesEngine(Logger())
+        with mock.patch.object(engine_mod, "IS_WINDOWS", False):
+            result = engine.run(PortableOptions(
+                installer_path=self.installer,
+                output_dir=self.temp.name,
+                app_name="Fusion",
+                capture_registry=False,
+                cleanup_host=False,
+            ))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.attempts_made, 1)
+        target = result.main_exe_rel.replace("\\", "/")
+        self.assertTrue(target.startswith(
+            "PortableData/AppData/Local/Autodesk/webdeploy/production/"))
+        config = json.loads(Path(
+            result.portable_dir, "launcher_config.json").read_text(
+                encoding="utf-8"))
+        self.assertEqual(config["target_exe_rel"], target)
+        self.assertIn("запускать его непосредственно оттуда",
+                      engine.log.text)
+        self.assertIn("без копирования 5+ ГБ", " ".join(result.hints))
+        readme_text = Path(
+            result.portable_dir, "README_PORTABLE.txt").read_text(
+                encoding="utf-8")
+        self.assertIn(target, readme_text)
+        self.assertIn("не является гарантией автономного portable",
+                      readme_text)
+        self.assertIn("UpdatePortable.cmd намеренно отключён", readme_text)
+        update_script = Path(
+            result.portable_dir, "UpdatePortable.cmd").read_text(
+                encoding="ascii")
+        self.assertIn("disabled here", update_script)
 
     def test_no_warning_for_a_normal_installer(self):
         engine = Portablizer(Logger())

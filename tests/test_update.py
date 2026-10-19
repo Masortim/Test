@@ -840,6 +840,20 @@ class PortablizerSideTests(unittest.TestCase):
         self.assertIn("%*", text)
         self.assertIn("\r\n", text.replace("\n", "\r\n"))
 
+    def test_update_script_refuses_targets_outside_app(self):
+        cfg = launcher_mod.LauncherConfig(
+            app_name="Autodesk Fusion",
+            target_exe_rel=(
+                "PortableData/AppData/Local/Autodesk/webdeploy/production/"
+                "build/Fusion.exe"),
+        )
+        text = launcher_mod.render_update_cmd(cfg)
+        self.assertTrue(text.isascii())
+        self.assertIn("disabled here", text)
+        self.assertIn("Use the application's own supported updater", text)
+        self.assertIn("webdeploy", text)
+        self.assertNotIn("--update", text)
+
     def test_refresh_writes_update_script_and_keeps_update_block(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_portable(tmp, dict(
