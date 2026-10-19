@@ -371,6 +371,37 @@ class MainWindow(QMainWindow):
             "программам лончер синхронизирует папки при каждом запуске. "
             "Уже существующие сохранения переносятся в общее хранилище, "
             "ничего не удаляется.")
+        self.cb_netstack = QCheckBox(
+            "Переносить системные компоненты сети в NetStack (VPN)")
+        self.cb_netstack.setChecked(True)
+        self.cb_netstack.setToolTip(
+            "VPN-клиенты (Planeta VPN и все, что собрано вокруг OpenVPN) "
+            "не работают без системного сетевого драйвера TAP-Windows и, "
+            "у части вендоров, службы: Windows не виртуализует ядро. "
+            "Portablizer копирует пакеты драйверов и конфигурацию служб в "
+            "папку NetStack рядом с App; на новом ПК лончер проверит "
+            "систему и досоздаст недостающее сам — один тихий запрос прав "
+            "вместо окон «Безопасность Windows». Всё созданное портативом "
+            "(службы, устройства адаптеров, пакет драйвера) снимается с "
+            "системы по завершении сеанса — см. соседнюю галочку "
+            "изоляции. Снимите эту галочку, чтобы портатив ничего не "
+            "устанавливал на чужих ПК: тогда VPN-клиент поедет без "
+            "адаптера и заработает только там, где драйвер уже есть.")
+        self.cb_netstack_isolated = QCheckBox(
+            "Изоляция: снимать драйвер и устройства адаптера после выхода")
+        self.cb_netstack_isolated.setChecked(True)
+        self.cb_netstack_isolated.setToolTip(
+            "Изолированный портативный режим: ядро Windows нельзя "
+            "виртуализовать, но можно не оставлять его чужой машине — "
+            "портатив публикует пакет TAP-Windows из NetStack на время "
+            "сеанса, а при выходе снимает устройства root\\tap0901 и сам "
+            "пакет из DriverStore. Чужие установки драйвера (например, "
+            "OpenVPN, поставленный отдельно) портатив не трогает: владение "
+            "фиксируется диффом %SystemRoot%\\INF при публикации. Цена "
+            "изоляции — новый тихий UAC при первом запуске после чистки. "
+            "Снимите галочку для режима общего компонента (драйвер "
+            "остаётся в системе, как Visual C++ из Redist) — удобно на "
+            "собственном ПК.")
         self.cb_autoopen = QCheckBox("Открыть папку результата по окончании")
         self.cb_autoopen.setChecked(True)
         self.cb_autoopen.setToolTip(
@@ -391,7 +422,9 @@ class MainWindow(QMainWindow):
         checks.addWidget(self.cb_integration, 1, 1)
         checks.addWidget(self.cb_exelauncher, 2, 0)
         checks.addWidget(self.cb_assisted, 2, 1)
-        checks.addWidget(self.cb_autoopen, 7, 0, 1, 2)
+        checks.addWidget(self.cb_netstack, 7, 0, 1, 2)
+        checks.addWidget(self.cb_netstack_isolated, 8, 0, 1, 2)
+        checks.addWidget(self.cb_autoopen, 9, 0, 1, 2)
         checks.addWidget(self.cb_runtimes, 3, 0)
         checks.addWidget(self.cb_fetch_runtimes, 3, 1)
         checks.addWidget(self.cb_full_runtimes, 4, 0, 1, 2)
@@ -798,6 +831,8 @@ class MainWindow(QMainWindow):
             silent_runtime_install=(self.cb_runtimes.isChecked()
                                     and self.cb_silent_redist.isChecked()),
             shared_saves=self.cb_shared_saves.isChecked(),
+            netstack_components=self.cb_netstack.isChecked(),
+            netstack_isolated=self.cb_netstack_isolated.isChecked(),
             extra_install_args=args,
             install_language=self.language_combo.currentData() or "",
             extra_env=self._parse_env(),

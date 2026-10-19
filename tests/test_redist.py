@@ -3110,6 +3110,15 @@ class DxsetupCommandTests(unittest.TestCase):
         # Исходные ключи установщика (args 1+) в скрипт не подставляются.
         self.assertNotIn("args(1)", text)
 
+    def test_public_temp_root_never_invents_a_drive_letter(self):
+        """Без %PUBLIC%/%SystemDrive% путь всё равно абсолютный (системный temp)."""
+        with mock.patch.dict(os.environ,
+                             {"PUBLIC": "", "SystemDrive": ""}):
+            root = redist._public_temp_root()
+        self.assertTrue(os.path.isabs(root), root)
+        self.assertEqual(root,
+                         os.path.join(tempfile.gettempdir(), "Portablizer"))
+
     def test_guard_is_a_noop_off_windows(self):
         with mock.patch.object(redist, "IS_WINDOWS", False):
             guard = redist.DxsetupSilentGuard()

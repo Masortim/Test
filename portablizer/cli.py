@@ -119,6 +119,14 @@ def build_parser() -> argparse.ArgumentParser:
                               "на этом ПК")
     toggles.add_argument("--no-shared-saves", action="store_true",
                          help="выключить сквозные портативные сохранения")
+    toggles.add_argument("--no-netstack", action="store_true",
+                         help="не переносить системные сетевые компоненты "
+                              "(драйверы TAP-Windows, службы VPN) в "
+                              "NetStack")
+    toggles.add_argument("--shared-netstack", action="store_true",
+                         help="NetStack в режиме общего компонента: драйвер "
+                              "остаётся в системе (по умолчанию — изоляция "
+                              "на время сеанса)")
     toggles.add_argument("--assisted", action="store_true",
                          help="разрешить окно мастера (старые InstallShield)")
     toggles.add_argument("--assisted-timeout", type=int, default=0,
@@ -173,6 +181,8 @@ def options_from_args(ns: argparse.Namespace) -> "object":
         silent_runtime_install=(bundle and bool(ns.silent_redist)
                                and not ns.no_silent_redist),
         shared_saves=not ns.no_shared_saves,
+        netstack_components=not ns.no_netstack,
+        netstack_isolated=not ns.shared_netstack,
         extra_install_args=[str(a) for a in (ns.extra_args or [])],
         install_language=(ns.lang or "").strip(),
         extra_env=_parse_env(ns.env or []),
@@ -256,6 +266,14 @@ def cmd_build(ns: argparse.Namespace) -> int:
             print(f"Внимание:      {hint}")
         if not result.folder_is_free and result.folder_holders:
             print(f"Внимание: папку держат {', '.join(result.folder_holders)}")
+        if result.netstack_drivers or result.netstack_services:
+            net = []
+            if result.netstack_drivers:
+                net.append("драйверы: " + ", ".join(result.netstack_drivers))
+            if result.netstack_services:
+                net.append("службы: " + ", ".join(result.netstack_services))
+            print("NetStack:      " + "; ".join(net)
+                  + (" (изоляция)" if opts.netstack_isolated else " (общий)"))
         return 0
     print(f"Сборка не удалась. Журнал: {log_file}")
     for hint in result.hints or []:

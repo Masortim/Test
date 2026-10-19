@@ -373,7 +373,23 @@ class TempRelocationTests(unittest.TestCase):
         for pinned in pinned_paths:
             with self.subTest(pinned=pinned):
                 self.assertTrue(os.path.isdir(pinned))
+                # Autodesk закрепляет ярлык Fusion на панели задач: без
+                # User Pinned\TaskBar Streamer падает с WinError -2147024894.
+                self.assertTrue(os.path.isdir(os.path.join(pinned, "TaskBar")))
                 self.assertEqual(os.path.commonpath([self.data, pinned]),
+                                 self.data)
+
+    def test_redirected_profile_precreates_known_folder_tree(self):
+        """Shell разрешает Known Folder и через %USERPROFILE%\AppData\... ."""
+        engine = Portablizer(Logger())
+        env = engine._build_isolated_env(self.opts, self.data)
+        for parts in (("AppData", "Local"), ("AppData", "Roaming"),
+                      ("AppData", "LocalLow"), ("Documents",),
+                      ("Saved Games",)):
+            with self.subTest(parts=parts):
+                folder = os.path.join(env["USERPROFILE"], *parts)
+                self.assertTrue(os.path.isdir(folder), folder)
+                self.assertEqual(os.path.commonpath([self.data, folder]),
                                  self.data)
 
     def test_shortage_without_another_disk_is_explained(self):
