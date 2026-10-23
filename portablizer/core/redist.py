@@ -1528,13 +1528,19 @@ _PROCEED_BUTTON_HINTS = (
 #: Заголовки/тексты диалогов выбора языка внутреннего установщика.
 _LANGUAGE_DIALOG_HINTS = (
     "выберите язык", "select language", "choose language",
-    "язык установки", "installation language",
+    "язык установки", "язык интерфейса", "installation language",
+    "setup language", "language selection",
 )
-#: Заголовки/тексты диалогов согласия на путь установки.
+#: Заголовки/тексты диалогов согласия на путь установки. Формулировки
+#: репаков (в том числе KpoJIuK) отличаются от стандартных Inno:
+#: «Выберите папку установки», «Куда установить программу».
 _PATH_DIALOG_HINTS = (
     "choose install location", "select install directory",
     "installation path", "путь установки", "место установки",
-    "install directory", "install location",
+    "папку установки", "папка установки", "папки установки",
+    "установить в папку", "куда установить", "выберите папку",
+    "install directory", "install location", "destination folder",
+    "install folder", "select destination",
 )
 #: Заголовки/тексты общих диалогов согласия установщика.
 _CONFIRM_DIALOG_HINTS = (
@@ -1816,7 +1822,10 @@ def installer_prompt_should_dismiss(title: str, body: str = "") -> bool:
 
 
 def _dismiss_installer_dialogs(
-        counter: "Optional[Dict[str, int]]" = None) -> int:
+        counter: "Optional[Dict[str, int]]" = None,
+        target_dir: str = "",
+        pids: "Optional[Sequence[int]]" = None,
+        state: "Optional[Dict[int, Tuple[str, float]]]" = None) -> int:
     """Click through leftover installer MessageBoxes that block the build.
 
     Families, none of which CREATE_NO_WINDOW hides:
@@ -1839,16 +1848,26 @@ def _dismiss_installer_dialogs(
       available, otherwise «OK»/«Next». Without this, the inner installer
       waits for a mouse click, the watchdog sees only weak activity (log/CPU),
       and the build stalls.
-    * Path consent («Choose Install Location») — the inner installer may not
-      understand /D= and shows its own path dialog with default
-      C:\\Program Files\\... Click «Next»/«Install» to proceed with the
-      default path; recovery moves files to App afterwards. Without this,
-      the inner installer waits for a mouse click and the build stalls.
+    * Path consent («Choose Install Location», «Выберите папку установки») —
+      the inner installer may not understand /D= and shows its own path
+      dialog with default C:\\Program Files\\....  When ``target_dir`` is
+      given, the path edit of that page is replaced with it BEFORE «Next» is
+      clicked; otherwise the default is accepted and recovery moves files to
+      App afterwards.  Typing the real target keeps the host drive clean:
+      nothing is installed into Program Files in the first place.
     * General confirm («Continue»/«Agree»/«Accept») — click «Yes»/«OK».
 
     ``counter`` (optional dict) receives per-family tallies: "device" counts
     driver-consent dialogs, "language" counts language dialogs, "path" counts
-    path-consent dialogs, so the caller can log them honestly.
+    path-consent dialogs, "interactive" counts polls where the installer was
+    showing a wizard page and waiting for input, so the caller can log them
+    honestly (and stop early instead of waiting the whole idle limit).
+
+    ``pids`` restricts the automation to windows of the installer's own
+    process tree: without it a wizard-looking window of *another* program
+    could receive the target path.  ``state`` is an optional per-attempt
+    cache (hwnd → (page fingerprint, timestamp)) that prevents posting the
+    same «Next» to the same unchanged page forever.
 
     Returns how many buttons (or WM_CLOSE) were posted (0 on non-Windows).
     """
@@ -1863,6 +1882,9 @@ def _dismiss_installer_dialogs(
     clicked = 0
     BM_CLICK = 0x00F5
     WM_CLOSE = 0x0010
+    WM_SETTEXT = 0x000C
+    CB_SELECTSTRING = 0x014D
+    LB_FINDSTRING = 0x018F
 
     def window_text(hwnd) -> str:
         length = user32.GetWindowTextLengthW(hwnd)
@@ -1879,26 +1901,99 @@ def _dismiss_installer_dialogs(
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
+    wanted_pids = {int(pid) for pid in (pids or ()) if pid}
+
+    def window_pid(hwnd) -> int:
+        """PID процесса, которому принадлежит окно (0 — не удалось)."""
+        try:
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return int(pid.value)
+        except Exception:  # noqa: BLE001 - cross-process probe
+            return 0
+
+    def set_text(hwnd, value: str) -> bool:
+        """Заменить текст поля ввода в чужом процессе."""
+        try:
+            user32.SendMessageW(hwnd, WM_SETTEXT, 0,
+                                ctypes.c_wchar_p(str(value)))
+            return True
+        except Exception:  # noqa: BLE001 - окно могло закрыться
+            return False
+
+    def select_localised_item(hwnd, class_lower: str) -> bool:
+        """Выбрать «Русский» в списке/комбобоксе диалога языка."""
+        try:
+            cap = (class_lower or "").lower()
+            if "combobox" in cap:
+                for needle in ("русский", "russian", "ru"):
+                    got = user32.SendMessageW(
+                        hwnd, CB_SELECTSTRING, 0,
+                        ctypes.c_wchar_p(needle))
+                    if got not in (None, -1):
+                        return True
+            elif "list" in cap:
+                for needle in ("русский", "russian", "ru"):
+                    got = user32.SendMessageW(
+                        hwnd, LB_FINDSTRING, 0, ctypes.c_wchar_p(needle))
+                    if got not in (None, -1):
+                        user32.SendMessageW(hwnd, 0x0186, int(got), 0)
+                        return True
+        except Exception:  # noqa: BLE001 - элемент мог не найтись
+            return False
+        return False
+
+    def page_fingerprint(title: str, body: str) -> str:
+        return f"{title}\x00{body}"[:600]
+
+    def allow_click(hwnd, fingerprint: str, tag: str = "") -> bool:
+        """Не постить один и тот же клик в неизменившуюся страницу."""
+        if state is None:
+            return True
+        import time as _time
+
+        now = _time.monotonic()
+        key = (int(hwnd), tag)
+        previous = state.get(key)
+        if (previous is not None and previous[0] == fingerprint
+                and now - previous[1] < 10.0):
+            return False
+        state[key] = (fingerprint, now)
+        return True
+
     device_prompts = 0
     lang_prompts = 0
     path_prompts = 0
+    interactive_pages = 0
 
     def each_top(hwnd, _lparam):
         nonlocal clicked, device_prompts, lang_prompts, path_prompts
+        nonlocal interactive_pages
         if not user32.IsWindowVisible(hwnd):
+            return True
+        if wanted_pids and window_pid(hwnd) not in wanted_pids:
             return True
         title = window_text(hwnd)
         body_parts = [title]
         buttons: List[Tuple[object, str]] = []
+        edits: List[object] = []
+        lists: List[Tuple[object, str]] = []
 
         def collect(child, _lp):
             body_parts.append(window_text(child))
-            if class_name(child).lower() == "button":
-                buttons.append((child, window_text(child)))
+            caption = window_text(child)
+            cap = class_name(child).lower()
+            if "button" in cap:
+                buttons.append((child, caption))
+            elif "edit" in cap:
+                edits.append(child)
+            elif "combobox" in cap or "list" in cap:
+                lists.append((child, cap))
             return True
 
         user32.EnumChildWindows(hwnd, WNDENUMPROC(collect), 0)
         body = " ".join(body_parts)
+        fingerprint = page_fingerprint(title, body)
         # --- Windows Security: driver consent. Handled BEFORE the generic
         # pass, because here the ONLY acceptable click is «Установить».
         if installer_prompt_looks_like_device_driver(title, body):
@@ -1927,30 +2022,54 @@ def _dismiss_installer_dialogs(
         # waits for a mouse click, the watchdog sees only weak activity, and
         # the build stalls after the idle limit.
         if installer_prompt_looks_like_language_selection(title, body):
+            interactive_pages += 1
+            acted = False
             russian = [item for item in buttons
                        if installer_button_is_russian(item[1])]
             if russian:
-                user32.PostMessageW(russian[0][0], BM_CLICK, 0, 0)
-                clicked += 1
-                lang_prompts += 1
-            else:
-                # No Russian button found — click OK/Next to accept default.
-                proceed = [item for item in buttons
-                           if installer_button_is_proceed(item[1])]
-                if proceed:
-                    user32.PostMessageW(proceed[0][0], BM_CLICK, 0, 0)
+                if allow_click(hwnd, fingerprint, "lang"):
+                    user32.PostMessageW(russian[0][0], BM_CLICK, 0, 0)
                     clicked += 1
-                    lang_prompts += 1
+                    acted = True
+            else:
+                for handle, cap in lists:
+                    if select_localised_item(handle, cap):
+                        acted = True
+                        break
+            # Диалог может требовать ещё и подтверждения («ОК», «Далее»):
+            # выбор языка в списке сам установку не продолжает.
+            proceed = [item for item in buttons
+                       if installer_button_is_proceed(item[1])
+                       and not installer_button_is_russian(item[1])]
+            if proceed and allow_click(hwnd, fingerprint, "lang-ok"):
+                user32.PostMessageW(proceed[0][0], BM_CLICK, 0, 0)
+                clicked += 1
+                acted = True
+            if acted:
+                lang_prompts += 1
             return True
-        # --- Path consent: click «Next»/«Install» to proceed with default
-        # path. The inner installer may not understand /D= and shows its own
-        # path dialog. Clicking «Next» accepts the default; recovery moves
-        # files to App afterwards. Without this, the inner installer waits
-        # for a mouse click and the build stalls.
+        # --- Path consent: put OUR folder into the path field, then click
+        # «Next»/«Install». Ранее здесь просто нажималась кнопка «Далее», и
+        # установщик ставил программу в C:\Program Files: на системном
+        # диске оставалась вторая копия, а при отсутствии прав её нельзя
+        # было удалить. Ввод реального пути решает обе проблемы сразу.
         if installer_prompt_looks_like_path_consent(title, body):
+            interactive_pages += 1
+            typed = False
+            if target_dir:
+                for handle in edits:
+                    current = window_text(handle).strip()
+                    if not current:
+                        continue
+                    if (":\\" in current or ":/" in current
+                            or current.startswith("\\\\")):
+                        if set_text(handle, target_dir):
+                            typed = True
+                        break
             proceed = [item for item in buttons
                        if installer_button_is_proceed(item[1])]
-            if proceed:
+            if proceed and allow_click(hwnd, fingerprint,
+                                       "path" if typed else "path-default"):
                 user32.PostMessageW(proceed[0][0], BM_CLICK, 0, 0)
                 clicked += 1
                 path_prompts += 1
@@ -1966,10 +2085,10 @@ def _dismiss_installer_dialogs(
         # Overwrite: Yes To All is the right answer. Command-line error and
         # DirectX notices: OK. General confirm: Yes/OK. Never Cancel / No.
         targets = (preferred or fallback) if overwrite else (fallback or preferred)
-        if targets:
+        if targets and allow_click(hwnd, fingerprint, "confirm"):
             user32.PostMessageW(targets[0][0], BM_CLICK, 0, 0)
             clicked += 1
-        elif command_error:
+        elif command_error and allow_click(hwnd, fingerprint, "confirm-close"):
             # MessageBox without a reachable button: closing it equals OK.
             # Not used for a bare DirectX title — that might be a progress
             # window, and WM_CLOSE would cancel the install.
@@ -1984,6 +2103,8 @@ def _dismiss_installer_dialogs(
             counter["device"] = counter.get("device", 0) + device_prompts
             counter["language"] = counter.get("language", 0) + lang_prompts
             counter["path"] = counter.get("path", 0) + path_prompts
+            counter["interactive"] = (
+                counter.get("interactive", 0) + interactive_pages)
         return clicked
     if counter is not None:
         if device_prompts:
@@ -1992,6 +2113,9 @@ def _dismiss_installer_dialogs(
             counter["language"] = counter.get("language", 0) + lang_prompts
         if path_prompts:
             counter["path"] = counter.get("path", 0) + path_prompts
+        if interactive_pages:
+            counter["interactive"] = (
+                counter.get("interactive", 0) + interactive_pages)
     return clicked
 
 

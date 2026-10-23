@@ -357,6 +357,31 @@ class InstallWaitTests(unittest.TestCase):
         self.assertTrue(self.engine._install_stalled)
         self.assertIsNotNone(self.engine._install_stall)
 
+    def test_installer_wizard_is_stopped_before_the_general_idle_limit(self):
+        """Мастер с вопросами — не повод ждать 15 минут.
+
+        Регрессия на «сборка стоит на 38 %»: установщик показал страницу
+        выбора языка/папки и ждёт нажатия. Общий предел паузы рассчитан на
+        распаковку (15 минут), а здесь видно, что дело в мастере.
+        """
+        proc = _FakeProc()
+
+        def fake_dismiss(counter=None, **_kwargs):  # noqa: ANN001
+            if counter is not None:
+                counter["interactive"] = 1
+            return 1
+
+        started = time.monotonic()
+        with mock.patch.object(engine_mod, "INSTALL_GUI_PROMPT_LIMIT", 0.3), \
+                mock.patch.object(engine_mod.redist_mod,
+                                  "_dismiss_installer_dialogs",
+                                  fake_dismiss):
+            rc = self._run(proc, idle=30.0)
+        self.assertEqual(rc, engine_mod.redist_mod.TIMEOUT_EXIT_CODE)
+        self.assertLess(time.monotonic() - started, 10.0)
+        self.assertTrue(proc.killed)
+        self.assertTrue(self.engine._install_gui_seen)
+
     def test_weak_activity_alone_still_ends_as_a_stall(self):
         """Процессор и лог растут, файлы/диск нет — это затишье.
 

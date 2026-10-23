@@ -329,6 +329,73 @@ _VENDOR_PROFILES: Tuple[VendorProfile, ...] = (
 )
 
 
+# --- профили перепаковщиков ---------------------------------------------------
+#
+# Репак — это не движок и не вендор: это конкретная сборка, автор которой
+# заменил мастер установки своим скриптом. У KpoJIuK такой скрипт собран на Inno
+# Setup, но разбирает командную строку сам: привычные ключи Inno
+# (``/VERYSILENT``, ``/DIR=``) он не понимает и открывает мастер с вопросами о
+# языке и папке. Документированный синтаксис его сборок —
+# ``/S /RU /D=ПУТЬ`` (ключ пути последним, без кавычек).
+#
+# Без такого профиля Portablizer выбирал команду по движку (Inno), установщик
+# показывал окно выбора языка и путь по умолчанию, сборка стояла на месте, а
+# каждый следующий сценарий лестницы открывал мастер заново — пользователь
+# видел один и тот же вопрос несколько раз.
+
+@dataclass(frozen=True)
+class RepackProfile:
+    """Документированная командная строка известного перепаковщика."""
+
+    name: str                          # автор репака (для журнала)
+    product: str                       # продукт, который он перепаковывает
+    filename_re: re.Pattern            # как называется файл репака
+    silent_switch: str = "/S"          # «тихий режим» этого скрипта
+    path_switch: str = "/D="           # ключ папки — последним, без кавычек
+    #: Код языка (``ru``) -> короткий ключ (``/RU``). Пустой кортеж — язык
+    #: скрипт не принимает.
+    language_switches: Tuple[Tuple[str, str], ...] = ()
+    hosts: Tuple[str, ...] = ()
+    #: Движок, на котором собран репак: важен для подсказок и для запасных
+    #: сценариев (распаковка, отчёт о журнале).
+    engine_hint: InstallerType = InstallerType.INNO
+
+
+_REPACK_PROFILES: Tuple[RepackProfile, ...] = (
+    # SketchUp Pro RePack by KpoJIuK (например, SketchUp Pro v26.1.189.exe).
+    # Документированные параметры (публикуются вместе с раздачей):
+    #   Тихая установка русской версии: /S /RU
+    #   Тихая установка английской версии: /S /EN
+    #   Выбор места установки: /D=ПУТЬ (указывать самым последним)
+    # Официальный установщик Trimble называется иначе (SketchUpFull-… exe /
+    # SketchUpPro-… exe), собирается WiX Burn и сюда не попадает.
+    RepackProfile(
+        name="KpoJIuK",
+        product="SketchUp Pro",
+        # Именно «SketchUp Pro <версия с точками>» (репак) или прямое
+        # упоминание автора. Официальный файл Trimble называется
+        # «SketchUpFull-2026-…exe» / «SketchUpPro-2026-0-…exe» (дефисы, не
+        # точки) и, главное, собирается WiX Burn — такой профиль к нему не
+        # применяется.
+        filename_re=re.compile(
+            r"^\s*sketchup[\s._-]*pro\b.*\bv?\d+(?:\.\d+){2,}"
+            r"|repack[\s._-]*by[\s._-]*kpojiuk",
+            re.IGNORECASE),
+        language_switches=(("ru", "/RU"), ("en", "/EN")),
+        hosts=("sketchup.com", "trimble.com"),
+    ),
+)
+
+
+def _repack_profile(path: str) -> Optional[RepackProfile]:
+    """Профиль перепаковщика по стандартизованному имени файла."""
+    basename = os.path.basename(path)
+    for profile in _REPACK_PROFILES:
+        if profile.filename_re.search(basename):
+            return profile
+    return None
+
+
 def _vendor_profile(path: str) -> Optional[VendorProfile]:
     """Профиль производителя по имени файла установщика.
 
@@ -778,6 +845,10 @@ class DetectionResult:
     media_size: int = 0
     #: Профиль онлайн-продукта с известной причиной, почему stub не портативен.
     online_product: Optional[OnlineOnlyProduct] = None
+    #: Профиль известного перепака (KpoJIuK и т. п.). Установщик такого файла
+    #: — обычно Inno Setup с СОБСТВЕННЫМ разбором командной строки: движковые
+    #: ключи молча не работают, а сборка открывает мастер и ждёт мышку.
+    repack_profile: Optional[RepackProfile] = None
 
     @property
     def human(self) -> str:
@@ -991,9 +1062,39 @@ def detect_installer(path: str) -> DetectionResult:
             vendor_args=list(profile.fixed_args),
             vendor_name=profile.name)
 
+    # Профиль перепака. Применяется к сборкам Inno/универсальным, но НЕ к
+    # настоящим бандлам Trimble (WiX Burn) и не к MSI: у официального
+    # установщика SketchUp свои ключи, и чужая команда ему только навредит.
+    repack: Optional[RepackProfile] = None
+    if profile is None:
+        candidate = _repack_profile(path)
+        if candidate is not None and result.installer_type in (
+                InstallerType.INNO, InstallerType.SELF_EXTRACT,
+                InstallerType.NSIS, InstallerType.UNKNOWN,
+                InstallerType.SQUIRREL):
+            repack = candidate
+            result.repack_profile = candidate
+            if not result.vendor_name:
+                result.vendor_name = candidate.name
+            language_keys = ", ".join(
+                key for _code, key in candidate.language_switches) or "—"
+            result.evidence.append(
+                f"перепак {candidate.name}: {candidate.product}; "
+                f"документированная тихая установка — {candidate.silent_switch} "
+                f"<язык> {candidate.path_switch}<папка>, ключ пути последним, "
+                f"без кавычек; ключи языка — {language_keys}. Стандартные "
+                "ключи Inno Setup (/VERYSILENT /DIR=) этот скрипт не "
+                "разбирает: он открывает мастер с выбором языка и папки"
+            )
+
     if profile is None:
         result.switch_hints = list(scan.switches)
         result.license_urls = list(scan.urls)
+        if repack is not None:
+            result.switch_hints = list(result.switch_hints) + [
+                repack.silent_switch, repack.path_switch,
+                *[key for _code, key in repack.language_switches],
+            ]
     result.requires_admin = scan.requires_admin
     result.is_dotnet = pe.is_dotnet
     result.sections = list(pe.sections)

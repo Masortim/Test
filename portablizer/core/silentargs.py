@@ -32,8 +32,9 @@ from typing import List, Optional, Sequence
 
 from .detect import (
     TRUSTED_CONFIDENCE, DetectionResult, InstallerType, InstallShieldGeneration,
+    RepackProfile,
 )
-from .languages import find_language, plan_language
+from .languages import find_language, os_ui_language_code, plan_language
 
 #: Больше попыток запускать бессмысленно: каждая стоит времени пользователя.
 MAX_ATTEMPTS = 6
@@ -626,6 +627,145 @@ def _effective_type(detection: DetectionResult) -> InstallerType:
     return detection.installer_type
 
 
+# --- известные перепаки -------------------------------------------------------
+#
+# Скрипт перепака разбирает командную строку сам. Документированный синтаксис
+# у каждого автора свой, и «универсальная» команда движка для него — набор
+# неизвестных аргументов: установщик показывает мастер (язык, папка) и ждёт
+# мышку. Поэтому лестница строится от опубликованной команды, а не от типа
+# движка.
+
+def _repack_language_order(profile: RepackProfile,
+                           language: str) -> List[Tuple[str, str]]:
+    """Порядок ключей языка: выбранный человеком → язык Windows → остальные.
+
+    Репак KpoJIuK без ``/RU`` или ``/EN`` открывает окно выбора языка, поэтому
+    «язык по умолчанию» здесь не пустой ключ, а язык интерфейса Windows.
+    """
+    switches = list(profile.language_switches or ())
+    if not switches:
+        return []
+    preferred = find_language(language) if (language or "").strip() else None
+    wanted = preferred.code.split("-")[0].lower() if preferred else ""
+    if not wanted:
+        wanted = os_ui_language_code()
+    ordered: List[Tuple[str, str]] = []
+    for code, switch in switches:
+        if code.casefold() == wanted.casefold():
+            ordered.append((code, switch))
+    for item in switches:
+        if item not in ordered:
+            ordered.append(item)
+    return ordered
+
+
+def build_repack_attempts(
+    profile: RepackProfile,
+    installer_path: str,
+    target_dir: str,
+    log_dir: str = "",
+    extra_args: Optional[Sequence[str]] = None,
+    language: str = "",
+) -> List[SilentPlan]:
+    """Лестница команд для документированного перепака.
+
+    Порядок намеренно повторяет документацию автора:
+
+    1. ``/S <язык> /D=<App>`` — «тихая установка нужного языка в нашу папку»;
+    2. ``/S <язык>`` — без пути: скрипт поставит в Program Files, и recovery
+       перенесёт файлы в App (``ignores_target_dir``);
+    3. стандартная команда Inno Setup — на случай, если перед нами всё-таки
+       обычный Inno Setup, а имя файла совпало случайно.
+
+    Ключ пути передаётся «сырым» хвостом без кавычек: так его разбирает
+    скрипт репака (как NSIS ``/D=``).
+    """
+    native_target = _native(target_dir)
+    installer_path = _norm(installer_path)
+    target_dir = _norm(target_dir)
+    user_extra = list(extra_args or [])
+    silence = profile.silent_switch or "/S"
+    path_switch = profile.path_switch or ""
+    attempts: List[SilentPlan] = []
+
+    language_pairs = _repack_language_order(profile, language)
+    chosen = find_language(language) if (language or "").strip() else None
+    chosen_short = chosen.code.split("-")[0].casefold() if chosen else ""
+    if chosen and language_pairs and language_pairs[0][0].casefold() == chosen_short:
+        language_note = (f"Язык установки: {chosen.title} — ключом "
+                         f"{language_pairs[0][1]}.")
+    elif language_pairs:
+        language_note = (
+            "Язык не выбран: репак без короткого ключа (/RU, /EN) открывает "
+            "окно выбора языка, поэтому передаётся язык интерфейса Windows "
+            f"({language_pairs[0][1]}). Выбрать язык вручную можно в поле "
+            "«Язык установки».")
+    else:
+        language_note = ""
+
+    def add(lang_switch: str, with_path: bool, note: str) -> None:
+        args = [silence]
+        if lang_switch:
+            args.append(lang_switch)
+        args.extend(user_extra)
+        raw_tail = (f"{path_switch}{target_dir}"
+                    if with_path and path_switch else None)
+        label = f"{profile.name}: {silence}"
+        if lang_switch:
+            label += f" {lang_switch}"
+        label += f" {path_switch}<App>" if raw_tail else " без пути"
+        attempts.append(SilentPlan(
+            program=installer_path,
+            args=args,
+            raw_tail=raw_tail,
+            notes=[note] + ([language_note] if language_note else []),
+            label=label,
+            output_dir=native_target,
+            ignores_target_dir=not with_path,
+        ))
+
+    documented_note = (
+        f"{profile.name} ({profile.product}): документированная команда — "
+        f"{silence} <язык> {path_switch}<папка>, ключ пути последним и без "
+        "кавычек, как у NSIS."
+    )
+
+    # 1. Документированная команда: язык + папка (сначала предпочтительный
+    #    язык, затем второй из тех, что знает скрипт).
+    for _code, switch in language_pairs:
+        add(switch, True, documented_note)
+    # 2. То же без ключа языка — если человек выбрал «как в установщике», а
+    #    у репака есть язык по умолчанию и мастер он не показывает.
+    add("", True, documented_note)
+    # 3. Без пути: скрипт поставит в Program Files, recovery заберёт файлы
+    #    в App и удалит оригинал. Это лучше, чем ещё один мастер с вопросом.
+    no_path_note = (
+        "Путь в командной строке не передан: скрипт поставит программу в "
+        "папку по умолчанию, Portablizer перенесёт её в App и удалит "
+        "оригинал из Program Files.")
+    for _code, switch in language_pairs:
+        add(switch, False, no_path_note)
+    add("", False, no_path_note)
+
+    # 4. Запасной путь: если это всё-таки обычный Inno Setup с необычным
+    #    именем файла, сработают его штатные ключи.
+    inno_language = find_language(language) if (language or "").strip() else None
+    inno_args = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
+    if inno_language is not None:
+        inno_args.append(f"/LANG={inno_language.inno_name}")
+    attempts.append(SilentPlan(
+        program=installer_path,
+        args=inno_args + user_extra,
+        raw_tail=f"/DIR={target_dir}",
+        notes=["Стандартная команда Inno Setup — если имя файла совпало с "
+               "репаком случайно и перед нами обычный установщик Inno."],
+        label=f"{profile.name}: запасной вариант Inno Setup /VERYSILENT /DIR=",
+        output_dir=native_target,
+        ignores_target_dir=True,
+    ))
+    return attempts
+
+
 def build_attempts(
     detection: DetectionResult,
     installer_path: str,
@@ -734,6 +874,16 @@ def build_attempts(
                 output_dir=native_target,
             ))
         return attempts[:STUB_MAX_ATTEMPTS]
+
+    # Известный перепак: документированная команда автора сборки важнее
+    # любых догадок по движку. Скрипт репака открывает мастер на «чужие»
+    # ключи Inno, поэтому здесь нельзя примешивать /LANG= и /DIR=.
+    repack = getattr(detection, "repack_profile", None)
+    if isinstance(repack, RepackProfile):
+        return build_repack_attempts(
+            repack, installer_path, target_dir,
+            log_dir=log_dir, extra_args=user_extra, language=language,
+        )[:MAX_ATTEMPTS + 2]
 
     if itype == InstallerType.CUSTOM_CLI:
         attempts.append(build_custom_cli_plan(

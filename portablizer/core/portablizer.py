@@ -60,7 +60,9 @@ from . import registry as reg_mod
 from . import saves as saves_mod
 from . import space as space_mod
 from . import unpacker as unpacker_mod
-from .detect import DetectionResult, InstallerType, detect_installer, read_pe_info
+from .detect import (
+    DetectionResult, InstallerType, RepackProfile, detect_installer, read_pe_info,
+)
 from .logutil import Logger
 from .languages import find_language, plan_language
 from .silentargs import (
@@ -112,6 +114,15 @@ INSTALL_DIR_SCAN_SECONDS = 20.0
 #: вопрос «ждать ещё?» не должен всплывать каждые несколько секунд. Тесты и
 #: внешние сценарии переопределяют это значение, а не обходят его.
 INSTALL_IDLE_FLOOR = 30.0
+
+#: Сколько ждать мастер установщика, который показывает страницы и ждёт
+#: нажатий. Обычный предел паузы (15 минут) рассчитан на распаковку: там
+#: молчание процесса ещё может означать «пишет большие файлы». Мастер же
+#: стоит ровно потому, что ему не нажали «Далее», и держать сборку четверть
+#: часа — это и есть «зависло на 38 %». Поэтому, как только на экране
+#: распознана страница выбора языка/папки и признаков работы нет, попытка
+#: заканчивается через минуту-полторы, а не через INSTALL_IDLE_LIMIT.
+INSTALL_GUI_PROMPT_LIMIT = 90.0
 
 #: Короткие быстрые «успехи» без payload обычно означают, что команда
 #: проигнорирована либо перед нами web-downloader. Двух подряд достаточно,
@@ -891,6 +902,9 @@ class Portablizer:
         self._install_stalled = False
         #: Доклад о последнем затишье: по нему строятся подсказки.
         self._install_stall: Optional[InstallStall] = None
+        #: Установщик открывал собственный мастер (язык/папка) и ждал
+        #: нажатий — из этого строится отдельная подсказка в отчёте.
+        self._install_gui_seen = False
         #: Папка TEMP, из которой работает установщик. По умолчанию —
         #: ``PortableData\Temp``; может быть перенесена на другой диск, если на
         #: диске портатива для распаковки не хватает места (см.
@@ -1631,6 +1645,7 @@ class Portablizer:
             self._installshield_result = None
             self._install_stalled = False
             self._install_stall = None
+            self._install_gui_seen = False
             # Всё, что относится к диагностике падений и временному месту
             # установщика, начинается заново: один и тот же объект может
             # собирать несколько портативов подряд.
@@ -1895,7 +1910,8 @@ class Portablizer:
             # каталоги, имя которых совпадает с приложением.
             if self._find_main_exe(app_dir, name):
                 leftover = self._cleanup_leftover_install_dirs(
-                    name, opts.installer_path, opts, data_dir)
+                    name, opts.installer_path, opts, data_dir,
+                    before=install_locations_before, app_dir=app_dir)
                 if leftover:
                     self.log.ok(
                         f"Удалено {len(leftover)} брошенных каталог(ов) "
@@ -2252,6 +2268,32 @@ class Portablizer:
 
         if self._install_stalled:
             hints.extend(self._stall_hints())
+
+        repack = getattr(det, "repack_profile", None)
+        if isinstance(repack, RepackProfile):
+            keys = ", ".join(
+                f"{repack.silent_switch} {key}"
+                for _code, key in repack.language_switches) or repack.silent_switch
+            hints.append(
+                f"Это перепак {repack.name} ({repack.product}). Его скрипт "
+                "понимает только документированную команду: "
+                f"{keys} и {repack.path_switch}<папка> — ключ пути последним, "
+                "без кавычек. Ключи Inno Setup (/VERYSILENT, /DIR=) для него "
+                "неизвестны: установщик открывает мастер с выбором языка и "
+                "папки. Выберите язык в поле «Язык установки» (или оставьте "
+                "«как в установщике» — тогда берётся язык Windows) и повторите "
+                "сборку."
+            )
+
+        if getattr(self, "_install_gui_seen", False):
+            hints.append(
+                "Установщик показывал собственный мастер (язык/папка) вместо "
+                "тихой установки — значит, переданные ключи ему не подошли. "
+                "Portablizer сам отвечал на страницы и вводил папку App, но "
+                "если мастер всё равно не продвинулся, посмотрите "
+                "installer-output.log: там видно, какая команда и какой код "
+                "возврата были у каждого сценария."
+            )
 
         # Падение установщика: свой диагноз и свои шаги. Общие советы про
         # «непонятую командную строку» здесь были бы прямым обманом.
@@ -3000,6 +3042,13 @@ class Portablizer:
         last_report = -1
         dismissed = 0
         last_dismiss_log = 0.0
+        # Состояние страниц мастера: какой клик уже отправлен и когда. Без
+        # него «Далее» уходило бы в ту же неизменившуюся страницу каждые
+        # полсекунды, прокручивая мастер рывками.
+        dialog_state: Dict[object, Tuple[str, float]] = {}
+        interactive_since = 0.0
+        tree_pids: List[int] = [proc.pid]
+        tree_refresh = 0.0
         while proc.poll() is None:
             now = time.monotonic()
             if self.cancel.is_set():
@@ -3010,14 +3059,42 @@ class Portablizer:
             # закрываем оставшееся окно сами — не сбрасывая таймер паузы.
             try:
                 tally: Dict[str, int] = {}
+                if now - tree_refresh >= 5.0:
+                    tree_pids = procutil.process_tree(proc.pid) or [proc.pid]
+                    tree_refresh = now
                 try:
-                    clicked = redist_mod._dismiss_installer_dialogs(tally)
+                    # target_dir — чтобы на странице выбора папки ввести
+                    # путь в App, а не согласиться с C:\\Program Files.
+                    # pids — чтобы не трогать окна чужих программ.
+                    clicked = redist_mod._dismiss_installer_dialogs(
+                        tally, target_dir=app_dir, pids=tree_pids,
+                        state=dialog_state)
                 except TypeError:
-                    # Совместимость с заменённой/старой реализацией без счётчика.
-                    clicked = redist_mod._dismiss_installer_dialogs()
+                    # Совместимость с заменённой/старой реализацией:
+                    # сначала только счётчик, затем вовсе без аргументов.
+                    try:
+                        clicked = redist_mod._dismiss_installer_dialogs(tally)
+                    except TypeError:
+                        clicked = redist_mod._dismiss_installer_dialogs()
                 self._device_prompt_hits += int(tally.get("device", 0))
+                if tally.get("interactive"):
+                    if not interactive_since:
+                        interactive_since = now
+                        if not self._install_gui_seen:
+                            self._install_gui_seen = True
+                            self.log.warn(
+                                "Установщик открыл собственный мастер "
+                                "(страница выбора языка или папки) — "
+                                "значит, тихие ключи не подошли. Portablizer "
+                                "отвечает на страницы сам и вводит папку App; "
+                                "если мастер не продвинется, попытка будет "
+                                "остановлена без ожидания общего предела."
+                            )
+                else:
+                    interactive_since = 0.0
             except Exception:  # noqa: BLE001 — WinAPI не вправе ронять сборку
                 clicked = 0
+                interactive_since = 0.0
             if clicked:
                 dismissed += clicked
                 if now - last_dismiss_log >= 5.0:
@@ -3058,6 +3135,33 @@ class Portablizer:
             if deadline and elapsed > deadline:
                 self._note_stall(watchdog, plan, elapsed, idle, idle_limit,
                                  deadline, reason="достигнут предел времени")
+                self._stop_installer(proc)
+                return redist_mod.TIMEOUT_EXIT_CODE
+            # Мастер с вопросами: не ждать INSTALL_IDLE_LIMIT. Установщик
+            # стоит не потому, что распаковывает гигабайты, а потому, что
+            # ему не нажали кнопку. Спрашиваем человека так же, как при
+            # обычном затишье, но уже через INSTALL_GUI_PROMPT_LIMIT.
+            if (not plan.interactive and interactive_since
+                    and idle >= INSTALL_GUI_PROMPT_LIMIT):
+                self.log.warn(
+                    "Установщик показывает мастер и ждёт нажатий: страница "
+                    f"выбора языка/папки не меняется {redist_mod.human_duration(idle)}. "
+                    "Это не долгая распаковка — без ответа сборка стояла бы "
+                    f"весь предел ({redist_mod.human_duration(idle_limit)})."
+                )
+                verdict = self._ask_about_stall(
+                    watchdog.report(plan.label, elapsed, idle,
+                                    INSTALL_GUI_PROMPT_LIMIT, deadline))
+                if verdict == STALL_WAIT:
+                    last_work = time.monotonic()
+                    interactive_since = 0.0
+                    continue
+                if verdict == STALL_CANCEL:
+                    self._stop_installer(proc)
+                    raise RuntimeError("Операция отменена пользователем.")
+                self._note_stall(watchdog, plan, elapsed, idle,
+                                 INSTALL_GUI_PROMPT_LIMIT, deadline,
+                                 reason="мастер установщика ждёт нажатий")
                 self._stop_installer(proc)
                 return redist_mod.TIMEOUT_EXIT_CODE
             if idle >= idle_limit:
@@ -4072,21 +4176,57 @@ class Portablizer:
                         return found
         return found
 
+    #: Слова, которые не могут быть «именем продукта»: названия версий,
+    #: редакций и обёрток («Pro», «Full Edition», «Setup»).
+    _GENERIC_NAME_WORDS = frozenset({
+        "the", "and", "for", "pro", "plus", "premium", "ultimate", "deluxe",
+        "studio", "classic", "standard", "enterprise", "professional",
+        "home", "student", "education", "full", "edition", "version",
+        "setup", "install", "installer", "portable", "repack", "game",
+        "download", "free", "win", "windows", "x64", "x86", "amd64",
+    })
+
+    #: Хвост «версия/редакция» после имени продукта: SketchUp 2026,
+    #: SketchUp Pro. Такой каталог считается тем же продуктом.
+    _EDITION_TAIL_RE = re.compile(
+        r"^(?:(?:19|20)\d{2}|v\d+|pro|plus|premium|ultimate|deluxe|studio|"
+        r"classic|standard|enterprise|professional|home|student|education|"
+        r"full|x64|x86|win(?:32|64))+$",
+        re.IGNORECASE,
+    )
+
     @staticmethod
     def _name_keys(app_name: str, installer_path: str) -> Set[str]:
-        """Формирует нормализованные имена для оценки найденных файлов."""
+        """Формирует нормализованные имена для оценки найденных файлов.
+
+        Кроме полного названия добавляется ключ-слово продукта. Это важно для
+        репаков: имя файла — «SketchUp Pro v26.1.189», а каталог установки —
+        просто «SketchUp». Без ключа «sketchup» такой каталог в Program Files
+        не совпадал ни с одним ключом (полное имя содержит версию) и потому
+        не удалялся после переноса в App.
+        """
         values = [app_name, os.path.splitext(os.path.basename(installer_path))[0]]
-        keys: Set[str] = set()
+        version_re = re.compile(
+            r"\b(?:v\.?\s*)?\d+(?:\.\d+){1,4}\b|\b(?:19|20)\d{2}\b",
+            re.IGNORECASE)
         suffixes = re.compile(
             r"(?:[\s._-]*(?:setup|installer|install|portable|win(?:32|64)|"
             r"x(?:86|64)|amd64|online|offline|latest|[0-9]+(?:\.[0-9]+)*))+$",
             re.IGNORECASE,
         )
+        keys: Set[str] = set()
         for value in values:
-            value = suffixes.sub("", value).strip()
-            normalized = "".join(ch for ch in value.casefold() if ch.isalnum())
+            cleaned = version_re.sub(" ", value or "")
+            cleaned = suffixes.sub("", cleaned).strip()
+            normalized = "".join(ch for ch in cleaned.casefold() if ch.isalnum())
             if len(normalized) >= 2:
                 keys.add(normalized)
+            # Первое содержательное слово названия — имя продукта.
+            for word in re.split(r"[\s._+\-()\[\]]+", cleaned):
+                token = "".join(ch for ch in word.casefold() if ch.isalnum())
+                if len(token) >= 4 and token not in Portablizer._GENERIC_NAME_WORDS:
+                    keys.add(token)
+                    break
         return keys
 
     @staticmethod
@@ -4097,6 +4237,11 @@ class Portablizer:
         for key in keys:
             if normalized == key:
                 score = max(score, 220)
+            elif (normalized.startswith(key)
+                  and Portablizer._EDITION_TAIL_RE.match(
+                      normalized[len(key):] or "")):
+                # «SketchUp 2026» / «SketchUp Pro» — тот же продукт.
+                score = max(score, 210)
             elif key in normalized or normalized in key:
                 score = max(score, 125)
         bad = (
@@ -4224,17 +4369,23 @@ class Portablizer:
 
     def _cleanup_leftover_install_dirs(
             self, name: str, installer_path: str,
-            opts: "PortableOptions", data_dir: str = "") -> List[str]:
+            opts: "PortableOptions", data_dir: str = "",
+            before: "Optional[Dict[str, Set[str]]]" = None,
+            app_dir: str = "") -> List[str]:
         """Удаляет брошенные каталоги установки из Program Files и профилей.
 
-        Внутренний установщик верстака SFX может поставить программу в
+        Установщик (особенно мастер репака) может поставить программу в
         C:\\Program Files\\<имя>, даже если recovery уже забрал файлы в App:
-        оригинал может остаться, если recovery не нашёл его (не совпало имя,
-        не попал в search roots) или не удалил из-за ошибки прав.
+        оригинал остаётся, если recovery не нашёл его (не совпало имя, не
+        попал в search roots) или не удалил из-за ошибки прав. На системном
+        диске при этом живёт вторая копия программы, и пользователь видит
+        «программа всё равно установилась».
 
-        Сканирует только каталоги установки (Program Files, Program Files
-        (x86), ProgramData) и удаляет те, имя которых совпадает с именем
-        приложения. Ничего другого не трогает.
+        Сканирует до двух уровней вглубь (Program Files, Program Files (x86),
+        ProgramData, LOCALAPPDATA\\Programs) и удаляет только каталоги,
+        которых ДО установки не было, чьё имя совпадает с приложением и
+        внутри которых есть exe. Предустановленную программу с тем же именем
+        не трогает: ``before`` — снимок, сделанный до запуска установщика.
         """
         if not IS_WINDOWS:
             return []
@@ -4255,44 +4406,67 @@ class Portablizer:
         for root in search_roots + user_roots:
             if not root or not os.path.isdir(root):
                 continue
+            root_key = os.path.normcase(os.path.abspath(root))
+            old_entries = (before or {}).get(root_key)
+            if before is not None and old_entries is None:
+                # Снимка именно этого корня нет (например, переменную
+                # окружения поменяли между снимком и уборкой). Удалять без
+                # снимка нельзя: под «похожее имя» может попасть чужая,
+                # давно установленная программа.
+                continue
+            old_entries = old_entries or set()
+            gone: Set[str] = set()
             try:
-                for entry in os.scandir(root):
-                    if not entry.is_dir(follow_symlinks=False):
-                        continue
-                    entry_name = entry.name
-                    # Проверяем совпадение имени с приложением.
-                    if self._name_score(entry_name, keys) < 200:
-                        continue
-                    entry_path = os.path.abspath(entry.path)
-                    # Не трогаем каталоги внутри портативного профиля.
-                    if data_abs and (
-                            os.path.normcase(entry_path) == os.path.normcase(data_abs)
-                            or os.path.normcase(entry_path).startswith(
-                                os.path.normcase(data_abs) + os.sep)):
-                        continue
-                    # Не трогаем App — это наш результат.
-                    if os.path.normcase(entry_path) == os.path.normcase(
-                            os.path.abspath(opts.app_dir)):
-                        continue
-                    # Проверяем, что внутри есть exe — иначе это не
-                    # каталог установки приложения.
-                    exes = self._find_executables(entry_path, limit=5)
-                    if not exes:
-                        continue
-                    self.log.info(
-                        f"Найден брошенный каталог установки: {entry_path}")
-                    try:
-                        shutil.rmtree(entry_path, ignore_errors=False)
-                        removed.append(entry_path)
-                        self.log.ok(
-                            f"Удалено: {entry_path}")
-                    except OSError as exc:
-                        self.log.warn(
-                            f"Не удалось удалить брошенный каталог "
-                            f"{entry_path}: {exc}. Проверьте права "
-                            "администратора.")
+                entries = self._location_entries(root)
             except OSError:
                 continue
+            for entry_path, entry_name, is_dir, _is_file in entries:
+                if not is_dir:
+                    continue
+                entry_abs = os.path.abspath(entry_path)
+                entry_key = os.path.normcase(entry_abs)
+                # Родитель уже удалён — его потомков обрабатывать нечего.
+                if any(entry_key == item or entry_key.startswith(item + os.sep)
+                       for item in gone):
+                    continue
+                if self._name_score(entry_name, keys) < 200:
+                    continue
+                # Каталог должен появиться именно в этой установке: иначе это
+                # чужая, ранее установленная программа с похожим именем.
+                if before is not None and entry_key in old_entries:
+                    continue
+                # Не трогаем каталоги внутри портативного профиля.
+                if data_abs and (
+                        entry_key == os.path.normcase(data_abs)
+                        or entry_key.startswith(
+                            os.path.normcase(data_abs) + os.sep)):
+                    continue
+                # Не трогаем App — это наш результат. Раньше здесь
+                # читалось opts.app_dir, которого у PortableOptions нет:
+                # первое же совпадение имени роняло всю сборку
+                # AttributeError уже после успешной установки.
+                result_dir = app_dir or getattr(opts, "app_dir", "")
+                if result_dir and entry_key == os.path.normcase(
+                        os.path.abspath(result_dir)):
+                    continue
+                # Проверяем, что внутри есть exe — иначе это не каталог
+                # установки приложения.
+                if not self._find_executables(entry_abs, limit=5):
+                    continue
+                self.log.info(
+                    f"Найден брошенный каталог установки: {entry_abs}")
+                try:
+                    shutil.rmtree(entry_abs, ignore_errors=False)
+                    removed.append(entry_abs)
+                    gone.add(entry_key)
+                    self.log.ok(f"Удалено: {entry_abs}")
+                except OSError as exc:
+                    self.log.warn(
+                        f"Не удалось удалить брошенный каталог "
+                        f"{entry_abs}: {exc}. Проверьте права "
+                        "администратора.")
+                    # Повторять для вложенных каталогов бессмысленно.
+                    gone.add(entry_key)
         return removed
 
     def _remove_recovered_source(self, source: str, app_dir: str,
@@ -4912,11 +5086,11 @@ class Portablizer:
         main_abs = os.path.join(portable_dir, main_exe_rel.replace("/", os.sep))
         main_dir = os.path.dirname(main_abs)
         main_base = os.path.basename(main_abs).lower()
-        electron_host = (
-            os.path.isfile(os.path.join(main_dir, "chrome_elf.dll"))
-            or os.path.isfile(os.path.join(main_dir, "libcef.dll"))
-            or os.path.isfile(os.path.join(main_dir, "resources", "app.asar"))
-        )
+        # Только настоящий Electron/NW.js. Раньше здесь хватало
+        # ``libcef.dll``, и SketchUp (встроенный CEF для браузерных панелей)
+        # получал Chromium-ключи, на которые отвечает окном «Unknown options:
+        # no-sandbox, disable-gpu-sandbox, disable-features» и не запускается.
+        electron_host = launcher_mod.is_electron_app(main_abs)
         webview2_host = (
             not electron_host
             and (
@@ -4927,11 +5101,7 @@ class Portablizer:
         if electron_host and not main_base.endswith("ollama.exe"):
             extra_env.setdefault("ELECTRON_NO_SANDBOX", "1")
             extra_env.setdefault("ELECTRON_DISABLE_SANDBOX", "1")
-            target_args = [
-                "--no-sandbox",
-                "--disable-gpu-sandbox",
-                "--disable-features=RendererCodeIntegrity",
-            ]
+            target_args = list(launcher_mod.ELECTRON_CHROMIUM_FLAGS)
         if webview2_host:
             extra_env.setdefault(
                 "WEBVIEW2_USER_DATA_FOLDER",
