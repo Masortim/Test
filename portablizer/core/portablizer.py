@@ -737,6 +737,10 @@ class _InstallWatchdog:
         self._next_probe = 0.0
         self._next_dir_scan = 0.0
         self._fingerprint: Tuple = ()
+        #: Признаки реальной работы (без логов и процессора) — последнее
+        #: изменение и сам fingerprint, чтобы знать, что опрос уже состоялся.
+        self._strong_fingerprint: Tuple = ()
+        self._strong_changed = False
         self.samples = 0
         self.io_bytes = 0
         self.cpu_seconds = 0.0
@@ -779,11 +783,27 @@ class _InstallWatchdog:
         return (self.processes, self.io_bytes, int(self.cpu_seconds * 10),
                 self.files, self.bytes, self.log_bytes)
 
+    def _strong_now(self) -> Tuple:
+        """Признаки реальной работы: процессы, диск, целевая папка.
+
+        Лог и счётчик процессора сюда не входят: у встроенного установщика
+        верстака SFX (особенно у верстальщиков, которые ставят «разогнанную»
+        версию) процессор мелькает и лог растёт, когда внутренний
+        установщик уже завис — и наоборот. Для таймаута затишья честным
+        признаком «работает» являются только процессы, диск и файлы, а
+        слабые признаки идут на вывод в журнал, но не удерживают якорь
+        непрерывной работы (см. ``strong_changed``).
+        """
+        return (self.processes, self.io_bytes, self.files, self.bytes)
+
     def poll(self, now: Optional[float] = None) -> bool:
         """``True``, если установщик подал признаки работы с прошлого опроса.
 
         Первый опрос всегда считается работой: установщик только что
         запустился, и ждать от него счётчиков раньше времени нечего.
+        Любое изменение счётчиков (включая слабые — лог, процессор)
+        считается прогрессом, чтобы таймер затишья не тикали при
+        правильном, но тихим установщике.
         """
         now = time.monotonic() if now is None else float(now)
         if self.samples and now < self._next_probe:
@@ -793,8 +813,24 @@ class _InstallWatchdog:
         current = self._fingerprint_now()
         changed = self.samples == 0 or current != self._fingerprint
         self._fingerprint = current
+        strong = self._strong_now()
+        self._strong_changed = (self.samples == 0
+                                or strong != self._strong_fingerprint)
+        self._strong_fingerprint = strong
         self.samples += 1
         return changed
+
+    def strong_changed(self) -> bool:
+        """Изменились ли признаки реальной работы на последнем опросе.
+
+        Вернёт ``True`` на первом опросе (установка только что началась)
+        и при любом изменении процессов, счётчиков ввода-вывода, файлов или
+        объёма в целевой папке. Изменения журнала и счётчика процессора
+        сами по себе это значение не обновляют — иначе установщик, который
+        завис внутри верстака, но сохраняет процессор и лог в движении,
+        никогда не спросит, что с ним сделать.
+        """
+        return self._strong_changed
 
     # -- отчёт ---------------------------------------------------------------
     def summary(self) -> str:
@@ -2981,7 +3017,12 @@ class Portablizer:
                         "устройства и подобные). Таких окон за эту попытку: "
                         f"{dismissed}."
                     )
-            if watchdog.poll(now):
+            if watchdog.poll(now) and watchdog.strong_changed():
+                # Якорь «установщик работает» тянем только по признакам
+                # реальной работы (процессы, диск, файлы): лог и процессор
+                # могут двигаться, когда внутри верстака SFX завис
+                # внутренний установщик — а тогда затишье не получится
+                # распознать и вопрос «с чем дела» не зададут.
                 last_work = now
             elapsed = now - started
             idle = now - last_work

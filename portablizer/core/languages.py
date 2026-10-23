@@ -16,7 +16,12 @@
                      ``russian``: неверный ключ Inno молча ставит язык по
                      умолчанию — английский;
   * NSIS           — ``/LANG=<LCID в десятичной записи>`` (``/LANG=1049``);
-  * InstallShield  — ``/L0x<LCID в шестнадцатеричной записи>`` (``/L0x0419``).
+  * InstallShield  — ``/L0x<LCID в шестнадцатеричной записи>`` (``/L0x0419``);
+  * SFX-архив      — короткий ключ в верхнем регистре (``/RU``, ``/EN``):
+                     сам модуль SFX его не понимает, но перенаправляет
+                     во внутренний установщик — так документируют свои
+                     сборки перепаковщики (например, SketchUp Pro RePack:
+                     ``/S /RU`` — тихая установка русской версии).
 
 Остальные движки язык ключом не выбирают (MSI переводится трансформом .mst,
 WiX Burn и собственные bootstrapper'ы — своими средствами). Для них модуль
@@ -113,7 +118,8 @@ def find_language(code: str) -> Optional[InstallerLanguage]:
 def supports_language_switch(installer_type: InstallerType) -> bool:
     """Умеет ли движок выбирать язык ключом командной строки."""
     return installer_type in (
-        InstallerType.INNO, InstallerType.NSIS, InstallerType.INSTALLSHIELD)
+        InstallerType.INNO, InstallerType.NSIS, InstallerType.INSTALLSHIELD,
+        InstallerType.SELF_EXTRACT)
 
 
 def has_language_switch(args: Sequence[str]) -> bool:
@@ -173,6 +179,12 @@ def switch_for(installer_type: InstallerType,
         return f"/LANG={language.lcid}"
     if installer_type == InstallerType.INSTALLSHIELD:
         return f"/L0x{language.lcid:04X}"
+    if installer_type == InstallerType.SELF_EXTRACT:
+        # Сворачиваемый архив: ключ языка доходит до внутреннего
+        # установщика коротким ключом в верхнем регистре (/RU, /EN) — так
+        # документируют свои сборки перепаковщики. Без него внутренний
+        # установщик показывает окно выбора языка и ждёт мышку.
+        return f"/{language.code.split('-')[0].upper()}"
     return None
 
 
