@@ -3013,6 +3013,8 @@ class GameLauncherHandoffTests(unittest.TestCase):
             app = Path(temp, "App")
             app.mkdir()
             (app / "chrome_elf.dll").write_bytes(b"MZ")
+            (app / "resources").mkdir()
+            (app / "resources" / "app.asar").write_bytes(b"")
             gui = app / "ollama app.exe"
             gui.write_bytes(b"MZ" + b"\x00" * (9 * 1024 * 1024))
             cli = app / "ollama.exe"
@@ -3088,6 +3090,8 @@ class GameLauncherHandoffTests(unittest.TestCase):
             app = Path(temp, "App")
             app.mkdir()
             (app / "chrome_elf.dll").write_bytes(b"MZ")
+            (app / "resources").mkdir()
+            (app / "resources" / "app.asar").write_bytes(b"")
             (app / "ollama app.exe").write_bytes(b"MZ")
             self.assertTrue(exe_launcher.is_electron_tree(app))
             self.assertFalse(exe_launcher.should_use_job(app / "ollama app.exe"))
@@ -4285,6 +4289,305 @@ class IexpressOverwriteDialogTests(unittest.TestCase):
     def test_dismiss_is_a_noop_off_windows(self):
         from portablizer.core import redist as redist_mod
         self.assertEqual(redist_mod._dismiss_installer_dialogs(), 0)
+
+
+class SketchUpRepackTests(unittest.TestCase):
+    """SketchUp Pro RePack by KpoJIuK: документированная команда /S /RU /D.
+
+    Регрессия на журнал пользователя: установщик — Inno Setup со СВОИМ
+    разбором командной строки. Стандартные ключи Inno (/VERYSILENT /DIR=)
+    он не понимает, показывает мастер «Выберите язык» и «Выберите папку
+    установки» (по умолчанию C:\\Program Files\\SketchUp) и ждёт мышку.
+    Каждая следующая попытка универсальной лестницы открывала мастер заново,
+    поэтому один и тот же вопрос появлялся несколько раз, а сборка стояла на
+    38 %.
+    """
+
+    NAME = "SketchUp Pro v26.1.189.exe"
+
+    @staticmethod
+    def _installer(temp, name=NAME,
+                   payload=b"Inno Setup " + b"https://www.sketchup.com/ "):
+        path = os.path.join(temp, name)
+        _fake_pe(path, [".text", ".rsrc"], payload, dotnet=False)
+        return path
+
+    def test_repack_is_recognized_by_product_filename(self):
+        with tempfile.TemporaryDirectory() as temp:
+            det = detect_installer(self._installer(temp))
+            self.assertIsNotNone(det.repack_profile)
+            self.assertEqual(det.repack_profile.name, "KpoJIuK")
+            self.assertEqual(det.vendor_name, "KpoJIuK")
+            self.assertTrue(any("перепак KpoJIuK" in e for e in det.evidence))
+            self.assertTrue(det.has_switch("/RU"))
+            self.assertTrue(det.has_switch("/D="))
+
+    def test_documented_command_comes_first_and_keeps_the_path_last(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._installer(temp)
+            attempts = build_attempts(detect_installer(installer), installer,
+                                      r"E:\Portable\SketchUp_Portable\App",
+                                      language="ru")
+            self.assertGreaterEqual(len(attempts), 4)
+            first = attempts[0]
+            self.assertEqual(first.args, ["/S", "/RU"])
+            self.assertEqual(first.raw_tail,
+                             r"/D=E:\Portable\SketchUp_Portable\App")
+            # Ключ пути — последним и без кавычек: так его разбирает скрипт
+            # репака (как NSIS /D=).
+            self.assertFalse(first.raw_tail.startswith('"'))
+            self.assertTrue(first.display().endswith(first.raw_tail))
+            self.assertFalse(first.ignores_target_dir)
+
+    def test_chosen_language_selects_its_short_switch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._installer(temp)
+            attempts = build_attempts(detect_installer(installer), installer,
+                                      r"E:\P\App", language="en")
+            self.assertEqual(attempts[0].args, ["/S", "/EN"])
+            self.assertIn(["/S", "/RU"],
+                          [plan.args for plan in attempts])
+
+    def test_attempt_without_path_is_marked_for_recovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._installer(temp)
+            attempts = build_attempts(detect_installer(installer), installer,
+                                      r"E:\P\App", language="ru")
+            no_path = [plan for plan in attempts if plan.raw_tail is None]
+            self.assertTrue(no_path)
+            # Без /D= установщик ставит программу в Program Files: результат
+            # обязан быть найден и перенесён в App (и оригинал удалён).
+            self.assertTrue(all(plan.ignores_target_dir for plan in no_path))
+
+    def test_generic_verysilent_is_only_a_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._installer(temp)
+            attempts = build_attempts(detect_installer(installer), installer,
+                                      r"E:\P\App", language="ru")
+            self.assertNotIn("/VERYSILENT", attempts[0].args)
+            self.assertTrue(any("/VERYSILENT" in plan.args
+                                for plan in attempts[1:]))
+
+    def test_official_burn_bundle_is_not_hijacked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self._installer(
+                temp,
+                payload=b"WixBurn .wixburn wixstdba https://www.sketchup.com/")
+            det = detect_installer(installer)
+            self.assertEqual(det.installer_type, InstallerType.WIX_BURN)
+            self.assertIsNone(det.repack_profile)
+            attempts = build_attempts(det, installer, r"E:\P\App")
+            self.assertNotEqual(attempts[0].args[:2], ["/S", "/RU"])
+
+    def test_lookalike_filename_does_not_get_the_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            det = detect_installer(
+                self._installer(temp, name="NotSketchUp Pro v26.1.189.exe"))
+            self.assertIsNone(det.repack_profile)
+
+
+class ChromiumFlagsTests(unittest.TestCase):
+    """Chromium-ключи — только настоящему Electron, не CEF-программе."""
+
+    def test_cef_distribution_with_chrome_elf_is_not_electron(self):
+        """CEF кладёт chrome_elf.dll — сам по себе он ничего не значит."""
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            (app / "libcef.dll").write_bytes(b"MZ")
+            (app / "chrome_elf.dll").write_bytes(b"MZ")
+            (app / "icudtl.dat").write_bytes(b"")
+            target = app / "SketchUp.exe"
+            target.write_bytes(b"MZ" + b"\x00" * (12 * 1024 * 1024))
+            self.assertFalse(launcher_mod.is_electron_app(str(target)))
+            self.assertFalse(exe_launcher.needs_electron_sandbox_off(target))
+
+    def test_cef_program_is_not_an_electron_host(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            (app / "libcef.dll").write_bytes(b"MZ")
+            # CEF-программа держит рядом icudtl.dat/snapshot_blob.bin — это
+            # НЕ признак Electron (их же кладёт Steam и другие CEF-хосты).
+            (app / "icudtl.dat").write_bytes(b"")
+            (app / "snapshot_blob.bin").write_bytes(b"")
+            sketchup = app / "SketchUp.exe"
+            sketchup.write_bytes(b"MZ" + b"\x00" * (9 * 1024 * 1024))
+            self.assertFalse(launcher_mod.is_electron_app(str(sketchup)))
+            self.assertFalse(exe_launcher.needs_electron_sandbox_off(sketchup))
+
+    def test_real_electron_exe_is_recognized_by_its_own_markers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            target = app / "SomeApp.exe"
+            target.write_bytes(b"MZ ... ELECTRON_RUN_AS_NODE ...")
+            self.assertTrue(launcher_mod.is_electron_app(str(target)))
+            self.assertTrue(exe_launcher.needs_electron_sandbox_off(target))
+
+    def test_stale_chromium_flags_are_stripped_for_a_cef_program(self):
+        """Старый launcher_config.json содержал --no-sandbox у SketchUp."""
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            (app / "libcef.dll").write_bytes(b"MZ")
+            target = app / "SketchUp.exe"
+            target.write_bytes(b"MZ" + b"\x00" * 4096)
+            command = exe_launcher.with_electron_flags(
+                [str(target), "--no-sandbox", "--disable-gpu-sandbox",
+                 "--disable-features=RendererCodeIntegrity", "-noload"],
+                target)
+            self.assertEqual(command, [str(target), "-noload"])
+
+    def test_cef_host_stays_out_of_the_kill_job(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            (app / "libcef.dll").write_bytes(b"MZ")
+            target = app / "SketchUp.exe"
+            target.write_bytes(b"MZ")
+            self.assertTrue(exe_launcher.is_chromium_tree(app))
+            self.assertFalse(exe_launcher.should_use_job(target))
+
+
+class ProductNameMatchingTests(unittest.TestCase):
+    """Каталог «SketchUp» должен совпадать с «SketchUp Pro v26.1.189»."""
+
+    NAME = "SketchUp Pro v26.1.189"
+
+    def test_version_suffix_does_not_hide_the_product_name(self):
+        keys = Portablizer._name_keys(self.NAME, self.NAME + ".exe")
+        self.assertIn("sketchup", keys)
+        self.assertGreaterEqual(Portablizer._name_score("SketchUp", keys), 200)
+
+    def test_year_edition_folder_is_the_same_product(self):
+        keys = Portablizer._name_keys(self.NAME, self.NAME + ".exe")
+        self.assertGreaterEqual(
+            Portablizer._name_score("SketchUp 2026", keys), 200)
+        self.assertGreaterEqual(
+            Portablizer._name_score("SketchUp Pro", keys), 200)
+
+    def test_unrelated_folder_is_not_matched(self):
+        keys = Portablizer._name_keys(self.NAME, self.NAME + ".exe")
+        self.assertLess(Portablizer._name_score("LayOut", keys), 200)
+        self.assertLess(Portablizer._name_score("SketchyApp", keys), 200)
+
+    def _options(self, root: Path) -> PortableOptions:
+        return PortableOptions(installer_path=str(root / (self.NAME + ".exe")),
+                               output_dir=str(root))
+
+    def test_new_program_files_copy_is_removed_after_recovery(self):
+        import portablizer.core.portablizer as engine_mod
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            program_files = root / "Program Files"
+            program_files.mkdir()
+            app_dir = root / "SketchUp_Portable" / "App"
+            app_dir.mkdir(parents=True)
+            engine = Portablizer(Logger())
+            with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                    mock.patch.dict(os.environ, {
+                        # Windows сравнивает имена переменных без учёта
+                        # регистра, Linux — с учётом: задаём оба написания,
+                        # потому что поиск мест установки и уборка читают
+                        # их разными именами.
+                        "PROGRAMFILES": str(program_files),
+                        "ProgramFiles": str(program_files),
+                        "PROGRAMFILES(X86)": "",
+                        "ProgramFiles(x86)": "",
+                        "PROGRAMW6432": "",
+                        "ProgramW6432": "",
+                        "PROGRAMDATA": "",
+                        "ProgramData": "",
+                        "LOCALAPPDATA": "",
+                        "APPDATA": "",
+                    }):
+                # Снимок делается ДО установщика — ровно как в run().
+                before = engine._snapshot_install_locations("")
+                target = program_files / "SketchUp"
+                target.mkdir()
+                (target / "SketchUp.exe").write_bytes(b"MZ")
+                removed = engine._cleanup_leftover_install_dirs(
+                    self.NAME, str(root / (self.NAME + ".exe")),
+                    self._options(root), "", before=before,
+                    app_dir=str(app_dir))
+            self.assertEqual(removed, [str(target)])
+            self.assertFalse(target.exists())
+
+    def test_preexisting_program_is_never_deleted(self):
+        import portablizer.core.portablizer as engine_mod
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            program_files = root / "Program Files"
+            target = program_files / "SketchUp"
+            target.mkdir(parents=True)
+            (target / "SketchUp.exe").write_bytes(b"MZ")
+            app_dir = root / "SketchUp_Portable" / "App"
+            app_dir.mkdir(parents=True)
+            before = {
+                os.path.normcase(os.path.abspath(str(program_files))):
+                    {os.path.normcase(os.path.abspath(str(target)))},
+            }
+            engine = Portablizer(Logger())
+            with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                    mock.patch.dict(os.environ, {
+                        # Windows сравнивает имена переменных без учёта
+                        # регистра, Linux — с учётом: задаём оба написания,
+                        # потому что поиск мест установки и уборка читают
+                        # их разными именами.
+                        "PROGRAMFILES": str(program_files),
+                        "ProgramFiles": str(program_files),
+                        "PROGRAMFILES(X86)": "",
+                        "ProgramFiles(x86)": "",
+                        "PROGRAMW6432": "",
+                        "ProgramW6432": "",
+                        "PROGRAMDATA": "",
+                        "ProgramData": "",
+                        "LOCALAPPDATA": "",
+                        "LOCALAPPDATA": "",
+                        "APPDATA": "",
+                    }):
+                removed = engine._cleanup_leftover_install_dirs(
+                    self.NAME, str(root / (self.NAME + ".exe")),
+                    self._options(root), "", before=before,
+                    app_dir=str(app_dir))
+            self.assertEqual(removed, [])
+            self.assertTrue(target.exists())
+
+
+class InstallerPathDialogTests(unittest.TestCase):
+    """Диалоги мастера репака: язык и папка установки."""
+
+    def test_russian_path_page_is_recognised(self):
+        from portablizer.core import redist as redist_mod
+        title = "Установка SketchUp Pro 2026"
+        body = ("Выберите папку установки. Папка установки: "
+                r"C:\Program Files\SketchUp  Папка установки должна быть пустой.")
+        self.assertTrue(
+            redist_mod.installer_prompt_looks_like_path_consent(title, body))
+
+    def test_language_page_is_recognised(self):
+        from portablizer.core import redist as redist_mod
+        self.assertTrue(
+            redist_mod.installer_prompt_looks_like_language_selection(
+                "Установка SketchUp Pro 2026",
+                "Выберите язык установки: Русский English"))
+        self.assertTrue(
+            redist_mod.installer_prompt_looks_like_language_selection(
+                "Setup", "Select Setup Language"))
+
+    def test_back_and_cancel_are_never_clicked(self):
+        from portablizer.core import redist as redist_mod
+        self.assertTrue(redist_mod.installer_button_is_proceed("Далее >"))
+        self.assertTrue(redist_mod.installer_button_is_proceed("Установить"))
+        self.assertFalse(redist_mod.installer_button_is_proceed("Назад"))
+        self.assertFalse(redist_mod.installer_button_is_proceed("Отмена"))
+
+    def test_automation_is_a_noop_off_windows(self):
+        from portablizer.core import redist as redist_mod
+        counter = {}
+        self.assertEqual(redist_mod._dismiss_installer_dialogs(
+            counter, target_dir=r"C:\P\App", pids=[1], state={}), 0)
 
 
 if __name__ == "__main__":

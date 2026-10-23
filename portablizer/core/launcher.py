@@ -1250,6 +1250,98 @@ goto :eof
 """
 
 
+# --- песочница Chromium: только у настоящих Electron-хостов -----------------
+#
+# ``--no-sandbox`` / ``--disable-gpu-sandbox`` — ключи Chromium. Их понимает
+# только сам Chromium-рантайм (Electron, NW.js). Обычная программа, которая
+# использует CEF для встроенных браузерных окон (SketchUp, Steam и десятки
+# CAD-пакетов), разбирает командную строку по-своему и на чужой ключ отвечает
+# окном «SketchUp: Unknown options: no-sandbox, disable-gpu-sandbox,
+# disable-features» — программа не запускается вовсе.
+#
+# Поэтому признак «рядом лежит libcef.dll» больше не считается признаком
+# Electron: CEF — это встраиваемая библиотека, а Electron — конкретный
+# рантайм, и его выдаёт сам исполняемый файл.
+
+#: Файлы, которые Electron/NW.js кладут рядом с исполняемым файлом.
+#: ``chrome_elf.dll`` здесь недостаточно: его содержат и CEF-сборки
+#: (SketchUp, Steam), поэтому Electron подтверждается ещё и ``nw.dll``
+#: либо ``resources\\app.asar``.
+ELECTRON_DIR_MARKERS = frozenset({"nw.dll"})
+
+#: Строки, которые есть в exe настоящего Electron/Chromium-хоста.
+ELECTRON_EXE_MARKERS = (b"ELECTRON_RUN_AS_NODE", b"electron.asar")
+
+#: Ключи, отключающие песочницу Chromium внутри портативной папки. Только
+#: для Electron: повторный запуск с ними обычной программы ломает её разбор
+#: командной строки (см. выше).
+ELECTRON_CHROMIUM_FLAGS = (
+    "--no-sandbox",
+    "--disable-gpu-sandbox",
+    "--disable-features=RendererCodeIntegrity",
+)
+
+#: Сколько байт exe просматривать в поисках маркеров Electron. Строки лежат
+#: в начале файла, но читаем с запасом и останавливаемся на первом совпадении.
+_ELECTRON_SCAN_BYTES = 8 * 1024 * 1024
+
+def exe_is_electron_style(path: str) -> bool:
+    """True, если САМ exe — Chromium-бинарник Electron/NW.js.
+
+    Проверяется содержимое файла, а не соседние dll: переименованный
+    ``electron.exe`` сохраняет строку ``ELECTRON_RUN_AS_NODE``, а
+    ``SketchUp.exe`` рядом с ``libcef.dll`` — нет.
+    """
+    try:
+        remaining = _ELECTRON_SCAN_BYTES
+        with open(path, "rb") as handle:
+            while remaining > 0:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                if any(marker in chunk for marker in ELECTRON_EXE_MARKERS):
+                    return True
+                remaining -= len(chunk)
+    except OSError:
+        return False
+    return False
+
+
+def is_electron_app(main_exe: str) -> bool:
+    """True для настоящего Electron/NW.js-хоста.
+
+    Условия намеренно узкие, потому что цена ложного срабатывания — окно
+    «Unknown options» вместо запуска программы:
+
+    * имя ``electron.exe`` / ``nw.exe``;
+    * в самом exe есть маркер Electron (переименованный exe приложения);
+    * рядом лежит ``chrome_elf.dll``/``nw.dll`` и exe достаточно крупный,
+      чтобы быть Chromium-хостом.
+
+    ``libcef.dll`` сюда не входит: его содержат обычные CEF-программы
+    (SketchUp), которые Chromium-ключи не понимают.
+    """
+    name = os.path.basename(main_exe or "").casefold()
+    if name in ("electron.exe", "nw.exe"):
+        return True
+    if exe_is_electron_style(main_exe):
+        return True
+    directory = os.path.dirname(main_exe or "")
+    try:
+        names = {item.name.casefold() for item in os.scandir(directory)
+                 if item.is_file()}
+    except OSError:
+        return False
+    if "nw.dll" in names:
+        return True
+    # app.asar бывает только у Electron. Одного chrome_elf.dll мало:
+    # CEF-программы (SketchUp) кладут его рядом со своим exe и разбирают
+    # командную строку сами — Chromium-ключи для них фатальны.
+    if "chrome_elf.dll" not in names:
+        return False
+    return os.path.isfile(os.path.join(directory, "resources", "app.asar"))
+
+
 def render_bat(cfg: LauncherConfig) -> str:
     title = ascii_display(cfg.app_name)
     data_dir = _bat_set_value(cfg.data_dir_name)

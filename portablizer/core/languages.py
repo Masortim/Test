@@ -40,6 +40,7 @@ GOG-установщик (``setup_*.exe`` + ``gog.com`` внутри) стави
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -102,6 +103,32 @@ _LANG_SWITCH_RE = re.compile(
     r"^(?:/LANG=|/L0x|/L\d|/L=|-LANG=|/langid=|-langid="
     r"|--language=|--lang=)",
     re.IGNORECASE)
+
+
+def os_ui_language_code() -> str:
+    """Короткий код языка интерфейса этой Windows («ru», «en»).
+
+    Нужен там, где выбор языка обязателен, а человек его не сделал: например,
+    репак KpoJIuK без ``/RU``/``/EN`` открывает окно выбора языка и ждёт
+    мышку. Пустая строка — язык определить не удалось.
+    """
+    try:
+        if os.name == "nt":  # pragma: no cover - выполняется только на Windows
+            import ctypes
+
+            lcid = int(ctypes.windll.kernel32.GetUserDefaultUILanguage())
+            primary = lcid & 0x3FF
+            return {0x19: "ru", 0x09: "en", 0x22: "uk", 0x07: "de",
+                    0x0C: "fr", 0x10: "it", 0x0A: "es", 0x15: "pl"}.get(
+                        primary, "")
+    except Exception:  # noqa: BLE001 - язык интерфейса не критичен
+        return ""
+    raw = (os.environ.get("LANGUAGE", "").split(":")[0]
+           or os.environ.get("LC_ALL", "")
+           or os.environ.get("LC_MESSAGES", "")
+           or os.environ.get("LANG", ""))
+    raw = raw.split(".")[0].split("_")[0].split("-")[0].strip().lower()
+    return raw if len(raw) == 2 and raw.isalpha() else ""
 
 
 def find_language(code: str) -> Optional[InstallerLanguage]:

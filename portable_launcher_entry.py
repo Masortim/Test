@@ -2362,12 +2362,32 @@ def _portable_processes(root: Path) -> int:
     return len(_portable_process_list(root))
 
 
-#: Files that mark an Electron/CEF/NW.js tree.  Those runtimes spawn GPU
-#: and renderer processes with CREATE_BREAKAWAY_FROM_JOB and often keep
-#: only a message-only HWND for the tray icon.
-_ELECTRON_MARKERS = frozenset({
+#: Files that mark a Chromium-based tree (Electron, NW.js or a native app
+#: with embedded CEF).  Those runtimes spawn GPU/renderer processes with
+#: CREATE_BREAKAWAY_FROM_JOB and often keep only a message-only HWND for the
+#: tray icon, so the launcher must not put them into its kill-on-close job.
+#:
+#: NOTE: ``libcef.dll`` means "uses CEF", NOT "is Electron".  SketchUp,
+#: Steam and many CAD tools embed CEF while parsing their own command line;
+#: Chromium switches make them refuse to start with «Unknown options:
+#: no-sandbox, disable-gpu-sandbox, disable-features».
+_CHROMIUM_EMBED_MARKERS = frozenset({
     "chrome_elf.dll", "libcef.dll", "nw.dll",
 })
+
+#: Files that only a real Electron/NW.js tree contains.  ``chrome_elf.dll``
+#: alone is NOT enough: CEF distributions (SketchUp, Steam) ship it too.
+#: Electron is identified by ``resources\\app.asar`` next to it or by
+#: ``nw.dll`` (NW.js); everything else is treated as a native CEF host.
+_ELECTRON_MARKERS = frozenset({"nw.dll"})
+
+#: Strings present in a real Electron/NW.js executable.  A renamed
+#: ``electron.exe`` keeps them; ``SketchUp.exe`` next to ``libcef.dll``
+#: does not, so it never gets the switches below.
+_ELECTRON_EXE_MARKERS = (b"ELECTRON_RUN_AS_NODE", b"electron.asar")
+
+#: How much of the target exe is scanned for the markers above.
+_ELECTRON_SCAN_BYTES = 8 * 1024 * 1024
 
 #: Chromium flags that let a portable Electron app (Ollama) actually open a
 #: window.  The renderer sandbox assumes a normal install layout and a job
@@ -2384,8 +2404,29 @@ _LEFTOVER_IMAGE_TOKENS = (
 )
 
 
+def _exe_is_electron_style(path: Path) -> bool:
+    """True when the executable itself carries Electron markers."""
+    try:
+        remaining = _ELECTRON_SCAN_BYTES
+        with open(path, "rb") as handle:
+            while remaining > 0:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                if any(marker in chunk for marker in _ELECTRON_EXE_MARKERS):
+                    return True
+                remaining -= len(chunk)
+    except OSError:
+        return False
+    return False
+
+
 def is_electron_tree(directory: Path) -> bool:
-    """True when ``directory`` looks like an Electron/CEF/NW.js app folder."""
+    """True when ``directory`` looks like an Electron/NW.js app folder.
+
+    Deliberately ignores ``libcef.dll``: embedded CEF is not Electron and
+    must not receive Chromium command-line switches (see above).
+    """
     try:
         names = {item.name.casefold() for item in directory.iterdir()
                  if item.is_file()}
@@ -2393,7 +2434,27 @@ def is_electron_tree(directory: Path) -> bool:
         return False
     if names & _ELECTRON_MARKERS:
         return True
-    if "icudtl.dat" in names and "snapshot_blob.bin" in names:
+    try:
+        # app.asar бывает только у Electron; chrome_elf.dll у CEF-программ
+        # тоже есть, поэтому одного его недостаточно.
+        return ((directory / "resources" / "app.asar").is_file()
+                and "chrome_elf.dll" in names)
+    except OSError:
+        return False
+
+
+def is_chromium_tree(directory: Path) -> bool:
+    """True for Chromium-based trees, including native CEF hosts.
+
+    Used only to keep such programs out of the launcher's kill-on-close
+    job: their child GPU/renderer processes break away from jobs.
+    """
+    try:
+        names = {item.name.casefold() for item in directory.iterdir()
+                 if item.is_file()}
+    except OSError:
+        return False
+    if names & _CHROMIUM_EMBED_MARKERS:
         return True
     try:
         if (directory / "resources" / "app.asar").is_file():
@@ -2404,7 +2465,7 @@ def is_electron_tree(directory: Path) -> bool:
 
 
 def should_use_job(target: Path) -> bool:
-    """False for Electron/Ollama: a kill-on-close job breaks their windows.
+    """False for Chromium/Ollama: a kill-on-close job breaks their windows.
 
     Chromium creates its own job and GPU/renderer processes with
     ``CREATE_BREAKAWAY_FROM_JOB``.  Even with BREAKAWAY_OK, starting the
@@ -2416,23 +2477,30 @@ def should_use_job(target: Path) -> bool:
     name = target.name.casefold()
     if "ollama" in name and "setup" not in name:
         return False
-    return not is_electron_tree(target.parent)
+    return not is_chromium_tree(target.parent)
 
 
 def needs_electron_sandbox_off(target: Path) -> bool:
-    """True when ``target`` is a real Electron/CEF/NW host.
+    """True when ``target`` is a real Electron/NW host.
 
     Ollama's ``ollama app.exe`` is a Go tray + WebView2 UI, not Electron.
-    Chromium switches passed to it are unknown arguments: the tray still
-    appears, then every menu item hangs.  Only trees with chrome_elf /
-    app.asar get those flags.
+    SketchUp (and Steam, and other CEF hosts) are native programs with an
+    embedded browser: the switches arrive as unknown arguments, so the app
+    answers «Unknown options: no-sandbox, …» and does not start.  Only an
+    actual Electron/NW.js executable gets the flags.
     """
     name = target.name.casefold()
     if name in {"electron.exe", "nw.exe"}:
         return True
+    if _exe_is_electron_style(target):
+        return True
+    # Дальше — только по надёжным признакам Electron (app.asar / nw.dll).
+    # Крупный exe рядом с chrome_elf.dll больше не считается: ровно так
+    # выглядит CEF-программа (SketchUp) и именно из-за этого она получала
+    # «Unknown options: no-sandbox».
     if not is_electron_tree(target.parent):
         return False
-    if name.endswith(" app.exe"):
+    if name.endswith(" app.exe") or name == "electron.exe":
         return True
     try:
         return target.stat().st_size >= 8 * 1024 * 1024
@@ -2441,10 +2509,19 @@ def needs_electron_sandbox_off(target: Path) -> bool:
 
 
 def with_electron_flags(command: Sequence[str], target: Path) -> list[str]:
-    """Prepend Chromium sandbox-off switches after the executable."""
+    """Add Chromium sandbox-off switches for Electron; strip them otherwise.
+
+    Stripping matters for old ``launcher_config.json`` files written by a
+    previous Portablizer version: they already contain ``--no-sandbox`` for
+    a program that is not Electron (e.g. SketchUp).  The rebuilt launcher
+    must not keep passing them.
+    """
     parts = [str(item) for item in command]
-    if not parts or not needs_electron_sandbox_off(target):
+    if not parts:
         return parts
+    if not needs_electron_sandbox_off(target):
+        return [parts[0], *[item for item in parts[1:]
+                            if item not in _ELECTRON_CLI_FLAGS]]
     extra = [flag for flag in _ELECTRON_CLI_FLAGS if flag not in parts]
     return [parts[0], *extra, *parts[1:]]
 
