@@ -2529,6 +2529,19 @@ class Portablizer:
             else raw_diff.keys_of(reg_mod.CATEGORY_INTEGRATION)
         )
 
+        # URL-протоколы: браузерные глубокие ссылки («Открыть Figma» после
+        # входа) должны открывать портативную программу, а не установленную.
+        # Переносим их всегда, даже без --shell-integration: это не ассоциация
+        # файлов, а часть работы приложения (см. core/registry.py).
+        protocol_keys = reg_mod.protocol_keys_of(raw_diff, after)
+        for protocol_key in protocol_keys:
+            if protocol_key not in portable_keys:
+                portable_keys.append(protocol_key)
+        skipped_integration = [
+            k for k in skipped_integration
+            if k not in set(protocol_keys)
+        ]
+
         # Путь портативной папки заменяем маркером: иначе настройки указывали
         # бы на каталог того ПК, где собирали портатив.
         tokens = [(portable_dir, launcher_mod.ROOT_TOKEN)]
@@ -2543,6 +2556,12 @@ class Portablizer:
         # установку недействительной и сразу закрывались.
         portable_after = reg_mod.retarget_install_paths(
             portable_after_in, portable_keys, app_dir)
+
+        # Команды открытия протоколов указывают на установленный каталог
+        # этого ПК: без замены «Открыть Figma» в браузере вернёт именно его.
+        if protocol_keys:
+            portable_after = reg_mod.retarget_protocol_paths(
+                portable_after, protocol_keys, app_dir)
 
         user_keys = [k for k in portable_keys if k.startswith("HKCU")]
         machine_keys = [k for k in portable_keys if k.startswith("HKLM")]
@@ -2648,6 +2667,13 @@ class Portablizer:
             self.log.info(
                 f"Ассоциации файлов и COM пропущены ({len(skipped_integration)} "
                 "ключ(ей)) — портатив не меняет настройки чужой системы."
+            )
+        if protocol_keys:
+            self.log.ok(
+                f"URL-протоколы перенесены в портатив ({len(protocol_keys)} "
+                "ключ(ей)): браузерные глубокие ссылки будут открывать "
+                "портативную программу (например, «Открыть Figma» после "
+                "входа в аккаунт)."
             )
         return capture
 

@@ -272,6 +272,240 @@ def is_uninstall_entry(key_path: str) -> bool:
     return bool(lowered[index + len(_UNINSTALL_MARKER):].strip("\\"))
 
 
+# --- URL-протоколы приложений --------------------------------------------------
+#
+# Протоколы (figma://, discord://, spotify:// и т.п.) — это браузерные
+# «глубокие ссылки»: браузер передаёт их в программу через реестр, а не через
+# аргументы запуска. Figma после входа в аккаунт показывает «Открыть Figma»,
+# и Windows открывает то, что записано в Software\Classes\<scheme> — если
+# протокол не перенесён в портатив, это установленная программа, а не
+# портативная копия. Поэтому протоколы переносятся ВСЕГДА (как настройки
+# программы), а не вместе с --shell-integration: это не ассоциация файлов,
+# а часть работы приложения.
+
+#: Grammar RFC 3986 для схемы URL (регистр не важен: figma и FIGMA — один
+#: протокол). Ассоциации файлов начинаются с «.», а COM-классы содержат
+#: точки и заглавные буквы — их отсечёт проверка значений ниже.
+_PROTOCOL_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*$", re.IGNORECASE)
+
+#: Значение, которое ставит установщик в ключ схемы при регистрации
+#: протокола (``HKCU\Software\Classes\<scheme>``).
+_PROTOCOL_MARKER_VALUE = "url protocol"
+
+#: Подключ с командой открытия протокола.
+_PROTOCOL_COMMAND_SUBKEY = r"\shell\open\command"
+
+
+def _protocol_tail(key_path: str) -> Optional[str]:
+    """``HKCU\Software\Classes\figma`` -> ``figma`` (иначе ``None``).
+
+    Только сам ключ схемы: ``...\figma\shell\open\command`` содержит
+    обратный слэш и не проходит проверку.
+    """
+    path = _strip_hive(key_path)
+    for prefix in (r"software\classes", r"software\wow6432node\classes"):
+        if path.startswith(prefix + "\\"):
+            tail = path[len(prefix) + 1:]
+            if tail and "\\" not in tail and "/" not in tail:
+                if _PROTOCOL_SCHEME_RE.match(tail):
+                    return tail
+    return None
+
+
+def is_protocol_key(key_path: str,
+                    values: Optional[Mapping[str, object]] = None,
+                    after: Optional[Mapping[str, Mapping[str, object]]] = None
+                    ) -> bool:
+    """Ключ регистрирует кастомный URL-протокол приложения.
+
+    Протокол живёт в ``HKCU/HKLM\Software\Classes\<scheme>`` и созывает
+    ``shell\open\command``. Самый сильный признак — значение
+    ``URL Protocol``; без него срабатывает наличие дочернего
+    ``shell\open\command`` (такие регистрации встречаются у Electron-
+    приложений, например Figma).
+    """
+    if not _protocol_tail(key_path):
+        return False
+    if values is not None and _PROTOCOL_MARKER_VALUE in {
+            str(name).casefold() for name in values}:
+        return True
+    if after is not None:
+        child = key_path + _PROTOCOL_COMMAND_SUBKEY
+        if after.get(child):
+            return True
+    return False
+
+
+def protocol_keys_of(diff: "RegistryDiff",
+                     after: Optional[Mapping[str, Mapping[str, object]]] = None
+                     ) -> List[str]:
+    """Ключи URL-протоколов в diff — переносим их в портатив всегда.
+
+    Без них браузер («Открыть Figma» после входа) открывает установленную
+    программу, а не портатив. Протокол — часть работы приложения, а не
+    мусор оболочки, поэтому его не связывают с ``--shell-integration``.
+    Возвращаются не только ключи схемы, но и измененные потомки
+    (``shell\\open\\command``, ``DefaultIcon``): именно в них живёт
+    команда открытия.
+    """
+    roots: List[str] = []
+    for key in diff.touched_keys:
+        if is_volatile(key):
+            continue
+        values = after.get(key) if after is not None else None
+        if is_protocol_key(key, values, after):
+            roots.append(key)
+    out = sorted(set(roots))
+    for root in roots:
+        prefix = root.casefold() + "\\"
+        for key in diff.touched_keys:
+            if key.casefold().startswith(prefix) and key not in out:
+                out.append(key)
+    return sorted(set(out))
+
+
+#: Первая кавычка в команде открытия протокола (``"...exe" --open "%1"``).
+_COMMAND_QUOTED_RE = re.compile(r'"([^"]+)"')
+
+#: Начало пути с буквы диска: ``C:\...`` или ``C:/...``.
+_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]", re.IGNORECASE)
+
+
+def _protocol_command_exe(command: str) -> Optional[str]:
+    """Путь к exe в команде открытия протокола.
+
+    Команда выглядит как ``"C:\\Users\\me\\Figma\\Figma.exe" --open "%1"`` —
+    путь в кавычках, а за ним аргументы. Ищем первый кавычный фрагмент,
+    заканчивающийся на ``.exe`` (аргументы в кавычках — `"%1"` — не пройдут
+    эту проверку). Без кавычек допустимо только когда первый токен явно
+    заканчивается на ``.exe`` (иначе у «C:\\Program Files\\...» разорвался бы
+    путь на слове).
+    """
+    if not command:
+        return None
+    candidates = _COMMAND_QUOTED_RE.findall(command)
+    for candidate in candidates:
+        if candidate.lower().endswith(".exe") and (
+                _DRIVE_PATH_RE.match(candidate)
+                or "/" in candidate or "\\" in candidate):
+            return candidate
+    # Без кавычек — только первый токен: «C:\Program Files\...\Figma.exe»
+    # разбивается на «C:\Program» + «Files\...\Figma.exe», и второй токен
+    # — не exe, а обломок пути. Путь без пробелов (C:\Users\me\Figma\...)
+    # целиком лежит в первом токене.
+    parts = command.split()
+    if parts and parts[0].lower().endswith(".exe"):
+        candidate = parts[0].strip('"')
+        if (_DRIVE_PATH_RE.match(candidate)
+                or "/" in candidate or "\\" in candidate):
+            return candidate
+    return None
+
+
+def _quoted_paths_in(value: str) -> List[str]:
+    """Все пути с буквы диска внутри кавычных фрагментов значения.
+
+    Иконка протокола имеет вид ``"C:\\...\\Figma.exe,0"``: путь берём до
+    запятой. Без кавычек пути не читаем — там path с пробелами
+    (``C:\\Program Files\\...``) токенизируется обрывами.
+    """
+    out: List[str] = []
+    for frag in _COMMAND_QUOTED_RE.findall(value):
+        path = frag.split(",")[0].strip()
+        if _DRIVE_PATH_RE.match(path):
+            out.append(path)
+    return out
+
+
+def retarget_protocol_paths(snapshot: Mapping[str, Mapping[str, object]],
+                            protocol_keys: Iterable[str],
+                            app_dir: str) -> Snapshot:
+    """Переписывает пути URL-протоколов в портативную ``App``.
+
+    Команда открытия из установщика указывает на установленный каталог
+    этого ПК (``"C:\\Users\\...\\Figma\\app-126\\Figma.exe" --open "%1"``).
+    Без замены браузер вернёт именно его. Меняем корень пути: имя exe
+    сохраняется (портатив лежит в ``App`` с тем же именем), аргументы не
+    трогаются. Корни собираются из всех значений дерева протокола —
+    ``shell\\open\\command`` и ``DefaultIcon`` могут указывать разные
+    каталоги (version-дир vs родительский).
+    """
+    result: Snapshot = {
+        key: {name: _as_entry(entry) for name, entry in values.items()}
+        for key, values in snapshot.items()
+    }
+    destination = os.path.normpath(app_dir)
+    for key in protocol_keys:
+        command_key = key + _PROTOCOL_COMMAND_SUBKEY
+        values = result.get(command_key)
+        if not values:
+            continue
+        entry = values.get("")
+        if entry is None:
+            continue
+        typ, _raw = _as_entry(entry)
+        if typ not in (REG_SZ, REG_EXPAND_SZ):
+            continue
+        command = _entry_value(entry)
+        if not isinstance(command, str):
+            continue
+        exe = _protocol_command_exe(command)
+        if not exe:
+            continue
+        roots = set()
+        old_root = ntpath.dirname(exe.rstrip("\\/"))
+        if old_root:
+            roots.add(old_root)
+        # Остальные значения дерева (DefaultIcon и т.п.) — по кавычным
+        # путям.
+        for k, vals in result.items():
+            if k != key and not k.casefold().startswith(key.casefold() + "\\"):
+                continue
+            for entry2 in vals.values():
+                value = _entry_value(entry2)
+                if not isinstance(value, str):
+                    continue
+                for path in _quoted_paths_in(value):
+                    root = ntpath.dirname(path.rstrip("\\/"))
+                    if root:
+                        roots.add(root)
+        # Сначала длинные корни: короткий «...\\Figma» не должен
+        # разрезать «...\\Figma\\app-126.10.11\\...» посередине.
+        old_roots = sorted(roots, key=len, reverse=True)
+        if not old_roots:
+            continue
+        # Путь портативной папки может содержать пробелы: в команде
+        # открытия его нужно закавычить, иначе разобьётся на слове.
+        target_exe = (destination + "\\" + ntpath.basename(exe)
+                      if " " in destination else None)
+        prefix = key.casefold() + "\\"
+        for k, vals in result.items():
+            if k != key and not k.casefold().startswith(prefix):
+                continue
+            for name, entry2 in list(vals.items()):
+                typ2, _raw2 = _as_entry(entry2)
+                if typ2 not in (REG_SZ, REG_EXPAND_SZ):
+                    continue
+                value = _entry_value(entry2)
+                if not isinstance(value, str):
+                    continue
+                rewritten = value
+                for old in old_roots:
+                    rewritten = re.sub(
+                        re.escape(old),
+                        lambda _match: destination,
+                        rewritten,
+                        flags=re.IGNORECASE,
+                    )
+                if rewritten != value:
+                    if (k == command_key and target_exe
+                            and target_exe in rewritten
+                            and f'"{target_exe}"' not in rewritten):
+                        rewritten = rewritten.replace(
+                            target_exe, f'"{target_exe}"', 1)
+                    vals[name] = (typ2, repr(rewritten))
+    return result
+
 # --- снимок -------------------------------------------------------------------
 
 def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
