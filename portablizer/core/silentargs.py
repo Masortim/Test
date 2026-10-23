@@ -33,7 +33,7 @@ from typing import List, Optional, Sequence
 from .detect import (
     TRUSTED_CONFIDENCE, DetectionResult, InstallerType, InstallShieldGeneration,
 )
-from .languages import plan_language
+from .languages import find_language, plan_language
 
 #: Больше попыток запускать бессмысленно: каждая стоит времени пользователя.
 MAX_ATTEMPTS = 6
@@ -834,6 +834,46 @@ def build_attempts(
             )
             attempts.append(plan)
 
+    # Inno Setup inside SFX: некоторые SFX-архивы содержат внутренний
+    # Inno Setup installer, который не понимает короткие ключи перепаковщика
+    # (/S, /RU, /D=) и показывает диалоги выбора языка и пути установки.
+    # Для него нужна собственная синтаксис: /VERYSILENT /SUPPRESSMSGBOXES
+    # /NORESTART /LANG=<язык> /DIR=<App>. Пробуем после универсальной
+    # лестницы, чтобы не разбивать уже работающие SFX с NSIS внутри.
+    if itype == InstallerType.SELF_EXTRACT:
+        _inno_switches = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
+        _inno_language = find_language(language) if (language or "").strip() else None
+        # Порядок: сначала с языком и path, потом без языка (если /LANG не
+        # поддерживается), но всегда с /DIR.
+        if _inno_language is not None:
+            plan = SilentPlan(
+                program=installer_path,
+                args=_inno_switches + [f"/LANG={_inno_language.inno_name}"],
+                raw_tail=f"/DIR={target_dir}",
+                notes=[
+                    "Внутренний Inno Setup: /VERYSILENT /SUPPRESSMSGBOXES "
+                    "/NORESTART /LANG= /DIR= передаётся как есть."
+                ],
+                label="Inno Setup внутри SFX: /VERYSILENT /LANG= /DIR=",
+                output_dir=native_target,
+                ignores_target_dir=True,
+            )
+            attempts.append(plan)
+        # Без языка — если внутренний установщик не поддерживает /LANG
+        plan = SilentPlan(
+            program=installer_path,
+            args=_inno_switches,
+            raw_tail=f"/DIR={target_dir}",
+            notes=[
+                "Внутренний Inno Setup: /VERYSILENT /SUPPRESSMSGBOXES "
+                "/NORESTART /DIR= (без /LANG — установщик сам выберет язык)."
+            ],
+            label="Inno Setup внутри SFX: /VERYSILENT /DIR=",
+            output_dir=native_target,
+            ignores_target_dir=True,
+        )
+        attempts.append(plan)
+
     if not attempts:
         attempts.append(build_silent_plan(
             itype, installer_path, target_dir,
@@ -855,9 +895,12 @@ def build_attempts(
     # обрезке лестницы.
     silent = [p for p in unique if not p.interactive]
     interactive = [p for p in unique if p.interactive]
+    # SELF_EXTRACT: универсальная лестница (6) + Inno Setup (2-3) —
+    # тратим на попытки чуть больше, чтобы Inno Setup не улетучивалась.
+    max_attempts = MAX_ATTEMPTS + 2 if itype == InstallerType.SELF_EXTRACT else MAX_ATTEMPTS
     if interactive:
-        return silent[:max(1, MAX_ATTEMPTS - len(interactive))] + interactive
-    return silent[:MAX_ATTEMPTS]
+        return silent[:max(1, max_attempts - len(interactive))] + interactive
+    return silent[:max_attempts]
 
 
 def candidate_silent_switches(installer_type: InstallerType) -> List[str]:
