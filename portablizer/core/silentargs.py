@@ -768,7 +768,11 @@ def build_attempts(
             log_file=artifact("setup-installshield.log"),
             extract_dir=layout_dir, extra_args=extra,
             allow_assisted=allow_assisted))
-    elif itype != InstallerType.UNKNOWN:
+    elif itype not in (InstallerType.UNKNOWN, InstallerType.SELF_EXTRACT):
+        # SELF_EXTRACT сюда не попадает: для него единственной лестницей
+        # служит универсальный набор ключей ниже — с ключом языка и
+        # /D=<App> в конце, а «просто /S» без пути только наделает
+        # побочного эффекта в Program Files.
         attempts.append(build_silent_plan(
             itype, installer_path, target_dir,
             log_file=log_path("install.log"), extra_args=extra,
@@ -805,11 +809,28 @@ def build_attempts(
                 else "Универсальный набор ключей: определение типа "
                      "ненадёжно, пробуем типовые ключи по очереди.")
         for switches in _GENERIC_LADDER:
+            args = list(switches) + user_extra
+            raw_tail: Optional[str] = None
+            ignores = False
+            if itype == InstallerType.SELF_EXTRACT:
+                # Сворачиваемый архив: ключ языка доходит до внутреннего
+                # установщика коротким ключом (/RU, /EN — см. languages),
+                # а путь установки — /D=<App> последним без кавычек, как
+                # у NSIS. Без /D= внутренний установщик ставит программу
+                # в Program Files этого ПК, а App остаётся пустым — и
+                # следующий сценарий пытается установить её заново.
+                args = list(switches) + list(lang_plan.args) + user_extra
+                raw_tail = f"/D={target_dir}"
+                ignores = True
             plan = SilentPlan(
-                program=installer_path, args=list(switches) + user_extra,
-                notes=[note],
+                program=installer_path, args=args,
+                notes=[note] + ([
+                    "Сворачиваемый архив: путь установки /D=<App> передан "
+                    "последним без кавычек, как документировано перепаковщиком."
+                ] if itype == InstallerType.SELF_EXTRACT else []),
                 label="Универсальные ключи: " + " ".join(switches),
-                output_dir=native_target,
+                output_dir=native_target, raw_tail=raw_tail,
+                ignores_target_dir=ignores,
             )
             attempts.append(plan)
 

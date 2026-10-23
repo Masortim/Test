@@ -152,6 +152,79 @@ class WatchdogTests(unittest.TestCase):
             fh.write("unpacked a file\n")
         self.assertTrue(watch.poll(now=100.4))
 
+    def test_log_growth_alone_is_not_strong_work(self):
+        """Лог растёт, а файлы/процессы не трогаются — сила не срабатывает.
+
+        Так ведёт себя внутренний установщик верстака SFX, который завис
+        внутри себя: процессор и лог «работают», а диск и целевая папка
+        всё то же. poll() всё ещё говорит «прогресс» (для строки деталей),
+        но якорь затишья я такое спасать не должен — иначе зависший
+        установщик никому не сообщит о себе.
+        """
+        log = Path(self.temp.name, "install.log")
+        log.write_text("start\n", encoding="utf-8")
+        watch = _InstallWatchdog(1, roots=[str(self.app)], logs=[str(log)],
+                                 probe_seconds=0.05, dir_seconds=60.0)
+        self.assertTrue(watch.poll(now=100.0))
+        self.assertTrue(watch.strong_changed())
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write("still unpacking...\n")
+        self.assertTrue(watch.poll(now=100.4))
+        self.assertFalse(watch.strong_changed())
+
+    def test_first_poll_counts_as_strong_work(self):
+        """Первый опрос всегда «силен»: установщик только что запустился."""
+        watch = _InstallWatchdog(1, roots=[str(self.app)],
+                                 probe_seconds=0.0, dir_seconds=0.0)
+        self.assertTrue(watch.poll(now=100.0))
+        self.assertTrue(watch.strong_changed())
+
+    def test_new_files_count_as_strong_work(self):
+        watch = _InstallWatchdog(1, roots=[str(self.app)],
+                                 probe_seconds=0.05, dir_seconds=0.05)
+        self.assertTrue(watch.poll(now=100.0))
+        self.assertTrue(watch.strong_changed())
+        self.assertFalse(watch.poll(now=100.01))
+        _touch(str(self.app), "game.bin", 1024)
+        self.assertTrue(watch.poll(now=100.2))
+        self.assertTrue(watch.strong_changed())
+
+    def test_process_io_counters_count_as_strong_work(self):
+        """Диск установщика дёргается — это честная работа, даже без файлов."""
+        watch = _InstallWatchdog(1, roots=[str(self.app)],
+                                 probe_seconds=0.05, dir_seconds=60.0)
+        activity = [procutil.ProcessActivity((1,), 1000, 0.5)]
+        with mock.patch.object(procutil, "process_activity",
+                               side_effect=lambda _pid: activity[0]):
+            self.assertTrue(watch.poll(now=100.0))
+            self.assertTrue(watch.strong_changed())
+            self.assertFalse(watch.poll(now=100.01))
+            activity[0] = procutil.ProcessActivity((1,), 999_000_000, 12.0)
+            self.assertTrue(watch.poll(now=100.2))
+            self.assertTrue(watch.strong_changed())
+
+    def test_only_cpu_growth_is_weak_work(self):
+        """Процессор дёргается, диск и процессы неподвижны — слабый признак.
+
+        Так может вести себя процесс верстака SFX, в котором завис
+        внутренний установщик: процессор мелькает, лог растёт, а реальной
+        работы нет. poll() показывает прогресс, strong_changed() — нет.
+        """
+        watch = _InstallWatchdog(1, roots=[str(self.app)],
+                                 probe_seconds=0.05, dir_seconds=60.0)
+        state = {"cpu": 0.5}
+
+        def fake_activity(_pid):  # noqa: ANN001
+            state["cpu"] += 0.25
+            return procutil.ProcessActivity((1,), 1000, state["cpu"])
+
+        with mock.patch.object(procutil, "process_activity", fake_activity):
+            self.assertTrue(watch.poll(now=100.0))
+            self.assertTrue(watch.strong_changed())
+            self.assertFalse(watch.poll(now=100.01))
+            self.assertTrue(watch.poll(now=100.2))
+            self.assertFalse(watch.strong_changed())
+
     def test_process_io_counters_are_progress_without_any_file(self):
         watch = _InstallWatchdog(1, roots=[str(self.app)],
                                  probe_seconds=0.05, dir_seconds=60.0)
@@ -284,6 +357,31 @@ class InstallWaitTests(unittest.TestCase):
         self.assertTrue(self.engine._install_stalled)
         self.assertIsNotNone(self.engine._install_stall)
 
+    def test_weak_activity_alone_still_ends_as_a_stall(self):
+        """Процессор и лог растут, файлы/диск нет — это затишье.
+
+        Встроенный установщик верстака SFX (как у SketchUp RePack) может
+        вести себя именно так: процессор и лог «работают», а диск и
+        целевая папка неподвижны — внутренний установщик завис внутри
+        себя. Слабые признаки не могут удерживать якорь непрерывной
+        работы, иначе такой установщик молча висит до предела времени.
+        """
+        proc = _FakeProc()
+        state = {"cpu": 0.5}
+
+        def creeping_activity(_pid):  # noqa: ANN001
+            state["cpu"] += 0.25
+            return procutil.ProcessActivity((1,), 1000, state["cpu"])
+
+        started = time.monotonic()
+        with mock.patch.object(procutil, "process_activity", creeping_activity):
+            rc = self._run(proc, idle=0.4)
+        self.assertEqual(rc, engine_mod.redist_mod.TIMEOUT_EXIT_CODE)
+        self.assertLess(time.monotonic() - started, 15.0)
+        self.assertTrue(proc.killed)
+        self.assertTrue(self.engine._install_stalled)
+        self.assertIsNotNone(self.engine._install_stall)
+
     def test_stall_report_tells_how_much_was_unpacked(self):
         proc = _FakeProc()
 
@@ -360,12 +458,20 @@ class InstallWaitTests(unittest.TestCase):
         proc = _FakeProc()
 
         class _BusyWatchdog:
-            """Стражник, который всегда видит работу (установщик зациклился)."""
+            """Стражник, который всегда видит работу (установщик зациклился).
+
+            ``strong_changed`` тоже истинно: это значит, что якорь непрерывной
+            работы не срывается, и потоповать по нему может только предел
+            времени попытки — тот, который проверялся в этом тесте.
+            """
 
             def __init__(self, *_args, **_kwargs) -> None:
                 pass
 
             def poll(self, _now=None) -> bool:  # noqa: ANN001
+                return True
+
+            def strong_changed(self) -> bool:
                 return True
 
             def summary(self) -> str:

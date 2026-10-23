@@ -97,6 +97,17 @@ class SwitchSyntaxTests(unittest.TestCase):
             plan_language(InstallerType.INSTALLSHIELD, "en").args,
             ["/L0x0409"])
 
+    def test_self_extract_takes_the_short_uppercase_code(self):
+        # Верстак SFX не распознаёт ключ языка сам, но перенаправляет
+        # короткие ключи во внутренний установщик: /RU и /EN по контракту
+        # перепаковщика (например, SketchUp Pro RePack: /S /RU).
+        self.assertEqual(
+            plan_language(InstallerType.SELF_EXTRACT, "ru").args, ["/RU"])
+        self.assertEqual(
+            plan_language(InstallerType.SELF_EXTRACT, "en").args, ["/EN"])
+        self.assertEqual(
+            plan_language(InstallerType.SELF_EXTRACT, "pt-BR").args, ["/PT"])
+
     def test_switch_for_matches_plan(self):
         ru = find_language("ru")
         self.assertEqual(switch_for(InstallerType.INNO, ru), "/LANG=russian")
@@ -219,6 +230,39 @@ class AttemptLadderTests(unittest.TestCase):
         self.assertIn("/LANG=1049", first.args)
         # /D= у NSIS обязан оставаться последним: язык идёт до него.
         self.assertTrue(first.raw_tail.startswith("/D="))
+
+    def test_sfx_language_reaches_the_generic_ladder(self):
+        # Верстак SFX ставится универсальной лестницей; ключ языка /RU
+        # идёт сразу после silent-switch'ей, а /D= стоит последним.
+        plans = build_attempts(self._detect(InstallerType.SELF_EXTRACT),
+                               self.INSTALLER, self.TARGET, language="ru")
+        self.assertTrue(plans)
+        for plan in plans:
+            self.assertTrue(plan.label.startswith("Универсальные"), plan.label)
+            self.assertIn("/RU", plan.args, plan.label)
+            self.assertTrue(plan.raw_tail.startswith("/D="), plan.label)
+            self.assertEqual(plan.ignores_target_dir, True)
+
+    def test_sfx_ladder_passes_the_target_dir_last(self):
+        # /D= без кавычек и строго последним — как у NSIS. Без этого
+        # внутренний установщик поставит программу в Program Files,
+        # а App останется пустым.
+        plans = build_attempts(self._detect(InstallerType.SELF_EXTRACT),
+                               self.INSTALLER, self.TARGET, language="en")
+        self.assertTrue(plans)
+        for plan in plans:
+            self.assertEqual(plan.raw_tail, f"/D={self.TARGET}")
+            # Ни один из args не содержит путь после ключей.
+            self.assertFalse(any("/D=" in a for a in plan.args), plan.label)
+
+    def test_sfx_ladder_without_language_still_passes_the_target_dir(self):
+        plans = build_attempts(self._detect(InstallerType.SELF_EXTRACT),
+                               self.INSTALLER, self.TARGET)
+        self.assertTrue(plans)
+        for plan in plans:
+            self.assertEqual(plan.raw_tail, f"/D={self.TARGET}")
+            self.assertNotIn("/RU", plan.args)
+            self.assertNotIn("/EN", plan.args)
 
     def test_installshield_msi_wrapper_gets_the_language(self):
         det = self._detect(
