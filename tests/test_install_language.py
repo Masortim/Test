@@ -48,7 +48,8 @@ from portablizer.core.languages import (  # noqa: E402
     plan_language, switch_for,
 )
 from portablizer.core.portablizer import PortableOptions  # noqa: E402
-from portablizer.core.silentargs import build_attempts  # noqa: E402
+from portablizer.core.silentargs import build_attempts
+from portablizer.core import redist as redist_mod  # noqa: E402
 
 
 class LanguageCatalogTests(unittest.TestCase):
@@ -237,10 +238,21 @@ class AttemptLadderTests(unittest.TestCase):
         plans = build_attempts(self._detect(InstallerType.SELF_EXTRACT),
                                self.INSTALLER, self.TARGET, language="ru")
         self.assertTrue(plans)
-        for plan in plans:
-            self.assertTrue(plan.label.startswith("Универсальные"), plan.label)
+        # Первые планы — универсальная лестница с /RU и /D=.
+        generic = [p for p in plans
+                   if p.label.startswith("Универсальные")]
+        self.assertTrue(generic, "no generic ladder plans found")
+        for plan in generic:
             self.assertIn("/RU", plan.args, plan.label)
             self.assertTrue(plan.raw_tail.startswith("/D="), plan.label)
+            self.assertEqual(plan.ignores_target_dir, True)
+        # Дополнительно: Inno Setup внутри SFX — /LANG= и /DIR=.
+        inno = [p for p in plans
+                if p.label.startswith("Inno Setup")]
+        self.assertTrue(inno, "no Inno Setup plans found")
+        for plan in inno:
+            self.assertIn("/VERYSILENT", plan.args, plan.label)
+            self.assertTrue(plan.raw_tail.startswith("/DIR="), plan.label)
             self.assertEqual(plan.ignores_target_dir, True)
 
     def test_sfx_ladder_passes_the_target_dir_last(self):
@@ -250,19 +262,44 @@ class AttemptLadderTests(unittest.TestCase):
         plans = build_attempts(self._detect(InstallerType.SELF_EXTRACT),
                                self.INSTALLER, self.TARGET, language="en")
         self.assertTrue(plans)
-        for plan in plans:
+        # Универсальная лестница: /D= последним, без /D= в args.
+        generic = [p for p in plans
+                   if p.label.startswith("Универсальные")]
+        self.assertTrue(generic, "no generic ladder plans found")
+        for plan in generic:
             self.assertEqual(plan.raw_tail, f"/D={self.TARGET}")
             # Ни один из args не содержит путь после ключей.
             self.assertFalse(any("/D=" in a for a in plan.args), plan.label)
+        # Inno Setup: /DIR= последним.
+        inno = [p for p in plans
+                if p.label.startswith("Inno Setup")]
+        self.assertTrue(inno, "no Inno Setup plans found")
+        for plan in inno:
+            self.assertEqual(plan.raw_tail, f"/DIR={self.TARGET}")
+            self.assertFalse(any("/DIR=" in a for a in plan.args), plan.label)
 
     def test_sfx_ladder_without_language_still_passes_the_target_dir(self):
         plans = build_attempts(self._detect(InstallerType.SELF_EXTRACT),
                                self.INSTALLER, self.TARGET)
         self.assertTrue(plans)
-        for plan in plans:
+        # Универсальная лестница: /D= последним, без /RU и /EN.
+        generic = [p for p in plans
+                   if p.label.startswith("Универсальные")]
+        self.assertTrue(generic, "no generic ladder plans found")
+        for plan in generic:
             self.assertEqual(plan.raw_tail, f"/D={self.TARGET}")
             self.assertNotIn("/RU", plan.args)
             self.assertNotIn("/EN", plan.args)
+        # Inno Setup: /DIR= последним, без /LANG.
+        inno = [p for p in plans
+                if p.label.startswith("Inno Setup")]
+        self.assertTrue(inno, "no Inno Setup plans found")
+        for plan in inno:
+            self.assertEqual(plan.raw_tail, f"/DIR={self.TARGET}")
+            self.assertNotIn("/RU", plan.args)
+            self.assertNotIn("/EN", plan.args)
+            self.assertFalse(any("/LANG=" in a for a in plan.args),
+                             plan.label)
 
     def test_installshield_msi_wrapper_gets_the_language(self):
         det = self._detect(
@@ -1008,6 +1045,166 @@ class GogLanguageInterfaceTests(unittest.TestCase):
         self.assertIn("goggame", window.language_hint.text().casefold())
         self.assertIn("/LANG=ru", window.language_hint.text())
 
+
+
+class DialogDetectionTests(unittest.TestCase):
+    """Тесты нового распознавания диалогов установщика.
+
+    Внутренний установщик верстака SFX показывает окна выбора языка и
+    согласия на путь установки, даже когда /RU и /D= переданы короткими
+    ключами. Эти диалоги должны распознаваться и закрываться автоматически.
+    """
+
+    INSTALLER = r"E:\Setup\setup.exe"
+    TARGET = r"E:\Portable\Game_Portable\App"
+
+    def test_language_selection_detected_by_title(self):
+        red = redist_mod
+        self.assertTrue(red.installer_prompt_looks_like_language_selection(
+            "Выберите язык установки", ""))
+        self.assertTrue(red.installer_prompt_looks_like_language_selection(
+            "Select Language", ""))
+        self.assertTrue(red.installer_prompt_looks_like_language_selection(
+            "Выберите язык", ""))
+
+    def test_language_selection_detected_by_body(self):
+        red = redist_mod
+        self.assertTrue(red.installer_prompt_looks_like_language_selection(
+            "Language", "Выберите язык установки для продолжения"))
+        self.assertTrue(red.installer_prompt_looks_like_language_selection(
+            "", "Please select language:"))
+
+    def test_language_selection_not_a_progress_window(self):
+        red = redist_mod
+        self.assertFalse(red.installer_prompt_looks_like_language_selection(
+            "Установка", ""))
+        self.assertFalse(red.installer_prompt_looks_like_language_selection(
+            "", ""))
+
+    def test_path_consent_detected(self):
+        red = redist_mod
+        self.assertTrue(red.installer_prompt_looks_like_path_consent(
+            "Choose Install Location", ""))
+        self.assertTrue(red.installer_prompt_looks_like_path_consent(
+            "Путь установки", ""))
+        self.assertTrue(red.installer_prompt_looks_like_path_consent(
+            "Installation Path", ""))
+
+    def test_path_consent_not_a_progress_window(self):
+        red = redist_mod
+        self.assertFalse(red.installer_prompt_looks_like_path_consent(
+            "Установка", ""))
+        self.assertFalse(red.installer_prompt_looks_like_path_consent(
+            "", ""))
+
+    def test_general_confirm_detected(self):
+        red = redist_mod
+        self.assertTrue(red.installer_prompt_looks_like_general_confirm(
+            "Continue", ""))
+        self.assertTrue(red.installer_prompt_looks_like_general_confirm(
+            "Agree", ""))
+        self.assertTrue(red.installer_prompt_looks_like_general_confirm(
+            "Accept", ""))
+        self.assertTrue(red.installer_prompt_looks_like_general_confirm(
+            "Продолжить", ""))
+        self.assertTrue(red.installer_prompt_looks_like_general_confirm(
+            "", "Do you agree to the terms?"))
+
+    def test_general_confirm_not_a_progress_window(self):
+        red = redist_mod
+        self.assertFalse(red.installer_prompt_looks_like_general_confirm(
+            "Установка", ""))
+        self.assertFalse(red.installer_prompt_looks_like_general_confirm(
+            "", ""))
+
+    def test_should_dismiss_includes_language(self):
+        red = redist_mod
+        self.assertTrue(red.installer_prompt_should_dismiss(
+            "Выберите язык установки", ""))
+        self.assertTrue(red.installer_prompt_should_dismiss(
+            "Select Language", ""))
+
+    def test_should_dismiss_includes_path(self):
+        red = redist_mod
+        self.assertTrue(red.installer_prompt_should_dismiss(
+            "Choose Install Location", ""))
+        self.assertTrue(red.installer_prompt_should_dismiss(
+            "Путь установки", ""))
+
+    def test_should_dismiss_includes_general_confirm(self):
+        red = redist_mod
+        self.assertTrue(red.installer_prompt_should_dismiss(
+            "Continue", ""))
+        self.assertTrue(red.installer_prompt_should_dismiss(
+            "Agree", ""))
+        self.assertTrue(red.installer_prompt_should_dismiss(
+            "Продолжить", ""))
+
+    def test_should_dismiss_still_works_for_old_families(self):
+        red = redist_mod
+        self.assertTrue(red.installer_prompt_should_dismiss(
+            "Do you want to overwrite the file?", ""))
+        self.assertTrue(red.installer_prompt_should_dismiss(
+            "Invalid command line operation", ""))
+
+    def test_russian_button_detected(self):
+        red = redist_mod
+        self.assertTrue(red.installer_button_is_russian("Русский"))
+        self.assertTrue(red.installer_button_is_russian("&Русский"))
+        self.assertTrue(red.installer_button_is_russian("Russian"))
+        self.assertFalse(red.installer_button_is_russian("English"))
+        self.assertFalse(red.installer_button_is_russian(""))
+
+    def test_proceed_button_detected(self):
+        red = redist_mod
+        self.assertTrue(red.installer_button_is_proceed("Next"))
+        self.assertTrue(red.installer_button_is_proceed("Install"))
+        self.assertTrue(red.installer_button_is_proceed("OK"))
+        self.assertTrue(red.installer_button_is_proceed("ОК"))
+        self.assertTrue(red.installer_button_is_proceed("Далее"))
+        self.assertTrue(red.installer_button_is_proceed("Продолжить"))
+        self.assertTrue(red.installer_button_is_proceed("Continue"))
+
+    def test_proceed_button_rejects_cancel(self):
+        red = redist_mod
+        self.assertFalse(red.installer_button_is_proceed("Cancel"))
+        self.assertFalse(red.installer_button_is_proceed("Отмена"))
+        self.assertFalse(red.installer_button_is_proceed("No"))
+        self.assertFalse(red.installer_button_is_proceed("Нет"))
+        self.assertFalse(red.installer_button_is_proceed("Back"))
+        self.assertFalse(red.installer_button_is_proceed("Назад"))
+        self.assertFalse(red.installer_button_is_proceed(""))
+
+    def test_inno_setup_sfx_ladder_has_language(self):
+        """Inno Setup внутри SFX: /VERYSILENT /LANG= /DIR= в лестнице."""
+        plans = build_attempts(
+            self._detect(InstallerType.SELF_EXTRACT),
+            self.INSTALLER, self.TARGET, language="ru")
+        inno = [p for p in plans
+                if p.label.startswith("Inno Setup")]
+        self.assertTrue(inno, "no Inno Setup plans in SFX ladder")
+        # Первый Inno Setup план должен содержать /LANG=russian
+        self.assertIn("/LANG=russian", inno[0].args, inno[0].label)
+        self.assertEqual(inno[0].raw_tail, f"/DIR={self.TARGET}")
+
+    def test_inno_setup_sfx_ladder_without_language(self):
+        """Inno Setup внутри SFX без языка: /VERYSILENT /DIR=."""
+        plans = build_attempts(
+            self._detect(InstallerType.SELF_EXTRACT),
+            self.INSTALLER, self.TARGET, language="")
+        inno = [p for p in plans
+                if p.label.startswith("Inno Setup")]
+        self.assertTrue(inno, "no Inno Setup plans in SFX ladder")
+        # Без языка не должен быть план с /LANG
+        for plan in inno:
+            self.assertFalse(any("/LANG=" in a for a in plan.args),
+                             plan.label)
+
+    @staticmethod
+    def _detect(installer_type):
+        from portablizer.core.detect import DetectionResult
+        return DetectionResult(installer_type=installer_type,
+                               confidence=0.5)
 
 
 if __name__ == "__main__":

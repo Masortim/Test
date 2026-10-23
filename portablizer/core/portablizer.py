@@ -1889,6 +1889,18 @@ class Portablizer:
                     if recovered:
                         self.log.ok("Файлы программы перенесены в папку App.")
 
+            # 5b. Бросовые каталоги из Program Files: даже если recovery
+            # забрал файлы в App, оригинал в Program Files может остаться
+            # (не совпало имя, не удалился из-за прав). Удаляем только
+            # каталоги, имя которых совпадает с приложением.
+            if self._find_main_exe(app_dir, name):
+                leftover = self._cleanup_leftover_install_dirs(
+                    name, opts.installer_path, opts, data_dir)
+                if leftover:
+                    self.log.ok(
+                        f"Удалено {len(leftover)} брошенных каталог(ов) "
+                        "установки из Program Files/профилей.")
+
             if opts.capture_registry and (IS_WINDOWS or opts.install_language.strip()):
                 capture = self._capture_registry(
                     portable_dir, before, after, opts,
@@ -3237,6 +3249,23 @@ class Portablizer:
                     )
                     return rc, plan
 
+            # Стойка (TIMEOUT_EXIT_CODE): внутренний установщик верстака SFX
+            # успел скопировать файлы в Program Files, но затем завис на
+            # диалоге выбора языка/пути. Recovery забирает эти файлы в App
+            # и удаляет оригинал из Program Files — без этого на C: остаётся
+            # брошенный каталог и Launcher.bat не находит главный exe.
+            if (plan.ignores_target_dir and recover is not None
+                    and rc == redist_mod.TIMEOUT_EXIT_CODE
+                    and not self._app_has_payload(app_dir)):
+                if recover():
+                    self.log.ok(
+                        "Программа была установлена в каталог по умолчанию "
+                        "(Program Files) перед зависанием установщика; "
+                        "файлы перенесены в App, оригинал удалён. "
+                        f"Сработал сценарий: {plan.label}"
+                    )
+                    return rc, plan
+
             # Autodesk Fusion штатно оставляет webdeploy-клиент в
             # %LOCALAPPDATA%, а не в App. Если загрузка завершилась и exe
             # уже находится в изолированном профиле, не запускаем второй
@@ -4184,10 +4213,120 @@ class Portablizer:
                 os.makedirs(app_dir, exist_ok=True)
                 continue
             if self._find_main_exe(app_dir, app_name):
+                # Удаляем оригинал из Program Files — иначе на C: остаётся
+                # брошенный каталог установки, который Launcher.bat может
+                # найти вместо App и запустить непортативную копию.
+                self._remove_recovered_source(source, app_dir, data_dir)
                 return True
             shutil.rmtree(app_dir, ignore_errors=True)
             os.makedirs(app_dir, exist_ok=True)
         return False
+
+    def _cleanup_leftover_install_dirs(
+            self, name: str, installer_path: str,
+            opts: "PortableOptions", data_dir: str = "") -> List[str]:
+        """Удаляет брошенные каталоги установки из Program Files и профилей.
+
+        Внутренний установщик верстака SFX может поставить программу в
+        C:\\Program Files\\<имя>, даже если recovery уже забрал файлы в App:
+        оригинал может остаться, если recovery не нашёл его (не совпало имя,
+        не попал в search roots) или не удалил из-за ошибки прав.
+
+        Сканирует только каталоги установки (Program Files, Program Files
+        (x86), ProgramData) и удаляет те, имя которых совпадает с именем
+        приложения. Ничего другого не трогает.
+        """
+        if not IS_WINDOWS:
+            return []
+        keys = self._name_keys(name, installer_path)
+        search_roots = [
+            os.environ.get("PROGRAMFILES", ""),
+            os.environ.get("PROGRAMFILES(X86)", ""),
+            os.environ.get("PROGRAMW6432", ""),
+            os.environ.get("PROGRAMDATA", ""),
+        ]
+        # User-owned roots: LOCALAPPDATA/Programs, LOCALAPPDATA
+        user_roots = [
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
+            os.environ.get("LOCALAPPDATA", ""),
+        ]
+        data_abs = os.path.abspath(data_dir) if data_dir else ""
+        removed: List[str] = []
+        for root in search_roots + user_roots:
+            if not root or not os.path.isdir(root):
+                continue
+            try:
+                for entry in os.scandir(root):
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    entry_name = entry.name
+                    # Проверяем совпадение имени с приложением.
+                    if self._name_score(entry_name, keys) < 200:
+                        continue
+                    entry_path = os.path.abspath(entry.path)
+                    # Не трогаем каталоги внутри портативного профиля.
+                    if data_abs and (
+                            os.path.normcase(entry_path) == os.path.normcase(data_abs)
+                            or os.path.normcase(entry_path).startswith(
+                                os.path.normcase(data_abs) + os.sep)):
+                        continue
+                    # Не трогаем App — это наш результат.
+                    if os.path.normcase(entry_path) == os.path.normcase(
+                            os.path.abspath(opts.app_dir)):
+                        continue
+                    # Проверяем, что внутри есть exe — иначе это не
+                    # каталог установки приложения.
+                    exes = self._find_executables(entry_path, limit=5)
+                    if not exes:
+                        continue
+                    self.log.info(
+                        f"Найден брошенный каталог установки: {entry_path}")
+                    try:
+                        shutil.rmtree(entry_path, ignore_errors=False)
+                        removed.append(entry_path)
+                        self.log.ok(
+                            f"Удалено: {entry_path}")
+                    except OSError as exc:
+                        self.log.warn(
+                            f"Не удалось удалить брошенный каталог "
+                            f"{entry_path}: {exc}. Проверьте права "
+                            "администратора.")
+            except OSError:
+                continue
+        return removed
+
+    def _remove_recovered_source(self, source: str, app_dir: str,
+                                 data_dir: str) -> None:
+        """Удаляет оригинал установки из Program Files после переноса в App.
+
+        Только если синхронная копия прошла успешно и App не совпадает с
+        первоначальным каталогом. При отсутствии прав на удаление логирует
+        предупреждение, но не роняет сборку.
+        """
+        try:
+            source_abs = os.path.abspath(source)
+            data_abs = os.path.abspath(data_dir)
+            # Не трогаем каталоги внутри портативного профиля.
+            if (os.path.normcase(source_abs) == os.path.normcase(data_abs)
+                    or os.path.normcase(source_abs).startswith(
+                        os.path.normcase(data_abs) + os.sep)):
+                return
+            if os.path.normcase(source_abs) == os.path.normcase(
+                    os.path.abspath(app_dir)):
+                return
+            if not os.path.isdir(source_abs):
+                return
+            # Проверяем, что каталог содержит exe с именем приложения —
+            # иначе это может быть системный каталог, не относящийся к
+            # recovered приложению.
+            self.log.info(
+                f"Удаляю оригинал установки из Program Files: {source_abs}")
+            shutil.rmtree(source_abs, ignore_errors=False)
+        except OSError as exc:
+            self.log.warn(
+                f"Не удалось удалить оригинал установки из Program Files "
+                f"({source}): {exc}. Файл оставлен, но портатив уже содержит "
+                "копию в App.")
 
     # -- поиск главного exe ---------------------------------------------------
     # -- поиск и классификация исполняемых файлов -----------------------------

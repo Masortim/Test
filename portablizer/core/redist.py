@@ -1516,6 +1516,32 @@ NATIVE_TOOL_TIMEOUT = 300
 #: помечается недостающей, и доставка продолжается со следующей.
 REQUIREMENT_TIMEOUT = 15 * 60
 
+#: Кнопки-маркеры языка в диалогах выбора языка. Русский — первый приоритет.
+_LANGUAGE_BUTTON_HINTS = (
+    "русский", "russian", "ru",
+)
+#: Кнопки-маркеры продолжения в диалогах установщика.
+_PROCEED_BUTTON_HINTS = (
+    "далее", "next", "продолжить", "continue",
+    "install", "установить", "ok", "ок",
+)
+#: Заголовки/тексты диалогов выбора языка внутреннего установщика.
+_LANGUAGE_DIALOG_HINTS = (
+    "выберите язык", "select language", "choose language",
+    "язык установки", "installation language",
+)
+#: Заголовки/тексты диалогов согласия на путь установки.
+_PATH_DIALOG_HINTS = (
+    "choose install location", "select install directory",
+    "installation path", "путь установки", "место установки",
+    "install directory", "install location",
+)
+#: Заголовки/тексты общих диалогов согласия установщика.
+_CONFIRM_DIALOG_HINTS = (
+    "continue", "agree", "accept", "yes",
+    "продолжить", "согласие", "принять",
+)
+
 # IExpress/wextract «Do you want to overwrite the file …?» — if we unpack
 # into a folder that already has files from an earlier pass, the wrapper
 # pops a Yes/Yes-to-All dialog even with /Q. Prefer an empty dest, and
@@ -1693,6 +1719,83 @@ def installer_prompt_looks_like_device_driver(title: str,
     return hint and device
 
 
+def installer_prompt_looks_like_language_selection(title: str,
+                                                    body: str = "") -> bool:
+    """Диалог выбора языка внутреннего установщика верстака SFX.
+
+    Верстак SFX перенаправляет короткие ключи (/RU, /EN) во внутренний
+    установщик, но тот может всё равно показать окно выбора языка — если
+    ключ не дошёл или установщик его не понял. Без обработки этого окна
+    внутренний установщик ждёт мышку, стража видит только слабые признаки
+    работы (лог/процессор), и сборка «зависает» на 15 минут.
+    """
+    blob = f"{title or ''} {body or ''}".lower()
+    if not blob.strip():
+        return False
+    heading = (title or "").replace("&", "").strip().lower()
+    has_title = any(hint in heading for hint in _LANGUAGE_DIALOG_HINTS)
+    has_body = any(hint in blob for hint in _LANGUAGE_DIALOG_HINTS)
+    return has_title or has_body
+
+
+def installer_prompt_looks_like_path_consent(title: str,
+                                             body: str = "") -> bool:
+    """Диалог согласия на путь установки внутреннего установщика.
+
+    Внутренний установщик верстака SFX (чаще всего Inno Setup) не понимает
+    /D= и показывает окно «Choose Install Location» со слоями по умолчанию
+    (C:\\Program Files\\...). Без обработки он ждёт мышку, и сборка
+    «зависает». Кнопка «Next»/«Install» принимает путь по умолчанию —
+    файлы уходят в Program Files, а App остаётся пустым.
+    """
+    blob = f"{title or ''} {body or ''}".lower()
+    if not blob.strip():
+        return False
+    heading = (title or "").replace("&", "").strip().lower()
+    has_title = any(hint in heading for hint in _PATH_DIALOG_HINTS)
+    has_body = any(hint in blob for hint in _PATH_DIALOG_HINTS)
+    return has_title or has_body
+
+
+def installer_prompt_looks_like_general_confirm(title: str,
+                                                 body: str = "") -> bool:
+    """Общий диалог согласия установщика (Continue/Agree/Accept).
+
+    Покрывает диалоги, которые не подпадают под конкретные recognizers
+    (перезапись, ошибка командной строки, Directx, устройство), но всё
+    же блокируют тихую установку. Кнопка «Yes»/«OK»/«Continue» — правильный
+    ответ; «No»/«Cancel» — никогда.
+    """
+    blob = f"{title or ''} {body or ''}".lower()
+    if not blob.strip():
+        return False
+    heading = (title or "").replace("&", "").strip().lower()
+    has_title = any(hint in heading for hint in _CONFIRM_DIALOG_HINTS)
+    has_body = any(hint in blob for hint in _CONFIRM_DIALOG_HINTS)
+    return has_title or has_body
+
+
+def installer_button_is_russian(title: str) -> bool:
+    """True для кнопки «Русский»/«Russian» в диалоге выбора языка."""
+    text = (title or "").replace("&", "").strip().lower()
+    return any(hint in text for hint in _LANGUAGE_BUTTON_HINTS)
+
+
+def installer_button_is_proceed(title: str) -> bool:
+    """True для кнопки продолжения (Next/Install/OK) — не Cancel/No.
+
+    Используется в диалогах пути установки и общего согласия: там правильный
+    ответ — продолжить с текущим (или выбранным) путём, а не отказаться.
+    """
+    text = (title or "").replace("&", "").strip().lower()
+    if not text:
+        return False
+    if any(bad in text for bad in ("cancel", "отмена", "abort", "прервать",
+                                    "no", "нет", "назад", "back")):
+        return False
+    return any(hint in text for hint in _PROCEED_BUTTON_HINTS)
+
+
 def installer_prompt_should_dismiss(title: str, body: str = "") -> bool:
     """True, если окно надо закрыть самим, не дожидаясь мышки."""
     if installer_prompt_looks_like_overwrite(title, body):
@@ -1701,14 +1804,22 @@ def installer_prompt_should_dismiss(title: str, body: str = "") -> bool:
         return True
     if installer_prompt_looks_like_directx_notice(title, body):
         return True
-    return installer_prompt_looks_like_device_driver(title, body)
+    if installer_prompt_looks_like_device_driver(title, body):
+        return True
+    if installer_prompt_looks_like_language_selection(title, body):
+        return True
+    if installer_prompt_looks_like_path_consent(title, body):
+        return True
+    if installer_prompt_looks_like_general_confirm(title, body):
+        return True
+    return False
 
 
 def _dismiss_installer_dialogs(
         counter: "Optional[Dict[str, int]]" = None) -> int:
     """Click through leftover installer MessageBoxes that block the build.
 
-    Three families, none of which CREATE_NO_WINDOW hides:
+    Families, none of which CREATE_NO_WINDOW hides:
 
     * IExpress/wextract «Do you want to overwrite the file …?» — Yes To All;
     * DXSETUP / vcredist «Неверная операция командной строки» /
@@ -1721,9 +1832,23 @@ def _dismiss_installer_dialogs(
       first, then — and only then — «Установить» is clicked. «Не устанавливать»
       is never touched: dismissing this dialog the wrong way fails the
       silent install.
+    * Language selection («Выберите язык» / «Select Language») — the inner
+      installer of an SFX archive may show its own language dialog even when
+      /RU is passed (the key may not reach the inner installer, or the inner
+      installer may not understand it). Click «Русский»/«Russian» if
+      available, otherwise «OK»/«Next». Without this, the inner installer
+      waits for a mouse click, the watchdog sees only weak activity (log/CPU),
+      and the build stalls.
+    * Path consent («Choose Install Location») — the inner installer may not
+      understand /D= and shows its own path dialog with default
+      C:\\Program Files\\... Click «Next»/«Install» to proceed with the
+      default path; recovery moves files to App afterwards. Without this,
+      the inner installer waits for a mouse click and the build stalls.
+    * General confirm («Continue»/«Agree»/«Accept») — click «Yes»/«OK».
 
     ``counter`` (optional dict) receives per-family tallies: "device" counts
-    driver-consent dialogs answered, so the caller can log them honestly.
+    driver-consent dialogs, "language" counts language dialogs, "path" counts
+    path-consent dialogs, so the caller can log them honestly.
 
     Returns how many buttons (or WM_CLOSE) were posted (0 on non-Windows).
     """
@@ -1755,9 +1880,11 @@ def _dismiss_installer_dialogs(
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     device_prompts = 0
+    lang_prompts = 0
+    path_prompts = 0
 
     def each_top(hwnd, _lparam):
-        nonlocal clicked, device_prompts
+        nonlocal clicked, device_prompts, lang_prompts, path_prompts
         if not user32.IsWindowVisible(hwnd):
             return True
         title = window_text(hwnd)
@@ -1794,6 +1921,40 @@ def _dismiss_installer_dialogs(
                     device_prompts += 1
                     break
             return True
+        # --- Language selection: click «Русский»/«Russian» if available.
+        # The inner installer of an SFX archive may show its own language
+        # dialog even when /RU is passed. Without this, the inner installer
+        # waits for a mouse click, the watchdog sees only weak activity, and
+        # the build stalls after the idle limit.
+        if installer_prompt_looks_like_language_selection(title, body):
+            russian = [item for item in buttons
+                       if installer_button_is_russian(item[1])]
+            if russian:
+                user32.PostMessageW(russian[0][0], BM_CLICK, 0, 0)
+                clicked += 1
+                lang_prompts += 1
+            else:
+                # No Russian button found — click OK/Next to accept default.
+                proceed = [item for item in buttons
+                           if installer_button_is_proceed(item[1])]
+                if proceed:
+                    user32.PostMessageW(proceed[0][0], BM_CLICK, 0, 0)
+                    clicked += 1
+                    lang_prompts += 1
+            return True
+        # --- Path consent: click «Next»/«Install» to proceed with default
+        # path. The inner installer may not understand /D= and shows its own
+        # path dialog. Clicking «Next» accepts the default; recovery moves
+        # files to App afterwards. Without this, the inner installer waits
+        # for a mouse click and the build stalls.
+        if installer_prompt_looks_like_path_consent(title, body):
+            proceed = [item for item in buttons
+                       if installer_button_is_proceed(item[1])]
+            if proceed:
+                user32.PostMessageW(proceed[0][0], BM_CLICK, 0, 0)
+                clicked += 1
+                path_prompts += 1
+            return True
         if not installer_prompt_should_dismiss(title, body):
             return True
         overwrite = installer_prompt_looks_like_overwrite(title, body)
@@ -1803,7 +1964,7 @@ def _dismiss_installer_dialogs(
         fallback = [item for item in buttons
                     if installer_button_is_confirm(item[1])]
         # Overwrite: Yes To All is the right answer. Command-line error and
-        # DirectX notices: OK. Never Cancel / No / Next.
+        # DirectX notices: OK. General confirm: Yes/OK. Never Cancel / No.
         targets = (preferred or fallback) if overwrite else (fallback or preferred)
         if targets:
             user32.PostMessageW(targets[0][0], BM_CLICK, 0, 0)
@@ -1821,9 +1982,16 @@ def _dismiss_installer_dialogs(
     except Exception:  # noqa: BLE001
         if counter is not None:
             counter["device"] = counter.get("device", 0) + device_prompts
+            counter["language"] = counter.get("language", 0) + lang_prompts
+            counter["path"] = counter.get("path", 0) + path_prompts
         return clicked
-    if counter is not None and device_prompts:
-        counter["device"] = counter.get("device", 0) + device_prompts
+    if counter is not None:
+        if device_prompts:
+            counter["device"] = counter.get("device", 0) + device_prompts
+        if lang_prompts:
+            counter["language"] = counter.get("language", 0) + lang_prompts
+        if path_prompts:
+            counter["path"] = counter.get("path", 0) + path_prompts
     return clicked
 
 
