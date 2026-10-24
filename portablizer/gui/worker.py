@@ -95,7 +95,8 @@ class MaintenanceWorker(QThread):
                  language: str = "") -> None:
         super().__init__()
         self.folder = folder
-        self.action = action                 # "release" | "refresh" | "update"
+        #: "release" | "refresh" | "update" | "startmenu"
+        self.action = action
         self.installer = installer           # для "update": файл или ссылка
         self.language = language             # для "refresh": код языка ("ru" и т.п.)
         self.logger = Logger()
@@ -113,6 +114,8 @@ class MaintenanceWorker(QThread):
         elif self.action == "update":
             report = maintenance.update_app(
                 self.folder, self.installer, self.logger)
+        elif self.action == "startmenu":
+            report = maintenance.repair_start_menu(self.logger)
         else:
             report = maintenance.release(self.folder, self.logger)
         self.finished_report.emit(report)

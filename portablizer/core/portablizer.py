@@ -52,6 +52,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tupl
 
 from .. import __version__
 from . import crashinfo as crash_mod
+from . import elevate as elevate_mod
 from . import launcher as launcher_mod
 from . import netstack as netstack_mod
 from . import procutil
@@ -133,6 +134,11 @@ HOLLOW_ATTEMPT_MAX_SECONDS = 15.0
 # Имя готового EXE-лончера внутри App/. Сам бинарник собирается из
 # portable_launcher_entry.py, встраивается в Portablizer.exe как ресурс и не
 # требует Python на компьютере, где запускают готовый портатив.
+#
+# Имя ``LaunchPortable.exe`` остаётся: его ищут Launch.bat, LaunchHidden.vbs,
+# StopPortable.cmd и UpdatePortable.cmd. Но в Диспетчере задач оно ничего не
+# говорило о запущенной программе, поэтому рядом создаётся та же самая копия
+# с именем ``Launch <Имя программы>.exe`` (см. ``_task_manager_name``).
 APP_EXE_LAUNCHER_NAME = "LaunchPortable.exe"
 
 
@@ -433,6 +439,118 @@ def _burn_layout_payloads(layout_dir: str) -> "Tuple[List[str], List[str]]":
 
     msis.sort(key=_size, reverse=True)
     return msis, others
+
+
+#: Временные каталоги, которые предыдущие версии оставляли в профиле
+#: пользователя (C:\Users\<user>). Они появляются, когда Portablizer
+#: аварийно завершается до уборки внешнего TEMP или когда PyInstaller
+#: не успевает удалить _MEI*. Очищаются при каждом запуске.
+_STALE_TEMP_PATTERNS = (
+    EXTERNAL_TEMP_PREFIX, "Portablizer_", "_MEI", "pblz",
+)
+
+#: Каталоги-однодневки redist/распаковки: имя начинается с этих префиксов.
+_STALE_TEMP_SOON = ("pblz",)
+
+#: Сколько секунд каталог должен «полежать», прежде чем его можно удалять.
+#: Свежий каталог может принадлежать идущей установке или другому экземпляру
+#: Portablizer, поэтому трогаем только заведомо брошенные.
+STALE_TEMP_MIN_AGE = 3600.0
+
+
+def _stale_temp_roots() -> List[str]:
+    """Где искать мусор предыдущих запусков: TEMP и профиль пользователя.
+
+    Именно в ``C:\\Users\\<user>`` пользователь и увидел десятки каталогов:
+    старые версии создавали там ``Portablizer-<имя>-Temp`` (внешний TEMP) и
+    ``_MEI*`` (распаковка PyInstaller), а убирали только то, что успели
+    создать в текущем запуске. Аварийное завершение оставляло их навсегда.
+    """
+    import tempfile
+
+    roots: List[str] = []
+    for value in (os.environ.get("TEMP"), os.environ.get("TMP"),
+                  tempfile.gettempdir(), os.environ.get("USERPROFILE")):
+        if not value:
+            continue
+        try:
+            folder = os.path.abspath(value)
+        except OSError:
+            continue
+        if os.path.isdir(folder) and folder not in roots:
+            roots.append(folder)
+    return roots
+
+
+def _mine_temp_directory(path: str) -> bool:
+    """True, если этот каталог принадлежит ТЕКУЩЕМУ процессу.
+
+    Однофайловый PyInstaller-EXE распаковывает себя в ``_MEIxxxx`` при каждом
+    запуске. Удалить свой же каталог — значит убить себя посреди работы,
+    поэтому он исключается всегда, независимо от времени создания.
+    """
+    own = str(getattr(sys, "_MEIPASS", "") or "")
+    if own and os.path.normcase(os.path.abspath(own)) == os.path.normcase(path):
+        return True
+    own_exe = os.path.normcase(os.path.abspath(sys.executable or ""))
+    try:
+        marker = os.path.join(path, "Portablizer.exe")
+        if own_exe and os.path.normcase(os.path.abspath(marker)) == own_exe:
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def _cleanup_stale_temp_dirs(log: Optional["Logger"] = None,
+                             roots: Optional[Sequence[str]] = None,
+                             min_age: float = STALE_TEMP_MIN_AGE,
+                             now: Optional[float] = None) -> List[str]:
+    """Удаляет брошенные временные каталоги Portablizer из прошлых запусков.
+
+    Возвращает список удалённых путей (он же идёт в журнал сборки). Ничего не
+    бросает: уборка мусора не имеет права сорвать сборку портатива.
+    """
+    current = time.time() if now is None else float(now)
+    removed: List[str] = []
+    for root in (list(roots) if roots is not None else _stale_temp_roots()):
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in entries:
+            if not any(name.casefold().startswith(prefix.casefold())
+                       for prefix in _STALE_TEMP_PATTERNS):
+                continue
+            path = os.path.join(root, name)
+            try:
+                if not os.path.isdir(path) or os.path.islink(path):
+                    continue
+                if _mine_temp_directory(path):
+                    continue
+                stat = os.stat(path)
+            except OSError:
+                continue
+            limit = min_age
+            for prefix in _STALE_TEMP_SOON:
+                if name.casefold().startswith(prefix):
+                    # Распаковка redist идёт минутами, а не часом.
+                    limit = min(limit, 600.0)
+            if current - stat.st_mtime < limit:
+                continue
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                continue
+            if os.path.exists(path):
+                continue
+            removed.append(path)
+            if log is not None:
+                try:
+                    log.debug(f"Удалён брошенный временный каталог: {path}")
+                except Exception:  # noqa: BLE001 - лог не должен мешать уборке
+                    pass
+    return removed
 
 
 @dataclass
@@ -1667,6 +1785,17 @@ class Portablizer:
             self._online_profile_targets = []
             self._online_profile_diagnostic = ""
             self._installer_name = opts.installer_path
+            # Жалоба: в C:\Users\<user> накапливались Portablizer-*-Temp / _MEI*
+            # от аварийных завершений предыдущих запусков. Убираем их сразу,
+            # до любой новой работы с TEMP — иначе их будет всё больше.
+            try:
+                removed = _cleanup_stale_temp_dirs(self.log)
+                if removed:
+                    self.log.info(
+                        "Убрано брошенных временных каталогов прошлых "
+                        f"запусков: {len(removed)}.")
+            except Exception:  # noqa: BLE001 - уборка не срывает сборку
+                pass
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
                 raise FileNotFoundError(f"Установщик не найден: {opts.installer_path}")
@@ -1757,11 +1886,17 @@ class Portablizer:
                     self.log.debug(f"  • запасной: {extra_plan.label}")
 
             # 3. Снимок реестра ДО
+            # Профиль чужого пользователя (UAC с вводом чужих учётных данных)
+            # не снимаем: его настройки оболочки нельзя приносить в портатив,
+            # иначе у пользователя «слетает» меню «Пуск» Windows 11.
+            switched_user = elevate_mod.switched_user_warning()
+            if switched_user:
+                self.log.warn(switched_user)
             before = {}
             if opts.capture_registry and IS_WINDOWS:
                 self.progress(22, "Снимок реестра (до установки)")
                 self.log.info("Делаю снимок реестра до установки...")
-                before = reg_mod.snapshot()
+                before = reg_mod.snapshot(include_user=not switched_user)
                 self.log.debug(f"  зафиксировано веток: {len(before)}")
             elif opts.capture_registry and not IS_WINDOWS:
                 self.log.warn("Захват реестра доступен только на Windows — пропускаю.")
@@ -1858,7 +1993,7 @@ class Portablizer:
                 self._check_cancel()
                 self.progress(65, "Снимок реестра (после установки)")
                 self.log.info("Делаю снимок реестра после установки...")
-                after = reg_mod.snapshot()
+                after = reg_mod.snapshot(include_user=not switched_user)
 
             # Если установщик не послушался целевого пути, ищем его результат
             # в перенаправленном профиле и в новых каталогах Program Files.
@@ -4000,6 +4135,13 @@ class Portablizer:
                 "USERPROFILE": user,
                 "PROGRAMDATA": programdata,
             })
+        if IS_WINDOWS and is_elevated():
+            # Portablizer уже повышен. Дочерний установщик наследует тот же
+            # уровень целостности, поэтому второе окно согласия ему не нужно —
+            # а именно оно и «зависает», когда появляется за окном программы
+            # или на защищённом рабочем столе. RunAsInvoker запрещает
+            # запрашивать повышение заново и ничего не отнимает: права уже есть.
+            env["__COMPAT_LAYER"] = "RunAsInvoker"
         for k, v in opts.extra_env.items():
             env[k] = os.path.expandvars(v)
         if opts.redirect_userdirs:
@@ -4960,7 +5102,72 @@ class Portablizer:
             f"Создан переносимый EXE-лончер: {rel}. Его можно запускать "
             "двойным кликом без Python и без Launch.bat."
         )
+        if os.path.normcase(os.path.normpath(destination_rel)) != os.path.normcase(
+                os.path.normpath(os.path.join("App", APP_EXE_LAUNCHER_NAME))):
+            # Копии под именами Launch_Launcher.exe / Launch_Configurator.exe
+            # получают свой алиас в конфиге; дополнительная «именная» копия
+            # нужна только рядом с основным лончером.
+            return rel
+        # Дополнительно: копия лончера с понятным именем для Диспетчера задач.
+        # Жалоба: в Task Manager висел ``LaunchPortable.exe``, и было
+        # непонятно, какую программу он запускает. Рядом кладётся та же самая
+        # копия с именем «Launch <AppName>.exe»: имя процесса в Диспетчере
+        # задач сразу говорит, что именно запущено. Цель у копии та же, что у
+        # основного лончера (main-цель из конфига), поэтому никаких aliases не
+        # требуется, а конфликт с настоящим exe программы исключён префиксом.
+        named = self._copy_named_exe_launcher(portable_dir, os.path.normpath(
+            os.path.join(portable_dir, destination_rel)))
+        if named:
+            self.log.ok(
+                "Создан лончер с именем программы: " + named + " — именно он "
+                "виден в Диспетчере задач как «Launch <программа>».")
         return rel
+
+    @staticmethod
+    def _task_manager_name(portable_dir: str) -> str:
+        """Имя лончера, понятное в Диспетчере задач: «Launch <Программа>».
+
+        ``LaunchPortable.exe`` само по себе не отвечает на вопрос «какую
+        программу он запускает» — а именно этот вопрос и задал пользователь.
+        """
+        # Путь может быть в Windows-синтаксисе даже на не-Windows (тесты,
+        # разбор чужого конфига), поэтому делим по обоим разделителям.
+        text = os.path.normpath(str(portable_dir)).replace("\\", "/")
+        base = text.rsplit("/", 1)[-1].strip()
+        if base.casefold().endswith("_portable"):
+            base = base[: -len("_portable")]
+        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", base or "")
+        cleaned = " ".join(cleaned.split()).strip(" .")
+        # Оставляем место под префикс и расширение: MAX_PATH никто не отменял.
+        return ("Launch " + cleaned)[:120] if cleaned else "Launch Portable"
+
+    def _copy_named_exe_launcher(self, portable_dir: str,
+                                 launcher_path: str) -> str:
+        """Кладёт рядом копию лончера с именем программы (для Task Manager).
+
+        Возвращает относительный путь копии или пустую строку. Копия — тот же
+        самый самодостаточный лончер: он находит ``launcher_config.json`` по
+        своему расположению и запускает ту же главную цель, что и
+        ``LaunchPortable.exe``. Имя начинается с «Launch », поэтому оно не
+        может совпасть с настоящим exe программы и ничего не перезапишет.
+        """
+        if not launcher_path or not os.path.isfile(launcher_path):
+            return ""
+        try:
+            name = self._task_manager_name(portable_dir) + ".exe"
+            destination = os.path.join(os.path.dirname(launcher_path), name)
+            if os.path.normcase(destination) == os.path.normcase(launcher_path):
+                return ""
+            portable_abs = os.path.abspath(portable_dir)
+            if os.path.commonpath((portable_abs, os.path.abspath(destination))) \
+                    != portable_abs:
+                return ""
+            temporary = destination + ".tmp"
+            shutil.copy2(launcher_path, temporary)
+            os.replace(temporary, destination)
+        except (OSError, ValueError):
+            return ""
+        return os.path.relpath(destination, portable_dir)
 
     # -- сквозные сохранения --------------------------------------------------
     def _setup_shared_saves(
@@ -5438,7 +5645,8 @@ class Portablizer:
                 ),
                 exe_launcher_file=(
                     "  App\\LaunchPortable.exe — основной запуск из EXE с "
-                    "портативным окружением\n"
+                    "портативным окружением (то же самое, что в Диспетчере "
+                    "задач видно как «Launch " + name + "»)\n"
                     if os.path.isfile(os.path.join(
                         portable_dir, "App", APP_EXE_LAUNCHER_NAME))
                     else ""
@@ -5514,6 +5722,9 @@ _README = """{app_name} — портативная версия
   --reset           забыть сохранённые настройки и стартовать «с нуля»
   --bat-fallback    принудительно использовать консольный BAT-лончер
   --help            справка
+  --repair-start-menu  починить меню «Пуск» Windows 11 (после сборки под
+                    администратором): вернуть «Документы» в профиль и
+                    сбросить испорченный кэш StartMenuExperienceHost
   -- <аргументы>    передать аргументы самой программе
 
 {runtime_section}{netstack_section}{saves_section}

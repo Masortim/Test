@@ -3188,7 +3188,11 @@ class GameLauncherHandoffTests(unittest.TestCase):
 
     def test_shutdown_settings_are_clamped_and_defaulted(self):
         default = exe_launcher.shutdown_settings({})
-        self.assertEqual(default["idle_grace"], 20.0)
+        # 5 секунд, а не 20: жалоба «LaunchPortable.exe висит в Диспетчере
+        # задач после закрытия программы». Программа с окном под таймер не
+        # попадает (это проверяется отдельно), а безымянные фоновые помощники
+        # получают короткую паузу и затем закрываются.
+        self.assertEqual(default["idle_grace"], 5.0)
         self.assertEqual(default["kill_leftovers"], 1.0)
 
         custom = exe_launcher.shutdown_settings(
