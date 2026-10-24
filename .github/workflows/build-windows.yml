@@ -75,9 +75,17 @@ jobs:
           Get-Content test-output.log -Tail 160 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           if ($testStatus -ne 0) {
+            # Имя упавшего модуля — в ЗАГОЛОВОК аннотации: хвоста журнала
+            # (последние 80 строк) мало, чтобы понять, какой модуль упал
+            # первым, а полный журнал доступен только артефактом.
+            $failedModules = @(Select-String -Path test-output.log -Pattern '^!! ' |
+              ForEach-Object { $_.Line.Trim() }) -join '; '
+            if (-not $failedModules) { $failedModules = 'unknown module' }
+            $title = "Windows unit tests failed: $failedModules"
+            if ($title.Length -gt 250) { $title = $title.Substring(0, 250) }
             $diagnostic = (Get-Content test-output.log -Tail 80) -join "`n"
             $diagnostic = $diagnostic.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-            Write-Host "::error title=Windows unit tests failed::$diagnostic"
+            Write-Host "::error title=$title::$diagnostic"
           }
           exit $testStatus
 
