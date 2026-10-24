@@ -83,7 +83,14 @@ jobs:
             if (-not $failedModules) { $failedModules = 'unknown module' }
             $title = "Windows unit tests failed: $failedModules"
             if ($title.Length -gt 250) { $title = $title.Substring(0, 250) }
-            $diagnostic = (Get-Content test-output.log -Tail 80) -join "`n"
+            # Сначала — только имена упавших модулей и тестов: в хвосте
+            # журнала их уже не видно, а именно они отвечают на вопрос «что
+            # сломалось», не заставляя скачивать артефакт.
+            $headline = @(Select-String -Path test-output.log `
+              -Pattern '^(FAIL|ERROR): |^!! ' |
+              ForEach-Object { $_.Line.Trim() }) -join "`n"
+            $diagnostic = $headline + "`n---`n" + `
+              ((Get-Content test-output.log -Tail 80) -join "`n")
             $diagnostic = $diagnostic.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Host "::error title=$title::$diagnostic"
           }
