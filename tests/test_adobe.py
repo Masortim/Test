@@ -537,7 +537,8 @@ class AdobeBuildTests(unittest.TestCase):
                 portable_dir=self.portable)
         self.assertEqual(rc, -1)
         self.assertIn("7-Zip", engine.log.text)
-        hints = engine._adobe_hints(self.detection, 191, self.portable)
+        with mock.patch.object(unpacker_mod, "find_unpacker", return_value=""):
+            hints = engine._adobe_hints(self.detection, 191, self.portable)
         self.assertTrue(any("7-Zip" in line for line in hints))
 
     def test_failure_hints_name_the_uwp_step_for_code_191(self):
