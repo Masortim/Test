@@ -500,6 +500,13 @@ class MainWindow(QMainWindow):
             "сохранения: сейвы прямого запуска exe и запуска через лончер "
             "сводятся в одно хранилище внутри портатива. Настройки "
             "портатива сохраняются, пересобирать его не нужно.\n"
+            "«Починить меню «Пуск»» лечит последствия сборки под "
+            "администратором: прежние версии захватывали ветку реестра "
+            "Explorer\\StartPage2/StartPins другого пользователя и оставляли "
+            "«Документы» внутри удалённой портативной папки — из-за этого "
+            "меню «Пуск» Windows 11 перестаёт открываться. Кнопка возвращает "
+            "«Документы» на место и сбрасывает испорченный кэш "
+            "StartMenuExperienceHost; закрепления не удаляются.\n"
             "«Обновить программу» ставит новую версию (например, Ollama) "
             "ВНУТРЬ портатива: из файла установщика или из загруженного "
             "программой. Файлы App подменяются только после проверки, "
@@ -532,15 +539,44 @@ class MainWindow(QMainWindow):
         self.update_btn = QPushButton("Обновить программу")
         self.update_btn.setObjectName("Ghost")
         self.update_btn.clicked.connect(self._update_program)
+        # Починка последствий сборки под администратором: меню «Пуск»
+        # перестаёт открываться, потому что прежняя версия захватывала ветку
+        # Explorer\StartPage2/StartPins другого пользователя и оставляла
+        # «Документы» внутри удалённой портативной папки.
+        self.startmenu_btn = QPushButton("Починить меню «Пуск»")
+        self.startmenu_btn.setObjectName("Ghost")
+        self.startmenu_btn.setToolTip(
+            "Возвращает папку «Документы» в профиль пользователя, если её "
+            "увели в удалённый портатив, и сбрасывает испорченный кэш меню "
+            "«Пуск» Windows 11 (StartMenuExperienceHost). Закрепления и "
+            "ярлыки пользователя не удаляются, explorer.exe не закрывается: "
+            "оболочка перестраивает меню сама.")
+        self.startmenu_btn.clicked.connect(self._repair_start_menu)
         buttons.addWidget(self.release_btn)
         buttons.addWidget(self.refresh_btn)
         buttons.addWidget(self.update_btn)
+        buttons.addWidget(self.startmenu_btn)
         buttons.addStretch(1)
         self.maintenance_status = QLabel("")
         self.maintenance_status.setObjectName("Hint")
         buttons.addWidget(self.maintenance_status, 1)
         lay.addLayout(buttons)
         return frame
+
+    def _repair_start_menu(self) -> None:
+        """Починить меню «Пуск» (папка портатива для этого не нужна)."""
+        if self.maintenance_worker and self.maintenance_worker.isRunning():
+            return
+        self.release_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        self.update_btn.setEnabled(False)
+        self.startmenu_btn.setEnabled(False)
+        self.maintenance_status.setText("Починяю меню «Пуск»…")
+        self.maintenance_worker = MaintenanceWorker("", "startmenu")
+        self.maintenance_worker.log_line.connect(self._on_log)
+        self.maintenance_worker.finished_report.connect(
+            self._on_maintenance_done)
+        self.maintenance_worker.start()
 
     def _browse_maintenance(self) -> None:
         start = self.maintenance_edit.text().strip() or (
@@ -609,6 +645,7 @@ class MainWindow(QMainWindow):
         self.release_btn.setEnabled(True)
         self.refresh_btn.setEnabled(True)
         self.update_btn.setEnabled(True)
+        self.startmenu_btn.setEnabled(True)
         text = "\n".join(report.messages) or "Готово."
         if report.success:
             self.maintenance_status.setText("✔ Готово")
@@ -1201,6 +1238,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(not running)
         self.release_btn.setEnabled(not running)
         self.refresh_btn.setEnabled(not running)
+        self.startmenu_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         for w in (self.installer_edit, self.output_edit, self.name_edit,
                   self.args_edit, self.env_edit, self.cb_redirect,

@@ -75,9 +75,24 @@ jobs:
           Get-Content test-output.log -Tail 160 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           if ($testStatus -ne 0) {
-            $diagnostic = (Get-Content test-output.log -Tail 80) -join "`n"
+            # Имя упавшего модуля — в ЗАГОЛОВОК аннотации: хвоста журнала
+            # (последние 80 строк) мало, чтобы понять, какой модуль упал
+            # первым, а полный журнал доступен только артефактом.
+            $failedModules = @(Select-String -Path test-output.log -Pattern '^!! ' |
+              ForEach-Object { $_.Line.Trim() }) -join '; '
+            if (-not $failedModules) { $failedModules = 'unknown module' }
+            $title = "Windows unit tests failed: $failedModules"
+            if ($title.Length -gt 250) { $title = $title.Substring(0, 250) }
+            # Сначала — только имена упавших модулей и тестов: в хвосте
+            # журнала их уже не видно, а именно они отвечают на вопрос «что
+            # сломалось», не заставляя скачивать артефакт.
+            $headline = @(Select-String -Path test-output.log `
+              -Pattern '^(FAIL|ERROR): |^!! |^(AssertionError|Assertion|ValueError|[A-Za-z_.]*Error|[A-Za-z_.]*Exception)[:] ' |
+              ForEach-Object { $_.Line.Trim() }) -join "`n"
+            $diagnostic = $headline + "`n---`n" + `
+              ((Get-Content test-output.log -Tail 80) -join "`n")
             $diagnostic = $diagnostic.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-            Write-Host "::error title=Windows unit tests failed::$diagnostic"
+            Write-Host "::error title=$title::$diagnostic"
           }
           exit $testStatus
 
@@ -422,6 +437,18 @@ jobs:
           done
           echo "::error title=Built EXE not committed::не удалось запушить бинарники в ${GITHUB_REF_NAME} за 3 попытки"
           exit 1
+
+      # Полный журнал тестов нужен именно тогда, когда модуль упал: шаг
+      # «Run tests» пишет только хвост в summary, а по нему не видно, какой
+      # модуль замолчал или упал первым.
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-log
+          path: test-output.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Report unit-test failures after publishing build
         if: steps.unit_tests.outcome == 'failure'

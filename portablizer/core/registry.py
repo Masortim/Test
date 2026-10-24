@@ -82,7 +82,18 @@ _ROOTS: List[Tuple[str, str]] = [("HKCU", "Software"), ("HKLM", "Software")]
 
 # Ветки, которые Windows и сторонние службы переписывают постоянно. Они не
 # имеют отношения к установке, поэтому не попадают ни в снимок, ни в очистку.
+# Кэш меню «Пуск» Win11 (StartPins / Start2 / StartCache) — типичный источник
+# жалобы: при запуске от администратора Portablizer захватывал эти ключи в
+# portable.reg, а лончер затем применял снимок из-под повышенных прав — в
+# итоге кэш сбрасывался и закреплённые плитки пропадали (жалоба №2).
 _VOLATILE_PREFIXES: Tuple[str, ...] = (
+    r"software\microsoft\windows\currentversion\explorer\startcache",
+    r"software\microsoft\windows\currentversion\explorer\startcache2",
+    r"software\microsoft\windows\currentversion\explorer\startpage",
+    r"software\microsoft\windows\currentversion\explorer\startpage2",
+    r"software\microsoft\windows\currentversion\explorer\startpins",
+    r"software\microsoft\windows\currentversion\explorer\start2",
+    r"software\microsoft\windows\currentversion\explorer\advanced\start",
     r"software\microsoft\windows\currentversion\explorer",
     r"software\microsoft\windows\currentversion\search",
     r"software\microsoft\windows\currentversion\cloudstore",
@@ -555,8 +566,16 @@ def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
               max_depth, depth + 1)
 
 
-def snapshot() -> Snapshot:
-    """Делает снимок наблюдаемых веток. На не-Windows возвращает пусто."""
+def snapshot(include_user: bool = True) -> Snapshot:
+    """Делает снимок наблюдаемых веток. На не-Windows возвращает пусто.
+
+    ``include_user=False`` исключает ``HKCU``. Это нужно при сборке под
+    ДРУГИМ пользователем (в окне UAC введены чужие учётные данные): профиль
+    тогда принадлежит администратору, и захват его настроек означал бы, что
+    лончер применит в профиле пользователя чужой снимок оболочки. Именно так
+    раньше «сбивалось» меню «Пуск» Windows 11. HKLM при этом снимается: он
+    общий для всех пользователей.
+    """
     if not IS_WINDOWS:
         return {}
     snap: Snapshot = {}
@@ -565,6 +584,8 @@ def snapshot() -> Snapshot:
         "HKLM": winreg.HKEY_LOCAL_MACHINE,  # type: ignore
     }
     for prefix, base in _ROOTS:
+        if prefix == "HKCU" and not include_user:
+            continue
         _walk(hives[prefix], base, prefix, snap)
     return snap
 

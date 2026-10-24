@@ -489,6 +489,222 @@ def stop_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
     return [f"NetStack teardown exit code {code}"]
 
 
+# --- меню «Пуск»: починка последствий ----------------------------------------
+#
+# Жалоба: после запуска Portablizer «от имени администратора» перестало
+# работать меню «Пуск» Windows 11. Механизм описан в portablizer/core/
+# startmenu.py: сборка под чужим пользователем и захват ветки Explorer
+# (StartPage2/StartPins/кэш Win11) плюс прерванное перенаправление папки
+# «Документы». Настройки оболочки больше не импортируются (см.
+# _SHELL_PROTECTED_SUBKEYS), а здесь — лечение того, что уже случилось.
+
+_USER_SHELL_KEY = (r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+                   r"\User Shell Folders")
+_LEGACY_SHELL_KEY = (r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+                     r"\Shell Folders")
+_DOCUMENTS_FOLDER_GUID = "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}"
+
+#: Признак «Документы уехали в портатив и остались там».
+_PORTABLE_DOCS_MARKER = os.path.join("portabledata", "user", "documents")
+
+
+def _documents_known_folder() -> str:
+    """Путь Known Folder «Документы» этого пользователя (пусто — нет)."""
+    if not IS_WINDOWS:
+        return ""
+    try:
+        import winreg  # type: ignore
+    except ImportError:
+        return ""
+    for subkey, name in ((_USER_SHELL_KEY, "Personal"),
+                         (_USER_SHELL_KEY, _DOCUMENTS_FOLDER_GUID),
+                         (_LEGACY_SHELL_KEY, "Personal"),
+                         (_LEGACY_SHELL_KEY, _DOCUMENTS_FOLDER_GUID)):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey, 0,
+                                winreg.KEY_QUERY_VALUE) as handle:
+                value, _typ = winreg.QueryValueEx(handle, name)
+        except OSError:
+            continue
+        if isinstance(value, str) and value.strip():
+            return os.path.expandvars(value.strip())
+    return ""
+
+
+def _documents_need_repair() -> bool:
+    """«Документы» указывают внутрь портатива, которого больше нет."""
+    value = _documents_known_folder()
+    if not value:
+        return False
+    if _PORTABLE_DOCS_MARKER not in value.replace("/", "\\").casefold():
+        return False
+    return not os.path.isdir(value)
+
+
+def restore_documents_known_folder(root: Optional[Path] = None) -> str:
+    """Возвращает «Документы» из удалённого портатива в профиль пользователя."""
+    if not IS_WINDOWS or not _documents_need_repair():
+        return ""
+    profile = os.environ.get("USERPROFILE", "")
+    destination = os.path.join(profile, "Documents") if profile else ""
+    if not destination:
+        return ""
+    try:
+        import winreg  # type: ignore
+    except ImportError:
+        return ""
+    written = False
+    for subkey, name, typ in (
+            (_USER_SHELL_KEY, "Personal", winreg.REG_EXPAND_SZ),
+            (_USER_SHELL_KEY, _DOCUMENTS_FOLDER_GUID, winreg.REG_EXPAND_SZ),
+            (_LEGACY_SHELL_KEY, "Personal", winreg.REG_SZ),
+            (_LEGACY_SHELL_KEY, _DOCUMENTS_FOLDER_GUID, winreg.REG_SZ)):
+        try:
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, subkey, 0,
+                                    winreg.KEY_SET_VALUE) as handle:
+                winreg.SetValueEx(handle, name, 0, typ, destination)
+            written = True
+        except OSError:
+            continue
+    if not written:
+        return ""
+    message = ("папка «Документы» возвращена в профиль пользователя ("
+               f"{destination}); раньше она указывала в удалённый портатив")
+    _run_log(root, "start menu repair: " + message)
+    return message
+
+
+def reset_start_menu_cache() -> int:
+    """Сбрасывает кэш меню «Пуск» (TempState пакета StartMenuExperienceHost)."""
+    if not IS_WINDOWS:
+        return 0
+    local = os.environ.get("LOCALAPPDATA", "")
+    if not local:
+        return 0
+    import glob as _glob
+
+    removed = 0
+    pattern = os.path.join(local, "Packages",
+                           "Microsoft.Windows.StartMenuExperienceHost_*",
+                           "TempState")
+    for folder in _glob.glob(pattern):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(folder, name)
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            except OSError:
+                continue
+            removed += 1
+    return removed
+
+
+def _notify_shell_change() -> None:
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SHChangeNotify(  # type: ignore[attr-defined]
+            0x08000000, 0, None, None)
+        ctypes.windll.user32.SendMessageTimeoutW(  # type: ignore[attr-defined]
+            0xFFFF, 0x001A, 0, "ShellState", 0x0002, 3000, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def repair_start_menu(root: Optional[Path] = None, reset_cache: bool = True,
+                      restart_shell: bool = True) -> "list[str]":
+    """Лечит меню «Пуск»: «Документы», кэш Win11, перезапуск оболочки.
+
+    Ничего не удаляет из пользовательских закреплений: перестраивается только
+    кэш, а ``explorer.exe`` никогда не завершается (Windows поднимает
+    ``StartMenuExperienceHost``/``SearchHost`` сама).
+    """
+    done: "list[str]" = []
+    if not IS_WINDOWS:
+        return done
+    restored = restore_documents_known_folder(root)
+    if restored:
+        done.append(restored)
+    if reset_cache:
+        removed = reset_start_menu_cache()
+        if removed:
+            message = f"кэш меню «Пуск» сброшен (файлов: {removed})"
+            _run_log(root, "start menu repair: " + message)
+            done.append(message)
+    _notify_shell_change()
+    if restart_shell and done:
+        for name in ("StartMenuExperienceHost.exe", "SearchHost.exe"):
+            try:
+                completed = subprocess.run(
+                    ["taskkill", "/f", "/im", name], capture_output=True,
+                    timeout=30, check=False, creationflags=NO_WINDOW)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if completed.returncode == 0:
+                done.append(f"перезапущен {name}")
+    return done
+
+
+def sanitize_portable_registry_files(root: Path) -> "list[str]":
+    """Убирает секции оболочки из ``portable*.reg`` прямо в папке портатива.
+
+    Нужно для портативов, собранных прежней версией: их ``portable.reg`` мог
+    содержать ветку ``Explorer\\StartPage2`` другого пользователя, и лончер
+    послушно её импортировал. Импорт теперь фильтруется, но запасной
+    ``Launch.bat`` вызывает ``reg import`` напрямую — поэтому файл лучше
+    вычистить один раз на месте. Возвращает список очищенных файлов.
+    """
+    cleaned: "list[str]" = []
+    for name in ("portable.reg", "portable_machine.reg"):
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            text = _decode_reg(path.read_bytes())
+        except OSError:
+            continue
+        sanitized, dropped = sanitize_reg_text(text)
+        if not dropped:
+            continue
+        try:
+            if not sanitized:
+                # В файле были только секции оболочки — он больше не нужен.
+                path.unlink()
+                cleaned.append(name + " (удалён: только секции оболочки)")
+                continue
+            path.write_text(sanitized, encoding="utf-16", newline="\r\n")
+            cleaned.append(name + f" (убрано секций: {len(dropped)})")
+        except OSError:
+            continue
+    for line in cleaned:
+        _run_log(root, "registry: shell sections removed from " + line)
+    return cleaned
+
+
+def autoheal_profile(root: Optional[Path] = None) -> None:
+    """Дешёвая самопроверка при каждом запуске: «Документы» на месте?
+
+    Если прежний сеанс был прерван и Known Folder остался направленным внутрь
+    уже удалённой портативной папки, это ломает не только меню «Пуск», но и
+    сохранения всех программ. Проверка стоит один запрос к реестру.
+    """
+    try:
+        restored = restore_documents_known_folder(root)
+    except Exception as exc:  # noqa: BLE001 - самопроверка не срывает запуск
+        _run_log(root, f"start menu check failed: {exc}")
+        return
+    if restored:
+        _notify_shell_change()
+
+
 def _write_error_log(root: Optional[Path], message: str) -> None:
     if root is None:
         return
@@ -557,13 +773,104 @@ def _decode_reg(raw: bytes) -> str:
             return raw.decode("utf-16-le", "replace")
 
 
-def _rewrite_reg(source: Path, destination: Path, replacements: Iterable[tuple[str, str]]) -> bool:
-    """Rewrite a .reg file as UTF-16 while replacing portable path markers."""
+# --- защита оболочки при импорте реестра --------------------------------------
+#
+# Портатив приносит с собой настройки приложения. Некоторые из них выглядят
+# как настройки приложения, а на деле принадлежат оболочке Windows: раскладка
+# меню «Пуск», закреплённые плитки, кэш Win11, панель задач, «Документы».
+#
+# Применять их из чужого снимка нельзя. Именно так ломалось меню «Пуск»:
+# сборка под администратором записывала в portable.reg ветку
+# ``...\CurrentVersion\Explorer\StartPage2`` (или ``StartPins``/``StartCache``)
+# другого пользователя, а лончер послушно её импортировал — и меню перестало
+# строиться. Теперь такие секции вырезаются из файла ПЕРЕД импортом, даже
+# если portable.reg был создан прежней версией Portablizer.
+_SHELL_PROTECTED_SUBKEYS = (
+    r"software\microsoft\windows\currentversion\explorer\startpage",
+    r"software\microsoft\windows\currentversion\explorer\startpage2",
+    r"software\microsoft\windows\currentversion\explorer\startpins",
+    r"software\microsoft\windows\currentversion\explorer\startcache",
+    r"software\microsoft\windows\currentversion\explorer\startcache2",
+    r"software\microsoft\windows\currentversion\explorer\starttiles",
+    r"software\microsoft\windows\currentversion\explorer\caches",
+    r"software\microsoft\windows\currentversion\explorer\taskband",
+    r"software\microsoft\windows\currentversion\explorer\user pinned",
+    r"software\microsoft\windows\currentversion\explorer\shell folders",
+    r"software\microsoft\windows\currentversion\explorer\user shell folders",
+    r"software\microsoft\windows\currentversion\explorer\fileexts",
+    r"software\microsoft\windows\currentversion\explorer\advanced",
+    r"software\microsoft\windows\currentversion\explorer\sessioninfo",
+    r"software\microsoft\windows\currentversion\shell",
+    r"software\microsoft\windows\currentversion\cloudstore",
+)
+
+
+def _reg_section_is_shell_owned(header: str) -> bool:
+    """Секция .reg принадлежит оболочке Windows (импортировать нельзя)."""
+    parts = [p for p in str(header or "").strip().strip("[]").split("\\") if p]
+    if len(parts) < 2:
+        return False
+    up = parts[0].upper()
+    if up in ("HKEY_CURRENT_USER", "HKCU"):
+        rest = parts[1:]
+    elif up in ("HKEY_USERS",):
+        # HKEY_USERS\<SID>\Software\... — та же ветка пользователя.
+        rest = parts[2:] if len(parts) > 2 else []
+    else:
+        return False
+    path = "\\".join(rest).casefold()
+    return any(path == prefix or path.startswith(prefix + "\\")
+               for prefix in _SHELL_PROTECTED_SUBKEYS)
+
+
+def sanitize_reg_text(text: str) -> "tuple[str, list[str]]":
+    """Вырезает из текста .reg секции оболочки. Возвращает (текст, вырезанное)."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    skip = False
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            skip = _reg_section_is_shell_owned(stripped)
+            if skip:
+                dropped.append(stripped.strip("[]"))
+                continue
+        if skip:
+            continue
+        kept.append(line)
+    body = "\n".join(kept).strip()
+    # Одного заголовка «Windows Registry Editor Version 5.00» недостаточно:
+    # если все секции вырезаны, импортировать нечего.
+    if not any(line.lstrip().startswith("[") for line in kept):
+        return "", dropped
+    if not body.casefold().startswith("windows registry editor"):
+        body = "Windows Registry Editor Version 5.00\n\n" + body
+    return body + "\n\n", dropped
+
+
+def _rewrite_reg(source: Path, destination: Path,
+                 replacements: Iterable[tuple[str, str]],
+                 sanitize: bool = False,
+                 log_root: "Optional[Path]" = None) -> bool:
+    """Rewrite a .reg file as UTF-16 while replacing portable path markers.
+
+    ``sanitize=True`` применяется при ИМПОРТЕ: секции оболочки Windows
+    (меню «Пуск», панель задач, «Документы») из файла вырезаются, поэтому
+    даже старый ``portable.reg`` не может их испортить.
+    """
     try:
         text = _decode_reg(source.read_bytes())
         for old, new in replacements:
             if old:
                 text = text.replace(old, new)
+        if sanitize:
+            text, dropped = sanitize_reg_text(text)
+            if not text:
+                # Импортировать нечего: профиль пользователя не трогаем.
+                return False
+            if dropped:
+                _run_log(log_root, "registry: shell sections skipped: "
+                         + ", ".join(dropped[:5]))
         # TextIO translates every \n when newline="\r\n". Normalize first so
         # an exported CRLF file does not turn into CRCRLF after rewriting.
         text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -574,13 +881,21 @@ def _rewrite_reg(source: Path, destination: Path, replacements: Iterable[tuple[s
         return False
 
 
-def _unpacked_reg(source: Path, runtime_dir: Path, root: Path, index: int) -> Path:
-    """Create a temporary importable copy with the current drive/path."""
+def _unpacked_reg(source: Path, runtime_dir: Path, root: Path,
+                  index: int) -> Optional[Path]:
+    """Create a temporary importable copy with the current drive/path.
+
+    ``None`` означает «импортировать нечего»: после вырезания секций оболочки
+    в файле не осталось ни одного ключа приложения. Возвращать в этом случае
+    исходный файл нельзя — он-то как раз и содержит эти секции, и именно их
+    импорт раньше ломал меню «Пуск».
+    """
     destination = runtime_dir / f"import-{index:03d}.reg"
     escaped_root = str(root).replace("\\", "\\\\")
-    if _rewrite_reg(source, destination, ((ROOT_TOKEN, escaped_root),)):
+    if _rewrite_reg(source, destination, ((ROOT_TOKEN, escaped_root),),
+                    sanitize=True, log_root=root):
         return destination
-    return source
+    return None
 
 
 def _pack_reg(path: Path, root: Path) -> None:
@@ -1143,6 +1458,7 @@ class ShellFolderSession:
                             pass
             self.backup_file.unlink()
             self.started = False
+            _notify_shell_change()
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             # Keep the recovery file: a later start can retry instead of
             # forgetting how the host profile looked before redirection.
@@ -1197,6 +1513,10 @@ class ShellFolderSession:
                         key, name, 0, value_type, str(self.documents)
                     )
             self.started = True
+            # Проводник и меню «Пуск» держат собственный кэш путей: без
+            # уведомления они продолжают показывать старые «Документы»,
+            # а иногда и отказываются строить меню. Уведомляем оболочку.
+            _notify_shell_change()
         except (OSError, TypeError, ValueError):
             # If the backup exists, restore whatever was changed before
             # allowing the target to start.
@@ -1833,6 +2153,11 @@ class RegistrySession:
         for index, source in enumerate(sources):
             if source.is_file():
                 imported = _unpacked_reg(source, self.runtime, self.root, index)
+                if imported is None:
+                    _run_log(self.root, "registry import " + source.name
+                             + ": skipped (only shell sections, nothing to "
+                               "apply)")
+                    continue
                 code = _reg(("import", str(imported)))
                 _run_log(
                     self.root,
@@ -3440,8 +3765,12 @@ def shutdown_settings(cfg: Dict[str, Any]) -> Dict[str, float]:
         # How long to wait for an official launcher to spawn the real program.
         "spawn_grace": number("spawn_grace", 6.0, 0.0, 120.0),
         # How long a windowless process from the folder may keep the session
-        # alive before it is treated as a leftover.
-        "idle_grace": number("idle_grace", 20.0, 1.0, 3600.0),
+        # alive before it is treated as a leftover. Снижено с 20 до 5 секунд:
+        # жалоба №4 — LaunchPortable.exe висел в Диспетчере задач после
+        # закрытия игры, потому что ждал фоновые crash-handler'ы 20 секунд.
+        # Настоящая программа с окном всё равно не попадёт под таймер
+        # (перепроверяется через _visible_window_pids / _is_interactive_image).
+        "idle_grace": number("idle_grace", 5.0, 1.0, 3600.0),
         # Politeness window after WM_CLOSE, before TerminateProcess.
         "close_grace": number("close_grace", 5.0, 0.0, 120.0),
         # Absolute ceiling for a single portable session.
@@ -3865,8 +4194,22 @@ def _is_elevated() -> bool:
         return False
 
 
-def _run_elevated(arguments: Sequence[str]) -> Optional[int]:
-    """Relaunch this frozen EXE through UAC and wait for its exit code."""
+#: Сколько ждать повышенную копию лончера, мс. Раньше ожидание было
+#: бесконечным (``WaitForSingleObject(..., INFINITE)``): если окно UAC никто не
+#: закрывал или повышенная копия зависала на своём диалоге, лончер висел
+#: навсегда — ровно это и выглядело как «завис запрос UAC».
+ELEVATED_WAIT_MS = 300_000
+
+
+def _run_elevated(arguments: Sequence[str],
+                  timeout_ms: int = ELEVATED_WAIT_MS) -> Optional[int]:
+    """Relaunch this frozen EXE through UAC, wait for its exit code — но не вечно.
+
+    ``None`` означает «результата нет»: пользователь отказался от UAC, окно
+    повышения не появилось или повышенная копия не уложилась в ``timeout_ms``.
+    Вызывающий код в этом случае продолжает работу без импорта HKLM (есть
+    запасной путь через VirtualStore), а не остаётся ждать навсегда.
+    """
     if not IS_WINDOWS or not getattr(sys, "frozen", False):
         return None
     try:
@@ -3901,13 +4244,69 @@ def _run_elevated(arguments: Sequence[str]) -> Optional[int]:
         if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
             return None
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
+        WAIT_TIMEOUT = 0x00000102
+        waited = kernel32.WaitForSingleObject(info.hProcess, int(timeout_ms))
+        if waited == WAIT_TIMEOUT:
+            # Повышенная копия не ответила за отведённое время. Процесс НЕ
+            # убиваем: он может добросовестно работать (например, ставить
+            # драйвер), а вот ждать его дальше нельзя — иначе весь запуск
+            # программы превращается в «висящий» UAC.
+            kernel32.CloseHandle(info.hProcess)
+            return None
         code = wintypes.DWORD()
         kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
         kernel32.CloseHandle(info.hProcess)
         return int(code.value)
     except Exception:
         return None
+
+
+#: Сколько помнить отказ от UAC, секунды. Раньше отказ нигде не запоминался,
+#: и лончер спрашивал права заново при КАЖДОМ запуске — при неудачном
+#: раскладе это выглядело как «завис запрос UAC».
+ELEVATION_REFUSAL_MEMORY = 3600.0
+
+
+def _elevation_stamp(root: Path) -> Path:
+    data = root / "PortableData" / "RegistryHostBackup"
+    return data / "elevation-refused.json"
+
+
+def mark_elevation_refused(root: Path, reason: str = "") -> None:
+    """Запоминает отказ/неудачу UAC, чтобы не спрашивать повторно каждый запуск."""
+    import time
+
+    path = _elevation_stamp(root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "when": time.time(),
+            "reason": str(reason)[:300],
+        }, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def elevation_recently_refused(root: Path,
+                              memory: float = ELEVATION_REFUSAL_MEMORY
+                              ) -> bool:
+    """Отказывались ли от UAC недавно (по умолчанию — в течение часа)."""
+    import time
+
+    try:
+        data = json.loads(_elevation_stamp(root).read_text(encoding="utf-8"))
+        when = float(data.get("when", 0.0))
+    except (OSError, ValueError, TypeError):
+        return False
+    return 0.0 < time.time() - when < float(memory)
+
+
+def clear_elevation_refusal(root: Path) -> None:
+    """Сбрасывает отметку об отказе (например, после удачного повышенного хода)."""
+    try:
+        _elevation_stamp(root).unlink()
+    except OSError:
+        pass
 
 
 def temp_leftovers(root: Path, cfg: "Optional[Dict[str, Any]]" = None) -> int:
@@ -5507,6 +5906,19 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
 
 def _run_session(argv: Optional[Sequence[str]], root: Path,
                  cfg: Dict[str, Any], watch: "UpdateWatch") -> int:
+    # Самопроверка профиля: прерванный прошлый сеанс мог оставить Known Folder
+    # «Документы» направленным внутрь уже удалённой папки портатива. Это ломает
+    # сохранения и меню «Пуск», а стоит проверка один запрос к реестру.
+    autoheal_profile(root)
+
+    # Портатив, собранный прежней версией, мог принести в portable.reg ветки
+    # оболочки (меню «Пуск»). Чистим файл на месте — и EXE-, и BAT-лончер
+    # тогда импортируют только настройки приложения.
+    try:
+        sanitize_portable_registry_files(root)
+    except Exception as exc:  # noqa: BLE001 - чистка не срывает запуск
+        _run_log(root, f"registry sanitize failed: {exc}")
+
     # Остатки прошлого запуска убираются ДО старта: иначе они так и будут
     # держать папку, пока пользователь не перезагрузит компьютер.
     stale = sweep_stale_session(root, cfg)
@@ -5563,21 +5975,36 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
 
     if needs_machine and machine_available and not already_elevated \
             and not _is_elevated():
-        elevated_code = _run_elevated(raw_arguments)
-        if elevated_code is not None:
-            # The elevated copy already reported its own result (including
-            # the friendly error 14001 box when the runtime is missing), so
-            # only record what happened.
-            _run_log(root, f"elevated run finished with code "
-                           f"{elevated_code}")
-            if elevated_code == 1223:
-                _run_log(root, "elevation declined at the UAC prompt; "
-                               "the captured HKLM entries stay unimported")
-            return elevated_code
-        # UAC refused or unavailable: keep going with the VirtualStore
-        # fallback instead of refusing to start the program at all.
-        _run_log(root, "elevation was refused or unavailable; "
-                       "continuing without the HKLM import")
+        if elevation_recently_refused(root):
+            # От UAC уже отказывались в последний час: спрашивать снова при
+            # каждом запуске — это и есть «зависший запрос UAC». Идём по
+            # запасному пути (VirtualStore) и честно пишем об этом в журнал.
+            _run_log(root, "the UAC prompt was declined recently; not asking "
+                           "again this hour, starting with the VirtualStore "
+                           "fallback instead")
+        else:
+            elevated_code = _run_elevated(raw_arguments)
+            if elevated_code is not None:
+                # The elevated copy already reported its own result (including
+                # the friendly error 14001 box when the runtime is missing), so
+                # only record what happened.
+                _run_log(root, f"elevated run finished with code "
+                               f"{elevated_code}")
+                if elevated_code == 1223:
+                    mark_elevation_refused(root, "declined at the UAC prompt")
+                    _run_log(root, "elevation declined at the UAC prompt; "
+                                   "the captured HKLM entries stay unimported "
+                                   "and the request will not repeat for an "
+                                   "hour")
+                else:
+                    clear_elevation_refusal(root)
+                return elevated_code
+            # UAC refused, unavailable or the elevated run did not answer in
+            # time: keep going with the VirtualStore fallback instead of
+            # refusing to start the program at all.
+            mark_elevation_refused(root, "no result from the UAC prompt")
+            _run_log(root, "elevation was refused, unavailable or timed out; "
+                           "continuing without the HKLM import")
 
     env = _prepare_environment(root, cfg)
     target = _as_relative_path(root, target_rel)
@@ -5846,6 +6273,38 @@ def _retry_stop_elevated(root: Path, reason: str) -> int:
     return 1
 
 
+def repair_start_menu_command(root: Optional[Path] = None) -> int:
+    """``LaunchPortable.exe --repair-start-menu``: починить меню «Пуск».
+
+    Нужно ровно после того, как сборка под администратором оставила след:
+    меню «Пуск» Windows 11 не открывается, плитки пропали. Команда возвращает
+    «Документы» в профиль (если их увели в удалённый портатив), сбрасывает
+    испорченный кэш ``StartMenuExperienceHost`` и перезапускает его — Windows
+    перестраивает меню по своей базе, закрепления пользователя не удаляются.
+    """
+    if not IS_WINDOWS:
+        _show_info("Починка меню «Пуск» доступна только на Windows.\n\n"
+                   "Команда работает внутри готового портатива: "
+                   "App\\LaunchPortable.exe --repair-start-menu")
+        return 1
+    try:
+        done = repair_start_menu(root)
+    except Exception as exc:  # noqa: BLE001 - починка не должна падать
+        _run_log(root, f"start menu repair failed: {exc}")
+        _show_error("Не удалось починить меню «Пуск».\n\n" + str(exc))
+        return 1
+    if not done:
+        _show_info("Следов поломки не найдено: папка «Документы» на месте, "
+                   "кэш меню «Пуск» выглядит целым.\n\nЕсли меню всё равно "
+                   "не открывается, перезагрузите компьютер: Windows "
+                   "пересоберёт кэш при старте.")
+        return 0
+    _show_info("Меню «Пуск» починено:\n\n  • " + "\n  • ".join(done)
+               + "\n\nПерезапустите Проводник или войдите заново, если меню "
+                 "не открылось сразу.")
+    return 0
+
+
 def sync_saves(root: Optional[Path] = None) -> int:
     """``LaunchPortable.exe --sync-saves``: свести сохранения вручную.
 
@@ -5870,6 +6329,17 @@ def sync_saves(root: Optional[Path] = None) -> int:
 
 def main() -> int:
     root: Optional[Path] = None
+    arguments = [str(arg).casefold() for arg in sys.argv[1:]]
+    # Починка меню «Пуск» — единственная команда, которой папка портатива не
+    # нужна: меню ломается как раз тогда, когда портатива под рукой может не
+    # быть. Она работает и из любой папки, куда скопировали этот EXE.
+    if any(arg in ("--repair-start-menu", "/repair-start-menu")
+           for arg in arguments):
+        try:
+            root = find_portable_root()
+        except Exception:  # noqa: BLE001 - вне портатива это нормально
+            root = None
+        return repair_start_menu_command(root)
     try:
         root = find_portable_root()
         if any(str(arg).casefold() in ("--stop", "/stop")

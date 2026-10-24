@@ -9,6 +9,7 @@ Portablizer работает с обычными правами, пока пол
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from typing import List, Optional, Sequence
 
@@ -97,3 +98,160 @@ def ensure_elevated(argv: Optional[Sequence[str]] = None) -> bool:
     except Exception:  # noqa: BLE001 - нет UAC: работаем без повышения
         return False
     return code > 32
+
+
+# --- сборка под ДРУГИМ пользователем ------------------------------------------
+#
+# Это самая опасная форма «запуска от имени администратора». Если в окне UAC
+# ввести учётные данные другого аккаунта, процесс получает ЕГО профиль: HKCU
+# указывает на чужую ветку реестра, а %USERPROFILE% — на чужую папку. Снимок
+# «до/после» тогда описывает настройки администратора (включая ветки оболочки
+# меню «Пуск»), а лончер применяет их в профиле обычного пользователя — отсюда
+# и «сбитое» меню «Пуск».
+#
+# Поэтому такие сборки не должны захватывать HKCU вообще. Отличить «тот же
+# пользователь, но с правами» от «другой пользователь» можно по владельцу
+# процесса explorer.exe: оболочка всегда работает от имени интерактивного
+# пользователя.
+
+_TOKEN_QUERY = 0x0008
+
+
+def _process_sid(pid: int) -> "Optional[str]":
+    """Строковый SID владельца процесса ``pid`` (``None`` — не определить)."""
+    if not IS_WINDOWS or not pid:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(_TOKEN_QUERY, False, int(pid))
+        if not handle:
+            return None
+        try:
+            token = wintypes.HANDLE()
+            if not advapi32.OpenProcessToken(ctypes.c_void_p(handle),
+                                            _TOKEN_QUERY,
+                                            ctypes.byref(token)):
+                return None
+            try:
+                size = wintypes.DWORD(0)
+                advapi32.GetTokenInformation(token, 1, None, 0,
+                                             ctypes.byref(size))
+                if not size.value:
+                    return None
+                buffer = ctypes.create_string_buffer(size.value)
+                if not advapi32.GetTokenInformation(token, 1, buffer,
+                                                    size.value,
+                                                    ctypes.byref(size)):
+                    return None
+                # TOKEN_USER: первым полем идёт указатель на SID.
+                sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+                text = wintypes.LPWSTR()
+                if not advapi32.ConvertSidToStringSidW(
+                        ctypes.c_void_p(sid), ctypes.byref(text)):
+                    return None
+                try:
+                    return str(text.value or "")
+                finally:
+                    kernel32.LocalFree(text)
+            finally:
+                kernel32.CloseHandle(token)
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+    except Exception:  # noqa: BLE001 - диагностика не должна падать
+        return None
+
+
+def _shell_owner_pid() -> int:
+    """PID процесса explorer.exe интерактивного пользователя (0 — нет).
+
+    Обходим снимок процессов через ``CreateToolhelp32Snapshot``, а не через
+    ``tasklist``: лишний дочерний процесс в момент старта сборки не нужен, а
+    подменённый в тестах ``subprocess`` не должен влиять на диагностику.
+    """
+    if not IS_WINDOWS:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot in (0, -1, None):
+            return 0
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while more:
+                if str(entry.szExeFile).casefold() == "explorer.exe":
+                    return int(entry.th32ProcessID)
+                more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+    except Exception:  # noqa: BLE001 - диагностика не должна падать
+        return 0
+    return 0
+
+
+def current_user_sid() -> "Optional[str]":
+    """SID пользователя, от имени которого работает текущий процесс."""
+    return _process_sid(os.getpid())
+
+
+def same_user_as_shell() -> bool:
+    """Работает ли процесс в профиле интерактивного пользователя.
+
+    ``True``, если определить не удалось: запрещать сборку «на всякий случай»
+    нельзя, а вот молча захватить чужой HKCU — можно предотвратить.
+    """
+    if not IS_WINDOWS:
+        return True
+    shell_pid = _shell_owner_pid()
+    if not shell_pid:
+        return True
+    shell = _process_sid(shell_pid)
+    own = current_user_sid()
+    if not shell or not own:
+        return True
+    return shell.casefold() == own.casefold()
+
+
+def switched_user_warning() -> str:
+    """Готовый текст предупреждения для журнала сборки (или пустая строка)."""
+    try:
+        if not IS_WINDOWS or not is_elevated() or same_user_as_shell():
+            return ""
+    except Exception:  # noqa: BLE001 - проверка не имеет права срывать сборку
+        return ""
+    return (
+        "Portablizer запущен с правами администратора в профиле ДРУГОГО "
+        "пользователя (в окне UAC введены чужие учётные данные). В этом "
+        "режиме HKEY_CURRENT_USER принадлежит администратору, поэтому "
+        "настройки пользователя не захватываются: иначе лончер применил бы "
+        "чужой снимок и испортил оболочку — в том числе меню «Пуск». "
+        "Сборка продолжится, но portable.reg останется пустым. Если нужны "
+        "настройки приложения, запустите Portablizer обычным пользователем "
+        "(при необходимости — «от имени администратора» со СВОИМ паролем)."
+    )

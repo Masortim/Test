@@ -142,6 +142,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "устанавливая")
     b.add_argument("--log-file", default="",
                    help="куда писать журнал (по умолчанию <out>/portablizer-cli.log)")
+
+    # Починка профиля: нужна после сборки под администратором, когда меню
+    # «Пуск» Windows 11 перестало открываться. Папка портатива не нужна.
+    sub.add_parser(
+        "repair-start-menu",
+        help="починить меню «Пуск» и вернуть папку «Документы» в профиль "
+             "пользователя после сборки под администратором")
     return parser
 
 
@@ -281,6 +288,21 @@ def cmd_build(ns: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_repair_start_menu(ns: argparse.Namespace) -> int:
+    """``repair-start-menu``: лечение последствий сборки под администратором."""
+    from .core.logutil import Logger
+    from .core.maintenance import repair_start_menu
+
+    log = Logger()
+    log.add_sink(lambda level, message: print(f"{level:<5} {message}"))
+
+    report = repair_start_menu(log)
+    print()
+    for message in report.messages:
+        print(f"• {message}")
+    return 0 if report.success else 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     attach_console()
@@ -288,5 +310,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns = parser.parse_args(args)
     if ns.command == "build":
         return cmd_build(ns)
+    if ns.command == "repair-start-menu":
+        return cmd_repair_start_menu(ns)
     parser.print_help()
     return 2

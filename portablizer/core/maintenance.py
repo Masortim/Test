@@ -360,6 +360,62 @@ def refresh(folder: str, log: Optional[Logger] = None,
     return report
 
 
+def repair_start_menu(log: Optional[Logger] = None) -> MaintenanceReport:
+    """Лечит меню «Пуск» после сборки под администратором.
+
+    Что именно ломалось и почему — в ``core/startmenu.py``. Здесь только
+    операция для окна: возвращает «Документы» на место, если их увели внутрь
+    удалённой портативной папки, сбрасывает испорченный кэш
+    ``StartMenuExperienceHost`` и перезапускает его (Windows перестраивает
+    меню сама; закрепления пользователя не удаляются).
+
+    ``explorer.exe`` не завершается никогда: это закрыло бы все окна.
+    """
+    from . import startmenu
+
+    log = log or Logger()
+    report = MaintenanceReport(folder="")
+    if not startmenu.IS_WINDOWS:
+        message = "Починка меню «Пуск» доступна только на Windows."
+        log.warn(message)
+        report.messages.append(message)
+        return report
+
+    found = startmenu.diagnose()
+    if not found:
+        message = ("Следов поломки не найдено: «Документы» указывают на "
+                   "существующую папку, кэш меню «Пуск» на месте.")
+        log.info(message)
+        report.messages.append(message)
+        report.success = True
+        return report
+    for line in found:
+        log.warn(line)
+
+    try:
+        done = startmenu.repair_start_menu(log)
+    except Exception as exc:  # noqa: BLE001 - починка не должна падать
+        message = f"Починить меню «Пуск» не удалось: {exc}"
+        log.error(message)
+        report.messages.append(message)
+        return report
+
+    report.messages.extend(done)
+    report.success = bool(done)
+    if done:
+        message = ("Меню «Пуск» починено. Если оно не открылось сразу, "
+                   "перезапустите Проводник или войдите заново.")
+        log.ok(message)
+        report.messages.append(message)
+    else:
+        message = ("Исправить автоматически нечего либо не хватило прав. "
+                   "Перезагрузите компьютер: Windows пересоберёт кэш меню при "
+                   "старте.")
+        log.warn(message)
+        report.messages.append(message)
+    return report
+
+
 #: Имя журнала обновления (лежит в папке данных портатива).
 UPDATE_LOG_NAME = "launcher-update.log"
 
