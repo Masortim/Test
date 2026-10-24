@@ -168,25 +168,50 @@ def _process_sid(pid: int) -> "Optional[str]":
 
 
 def _shell_owner_pid() -> int:
-    """PID процесса explorer.exe интерактивного пользователя (0 — нет)."""
+    """PID процесса explorer.exe интерактивного пользователя (0 — нет).
+
+    Обходим снимок процессов через ``CreateToolhelp32Snapshot``, а не через
+    ``tasklist``: лишний дочерний процесс в момент старта сборки не нужен, а
+    подменённый в тестах ``subprocess`` не должен влиять на диагностику.
+    """
     if not IS_WINDOWS:
         return 0
     try:
-        completed = subprocess.run(
-            ["tasklist", "/fi", "imagename eq explorer.exe", "/fo", "csv",
-             "/nh"],
-            capture_output=True, text=True, timeout=20, check=False,
-            creationflags=0x08000000)
-    except (OSError, subprocess.SubprocessError):
-        return 0
-    for line in (completed.stdout or "").splitlines():
-        parts = [item.strip().strip('"') for item in line.split('","')]
-        if len(parts) < 2:
-            continue
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot in (0, -1, None):
+            return 0
         try:
-            return int(parts[1])
-        except ValueError:
-            continue
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while more:
+                if str(entry.szExeFile).casefold() == "explorer.exe":
+                    return int(entry.th32ProcessID)
+                more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+    except Exception:  # noqa: BLE001 - диагностика не должна падать
+        return 0
     return 0
 
 
@@ -215,7 +240,10 @@ def same_user_as_shell() -> bool:
 
 def switched_user_warning() -> str:
     """Готовый текст предупреждения для журнала сборки (или пустая строка)."""
-    if not IS_WINDOWS or not is_elevated() or same_user_as_shell():
+    try:
+        if not IS_WINDOWS or not is_elevated() or same_user_as_shell():
+            return ""
+    except Exception:  # noqa: BLE001 - проверка не имеет права срывать сборку
         return ""
     return (
         "Portablizer запущен с правами администратора в профиле ДРУГОГО "

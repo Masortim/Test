@@ -87,7 +87,7 @@ jobs:
             # журнала их уже не видно, а именно они отвечают на вопрос «что
             # сломалось», не заставляя скачивать артефакт.
             $headline = @(Select-String -Path test-output.log `
-              -Pattern '^(FAIL|ERROR): |^!! ' |
+              -Pattern '^(FAIL|ERROR): |^!! |^(AssertionError|Assertion|ValueError|[A-Za-z_.]*Error|[A-Za-z_.]*Exception)[:] ' |
               ForEach-Object { $_.Line.Trim() }) -join "`n"
             $diagnostic = $headline + "`n---`n" + `
               ((Get-Content test-output.log -Tail 80) -join "`n")
