@@ -423,6 +423,18 @@ jobs:
           echo "::error title=Built EXE not committed::не удалось запушить бинарники в ${GITHUB_REF_NAME} за 3 попытки"
           exit 1
 
+      # Полный журнал тестов нужен именно тогда, когда модуль упал: шаг
+      # «Run tests» пишет только хвост в summary, а по нему не видно, какой
+      # модуль замолчал или упал первым.
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-log
+          path: test-output.log
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Report unit-test failures after publishing build
         if: steps.unit_tests.outcome == 'failure'
         shell: pwsh
