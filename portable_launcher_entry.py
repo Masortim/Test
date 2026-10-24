@@ -4266,6 +4266,12 @@ def _run_elevated(arguments: Sequence[str],
 #: раскладе это выглядело как «завис запрос UAC».
 ELEVATION_REFUSAL_MEMORY = 3600.0
 
+#: Насколько «в прошлое» может уйти отметка об отказе UAC из-за перевода
+#: часов на машине (служба времени может сдвинуть их на несколько секунд
+#: назад уже после записи файла). Без этого допуска только что записанная
+#: отметка считалась бы отсутствующей, и лончер снова спрашивал бы UAC.
+ELEVATION_CLOCK_SLACK = 300.0
+
 
 def _elevation_stamp(root: Path) -> Path:
     data = root / "PortableData" / "RegistryHostBackup"
@@ -4298,7 +4304,12 @@ def elevation_recently_refused(root: Path,
         when = float(data.get("when", 0.0))
     except (OSError, ValueError, TypeError):
         return False
-    return 0.0 < time.time() - when < float(memory)
+    if float(memory) <= 0.0:
+        return False
+    # Часы могли уйти назад уже после записи отметки — её всё равно считаем
+    # свежей, иначе лончер спрашивал бы UAC заново каждый запуск.
+    age = time.time() - when
+    return -ELEVATION_CLOCK_SLACK < age < float(memory)
 
 
 def clear_elevation_refusal(root: Path) -> None:

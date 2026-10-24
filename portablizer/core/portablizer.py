@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .. import __version__
+from . import adobe as adobe_mod
 from . import crashinfo as crash_mod
 from . import elevate as elevate_mod
 from . import launcher as launcher_mod
@@ -170,6 +171,10 @@ _EXIT_CODE_HINTS: Dict[int, str] = {
     14001: "параллельная конфигурация неправильна (side-by-side): программа "
            "собрана с Visual C++ 2005/2008, а этого рантайма на ПК нет — "
            "запустите Redist\\Install-Redist.cmd из портативной папки",
+    # Коды установщиков Adobe HyperDrive. 191 — это не «непонятая
+    # командная строка»: упал шаг установки UWP-пакета (Appx). Разбор и
+    # обход — в core/adobe.py.
+    **adobe_mod.ADOBE_CODES,
 }
 
 _NEGATIVE_EXIT_HINT = (
@@ -714,6 +719,9 @@ class PortableResult:
     #: Распаковщик, которым достали содержимое установщика БЕЗ его запуска
     #: (пусто — не потребовался).
     unpacked_with: str = ""
+    #: Объяснение, почему в портативе нет UWP-части Adobe
+    #: (``adobe-uwp.txt``), если установщик этой части и требовал.
+    adobe_note_rel: str = ""
     #: Найденные службы, указывающие внутрь портатива. Они только сообщаются;
     #: Portablizer не останавливает и не удаляет системные службы автоматически.
     registered_services: List[str] = field(default_factory=list)
@@ -1054,6 +1062,22 @@ class Portablizer:
         self._hollow_note = ""
         #: Текущий результат распознавания, нужен и для диагностики лестницы.
         self._detection: Optional[DetectionResult] = None
+        #: Установщик Adobe (HyperDrive): UWP-шаг (код 191) портативу не
+        #: нужен, поэтому пакеты раскладываются в обход установщика. Флаги —
+        #: ниже; разбор и тексты — в core/adobe.py.
+        self._adobe_detected = False
+        #: Что удалось разложить в App из пакетов Adobe (для подсказок).
+        self._adobe_applied: Optional[adobe_mod.ApplyResult] = None
+        #: Найденные пакеты Adobe (для подсказок про «только UWP без MSI»).
+        self._adobe_layout: Optional[adobe_mod.AdobeLayout] = None
+        #: Откуда взяли пакеты Adobe (каталог распаковки/TEMP установщика).
+        self._adobe_source = ""
+        #: Установщик уже оставил payload в TEMP — забирать его пробовали.
+        self._adobe_salvage_attempted = False
+        #: Разобранная причина отказа Adobe из журнала (код 191, OS-код Appx).
+        self._adobe_failure: Optional[adobe_mod.AdobeFailure] = None
+        #: Файл-объяснение про UWP-часть (``adobe-uwp.txt``), если он записан.
+        self._adobe_note_rel = ""
         #: Fusion может развернуться в перенаправленный LOCALAPPDATA, а не App.
         self._online_profile_main_exe = ""
         self._online_profile_checked = False
@@ -1732,6 +1756,19 @@ class Portablizer:
             self.log.info("Язык установщика: по умолчанию (как в самом "
                           "установщике).")
             return
+        if getattr(det, "is_adobe_hd", False):
+            # Adobe принимает локаль в виде ru_RU/en_US, а не имя языка Inno.
+            locale = adobe_mod.language_locale(opts.install_language)
+            if locale:
+                self.log.ok(
+                    f"Язык установки Adobe: {opts.install_language} "
+                    f"(ключ --INSTALLLANGUAGE={locale}).")
+            else:
+                self.log.warn(
+                    f"Язык «{opts.install_language}» не поддерживается "
+                    "Portablizer — установщик Adobe выполнится с языком по "
+                    "умолчанию.")
+            return
         plan = plan_language(
             det.installer_type, opts.install_language,
             opts.extra_install_args,
@@ -1779,6 +1816,13 @@ class Portablizer:
             self._unpacked_with = ""
             self._hollow_note = ""
             self._detection = None
+            self._adobe_detected = False
+            self._adobe_applied = None
+            self._adobe_layout = None
+            self._adobe_source = ""
+            self._adobe_salvage_attempted = False
+            self._adobe_failure = None
+            self._adobe_note_rel = ""
             self._online_profile_main_exe = ""
             self._online_profile_checked = False
             self._online_profile_deferred = False
@@ -1817,6 +1861,11 @@ class Portablizer:
             det = detect_installer(opts.installer_path)
             result.detection = det
             self._detection = det
+            # Adobe: даже если движок опознан иначе (оболочка пакета — обычный
+            # самораспаковывающийся архив), имя файла и раскладка payloads
+            # говорят, что это Adobe. Тогда имеет смысл забирать пакеты из
+            # adobeTemp после отказа и объяснять код 191 по-человечески.
+            self._adobe_detected = bool(det.is_adobe_hd or det.adobe_named)
             self.log.ok(f"Тип установщика: {det.human}")
             for e in det.evidence:
                 self.log.debug(f"  • {e}")
@@ -1870,7 +1919,16 @@ class Portablizer:
                 response_file=response_file,
                 allow_assisted=opts.allow_assisted_install,
                 language=opts.install_language,
+                adobe_layout_dir=os.path.join(portable_dir, "_adobe_payloads"),
             )
+            if det.is_adobe_hd:
+                self.log.info(
+                    "Adobe HyperDrive ставит программу в два этапа: пакеты "
+                    "MSI и UWP-пакет (Appx). Второй шаг падает с «кодом "
+                    "ошибки 191» и отменяет установку целиком. Для портатива "
+                    "он не нужен: пакеты программы раскладываются в App, а "
+                    "UWP пропускается."
+                )
             result.plan = attempts[0] if attempts else None
             result.attempts_planned = len(attempts)
             self.log.info(f"Команда: {attempts[0].display()}")
@@ -1973,7 +2031,11 @@ class Portablizer:
             # honest-шанс: распаковать приклеенный к exe ZIP — так устроены
             # многие современные bootstrapper'ы, и это не требует ни прав
             # администратора, ни изменения системы.
-            if not self._find_main_exe(app_dir, name) and det.has_zip_payload:
+            if (not self._find_main_exe(app_dir, name) and det.has_zip_payload
+                    and not self._adobe_detected):
+                # У Adobe приклеенный архив — это весь пакет (payloads, MSI,
+                # Appx). Вываливать его содержимое в App нельзя: пакеты
+                # ставятся отдельно, а не копируются как файлы.
                 self._check_cancel()
                 self.progress(62, "Распаковка вложенного архива установщика")
                 self._extract_zip_payload(opts.installer_path, app_dir, name)
@@ -2371,6 +2433,12 @@ class Portablizer:
         именно сделать дальше. Подсказки упорядочены по вероятности решения.
         """
         hints: List[str] = []
+
+        # Adobe: «код 191» — это шаг установки UWP-пакета, а не непонятая
+        # командная строка. Общие советы про права и ключи тишины здесь
+        # уводят в сторону, поэтому диагноз ставится первым.
+        if det.is_adobe_hd or self._adobe_detected or self._adobe_failure:
+            hints.extend(self._adobe_hints(det, rc, portable_dir))
 
         if getattr(det, "is_downloader_stub", False) is True:
             product = getattr(det, "online_product", None)
@@ -3413,9 +3481,19 @@ class Portablizer:
                     "выполняю, но успех маловероятен"
                 )
 
-            rc = self._run_install(plan, opts, app_dir, data_dir,
-                                   progress_from=start, progress_to=stop,
-                                   console_log=console_log)
+            if plan.payload_kind:
+                # План не запускает установщик: он раскладывает его пакеты
+                # своими силами (Adobe: UWP-шаг с кодом 191 тогда просто не
+                # выполняется). Запускать установщик здесь нельзя — смысл
+                # сценария именно в обратном.
+                rc = self._run_payload_plan(
+                    plan, opts, app_dir, data_dir, name,
+                    portable_dir=portable_dir, console_log=console_log,
+                    progress_from=start, progress_to=stop)
+            else:
+                rc = self._run_install(plan, opts, app_dir, data_dir,
+                                       progress_from=start, progress_to=stop,
+                                       console_log=console_log)
             last_rc = rc
             # Классический InstallShield пишет причину отказа в свой
             # setup.log — без неё «код 0 при пустой папке» необъясним.
@@ -3423,6 +3501,17 @@ class Portablizer:
             self._attempts_made += 1
             self._attempt_history.append((plan.label, rc))
             index += 1
+
+            # Adobe: установщик успевает разложить пакеты во временный каталог
+            # ДО того, как упадёт на UWP-шаге с кодом 191 (и откатит
+            # установку). Забираем их оттуда в App — это второй источник
+            # пакетов после контейнера самого установщика.
+            if (self._adobe_detected
+                    and plan.payload_kind != adobe_mod.PAYLOAD_ADOBE
+                    and not self._find_main_exe(app_dir, name)):
+                self._salvage_adobe_payloads(
+                    opts, app_dir, data_dir, name, portable_dir=portable_dir,
+                    console_log=console_log)
 
             if plan.interactive and plan.response_file \
                     and os.path.isfile(plan.response_file):
@@ -3433,9 +3522,12 @@ class Portablizer:
                 )
 
             # Распаковка бандла сама по себе файлов в App не даёт: из неё ещё
-            # нужно вытащить MSI-пакеты.
-            if plan.extracts_only and plan.output_dir \
-                    and os.path.normcase(plan.output_dir) != os.path.normcase(app_dir):
+            # нужно вытащить MSI-пакеты. Для планов со свой раскладкой
+            # (``payload_kind``) это уже сделано внутри них: их каталог — не
+            # layout Burn-бандла, и разбирать его как бандл нельзя.
+            if (plan.extracts_only and not plan.payload_kind
+                    and plan.output_dir
+                    and os.path.normcase(plan.output_dir) != os.path.normcase(app_dir)):
                 if self._install_layout_packages(plan.output_dir, opts, app_dir,
                                                  data_dir, name,
                                                  console_log=console_log):
@@ -3897,6 +3989,7 @@ class Portablizer:
         """
         result.installer_temp_dir = self._install_temp_dir
         result.unpacked_with = self._unpacked_with
+        result.adobe_note_rel = self._adobe_note_rel
         if not portable_dir:
             return
         report = os.path.join(portable_dir, crash_mod.CRASH_LOG_NAME)
@@ -4010,6 +4103,16 @@ class Portablizer:
                 "загрузчик, а не как контейнер с файлами программы."
             )
             return False
+        if self._adobe_detected:
+            # У Adobe контейнер — это набор пакетов (payloads, MSI, Appx), а не
+            # папка программы: копировать его в App бессмысленно. Пакеты
+            # раскладывает отдельный сценарий (см. _run_payload_plan), он же
+            # пропускает UWP-шаг с кодом 191.
+            self.log.info(
+                "Распаковку «в общую кучу» не делаю: это установщик Adobe, "
+                "его содержимое — пакеты, а не папка программы."
+            )
+            return False
         if not self._unpacker_worth_trying(det):
             return False
         unpacker = unpacker_mod.find_unpacker()
@@ -4056,12 +4159,19 @@ class Portablizer:
         return False
 
     def _run_unpacker_command(self, cmd: Sequence[str], console_log: str,
-                              opts: PortableOptions) -> "Tuple[int, str]":
+                              opts: PortableOptions,
+                              progress: "Tuple[int, int]" = (63, 65),
+                              stage: str = "Распаковка установщика",
+                              ) -> "Tuple[int, str]":
         """Запускает распаковщик с возможностью отмены и отчётом о ходе.
 
         Распаковка десятков гигабайт идёт минутами, поэтому у неё тот же
         контракт, что у установки: видимый прогресс, реакция на «Отменить» и
         жёсткий потолок по времени вместо молчаливого зависания.
+
+        ``progress`` — отрезок общей полосы, на котором виден ход распаковки:
+        у сценария Adobe он свой (лестница попыток идёт с 30 до 58 %), а не
+        63–65 %, где живёт «последний шанс» после установки.
         """
         handle = None
         try:
@@ -4094,9 +4204,10 @@ class Portablizer:
                 raise RuntimeError("Операция отменена пользователем.")
             elapsed = time.monotonic() - started
             fraction = creep_fraction(elapsed, scale=120.0)
-            # Отрезок 63..65 (а не один процент): плавная полоса должна
-            # сдвигаться, иначе она замирала бы на 63 % на всё время распаковки.
-            self._emit_progress(63 + int(2 * fraction), "Распаковка установщика")
+            # Несколько процентов вместо одного: плавная полоса должна
+            # сдвигаться, иначе она замирала бы на всё время распаковки.
+            low, high = progress
+            self._emit_progress(low + int(max(0, high - low) * fraction), stage)
             self._detail(
                 min(99, int(fraction * 100)),
                 "Распаковка без запуска идёт "
@@ -4116,6 +4227,313 @@ class Portablizer:
         if timed_out:
             return -1, "распаковка снята по пределу времени"
         return int(rc or 0), _text_tail(console_log)
+
+    # -- Adobe: обход UWP-шага (код ошибки 191) -------------------------------
+    #
+    # Установщик Adobe ставит программу в два этапа: пакеты MSI и UWP-пакет
+    # (Appx, шаг AddUWPAppxCommand). Второй этап регистрирует пакет в Windows
+    # для ВСЕХ пользователей и падает с «кодом 191» везде, где нет рабочей
+    # службы AppX, разрешения на неопубликованные приложения, системного тома
+    # или прав администратора. При этом он отменяет установку целиком.
+    #
+    # Портативу этот шаг не нужен: сама программа — обычное Win32-приложение.
+    # Поэтому пакеты берутся из контейнера установщика (7-Zip) или из каталога
+    # payloads рядом с ним, а если контейнер не читается — из adobeTemp, куда
+    # установщик успевает их разложить ДО падения на UWP-шаге. Разбор и тексты
+    # живут в core/adobe.py, здесь только решения оркестратора.
+
+    def _run_payload_plan(self, plan: SilentPlan, opts: PortableOptions,
+                          app_dir: str, data_dir: str, name: str,
+                          portable_dir: str = "",
+                          console_log: Optional[str] = None,
+                          progress_from: int = 30,
+                          progress_to: int = 58) -> Optional[int]:
+        """Раскладывает пакеты установщика в App, не запуская его.
+
+        Источников три, и проверяются они по порядку: сам контейнер
+        установщика (7-Zip, а для ZIP-оболочки — стандартная библиотека),
+        каталог ``payloads`` рядом с установщиком (пакет Adobe Admin Console)
+        и — уже после запуска установщика, отдельным шагом —
+        ``adobeTemp`` (см. :meth:`_salvage_adobe_payloads`). Возвращает код
+        0, если в App появился исполняемый файл, иначе — понятную причину в
+        журнале и код -1.
+        """
+        if not IS_WINDOWS:
+            self.log.warn(
+                "Не Windows: раскладка пакетов установщика невозможна.")
+            return None
+
+        work = plan.output_dir or os.path.join(portable_dir, "_adobe_payloads")
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            os.makedirs(work, exist_ok=True)
+        except OSError as exc:
+            self.log.warn(f"Не удалось создать папку распаковки: {exc}")
+            return -1
+
+        layout = adobe_mod.AdobeLayout(root=work)
+        unpacker = unpacker_mod.find_unpacker()
+        if unpacker:
+            self.log.info(
+                "Достаю пакеты Adobe из установщика без его запуска: "
+                f"{os.path.basename(unpacker)} читает контейнер напрямую, а "
+                "UWP-шаг (код 191) при этом не выполняется вовсе."
+            )
+            cmd = unpacker_mod.unpacker_argv(unpacker, opts.installer_path,
+                                             work)
+            unpack_log = console_log or os.path.join(portable_dir,
+                                                     "unpacker-output.log")
+            try:
+                code, _output = self._run_unpacker_command(
+                    cmd, unpack_log, opts,
+                    progress=(progress_from, max(progress_from,
+                                                 progress_to - 2)),
+                    stage="Распаковка пакета Adobe")
+            except RuntimeError:
+                shutil.rmtree(work, ignore_errors=True)
+                raise
+            if code not in (0, 1):
+                self.log.warn(
+                    f"{os.path.basename(unpacker)} завершился с кодом {code}: "
+                    "контейнер установщика прочитать не удалось.")
+            layout = adobe_mod.find_payloads(
+                work, installer_path=opts.installer_path)
+            if layout.is_empty:
+                self.log.warn(
+                    "Внутри контейнера не нашлось пакетов Adobe "
+                    "(payloads/MSI/ZIP).")
+        else:
+            self.log.info(
+                "Распаковщик (7-Zip) не найден: контейнер установщика Adobe "
+                "достать нечем. Пробую каталог payloads рядом с установщиком."
+            )
+
+        # Контейнер установщика может оказаться обычным ZIP (так устроены
+        # некоторые оболочки Adobe). Тогда 7-Zip не обязателен: стандартная
+        # библиотека распакует его сама — и код установщика снова не
+        # выполняется.
+        if layout.is_empty and getattr(self._detection, "has_zip_payload",
+                                       False):
+            self.log.info(
+                "Контейнер установщика — обычный ZIP: распаковываю его без "
+                "7-Zip и без запуска установщика.")
+            ok, text = adobe_mod.extract_zip(opts.installer_path, work)
+            if ok:
+                layout = adobe_mod.find_payloads(
+                    work, installer_path=opts.installer_path)
+            else:
+                self.log.warn(f"Распаковать ZIP установщика не удалось: {text}")
+
+        # Второй источник: готовый каталог payloads рядом с установщиком
+        # (распакованный пакет Admin Console, папка Build).
+        media = getattr(self._detection, "media_dir", "") or os.path.dirname(
+            opts.installer_path)
+        if media:
+            # Только ближайшие каталоги: ``payloads`` в пакете Admin Console
+            # лежит прямо рядом с setup.exe или в ``Build``. Глубже искать
+            # нельзя — в соседних папках могут оказаться чужие MSI (и наша же
+            # распаковка внутри папки портатива).
+            nearby = adobe_mod.find_payloads(
+                media, payload_dirs_only=True, max_depth=2,
+                installer_path=opts.installer_path)
+            if nearby.has_app_payload:
+                self.log.info(
+                    "Пакеты Adobe найдены рядом с установщиком: "
+                    + ", ".join(os.path.basename(p) for p in nearby.payload_dirs))
+                layout.extend(nearby)
+
+        if layout.is_empty:
+            self.log.warn(
+                "Пакетов программы Adobe найти не удалось: ни внутри "
+                "контейнера, ни в каталоге payloads рядом с установщиком.")
+            self._adobe_source = ""
+            self._adobe_applied = None
+            shutil.rmtree(work, ignore_errors=True)
+            return -1
+
+        self.log.info(f"Найдено в установщике Adobe: {layout.summary()}.")
+        applied = self._install_adobe_payloads(
+            layout, opts, app_dir, data_dir, name,
+            portable_dir=portable_dir, console_log=console_log,
+            progress_from=max(progress_from, progress_to - 3),
+            progress_to=progress_to)
+        self._adobe_source = layout.root
+        if self._find_main_exe(app_dir, name):
+            shutil.rmtree(work, ignore_errors=True)
+            self.log.ok(
+                "Пакеты Adobe разложены в App без запуска установщика — "
+                "UWP-шаг с кодом 191 не выполнялся."
+            )
+            return 0
+
+        self.log.warn(
+            "Пакеты Adobe разложены, но исполняемого файла программы в App "
+            "нет: возможно, в этой сборке только UWP-часть (Appx) без MSI. "
+            f"Распакованное оставлено для проверки: {work}"
+        )
+        return -1
+
+    def _install_adobe_payloads(self, layout: adobe_mod.AdobeLayout,
+                                opts: PortableOptions, app_dir: str,
+                                data_dir: str, name: str,
+                                portable_dir: str = "",
+                                console_log: Optional[str] = None,
+                                progress_from: int = 55,
+                                progress_to: int = 58,
+                                ) -> adobe_mod.ApplyResult:
+        """Ставит пакеты Adobe в App и объясняет, что пропущено.
+
+        MSI ставятся административной установкой (``msiexec /a``) — так же,
+        как пакеты WiX Burn: файлы попадают в App, а система не меняется.
+        ZIP распаковываются стандартной библиотекой, UWP-пакеты не трогаются.
+        """
+        def install_msi(msi_path: str) -> Optional[int]:
+            self.log.info(
+                f"Раскладываю пакет Adobe в App: {os.path.basename(msi_path)}")
+            msi_plan = build_silent_plan(
+                InstallerType.MSI, msi_path, app_dir, is_msi=True)
+            return self._run_install(
+                msi_plan, opts, app_dir, data_dir,
+                progress_from=progress_from, progress_to=progress_to,
+                console_log=console_log)
+
+        self._adobe_layout = layout
+        applied = adobe_mod.materialize(layout, app_dir, install_msi)
+        self._adobe_applied = applied
+        self.log.info(f"Итог по пакетам Adobe: {applied.summary()}.")
+        for name_failed, reason in applied.msi_failed:
+            self.log.warn(f"Пакет {name_failed} не разложился: {reason}")
+        for name_failed, reason in applied.archives_failed:
+            self.log.warn(f"Архив {name_failed} не распаковался: {reason}")
+        if applied.skipped_uwp:
+            self.log.info(
+                "UWP-пакеты пропущены (это и есть обход кода 191): "
+                + ", ".join(applied.skipped_uwp)
+                + ". Плитка в меню «Пуск» и другие UWP-точки входа в портатив "
+                "не переносятся, для запуска программы они не нужны.")
+        if portable_dir:
+            self._write_adobe_note(portable_dir, name, applied)
+        return applied
+
+    def _salvage_adobe_payloads(self, opts: PortableOptions, app_dir: str,
+                                data_dir: str, name: str,
+                                portable_dir: str = "",
+                                console_log: Optional[str] = None) -> bool:
+        """Забирает пакеты, которые установщик Adobe уже распаковал в TEMP.
+
+        Установщик раскладывает payload в ``adobeTemp\\ETRxxxx.tmp\\N`` и
+        только потом падает на UWP-шаге. Даже если контейнер установщика
+        сторонним распаковщиком не читается, эти пакеты никуда не делись:
+        из них можно собрать портатив. TEMP установщика принадлежит сборке
+        (``PortableData\Temp``), поэтому сначала смотрим туда, потом — в
+        системный ``adobeTemp``.
+        """
+        self._adobe_salvage_attempted = True
+        if self._adobe_applied is not None and self._adobe_applied.has_result:
+            # Пакеты из этого же временного каталога уже разложены: повторять
+            # установку тех же MSI на каждом следующем сценарии незачем.
+            self.log.debug(
+                "Пакеты Adobe уже разложены из временного каталога — "
+                "повторять не буду.")
+            return False
+        roots: List[str] = []
+        if self._install_temp_dir:
+            roots.append(self._install_temp_dir)
+        if portable_dir:
+            roots.append(os.path.join(portable_dir, "_adobe_payloads"))
+        roots.extend(adobe_mod.default_temp_roots())
+        layout = adobe_mod.find_payloads_in_roots(roots)
+        if not layout.has_app_payload:
+            self.log.debug(
+                "Распакованных пакетов Adobe во временных каталогах нет: "
+                "установщик убрал их при откате.")
+            return False
+
+        self.log.info(
+            "Установщик Adobe успел распаковать пакеты до отказа на "
+            f"UWP-шаге: {layout.summary()}. Забираю их в App — сам "
+            "установщик для этого запускать не нужно."
+        )
+        for note in layout.notes[:4]:
+            self.log.debug(f"  • {note}")
+        applied = self._install_adobe_payloads(
+            layout, opts, app_dir, data_dir, name,
+            portable_dir=portable_dir, console_log=console_log,
+            progress_from=56, progress_to=58)
+        self._adobe_source = layout.root
+        if self._find_main_exe(app_dir, name):
+            self.log.ok(
+                "Программа собрана из пакетов, распакованных установщиком "
+                "Adobe, — без UWP-шага.")
+            return True
+        self.log.warn(
+            "Пакеты из временного каталога Adobe не дали исполняемого файла "
+            f"в App. Что удалось разложить: {applied.summary()}.")
+        return False
+
+    def _write_adobe_note(self, portable_dir: str, name: str,
+                          applied: adobe_mod.ApplyResult) -> None:
+        """Пишет рядом объяснение, чего в портативе нет и почему.
+
+        Без этого файла пользователь, увидев в журнале «UWP пропущен»,
+        решит, что сборка недоделана. Объяснение остаётся рядом с портативом
+        и переезжает вместе с ним.
+        """
+        failure = self._adobe_failure
+        if failure is None and portable_dir:
+            failure = self._read_adobe_failure(portable_dir)
+        path = os.path.join(portable_dir, adobe_mod.ADOBE_NOTE_NAME)
+        try:
+            self._write_text(
+                path, adobe_mod.note_text(name, applied, failure=failure,
+                                          source=self._adobe_source))
+        except OSError as exc:
+            self.log.warn(f"Не удалось записать {adobe_mod.ADOBE_NOTE_NAME}: "
+                          f"{exc}")
+            return
+        self._adobe_note_rel = os.path.relpath(path, portable_dir)
+
+    def _read_adobe_failure(self, portable_dir: str
+                            ) -> Optional[adobe_mod.AdobeFailure]:
+        """Разбирает причину отказа Adobe из журналов сборки.
+
+        Сначала — собственный вывод установщика (``installer-output.log``),
+        затем журнал внутри портатива (``install.log``). Точная причина
+        (шаг, пакет, OS-код Appx) важнее кода возврата: именно она отличает
+        «не хватило прав» от «служба AppX отключена».
+        """
+        candidates = [os.path.join(portable_dir, "installer-output.log"),
+                      os.path.join(portable_dir, "install.log")]
+        for path in candidates:
+            try:
+                with open(path, "rb") as handle:
+                    text = handle.read(512 * 1024).decode("utf-8", "replace")
+            except OSError:
+                continue
+            failure = adobe_mod.parse_failure(text)
+            if failure is not None:
+                return failure
+        return None
+
+    def _adobe_hints(self, det: DetectionResult, rc: Optional[int],
+                     portable_dir: str = "") -> List[str]:
+        """Подсказки для Adobe: код 191 — это UWP-шаг, а не ключи тишины."""
+        failure = self._adobe_failure
+        if failure is None and portable_dir:
+            failure = self._read_adobe_failure(portable_dir)
+            self._adobe_failure = failure
+        if failure is None and rc in adobe_mod.ADOBE_CODES:
+            failure = adobe_mod.AdobeFailure(code=int(rc))
+        if failure is None and not det.is_adobe_hd:
+            return []
+        return adobe_mod.failure_hints(
+            failure,
+            applied=self._adobe_applied,
+            payload_extracted=bool(self._adobe_source),
+            unpacker_missing=not bool(unpacker_mod.find_unpacker()),
+            salvage_attempted=self._adobe_salvage_attempted,
+            layout=self._adobe_layout,
+        )
 
     def _build_isolated_env(self, opts: PortableOptions,
                             data_dir: str) -> Dict[str, str]:

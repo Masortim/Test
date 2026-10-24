@@ -295,6 +295,21 @@ class ElevationMemoryTests(unittest.TestCase):
             entry.clear_elevation_refusal(root)
             self.assertFalse(entry.elevation_recently_refused(root))
 
+    def test_stamp_from_a_slightly_wrong_clock_is_still_recent(self) -> None:
+        """Часы могли уйти назад после записи — отметка всё равно свежая.
+
+        На Windows-раннере служба времени уже подводила часы между записью
+        файла и чтением, и лончер снова спрашивал UAC в тот же запуск.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry.mark_elevation_refused(root, "declined")
+            entry._elevation_stamp(root).write_text(
+                json.dumps({"when": time.time() + 30.0, "reason": "declined"}),
+                encoding="utf-8")
+            self.assertTrue(entry.elevation_recently_refused(root))
+            self.assertFalse(entry.elevation_recently_refused(root, memory=0.0))
+
     def test_stamp_is_valid_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
