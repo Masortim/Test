@@ -30,11 +30,14 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import List, Optional, Sequence
 
+from . import adobe as adobe_mod
 from .detect import (
     TRUSTED_CONFIDENCE, DetectionResult, InstallerType, InstallShieldGeneration,
     RepackProfile,
 )
-from .languages import find_language, os_ui_language_code, plan_language
+from .languages import (
+    find_language, os_ui_language_code, plan_language,
+)
 
 #: Больше попыток запускать бессмысленно: каждая стоит времени пользователя.
 MAX_ATTEMPTS = 6
@@ -79,6 +82,11 @@ class SilentPlan:
     instructions: List[str] = field(default_factory=list)
     #: Файл ответов, который план читает (или записывает в режиме /r).
     response_file: str = ""
+    #: План не запускает установщик, а раскладывает его пакеты своими силами.
+    #: ``adobe`` — Adobe HyperDrive: пакеты берутся из контейнера и из
+    #: ``payloads``, UWP-шаг пропускается (см. core/adobe.py). Для таких
+    #: планов оркестратор вызывает не ``_run_install``, а свой обработчик.
+    payload_kind: str = ""
 
     def display(self) -> str:
         parts = [self.program] + list(self.args)
@@ -766,6 +774,129 @@ def build_repack_attempts(
     return attempts
 
 
+# -- Adobe Creative Cloud / XD -------------------------------------------------
+#
+# Установщик Adobe ставит программу в два этапа: пакеты MSI (файлы программы)
+# и UWP-пакет (Appx) — последний регистрируется в Windows для всех
+# пользователей и падает с «кодом ошибки 191» на большинстве машин (служба
+# AppXSvc, sideloading, системный том, права). Для портатива UWP-шаг не
+# нужен вовсе, поэтому первый и главный сценарий — вообще не запускать
+# установщик: достать пакеты из контейнера/каталога payloads и поставить их в
+# App (см. core/adobe.py). Тихие команды Adobe остаются запасными: если
+# пакетов достать не удалось, установщик хотя бы попробует отработать сам, а
+# сборка заберёт распакованное им из adobeTemp.
+
+#: Документированные наборы ключей Adobe. Современный пакет (``Build\\setup.exe``,
+#: в т. ч. собранный из Adobe Admin Console) принимает ``--silent`` с
+#: ``--ADOBEINSTALLDIR=``; старые оболочки — ``/sAll /rs``. ``/S`` оставлен для
+#: сборок HyperDrive, у которых нет длинных ключей.
+_ADOBE_LADDER: Sequence[Tuple[str, ...]] = (
+    ("--silent",),
+    ("/sAll", "/rs"),
+    ("/S",),
+)
+
+
+def build_adobe_payload_plan(installer_path: str, layout_dir: str) -> SilentPlan:
+    """План «раскладка пакетов Adobe без запуска установщика».
+
+    Установщик при этом не выполняется вообще: пакеты достаются из его
+    контейнера (7-Zip) или из каталога ``payloads`` рядом с ним, а UWP-пакет
+    пропускается — то есть шаг, падающий с кодом 191, просто не выполняется.
+    """
+    return SilentPlan(
+        program=installer_path,
+        notes=[
+            "Установщик Adobe не запускается: пакеты программы достаются из "
+            "его контейнера (7-Zip) или из каталога payloads, а UWP-пакет "
+            "пропускается.",
+            "Именно UWP-шаг (AddUWPAppxCommand) падает с «кодом ошибки 191» и "
+            "отменяет установку целиком. Портативу он не нужен: Windows "
+            "регистрирует такой пакет на конкретном компьютере для всех "
+            "пользователей, а не «в папке».",
+        ],
+        label="Adobe: раскладка пакетов без установки (UWP пропускается)",
+        output_dir=_native(layout_dir),
+        extracts_only=True,
+        payload_kind=adobe_mod.PAYLOAD_ADOBE,
+    )
+
+
+def build_adobe_attempts(
+    detection: DetectionResult,
+    installer_path: str,
+    target_dir: str,
+    layout_dir: str = "",
+    extra_args: Optional[Sequence[str]] = None,
+    language: str = "",
+) -> List[SilentPlan]:
+    """Лестница для установщика Adobe HyperDrive.
+
+    Порядок принципиален:
+
+    1. **раскладка пакетов без установки** — единственный сценарий, который
+       не упирается в UWP-шаг;
+    2. документированный ``--silent --ADOBEINSTALLDIR=<App>`` (пакет
+       Admin Console умеет ставить программу в указанную папку);
+    3. ``--silent`` без пути — если конкретная сборка не знает
+       ``--ADOBEINSTALLDIR``, файлы найдутся в перенаправленном профиле;
+    4. ``/sAll /rs`` и ``/S`` — старые оболочки HyperDrive.
+
+    После каждого запуска сборка забирает распакованные пакеты из
+    ``adobeTemp``: установщик успевает разложить их ДО падения на UWP-шаге.
+    """
+    user_extra = list(extra_args or [])
+    native_target = _native(target_dir)
+    installer_path = _norm(installer_path)
+    target_dir = _norm(target_dir)
+
+    attempts: List[SilentPlan] = []
+    if layout_dir:
+        attempts.append(build_adobe_payload_plan(installer_path, layout_dir))
+
+    lang_args: List[str] = []
+    locale = adobe_mod.language_locale(language)
+    if locale:
+        # Adobe принимает локаль в виде en_US/fr_CA, а не имя языка Inno.
+        lang_args = [f"--INSTALLLANGUAGE={locale}"]
+
+    def silent_plan(args: Sequence[str], label: str, notes: Sequence[str],
+                    ignores: bool = False) -> SilentPlan:
+        return SilentPlan(
+            program=installer_path,
+            args=list(args) + lang_args + user_extra,
+            notes=list(notes),
+            label=label,
+            output_dir=native_target,
+            ignores_target_dir=ignores,
+        )
+
+    attempts.append(silent_plan(
+        ["--silent", f"--ADOBEINSTALLDIR={target_dir}"],
+        "Adobe: --silent --ADOBEINSTALLDIR",
+        ["Документированная тихая установка пакета Adobe: "
+         "setup.exe --silent --ADOBEINSTALLDIR=<папка>.",
+         "Если сборка всё равно упадёт с кодом 191 — это UWP-шаг, а не "
+         "командная строка; файлы программы при этом уже могут лежать в "
+         "adobeTemp, и сборка заберёт их оттуда."]))
+    attempts.append(silent_plan(
+        ["--silent"],
+        "Adobe: --silent",
+        ["Не все сборки HyperDrive знают --ADOBEINSTALLDIR: тихий режим без "
+         "ключа папки, программа окажется в профиле или Program Files, а "
+         "сборка перенесёт её в App."],
+        ignores=True))
+    attempts.append(silent_plan(
+        ["/sAll", "/rs"], "Adobe: /sAll /rs",
+        ["Старая оболочка HyperDrive: /sAll — полная тишина, /rs — без "
+         "перезагрузки."], ignores=True))
+    attempts.append(silent_plan(
+        ["/S"], "Adobe: /S",
+        ["Минимальный ключ тишины, который понимают сборки HyperDrive без "
+         "длинных ключей."], ignores=True))
+    return attempts
+
+
 def build_attempts(
     detection: DetectionResult,
     installer_path: str,
@@ -776,6 +907,7 @@ def build_attempts(
     response_file: str = "",
     allow_assisted: bool = False,
     language: str = "",
+    adobe_layout_dir: str = "",
 ) -> List[SilentPlan]:
     """Строит упорядоченную лестницу попыток тихой установки.
 
@@ -884,6 +1016,17 @@ def build_attempts(
             repack, installer_path, target_dir,
             log_dir=log_dir, extra_args=user_extra, language=language,
         )[:MAX_ATTEMPTS + 2]
+
+    # Adobe HyperDrive: UWP-шаг (код 191) портативу не нужен, поэтому первым
+    # сценарием идёт раскладка пакетов без запуска установщика. Обычная
+    # тихая установка Adobe всё равно упирается в этот шаг.
+    if itype == InstallerType.ADOBE_HD:
+        payload_dir = adobe_layout_dir or layout_dir
+        return build_adobe_attempts(
+            detection, installer_path, target_dir,
+            layout_dir=payload_dir, extra_args=user_extra,
+            language=language,
+        )
 
     if itype == InstallerType.CUSTOM_CLI:
         attempts.append(build_custom_cli_plan(

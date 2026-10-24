@@ -90,6 +90,7 @@ class InstallerType(str, Enum):
     ADVANCED_INSTALLER = "Advanced Installer"
     SQUIRREL = "Squirrel/ClickOnce"
     SELF_EXTRACT = "Self-extracting archive"
+    ADOBE_HD = "Adobe Creative Cloud (HyperDrive)"
     CUSTOM_CLI = "Custom CLI bootstrapper"
     UNKNOWN = "Unknown / Generic"
 
@@ -130,6 +131,13 @@ _SIGNATURES: Dict[InstallerType, List[bytes]] = {
     ],
     InstallerType.SELF_EXTRACT: [
         b"7-Zip", b"SFXWizard", b"WinRAR SFX", b"WinZip Self-Extractor",
+    ],
+    # Adobe HyperDrive (HDSetup/HDPIM): так устроены установщики Creative
+    # Cloud и отдельных программ (XD, Photoshop, Illustrator…). Последним
+    # шагом движок ставит UWP-пакет — именно он падает с «кодом ошибки 191».
+    InstallerType.ADOBE_HD: [
+        b"HDPIM", b"HDSetup", b"AddUWPAppxCommand", b"adobeTemp",
+        b"Adobe Desktop Common", b"UWPAssets", b"SparklerApp",
     ],
 }
 
@@ -325,6 +333,27 @@ _VENDOR_PROFILES: Tuple[VendorProfile, ...] = (
         switches=("/S", "/D=", "/NCRC"),
         license_url="",
         installer_hint=InstallerType.NSIS,
+    ),
+    # Adobe (Creative Cloud, XD, Photoshop, Illustrator…): установщик —
+    # оболочка над HyperDrive, внутри сборки строки упакованы, но имя файла
+    # стандартизовано (``Adobe.XD.v61.0.12.1.exe``, ``Adobe Photoshop 2024.exe``).
+    # Документированный тихий режим пакета — ``setup.exe --silent``
+    # (``--ADOBEINSTALLDIR=``, ``--INSTALLLANGUAGE=``), у старых сборок —
+    # ``/sAll``. Главное здесь не ключи, а то, что портатив собирается без
+    # UWP-шага: см. core/adobe.py.
+    VendorProfile(
+        name="Adobe",
+        filename_re=re.compile(
+            r"(?=.*adobe)(?=.*(?:xd|photoshop|illustrator|indesign|"
+            r"premiere|after[\s._-]*effects|lightroom|animate|audition|"
+            r"acrobat|creative[\s._-]*cloud|media[\s._-]*encoder|bridge))"
+            r".*\.exe$",
+            re.IGNORECASE),
+        hosts=("adobe.com",),
+        switches=("--silent", "--ADOBEINSTALLDIR", "--INSTALLLANGUAGE",
+                  "/sAll"),
+        license_url="",
+        installer_hint=InstallerType.ADOBE_HD,
     ),
 )
 
@@ -704,12 +733,31 @@ class MediaLayout:
 
     directory: str = ""
     files: List[str] = field(default_factory=list)
+    #: Подкаталоги рядом с установщиком (``payloads`` у пакета Adobe).
+    subdirs: List[str] = field(default_factory=list)
     #: Найденные файлы ответов InstallShield (*.iss).
     response_files: List[str] = field(default_factory=list)
     #: MSI-пакеты рядом с setup.exe (признак обёртки над Windows Installer).
     msi_files: List[str] = field(default_factory=list)
     legacy_hits: List[str] = field(default_factory=list)
     msi_hits: List[str] = field(default_factory=list)
+    #: Каталоги с пакетами Adobe (``payloads``/``payload``).
+    payload_dirs: List[str] = field(default_factory=list)
+
+    @property
+    def adobe_layout(self) -> bool:
+        """Рядом лежит распакованный пакет Adobe (``Build\\payloads``).
+
+        Такая раскладка — не догадка: у Adobe пакеты лежат именно в
+        ``payloads``, а вместе с ними идут ``setup.exe``/``Setup.xml``/
+        ``PackageInfo.txt``/``*.ccp``. По ней Portablizer может собрать
+        портатив, не запуская установщик вовсе.
+        """
+        if not self.payload_dirs:
+            return False
+        markers = {"setup.exe", "set-up.exe", "setup.xml", "packageinfo.txt"}
+        return any(name.casefold() in markers or name.casefold().endswith(".ccp")
+                   for name in self.files)
 
     @property
     def legacy_score(self) -> int:
@@ -729,6 +777,15 @@ def scan_media_layout(path: str, limit: int = 4000) -> MediaLayout:
             for index, entry in enumerate(entries):
                 if index >= limit:
                     break
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    is_dir = False
+                if is_dir:
+                    layout.subdirs.append(entry.name)
+                    if entry.name.casefold() in ("payloads", "payload"):
+                        layout.payload_dirs.append(entry.path)
+                    continue
                 if not entry.is_file():
                     continue
                 layout.files.append(entry.name)
@@ -849,6 +906,17 @@ class DetectionResult:
     #: — обычно Inno Setup с СОБСТВЕННЫМ разбором командной строки: движковые
     #: ключи молча не работают, а сборка открывает мастер и ждёт мышку.
     repack_profile: Optional[RepackProfile] = None
+    #: Имя файла — стандартизованное имя продукта Adobe. Движок при этом мог
+    #: опознаться как self-extract (внешняя оболочка пакета): для журнала и
+    #: диагностики кода 191 это важно, но лестницу команд не подменяет.
+    adobe_named: bool = False
+    #: Рядом с установщиком лежит распакованный пакет Adobe (``payloads``).
+    adobe_layout: bool = False
+
+    @property
+    def is_adobe_hd(self) -> bool:
+        """Установщик Adobe HyperDrive: ставит и MSI, и UWP-пакет."""
+        return self.installer_type == InstallerType.ADOBE_HD
 
     @property
     def human(self) -> str:
@@ -1016,6 +1084,18 @@ def detect_installer(path: str) -> DetectionResult:
         evidence.setdefault(InstallerType.INSTALLSHIELD, []).append(
             "рядом с установщиком лежит медиа-раскладка InstallShield")
 
+    # Пакет Adobe Admin Console: рядом с setup.exe лежит ``payloads`` и
+    # PackageInfo.txt/Setup.xml (или *.ccp). Это сильнее любой строки внутри
+    # упакованной оболочки: такой пакет можно собрать, вообще не запуская
+    # установщик (см. core/adobe.py).
+    if layout.adobe_layout:
+        scores[InstallerType.ADOBE_HD] = max(
+            scores.get(InstallerType.ADOBE_HD, 0.0), 0.93)
+        evidence.setdefault(InstallerType.ADOBE_HD, []).append(
+            "рядом с установщиком лежит раскладка Adobe: каталог payloads и "
+            "Setup.xml/PackageInfo.txt — пакеты программы можно поставить, "
+            "не запуская установщик")
+
     if not scores:
         result = DetectionResult(
             InstallerType.UNKNOWN, 0.2,
@@ -1031,9 +1111,23 @@ def detect_installer(path: str) -> DetectionResult:
     # файла: репак, названный Zenno*.exe, но собранный в Inno Setup,
     # обрабатывается как Inno Setup.
     profile: Optional[VendorProfile] = None
+    candidate_profile = _vendor_profile(path)
+    adobe_named = (candidate_profile is not None
+                   and candidate_profile.installer_hint == InstallerType.ADOBE_HD)
     if (result.installer_type != InstallerType.CUSTOM_CLI
             and result.confidence < TRUSTED_CONFIDENCE):
-        profile = _vendor_profile(path)
+        profile = candidate_profile
+    # Adobe: оболочка пакета — самораспаковывающийся архив, поэтому движок
+    # опознаётся как SELF_EXTRACT/UNKNOWN. Стандартизованное имя файла
+    # (``Adobe.XD.v61.0.12.1.exe``) здесь доказательство сильнее: без профиля
+    # сборка пошла бы универсальными ключами и упёрлась в тот же UWP-шаг с
+    # кодом 191. Настоящий движок внутри (Inno, NSIS, InstallShield) не
+    # перебивается: чужому установщику ключи Adobe не нужны.
+    if (profile is None and adobe_named
+            and result.installer_type in (InstallerType.UNKNOWN,
+                                          InstallerType.SELF_EXTRACT,
+                                          InstallerType.SQUIRREL)):
+        profile = candidate_profile
     if profile is not None:
         vendor_evidence = [
             f"установщик {profile.name}: имя файла соответствует продукту "
@@ -1048,6 +1142,13 @@ def detect_installer(path: str) -> DetectionResult:
             vendor_evidence.append(
                 "внутри найден сайт производителя: "
                 + ", ".join(profile.hosts))
+        if profile.installer_hint == InstallerType.ADOBE_HD:
+            vendor_evidence.append(
+                "Adobe HyperDrive (HDSetup/HDPIM): установщик ставит не "
+                "только MSI, но и UWP-пакет (Appx) для всех пользователей. "
+                "Именно этот шаг падает с «кодом ошибки 191», и для "
+                "портатива он не нужен: пакеты программы ставятся в App, "
+                "а UWP пропускается")
         scan_evidence = result.evidence
         # Профиль может называть движок (NSIS у Planeta) — тогда лестница
         # строится по движку; если движок не указан, остаёмся на собственном
@@ -1060,7 +1161,11 @@ def detect_installer(path: str) -> DetectionResult:
             license_urls=([profile.license_url] if profile.license_url else [])
             + [u for u in scan.urls if u != profile.license_url],
             vendor_args=list(profile.fixed_args),
-            vendor_name=profile.name)
+            vendor_name=profile.name,
+            adobe_named=adobe_named)
+        # Раскладка ``payloads`` рядом с установщиком сохраняется: по ней
+        # пакеты достаются без запуска (core/adobe.py).
+        result.adobe_layout = layout.adobe_layout
 
     # Профиль перепака. Применяется к сборкам Inno/универсальным, но НЕ к
     # настоящим бандлам Trimble (WiX Burn) и не к MSI: у официального
@@ -1101,6 +1206,21 @@ def detect_installer(path: str) -> DetectionResult:
     result.has_zip_payload = _has_zip_payload(path)
     result.media_dir = layout.directory
     result.response_files = list(layout.response_files)
+    result.adobe_named = result.adobe_named or adobe_named
+    result.adobe_layout = layout.adobe_layout
+    if result.installer_type == InstallerType.ADOBE_HD:
+        if not result.vendor_name:
+            # Движок HyperDrive есть только у Adobe: другого производителя,
+            # поставившего его, не существует, поэтому имя известно точно.
+            result.vendor_name = "Adobe"
+        if not result.evidence:
+            result.evidence = [
+                "внутри найдены строки движка Adobe HyperDrive "
+                "(HDSetup/HDPIM/AddUWPAppxCommand)"]
+    if result.adobe_layout:
+        result.evidence.append(
+            "рядом с установщиком лежит каталог payloads — пакеты программы "
+            "можно поставить в App, не запуская установщик")
 
     if result.installer_type == InstallerType.INSTALLSHIELD:
         generation, generation_evidence = installshield_generation(scan, layout)
