@@ -346,6 +346,25 @@ class LauncherRepairTests(unittest.TestCase):
         # Штамп обновлён: второй запуск уже ничего не правит.
         self.assertEqual(exe_launcher.repair_paths(new), [])
 
+    def test_path_from_two_moves_ago_is_rewritten_too(self):
+        """В настройках мог остаться путь не только прошлого места."""
+        new = self._move()
+        even_older = self.base / "C" / "Old" / "XD_Portable"
+        (new / "PortableData" / "User" / "history.ini").write_text(
+            "[Recent]\\r\\nDir=" + str(even_older) + "\\r\\n", encoding="utf-8")
+        stamp = json.loads((new / "PortableData" / "portable-root.json")
+                           .read_text(encoding="utf-8"))
+        stamp["previous"] = str(even_older)
+        (new / "PortableData" / "portable-root.json").write_text(
+            json.dumps(stamp), encoding="utf-8")
+
+        lines = exe_launcher.repair_paths(new)
+        self.assertTrue(lines)
+        text = (new / "PortableData" / "User" / "history.ini").read_text(
+            encoding="utf-8")
+        self.assertIn(str(new), text)
+        self.assertNotIn(str(even_older), text)
+
     def test_stamp_text_file_is_ascii_copy(self):
         new = self._move()
         exe_launcher.repair_paths(new)

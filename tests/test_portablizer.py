@@ -4042,6 +4042,51 @@ class OpenFileHolderTests(unittest.TestCase):
             self.assertNotIn("виновника определить не удалось", text)
 
 
+class InstallerShortcutCleanupTests(unittest.TestCase):
+    """Сборка не оставляет ярлык установщика на рабочем столе.
+
+    Жалоба: после портирования на рабочем столе оставался ярлык со статичным
+    абсолютным путём, и после переноса папки он вёл в прежнее место.
+    Убираются только ярлыки, появившиеся за время сборки и ведущие внутрь
+    портатива; чужое не трогается.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.root = self.base / "App_Portable"
+        (self.root / "App").mkdir(parents=True)
+        self.desktop = self.base / "Desktop"
+        self.desktop.mkdir()
+        self.engine = Portablizer(Logger())
+
+    def _guard(self):
+        from portablizer.core import shortcuts
+
+        return shortcuts.ShortcutGuard(self.root, folders=[self.desktop])
+
+    def test_shortcut_of_the_installer_is_removed_and_logged(self):
+        guard = self._guard()
+        guard.snapshot()
+        link = self.desktop / "App.lnk"
+        link.write_bytes(str(self.root / "App" / "app.exe")
+                         .encode("utf-16-le"))
+        removed = self.engine._report_own_shortcuts(guard)
+        self.assertEqual(removed, [str(link)])
+        self.assertFalse(link.exists())
+        self.assertIn("Убрано ярлыков", self.engine.log.text)
+
+    def test_user_shortcut_survives_the_build(self):
+        link = self.desktop / "App.lnk"
+        link.write_bytes(str(self.root / "App" / "app.exe")
+                         .encode("utf-16-le"))
+        guard = self._guard()
+        guard.snapshot()
+        self.assertEqual(self.engine._report_own_shortcuts(guard), [])
+        self.assertTrue(link.exists())
+
+
 class LauncherLeftoverCleanupTests(unittest.TestCase):
     """Портатив не запущен — значит и фоновых остатков быть не должно."""
 

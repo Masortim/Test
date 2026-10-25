@@ -206,6 +206,134 @@ class InstallerCommandTests(unittest.TestCase):
         self.assertIn("--silent", commands[0][1])
         self.assertIn("stage", commands[0][1])
 
+    def test_custom_args_without_a_folder_still_get_the_current_target(self):
+        """Свои ключи не должны лишать обновление привязки к портативу."""
+        command = exe_launcher.install_commands(
+            Path("a.exe"), Path("C:/p/Updates/stage"), "inno",
+            {"installer_args": ["/SILENT"]})[0][1]
+        self.assertIn("/DIR=C:/p/Updates/stage", command)
+        self.assertIn("/NOICONS", command)
+
+    def test_custom_args_with_the_previous_root_point_to_the_current_portable(self):
+        """Перенос на другой диск: установщик не должен ставить по старому пути."""
+        old = "C:\\Old\\App_Portable"
+        command = exe_launcher.install_commands(
+            Path("a.exe"), Path("C:/p/Updates/stage"), "nsis",
+            {"installer_args": ["/D=" + old + "\\App",
+                                "--config=" + old + "\\PortableData\\x.ini"]},
+            stale_roots=[old], portable_root=Path("C:/p"))[0][1]
+        self.assertNotIn("Old", command)
+        self.assertIn("C:/p/Updates/stage", command)
+        self.assertIn("C:/p", command)
+        self.assertTrue(command.endswith("/D=C:/p/Updates/stage"))
+
+    def test_similar_folder_name_is_not_rewritten(self):
+        """Границы пути: ``Foo`` не должен испортить соседнюю ``FooBar``."""
+        command = exe_launcher.install_commands(
+            Path("a.exe"), Path("C:/p/Updates/stage"), "nsis",
+            {"installer_args": ["--x=C:\\\\Apps\\\\FooBar\\\\app.ini"]},
+            stale_roots=["C:\\\\Apps\\\\Foo"], portable_root=Path("C:/p"))[0][1]
+        self.assertIn("FooBar", command)
+
+
+class UpdatePortabilityTests(unittest.TestCase):
+    """Обновление ставится в папку портатива на том диске, где он лежит сейчас."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = make_portable(self._tmp.name)
+        self.installer = _write(Path(self._tmp.name) / "OllamaSetup.exe",
+                                "installer")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _previous_location(self) -> Path:
+        """Прежнее место этой же папки + штамп переноса."""
+        old = Path(self._tmp.name) / "OldDrive" / "Ollama_Portable"
+        (old / "App").mkdir(parents=True)
+        _write(old / "launcher_config.json", json.dumps(OLLAMA_CFG))
+        _write(old / "App" / "ollama app.exe", "old-copy")
+        exe_launcher.write_paths_stamp(self.root, previous=str(old))
+        self.assertEqual(exe_launcher.remembered_roots(self.root), [str(old)])
+        return old
+
+    def _apply(self, runner):
+        return exe_launcher.apply_update(self.root, OLLAMA_CFG, self.installer,
+                                         runner=runner)
+
+    def test_paths_of_the_previous_root_are_repaired_before_the_installer(self):
+        old = self._previous_location()
+        settings = _write(
+            self.root / "PortableData" / "AppData" / "Roaming" / "Ollama"
+            / "settings.json",
+            json.dumps({"install_dir": str(old / "App")}))
+
+        def installer(command, env, cwd, timeout):
+            # Установщик читает каталог из настроек программы.
+            seen.append(settings.read_text(encoding="utf-8"))
+            return fake_installer(NEW_FILES)(command, env, cwd, timeout)
+
+        seen = []
+        result = self._apply(installer)
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("OldDrive", seen[0], "путь починен до установки")
+        self.assertIn(str(self.root / "App"), seen[0])
+
+    def test_install_into_the_previous_location_is_adopted(self):
+        """Упрямый установщик: новая версия всё равно попадает в портатив."""
+        old = self._previous_location()
+
+        def stubborn(command, env, cwd, timeout):
+            for rel, text in NEW_FILES.items():
+                _write(old / "App" / rel, text)
+            return 0
+
+        result = self._apply(stubborn)
+        self.assertTrue(result.ok, result.message)
+        app = self.root / "App"
+        self.assertEqual((app / "ollama app.exe").read_text(), "new-app")
+        self.assertTrue((app / "lib" / "ollama" / "new.dll").is_file())
+        self.assertFalse((self.root / "Updates" / "stage").exists())
+        # Прежнюю папку Portablizer не удаляет: это решает пользователь.
+        self.assertTrue((old / "App" / "ollama app.exe").is_file())
+
+    def test_unrelated_previous_folder_is_not_adopted(self):
+        old = Path(self._tmp.name) / "OtherDrive" / "Ollama_Portable"
+        (old / "App").mkdir(parents=True)
+        _write(old / "launcher_config.json",
+               json.dumps(dict(OLLAMA_CFG, app_name="Something Else")))
+        _write(old / "App" / "ollama app.exe", "foreign")
+        exe_launcher.write_paths_stamp(self.root, previous=str(old))
+
+        def stubborn(command, env, cwd, timeout):
+            _write(old / "App" / "ollama app.exe", "foreign-new")
+            return 0
+
+        result = self._apply(stubborn)
+        self.assertFalse(result.ok)
+        self.assertEqual((self.root / "App" / "ollama app.exe").read_text(),
+                         "old-app", "чужая папка в портатив не попадает")
+
+    def test_shortcut_created_by_the_update_is_removed(self):
+        desktop = Path(self._tmp.name) / "Desktop"
+        desktop.mkdir()
+
+        def installer(command, env, cwd, timeout):
+            code = fake_installer(NEW_FILES)(command, env, cwd, timeout)
+            link = desktop / "Ollama.lnk"
+            link.write_bytes(str(self.root / "App" / "ollama app.exe")
+                             .encode("utf-16-le"))
+            return code
+
+        with mock.patch.object(exe_launcher, "shortcut_folders",
+                               lambda *a, **k: [desktop]):
+            result = self._apply(installer)
+        self.assertTrue(result.ok, result.message)
+        self.assertFalse((desktop / "Ollama.lnk").exists(),
+                         "статичный ярлык установщика убран")
+
 
 class PayloadTests(unittest.TestCase):
     def test_direct_and_nested_layouts(self):
@@ -382,58 +510,83 @@ class OpenCodeInterceptTests(unittest.TestCase):
 
 
 class HostShortcutSafetyTests(unittest.TestCase):
-    """Обновление не удаляет пользовательские ярлыки на этом ПК."""
+    """Уборка только своих ярлыков: ярлык пользователя и чужие остаются.
+
+    Жалоба: после портирования на рабочем столе оставался ярлык установщика
+    со статичным абсолютным путём, а после переноса папки на другой диск он
+    вёл в прежнее место.
+    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = make_opencode_portable(self._tmp.name)
         self.desktop = Path(self._tmp.name) / "Desktop"
         self.desktop.mkdir()
-        self.programs = Path(self._tmp.name) / "Programs"
-        (self.programs / "OpenCode").mkdir(parents=True)
 
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _cleanup(self, targets, folders=None):
-        return exe_launcher.remove_host_app_shortcuts(
-            self.root, OPENCODE_CFG,
-            folders=folders if folders is not None else [self.desktop],
-            resolver=lambda p: targets.get(str(p)),
-            programs_dir=self.programs)
+    def _guard(self, extra_roots=()):
+        return exe_launcher.ShortcutGuard(
+            self.root, extra_roots=extra_roots, folders=[self.desktop])
 
-    def test_host_install_shortcut_is_preserved(self):
-        link = _write(self.desktop / "OpenCode.lnk", "x")
-        target = self.programs / "OpenCode" / "OpenCode.exe"
-        removed = self._cleanup({str(link): str(target)})
-        self.assertEqual(removed, [])
+    @staticmethod
+    def _link(path: Path, target: Path) -> Path:
+        """Ярлык на Windows хранит цель в UTF-16LE — так же и пишем."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(str(target).encode("utf-16-le"))
+        return path
+
+    def test_shortcut_created_during_the_update_is_removed(self):
+        guard = self._guard()
+        guard.snapshot()
+        link = self._link(self.desktop / "OpenCode.lnk",
+                          self.root / "App" / "OpenCode.exe")
+        self.assertEqual(guard.cleanup(), [str(link)])
+        self.assertFalse(link.exists())
+        self.assertEqual(guard.cleanup(), [], "вторая уборка ничего не находит")
+
+    def test_shortcut_that_existed_before_the_update_is_kept(self):
+        link = self._link(self.desktop / "OpenCode.lnk",
+                          self.root / "App" / "OpenCode.exe")
+        guard = self._guard()
+        guard.snapshot()
+        self.assertEqual(guard.cleanup(), [])
         self.assertTrue(link.exists())
 
-    def test_shortcut_into_the_stage_folder_is_preserved(self):
-        link = _write(self.desktop / "OpenCode.lnk", "x")
-        target = self.root / "Updates" / "stage" / "OpenCode.exe"
-        removed = self._cleanup({str(link): str(target)})
-        self.assertEqual(removed, [])
+    def test_new_shortcut_to_another_program_is_kept(self):
+        guard = self._guard()
+        guard.snapshot()
+        link = self._link(self.desktop / "Other.lnk",
+                          Path("C:/Program Files/Other/Other.exe"))
+        self.assertEqual(guard.cleanup(), [])
         self.assertTrue(link.exists())
 
-    def test_shortcut_into_the_portable_folder_is_kept(self):
-        link = _write(self.desktop / "OpenCode.lnk", "x")
-        target = self.root / "App" / "OpenCode.exe"
-        removed = self._cleanup({str(link): str(target)})
+    def test_shortcut_pointing_to_the_previous_location_is_removed(self):
+        previous = Path(self._tmp.name) / "OldDrive" / "OpenCode_Portable"
+        guard = self._guard(extra_roots=[str(previous)])
+        guard.snapshot()
+        link = self._link(self.desktop / "OpenCode.lnk",
+                          previous / "App" / "OpenCode.exe")
+        self.assertEqual(guard.cleanup(), [str(link)])
+        self.assertFalse(link.exists())
+
+    def test_url_link_naming_the_portable_is_removed(self):
+        guard = self._guard()
+        guard.snapshot()
+        link = _write(self.desktop / "OpenCode.url",
+                      "[InternetShortcut]\nURL=file:///" +
+                      str(self.root / "App" / "OpenCode.exe").replace("\\", "/"))
+        self.assertEqual(guard.cleanup(), [str(link)])
+        self.assertFalse(link.exists())
+
+    def test_removal_without_a_snapshot_does_nothing(self):
+        link = self._link(self.desktop / "OpenCode.lnk",
+                          self.root / "App" / "OpenCode.exe")
+        removed = exe_launcher.remove_host_app_shortcuts(
+            self.root, OPENCODE_CFG, folders=[self.desktop], programs_dir=None)
         self.assertEqual(removed, [])
         self.assertTrue(link.exists())
-
-    def test_shortcut_to_another_program_is_kept(self):
-        link = _write(self.desktop / "Other.lnk", "x")
-        target = self.programs / "Other" / "Other.exe"
-        removed = self._cleanup({str(link): str(target)})
-        self.assertEqual(removed, [])
-
-    def test_shortcut_outside_installer_locations_is_kept(self):
-        link = _write(self.desktop / "OpenCode.lnk", "x")
-        target = Path("D:/Apps/opencode/OpenCode.exe")
-        removed = self._cleanup({str(link): str(target)})
-        self.assertEqual(removed, [])
 
 
 class HostTraceGuardSafetyTests(unittest.TestCase):
