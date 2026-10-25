@@ -375,6 +375,80 @@ class InstallRecordRetargetTests(unittest.TestCase):
                 value)
 
 
+class PortableMarkerTests(unittest.TestCase):
+    """Маркер ``@@PORTABLE_ROOT@@`` не должен доживать до установщика.
+
+    Жалоба (скриншот): установщик обновления показывает каталог
+    ``@@PORTABLE_ROOT@@\\App`` и падает с «Error opening file for writing» —
+    такого пути нет. Маркер утёк в реестр или в настройки программы, поэтому
+    лончер разворачивает его в текущий корень при каждом запуске.
+    """
+
+    ROOT = r"E:\Backup\Apps\Baalda_0.1.87_Portable"
+
+    def test_marker_is_replaced_by_the_current_root(self):
+        self.assertEqual(
+            exe_launcher.expand_root_token_text(
+                r"@@PORTABLE_ROOT@@\App\desktop.exe", self.ROOT),
+            self.ROOT + r"\App\desktop.exe")
+
+    def test_doubled_backslashes_stay_doubled(self):
+        # Значения .reg внутри JSON-подобных настроек бывают с «\\».
+        fixed = exe_launcher.expand_root_token_text(
+            "@@PORTABLE_ROOT@@\\\\App\\\\desktop.exe", self.ROOT)
+        self.assertEqual(fixed, self.ROOT.replace("\\", "\\\\")
+                         + "\\\\App\\\\desktop.exe")
+
+    def test_forward_slashes_are_kept(self):
+        fixed = exe_launcher.expand_root_token_text(
+            "@@PORTABLE_ROOT@@/App/desktop.exe", self.ROOT)
+        self.assertEqual(fixed, self.ROOT.replace("\\", "/") + "/App/desktop.exe")
+
+    def test_case_does_not_matter(self):
+        self.assertIn(self.ROOT, exe_launcher.expand_root_token_text(
+            "@@portable_root@@\\App", self.ROOT))
+
+    def test_retarget_record_text_expands_the_marker(self):
+        value = r"@@PORTABLE_ROOT@@\App\desktop.exe"
+        self.assertEqual(
+            exe_launcher.retarget_record_text(value, [], self.ROOT),
+            self.ROOT + r"\App\desktop.exe")
+
+    def test_text_without_the_marker_is_untouched(self):
+        value = r"C:\Program Files\Other\app.exe"
+        self.assertEqual(
+            exe_launcher.expand_root_token_text(value, self.ROOT), value)
+
+    def test_marker_in_a_config_file_is_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            path = _write(root / "App" / "installer.ini",
+                          "InstallDir=@@PORTABLE_ROOT@@\\App")
+            fixed = exe_launcher.expand_root_token_in_files(
+                root, OLLAMA_CFG, deep=True)
+            self.assertIn("App/installer.ini", [item.replace("\\", "/")
+                                                for item in fixed])
+            self.assertNotIn("@@PORTABLE_ROOT@@", path.read_text())
+
+    def test_one_off_sweep_runs_once_per_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            _write(root / "App" / "installer.ini",
+                   "InstallDir=@@PORTABLE_ROOT@@\\App")
+            first = exe_launcher.sweep_root_token_once(root, OLLAMA_CFG)
+            self.assertTrue(first)
+            _write(root / "App" / "second.ini",
+                   "InstallDir=@@PORTABLE_ROOT@@\\App")
+            # Отметка помнит это положение папки: второй раз проход не нужен.
+            self.assertEqual(
+                exe_launcher.sweep_root_token_once(root, OLLAMA_CFG), [])
+
+    def test_registry_healing_is_a_noop_outside_windows(self):
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", False):
+            self.assertEqual(exe_launcher.heal_host_registry(
+                Path("E:/Baalda"), OLLAMA_CFG), [])
+
+
 class PreviousLocationAdoptionTests(unittest.TestCase):
     """Обновление поставилось в ПРЕЖНЕЕ место — файлы забираются в текущее.
 

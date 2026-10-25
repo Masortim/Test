@@ -992,6 +992,27 @@ class LaunchBatExecutionTests(unittest.TestCase):
         self.assertIn("reg delete", joined)           # ключ убран из системы
         self.assertTrue(res.launched)
 
+    def test_settings_with_the_marker_are_never_imported_verbatim(self):
+        """PowerShell недоступен: маркер не попадает в реестр чужого ПК.
+
+        Импорт файла «как есть» записал бы значение
+        ``@@PORTABLE_ROOT@@\\App`` — и установщик обновления программы
+        попытался бы писать в такую папку («Error opening file for
+        writing»). Лучше пропустить импорт и оставить запись в журнале.
+        """
+        cfg = LauncherConfig(
+            app_name="App", target_exe_rel="App/MyApp.exe",
+            apply_registry=True,
+            registry_keys=[r"HKCU\Software\Vendor\MyApp"],
+            registry_has_root_token=True)
+        res = self._run(cfg, fs=self._fs(extra=["portable.reg"]),
+                        env={"BATSIM_NO_POWERSHELL": "1"})
+        joined = " | ".join(res.reg_commands).lower()
+        self.assertNotIn("reg import", joined,
+                         "файл с маркером импортирован без подстановки корня")
+        self.assertIn("skipped the import", res.text.lower())
+        self.assertTrue(res.launched)
+
     def test_no_registry_switch_leaves_the_registry_untouched(self):
         cfg = LauncherConfig(
             app_name="App", target_exe_rel="App/MyApp.exe",
@@ -1105,7 +1126,10 @@ class LaunchBatExecutionTests(unittest.TestCase):
                          rf"{self.ROOT}\App\witcher.exe")
         joined = " | ".join(res.reg_commands).lower()
         self.assertIn("reg import", joined)
-        self.assertIn("portable_machine.reg", joined)
+        # Импортируется копия с подставленным корнем, а не исходный файл с
+        # маркером @@PORTABLE_ROOT@@: иначе установщик обновления игры искал бы
+        # папку с таким именем.
+        self.assertIn("portable_import_", joined)
 
     def test_direct_launch_exit_14001_explains_the_sxs_fix(self):
         cfg = LauncherConfig(app_name="The Witcher",

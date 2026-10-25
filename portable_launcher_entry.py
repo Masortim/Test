@@ -1215,6 +1215,11 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
                           current.replace("\\", "\\\\")))
         pairs.append((item, current))
         pairs.append((item.replace("\\", "/"), current.replace("\\", "/")))
+    # Маркер — тоже «не тот» путь: пока он в настройках, ни программа, ни её
+    # установщик не понимают, где лежит папка.
+    token_pair = (ROOT_TOKEN, current)
+    if token_pair not in pairs:
+        pairs.append(token_pair)
     pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
 
     files: "list[str]" = []
@@ -1263,6 +1268,143 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
     return [note]
 
 
+#: Файл-отметка: маркер уже развёрнут в файлах для этого положения папки.
+TOKEN_SWEEP_NAME = "token-sweep.json"
+
+
+def _token_sweep_file(root: Path, cfg: "Optional[Dict[str, Any]]" = None) -> Path:
+    return _data_dir(root, cfg or {}) / TOKEN_SWEEP_NAME
+
+
+def expand_root_token_in_files(root: Path,
+                              cfg: "Optional[Dict[str, Any]]" = None,
+                              deep: bool = False) -> "list[str]":
+    """Разворачивает маркер ``@@PORTABLE_ROOT@@`` в текстовых файлах портатива.
+
+    Утечка маркера в настройки самой программы (или в её блокнот установщика)
+    даёт тот же эффект, что и маркер в реестре: обновление пытается писать в
+    ``@@PORTABLE_ROOT@@\\App`` и падает. Проход ограничен теми же правилами,
+    что и ``repair_paths``: расширения, размер, потолок числа файлов, пропуск
+    кэшей.
+
+    ``deep=True`` — для обновления и ``--repair-paths`` (внутри ``App`` на
+    любую глубину). Возвращает список исправленных файлов.
+    """
+    settings = _paths_settings(cfg)
+    fixed_files: "list[str]" = []
+    own = {_paths_stamp_file(root), _paths_stamp_text_file(root),
+           _token_sweep_file(root, cfg)}
+    for path in _iter_paths_files(root, settings, deep=deep):
+        if path in own:
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        decoded = _decode_text_bytes(data)
+        if decoded is None:
+            continue
+        text, encoding = decoded
+        if ROOT_TOKEN.casefold() not in text.casefold():
+            continue
+        fixed = expand_root_token_text(text, root)
+        if fixed == text:
+            continue
+        try:
+            path.write_bytes(fixed.encode(encoding))
+        except (OSError, UnicodeError):
+            continue
+        try:
+            fixed_files.append(str(path.relative_to(root)))
+        except ValueError:
+            fixed_files.append(str(path))
+    if fixed_files:
+        _run_log(root, "paths: replaced the portable marker in "
+                       f"{len(fixed_files)} file(s): "
+                       + ", ".join(fixed_files[:8])
+                       + (" ..." if len(fixed_files) > 8 else ""))
+    return fixed_files
+
+
+def sweep_root_token_once(root: Path,
+                          cfg: "Optional[Dict[str, Any]]" = None) -> "list[str]":
+    """Разовый проход по маркеру для текущего положения папки.
+
+    Полный (глубокий) обход на каждом запуске был бы слишком дорог, а маркер
+    появляется только вместе с переездом или старой сборкой. Поэтому проход
+    выполняется один раз на каждое место папки и запоминается в
+    ``PortableData\\token-sweep.json``. После переезда отметка не совпадёт с
+    текущим корнем, и проход повторится.
+    """
+    marker = _token_sweep_file(root, cfg)
+    current = str(root)
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+        if str(data.get("root", "")).casefold() == current.casefold():
+            return []
+    except (OSError, ValueError):
+        pass
+    fixed = expand_root_token_in_files(root, cfg, deep=True)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({
+            "root": current,
+            "replaced": len(fixed),
+            "files": fixed[:50],
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return fixed
+
+
+def import_reg_command(root: "Optional[Path]" = None,
+                       source: "Optional[str]" = None) -> int:
+    """``LaunchPortable.exe --import-reg <файл>``: импорт с подстановкой маркера.
+
+    Нужен ``Launch.bat``: если PowerShell на этом ПК недоступен или запрещён
+    политикой, батник не может заменить ``@@PORTABLE_ROOT@@`` сам. Импортировать
+    файл «как есть» нельзя — маркер попал бы в реестр, и установщик обновления
+    программы пытался бы писать в ``@@PORTABLE_ROOT@@\\App``. Поэтому импорт
+    передаётся лончеру, который маркер разворачивает.
+    """
+    root = root or find_portable_root()
+    if not source:
+        return 2
+    path = Path(str(source).strip().strip('"'))
+    if not path.is_absolute():
+        path = root / path
+    if not path.is_file():
+        _run_log(root, f"registry: --import-reg: file not found ({path})")
+        return 1
+    try:
+        text = _decode_reg(path.read_bytes())
+    except OSError as exc:
+        _run_log(root, f"registry: --import-reg: cannot read {path} ({exc})")
+        return 1
+    if ROOT_TOKEN.casefold() in text.casefold():
+        text = expand_root_token_text(text, root)
+    if ROOT_TOKEN.casefold() in text.casefold():
+        _run_log(root, "registry: --import-reg: the marker is still present, "
+                       "the file is not imported")
+        return 1
+    runtime = _data_dir(root, {}) / "Runtime"
+    try:
+        runtime.mkdir(parents=True, exist_ok=True)
+        target = runtime / "import-bat.reg"
+        target.write_text(text, encoding="utf-16", newline="\r\n")
+    except OSError as exc:
+        _run_log(root, f"registry: --import-reg: cannot write ({exc})")
+        return 1
+    code = _reg(("import", str(target)))
+    _run_log(root, f"registry: --import-reg {path.name}: "
+                   f"{'ok' if code == 0 else f'FAILED (rc={code})'}")
+    try:
+        target.unlink()
+    except OSError:
+        pass
+    return 0 if code == 0 else 1
+
+
 def repair_paths_command(root: "Optional[Path]" = None) -> int:
     """``LaunchPortable.exe --repair-paths``: починить пути вручную.
 
@@ -1276,6 +1418,11 @@ def repair_paths_command(root: "Optional[Path]" = None) -> int:
     except (OSError, ValueError):
         cfg = {}
     lines = repair_paths(root, cfg, force=True, deep=True)
+    tokens = expand_root_token_in_files(root, cfg, deep=True)
+    lines = list(lines)
+    if tokens:
+        lines.append("paths: replaced the portable marker @@PORTABLE_ROOT@@ "
+                     f"in {len(tokens)} file(s)")
     for line in lines or ["paths: nothing to repair"]:
         _run_log(root, line)
     return 0
@@ -5920,6 +6067,38 @@ _INSTALL_PATH_VALUES = (
 )
 
 
+def expand_root_token_text(text: str, root: Any,
+                           token: str = ROOT_TOKEN) -> str:
+    """Заменяет маркер ``@@PORTABLE_ROOT@@`` текущим корнем портатива.
+
+    Маркер — наш собственный способ хранить путь в ``portable*.reg``. Он
+    должен исчезать при подстановке, раньше любого импорта. Но если маркер
+    всё-таки оказался в реестре или в настройках программы (портатив собран
+    прежней версией, импорт делал ``Launch.bat`` без PowerShell, настройки
+    скопировали с другого ПК), установщик обновления получает каталог
+    ``@@PORTABLE_ROOT@@\\App`` — и падает с «Error opening file for writing»:
+    такой папки нет. Поэтому маркер разворачивается ещё и при каждом запуске.
+
+    Форма значения сохраняется: если после маркера идёт ``\\`` (удвоенные
+    слэши внутри ``.reg``), корень тоже пишется с удвоенными; если ``/`` —
+    с прямыми слэшами.
+    """
+    value = str(text or "")
+    base = str(root or "").strip().strip('"').rstrip("\\/")
+    if not value or not base or not token:
+        return value
+
+    def _replacement(match: "re.Match[str]") -> str:
+        following = value[match.end():match.end() + 2]
+        if following.startswith("\\\\"):
+            return base.replace("\\", "\\\\")
+        if following.startswith("/"):
+            return base.replace("\\", "/")
+        return base
+
+    return re.sub(re.escape(token), _replacement, value, flags=re.IGNORECASE)
+
+
 def retarget_record_text(text: str, stale_roots: "Sequence[str]",
                          current_root: str) -> str:
     """Заменяет в значении записи прежние места портатива текущим корнем.
@@ -5940,7 +6119,7 @@ def retarget_record_text(text: str, stale_roots: "Sequence[str]",
             pattern = re.compile(r"(?<![0-9A-Za-z_])" + re.escape(form)
                                  + r"(?![0-9A-Za-z_.])", re.IGNORECASE)
             result = pattern.sub(lambda _m: base, result)
-    return result
+    return expand_root_token_text(result, base)
 
 
 def _registry_views():
@@ -6086,7 +6265,9 @@ def _retarget_key_values(reg, key, subkey: str, stale_roots: "Sequence[str]",
     for name, value, kind in values:
         if kind not in (reg.REG_SZ, reg.REG_EXPAND_SZ) or not isinstance(value, str):
             continue
-        fixed = value
+        # Маркер — всегда наш: он разворачивается в текущий корень независимо
+        # от того, чья это запись (у чужой программы маркера быть не может).
+        fixed = expand_root_token_text(value, str(current_root))
         if stale_roots:
             fixed = retarget_record_text(fixed, stale_roots, str(current_root))
         if fixed == value and belongs:
@@ -6101,6 +6282,172 @@ def _retarget_key_values(reg, key, subkey: str, stale_roots: "Sequence[str]",
         except OSError:
             continue
         changed.append(f"{subkey} :: {name or '(default)'}")
+    return changed
+
+
+# --- маркер в реестре и в настройках программы --------------------------------
+#
+# Маркер ``@@PORTABLE_ROOT@@`` — наш: он живёт в ``portable*.reg`` и подменяется
+# текущим корнем при импорте. Но путь к маркеру может утечь на ПК:
+# * ``Launch.bat`` без PowerShell импортирует файл целиком (ветка «не удалось
+#   переписать»);
+# * портатив собран прежней версией, где подстановки не было;
+# * настройки скопировали с другого портатива вместе с реестром.
+# Тогда программа (и её установщик обновления) видит каталог установки
+# ``@@PORTABLE_ROOT@@\\App`` — такой папки нет, и установка падает с
+# «Error opening file for writing». Поэтому при каждом запуске маркер
+# разворачивается в текущий корень: и в записях об установке, и во всех
+# захваченных ключах программы (включая VirtualStore-зеркала).
+
+#: Сколько уровней вглубь просматривается внутри захваченного ключа.
+REGISTRY_HEAL_MAX_DEPTH = 3
+#: Потолок числа значений за один проход: запуск не должен зависать.
+REGISTRY_HEAL_MAX_VALUES = 4000
+
+_HIVE_NAMES = {
+    "HKCU": "HKEY_CURRENT_USER",
+    "HKEY_CURRENT_USER": "HKEY_CURRENT_USER",
+    "HKLM": "HKEY_LOCAL_MACHINE",
+    "HKEY_LOCAL_MACHINE": "HKEY_LOCAL_MACHINE",
+    "HKCR": "HKEY_CLASSES_ROOT",
+    "HKEY_CLASSES_ROOT": "HKEY_CLASSES_ROOT",
+    "HKU": "HKEY_USERS",
+    "HKEY_USERS": "HKEY_USERS",
+}
+
+
+def _captured_registry_views(cfg: "Optional[Dict[str, Any]]" = None
+                             ) -> "list[tuple[Any, str, int]]":
+    """Ключи этого портатива (``registry.keys``) в виде открываемых путей."""
+    reg = _winreg()
+    if reg is None:
+        return []
+    registry = (cfg or {}).get("registry") or {}
+    keys: "list[str]" = []
+    for name in ("keys", "created_keys"):
+        value = registry.get(name)
+        if isinstance(value, (list, tuple)):
+            keys.extend(str(item) for item in value if str(item).strip())
+    views: "list[tuple[Any, str, int]]" = []
+    seen = set()
+    for key in keys:
+        head, _, tail = key.strip().partition("\\")
+        hive_name = _HIVE_NAMES.get(head.strip().upper())
+        if not hive_name or not tail:
+            continue
+        hive = getattr(reg, hive_name, None)
+        if hive is None:
+            continue
+        for extra in (0, getattr(reg, "KEY_WOW64_64KEY", 0),
+                      getattr(reg, "KEY_WOW64_32KEY", 0)):
+            access = reg.KEY_READ | reg.KEY_SET_VALUE | extra
+            marker = (hive_name, tail.casefold(), extra)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            views.append((hive, tail, access))
+    return views
+
+
+def _heal_registry_tree(reg, hive, path: str, access: int,
+                        stale_roots: "Sequence[str]", root: Path,
+                        names: "Sequence[str]", budget: "list[int]",
+                        depth: int = 0) -> "list[str]":
+    """Разворачивает маркер и прежние корни в значениях ключа и его подключах."""
+    changed: "list[str]" = []
+    if budget[0] <= 0:
+        return changed
+    try:
+        with reg.OpenKey(hive, path, 0, access) as key:
+            subkeys: "list[str]" = []
+            index = 0
+            while True:
+                try:
+                    subkeys.append(reg.EnumKey(key, index))
+                except OSError:
+                    break
+                index += 1
+            values: "list[tuple[str, Any, int]]" = []
+            index = 0
+            while True:
+                try:
+                    values.append(reg.EnumValue(key, index))
+                except OSError:
+                    break
+                index += 1
+            for name, value, kind in values:
+                budget[0] -= 1
+                if budget[0] <= 0:
+                    break
+                if kind not in (reg.REG_SZ, reg.REG_EXPAND_SZ):
+                    continue
+                if not isinstance(value, str) or not value:
+                    continue
+                fixed = retarget_record_text(value, stale_roots, str(root))
+                if fixed == value and names:
+                    fixed = replace_app_prefix(fixed, root, names)
+                if fixed == value:
+                    continue
+                try:
+                    reg.SetValueEx(key, name, 0, kind, fixed)
+                except OSError:
+                    continue
+                changed.append(f"{path} :: {name or '(default)'}")
+    except OSError:
+        return changed
+    if depth >= REGISTRY_HEAL_MAX_DEPTH:
+        return changed
+    for name in subkeys:
+        if budget[0] <= 0:
+            break
+        changed.extend(_heal_registry_tree(
+            reg, hive, path + "\\" + name, access, stale_roots, root, names,
+            budget, depth + 1))
+    return changed
+
+
+def heal_host_registry(root: Path,
+                       cfg: "Optional[Dict[str, Any]]" = None,
+                       stale_roots: "Optional[Sequence[str]]" = None
+                       ) -> "list[str]":
+    """Правит реестр этого ПК до запуска программы и до установки обновления.
+
+    Три вещи, из-за которых обновление уходит не туда:
+
+    1. **Маркер** ``@@PORTABLE_ROOT@@`` в любом значении — разворачивается в
+       текущий корень (``...\\App\\.exe`` сохраняется).
+    2. **Прежнее место портатива** (``D:\\Portable\\Foo`` после переезда на
+       ``E:``) — заменяется текущим корнем.
+    3. **Несуществующая папка перед ``App``** у записи этой программы —
+       заменяется текущим корнем (``replace_app_prefix``).
+
+    Возвращает список исправленных значений для журнала. Мутирует только
+    ``REG_SZ``/``REG_EXPAND_SZ`` и только если путь действительно указывает в
+    прежнее место или содержит маркер.
+    """
+    if not IS_WINDOWS:
+        return []
+    reg = _winreg()
+    if reg is None:
+        return []
+    settings = cfg or {}
+    stale = list(stale_roots if stale_roots is not None
+                 else remembered_roots(root, cfg))
+    names = _app_shortcut_names(root, settings)
+    changed: "list[str]" = []
+    try:
+        changed.extend(retarget_host_install_records(stale, root, names))
+    except Exception:  # noqa: BLE001 - реестр не срывает запуск
+        pass
+    budget = [REGISTRY_HEAL_MAX_VALUES]
+    for hive, path, access in _captured_registry_views(settings):
+        if budget[0] <= 0:
+            break
+        try:
+            changed.extend(_heal_registry_tree(
+                reg, hive, path, access, stale, root, names, budget))
+        except OSError:
+            continue
     return changed
 
 
@@ -6828,10 +7175,21 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
     # именно там. Если запись помнит прежний диск портатива, новая версия
     # встанет по старому адресу — переводим её на текущий корень.
     try:
-        moved = retarget_host_install_records(stale_roots, root)
+        moved = heal_host_registry(root, cfg, stale_roots)
     except Exception as exc:  # noqa: BLE001 - реестр не должен срывать обновление
         moved = []
         _update_log(root, f"install records: retarget failed ({exc})")
+    try:
+        marker_files = expand_root_token_in_files(root, cfg, deep=True)
+    except Exception as exc:  # noqa: BLE001 - проход не срывает обновление
+        marker_files = []
+        _update_log(root, f"paths: marker sweep failed ({exc})")
+    if marker_files:
+        _update_log(
+            root, "paths: the portable marker is replaced in "
+            f"{len(marker_files)} file(s)" + (": "
+            + ", ".join(marker_files[:5])
+            + (" ..." if len(marker_files) > 5 else "")))
     if moved:
         _update_log(
             root,
@@ -7389,13 +7747,24 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # версию по старому адресу. Перед запуском переводим их на текущий корень
     # — обновление, которое запустит сама программа, попадёт в эту папку.
     try:
-        moved = retarget_host_install_records(
-            remembered_roots(root, cfg), root, _app_shortcut_names(root, cfg))
+        moved = heal_host_registry(root, cfg)
         for item in moved:
-            _run_log(root, "install records: previous location now points to "
-                           f"{root}: {item}")
+            _run_log(root, "registry: previous location or portable marker now "
+                           f"points to {root}: {item}")
     except Exception as exc:  # noqa: BLE001 - реестр не срывает запуск
-        _run_log(root, f"install records: retarget failed ({exc})")
+        _run_log(root, f"registry: healing failed ({exc})")
+
+    # Маркер мог остаться и в настройках самой программы (включая App на любой
+    # глубине): тогда установщик обновления читает каталог
+    # ``@@PORTABLE_ROOT@@\App`` и падает с «Error opening file for writing».
+    # Проход выполняется один раз на каждое положение папки.
+    try:
+        replaced = sweep_root_token_once(root, cfg)
+        if replaced:
+            _run_log(root, "paths: the portable marker is gone from "
+                           f"{len(replaced)} file(s)")
+    except Exception as exc:  # noqa: BLE001 - проход не срывает запуск
+        _run_log(root, f"paths: marker sweep failed ({exc})")
 
     # Обновление, поставленное в прежнее место портатива (в том числе
     # предыдущим сеансом, который закрыли аварийно), забирается в App — до
@@ -7899,6 +8268,15 @@ def main() -> int:
         if any(str(arg).casefold() in ("--repair-paths", "/repair-paths")
                for arg in sys.argv[1:]):
             return repair_paths_command(root)
+        if any(str(arg).casefold() in ("--import-reg", "/import-reg")
+               for arg in sys.argv[1:]):
+            value = ""
+            args = list(sys.argv[1:])
+            for index, item in enumerate(args):
+                if str(item).casefold() in ("--import-reg", "/import-reg"):
+                    value = args[index + 1] if index + 1 < len(args) else ""
+                    break
+            return import_reg_command(root, value)
         if any(str(arg).casefold() in ("--sync-saves", "/sync-saves")
                for arg in sys.argv[1:]):
             return sync_saves(root)
