@@ -1659,6 +1659,18 @@ class BurnFallbackTests(unittest.TestCase):
             self.assertEqual(result.main_exe_rel,
                              os.path.join("App", "Type.exe"))
             self.assertIn("Сработал запасной сценарий", engine.log.text)
+            # Собранный портатив сразу переносим: корень запомнен, отчёт о
+            # путях лежит в корне, а в конфиге лончера нет абсолютного пути.
+            portable = Path(temp, "Type_Portable")
+            self.assertTrue((portable / "portability-report.txt").is_file())
+            self.assertTrue(Path(portable, "PortableData",
+                                 "portable-root.json").is_file())
+            config_text = (portable / "launcher_config.json").read_text(
+                encoding="utf-8")
+            self.assertNotIn(str(portable), config_text)
+            self.assertTrue(json.loads(config_text)["relative_paths"]["enabled"])
+            self.assertEqual(result.portability_report_rel,
+                             "portability-report.txt")
 
     def test_failed_burn_reports_decoded_exit_code(self):
         # Даже резервные сценарии не помогли: ошибка обязана расшифровать

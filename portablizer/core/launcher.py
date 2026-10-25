@@ -59,6 +59,10 @@ ROOT_TOKEN = "@@PORTABLE_ROOT@@"
 #: Максимум ключей реестра, обслуживаемых лончером (защита от «простыни»).
 MAX_REGISTRY_KEYS = 256
 
+#: Имя готового EXE-лончера в ``App``. Из ``Launch.bat`` он вызывается для
+#: починки путей после переноса папки (``--repair-paths``).
+EXE_LAUNCHER_NAME = "LaunchPortable.exe"
+
 #: Максимум строк в предстартовой проверке системных библиотек.
 MAX_RUNTIME_CHECKS = 12
 
@@ -166,6 +170,12 @@ class LauncherConfig:
     netstack: Dict[str, object] = field(default_factory=dict)
     # Код выбранного языка установки («ru», «en», ...), если задан.
     language: str = ""
+    # --- относительные пути (см. core/relpaths.py) ---------------------------
+    # Секция ``relative_paths`` конфига: следует ли лончеру при запуске
+    # сравнивать запомненный корень портатива с текущим и переписывать
+    # абсолютные пути старого корня новым (перенос между дисками). Пустой
+    # словарь — секция не пишется, лончер берёт значения по умолчанию.
+    relative_paths: Dict[str, object] = field(default_factory=dict)
 
 
 # --- утилиты экранирования ----------------------------------------------------
@@ -923,6 +933,17 @@ set "PORTABLE_REG_BACKUP=%PORTABLE_DATA%\RegistryHostBackup"
 rem Placeholder standing in for this folder inside the captured settings.
 set "PORTABLE_REG_MARKER={root_token}"
 
+rem --- Moved to another disk since the last run? ------------------------------
+rem Our own files keep only relative paths and the captured registry keeps the
+rem {root_token} marker, so the folder itself moves fine. Settings written by the
+rem program are a different story: their format is not ours, so an absolute
+rem path cannot be made relative. The EXE launcher stores the last known root in
+rem {data_dir_name}\portable-root.txt and rewrites stale absolute paths itself;
+rem here we only delegate that job (cmd cannot compare non-ASCII paths byte by
+rem byte). Called from a subroutine on purpose: %VAR% inside a parenthesised
+rem block is expanded when the block is parsed, before the for loop fills it.
+call :portable_paths_check
+
 rem --- The REAL profile of this PC, remembered before the redirect ----------
 rem Shared saves need it: a direct start of the program inside App writes into
 rem the real Documents folder, the launcher writes inside the portable folder.
@@ -1192,6 +1213,18 @@ rem files installers unpack there (fonts above all) are picked up by Windows
 rem services and keep the whole folder locked long after the program is gone.
 if exist "%PORTABLE_ROOT%\{data_dir}\Temp" rd /s /q "%PORTABLE_ROOT%\{data_dir}\Temp" >nul 2>&1
 if not exist "%PORTABLE_ROOT%\{data_dir}\Temp" md "%PORTABLE_ROOT%\{data_dir}\Temp" >nul 2>&1
+goto :eof
+
+:portable_paths_check
+if not exist "%PORTABLE_DATA%\portable-root.txt" goto :eof
+if not exist "%PORTABLE_ROOT%\App\{exe_launcher}" goto :eof
+set "PORTABLE_ROOT_BEFORE="
+for /f "usebackq delims=" %%R in ("%PORTABLE_DATA%\portable-root.txt") do if not defined PORTABLE_ROOT_BEFORE set "PORTABLE_ROOT_BEFORE=%%R"
+if not defined PORTABLE_ROOT_BEFORE goto :eof
+if /i "%PORTABLE_ROOT%\" == "%PORTABLE_ROOT_BEFORE%" goto :eof
+echo The portable folder was moved since the last run.
+echo Updating absolute paths inside saved settings to the new location...
+"%PORTABLE_ROOT%\App\{exe_launcher}" --repair-paths >nul 2>&1
 goto :eof
 
 :portable_saves_import
@@ -1467,6 +1500,7 @@ def render_bat(cfg: LauncherConfig) -> str:
         netstack_teardown=netstack_teardown,
         redist_dir=REDIST_DIR_NAME,
         redist_script=REDIST_SCRIPT_NAME,
+        exe_launcher=EXE_LAUNCHER_NAME,
         idle_grace=int(max(1, round(cfg.shutdown_idle_grace))),
         kill_leftovers="1" if cfg.shutdown_kill_leftovers else "0",
         data_dir=data_dir,
@@ -1594,6 +1628,11 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         shutdown_handle_budget=number("handle_budget", 8.0),
         shutdown_purge_temp=shutdown.get("purge_temp", True) is not False,
         language=text("language"),
+        # Секция относительных путей переносится как есть: без неё
+        # перевыпущенный лончер забыл бы, что папку можно переносить.
+        relative_paths=(dict(data["relative_paths"])
+                        if isinstance(data.get("relative_paths"), dict)
+                        else {}),
     )
 
 
@@ -2193,6 +2232,11 @@ def render_config_json(cfg: LauncherConfig) -> str:
     }
     if cfg.language:
         payload["language"] = cfg.language
+    # Относительные пути: корень портатива нигде в конфиге не записан
+    # абсолютно, а починка после переноса описана только относительными
+    # именами (штамп и отчёт лежат внутри портатива).
+    if cfg.relative_paths:
+        payload["relative_paths"] = cfg.relative_paths
     # Ключ входа переносится только для программ из IDENTITY_PROFILES.
     identity = identity_settings(cfg)
     if identity is not None:

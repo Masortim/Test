@@ -43,9 +43,11 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from .. import __version__
 from . import launcher as launcher_mod
 from . import procutil
 from . import registry as reg_mod
+from . import relpaths
 from . import saves as saves_mod
 from .languages import find_language
 from .logutil import Logger
@@ -236,6 +238,16 @@ def refresh(folder: str, log: Optional[Logger] = None,
 
     cfg = launcher_mod.config_from_dict(data)
     log.info(f"Обновляю лончеры портатива «{cfg.app_name}»")
+
+    # Портатив, собранный до 1.15.0, не имеет ни секции относительных путей,
+    # ни штампа корня — значит после переноса на другой диск его настройки не
+    # починятся. Обслуживание дописывает и то, и другое.
+    if not cfg.relative_paths:
+        cfg.relative_paths = relpaths.launcher_section(folder)
+    try:
+        relpaths.write_stamp(folder, folder, __version__)
+    except OSError as exc:  # noqa: BLE001 - штамп не должен срывать обслуживание
+        log.warn(f"Не удалось запомнить корень портатива: {exc}")
 
     effective_lang = (language or cfg.language or "").strip()
     if effective_lang:

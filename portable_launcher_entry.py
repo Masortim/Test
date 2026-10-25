@@ -848,6 +848,25 @@ def sanitize_reg_text(text: str) -> "tuple[str, list[str]]":
     return body + "\n\n", dropped
 
 
+def _root_marker_pattern(needle: str) -> "re.Pattern[str]":
+    """Регулярное выражение для пути/маркера с границами имени.
+
+    Простая замена подстроки портила соседние каталоги: путь
+    ``D:\\Apps\\XD`` находился внутри ``D:\\Apps\\XData\\save.ini``, и файл
+    настроек после переноса указывал в никуда. Границы решают это, а
+    ``IGNORECASE`` — ещё и разницу в регистре буквы диска (``d:\\`` и ``D:\\``).
+    """
+    return re.compile(r"(?<![0-9A-Za-z_.])" + re.escape(needle)
+                      + r"(?![0-9A-Za-z_.])", re.IGNORECASE)
+
+
+def _replace_root_text(text: str, old: str, new: str) -> str:
+    """Меняет все вхождения пути/маркера ``old`` на ``new`` с границами."""
+    if not text or not old:
+        return text
+    return _root_marker_pattern(old).sub(lambda _match: new, text)
+
+
 def _rewrite_reg(source: Path, destination: Path,
                  replacements: Iterable[tuple[str, str]],
                  sanitize: bool = False,
@@ -861,8 +880,7 @@ def _rewrite_reg(source: Path, destination: Path,
     try:
         text = _decode_reg(source.read_bytes())
         for old, new in replacements:
-            if old:
-                text = text.replace(old, new)
+            text = _replace_root_text(text, old, new)
         if sanitize:
             text, dropped = sanitize_reg_text(text)
             if not text:
@@ -903,10 +921,12 @@ def _pack_reg(path: Path, root: Path) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     root_text = str(root)
     escaped_root = root_text.replace("\\", "\\\\")
+    slashed_root = root_text.replace("\\", "/")
     if _rewrite_reg(
         path,
         temporary,
-        ((escaped_root, ROOT_TOKEN), (root_text, ROOT_TOKEN)),
+        ((escaped_root, ROOT_TOKEN), (root_text, ROOT_TOKEN),
+         (slashed_root, ROOT_TOKEN)),
     ):
         try:
             os.replace(temporary, path)
@@ -920,6 +940,271 @@ def _pack_reg(path: Path, root: Path) -> None:
 def _as_relative_path(root: Path, value: str) -> Path:
     normalized = str(value).replace("\\", os.sep).replace("/", os.sep)
     return root / normalized
+
+
+# --- относительные пути и перенос между дисками ------------------------------
+#
+# Портатив переносят: ``D:\Apps\XD_Portable`` -> ``F:\XD_Portable``, с флешки
+# на внешний диск, из папки пользователя в ``E:\Backup``. Наши собственные
+# файлы (``Launch.bat``, ``launcher_config.json``, скрипты) хранят только пути
+# относительно корня, а захваченный реестр — маркер ``@@PORTABLE_ROOT@@``,
+# поэтому их перенос не ломает ничего.
+#
+# Иначе с настройками самой программы: формат чужой, и переписать абсолютный
+# путь «в относительный» нельзя — программа такого не поймёт. Поэтому корень
+# запоминается в ``PortableData\portable-root.json``, а при каждом запуске
+# лончер сравнивает его с текущим положением папки. Если папка переехала,
+# старый путь заменяется новым во всех найденных текстовых файлах — до того,
+# как программа прочитает свои настройки. Так перенос работает и для чужих
+# конфигов, и без единого абсолютного пути в наших файлах.
+
+#: Штамп с последним известным корнем портатива (JSON, UTF-8).
+PATHS_STAMP_NAME = "portable-root.json"
+
+#: Тот же корень одной ASCII-строкой: его читает ``Launch.bat`` (cmd умеет
+#: сравнивать только байты, поэтому не-ASCII путь в этот файл не пишется).
+PATHS_STAMP_TEXT_NAME = "portable-root.txt"
+
+#: Расширения, в которых имеет смысл искать текстовые пути.
+PATHS_TEXT_SUFFIXES = (
+    ".ini", ".cfg", ".conf", ".config", ".json", ".xml", ".yaml", ".yml",
+    ".txt", ".reg", ".bat", ".cmd", ".vbs", ".ps1", ".url", ".properties",
+    ".settings", ".prefs", ".toml", ".local", ".dat",
+)
+
+#: Каталоги, которые меняются каждую секунду и к переносу отношения не имеют.
+PATHS_SKIP_DIRS = (
+    "temp", "tmp", "cache", "caches", "cache2", "gpucache", "shadercache",
+    "codecache", "crashpad", "crashdumps", "logs",
+)
+
+#: Потолки одного прохода: починка не должна задерживать запуск программы.
+PATHS_MAX_FILES = 6000
+PATHS_MAX_BYTES = 2 * 1024 * 1024
+
+_PATHS_BOMS = (
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xff\xfe\x00\x00", "utf-32-le"),
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xfe\xff", "utf-16-be"),
+)
+
+
+def _paths_settings(cfg: "Optional[Dict[str, Any]]") -> Dict[str, Any]:
+    """Секция ``relative_paths`` конфига с разумными значениями по умолчанию.
+
+    Конфиг мог быть создан прежней версией Portablizer: тогда секции нет, и
+    починка всё равно должна работать — она и есть причина, по которой папку
+    можно перенести.
+    """
+    section = (cfg or {}).get("relative_paths")
+    settings: Dict[str, Any] = {
+        "enabled": True,
+        "include_app": True,
+        "max_files": PATHS_MAX_FILES,
+        "max_bytes": PATHS_MAX_BYTES,
+        "skip_dirs": list(PATHS_SKIP_DIRS),
+        "suffixes": list(PATHS_TEXT_SUFFIXES),
+    }
+    if isinstance(section, dict):
+        if "enabled" in section:
+            settings["enabled"] = bool(section.get("enabled"))
+        if "include_app" in section:
+            settings["include_app"] = bool(section.get("include_app"))
+        for key in ("max_files", "max_bytes"):
+            try:
+                value = int(section.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                settings[key] = value
+        for key in ("skip_dirs", "suffixes"):
+            raw = section.get(key)
+            if isinstance(raw, (list, tuple)) and raw:
+                settings[key] = [str(item) for item in raw]
+    return settings
+
+
+def _paths_stamp_file(root: Path) -> Path:
+    return root / "PortableData" / PATHS_STAMP_NAME
+
+
+def _paths_stamp_text_file(root: Path) -> Path:
+    return root / "PortableData" / PATHS_STAMP_TEXT_NAME
+
+
+def _read_paths_stamp(root: Path) -> Dict[str, Any]:
+    try:
+        data = json.loads(_paths_stamp_file(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_paths_stamp(root: Path, previous: str = "") -> None:
+    """Запоминает текущий корень портатива (для следующего переноса)."""
+    import time
+
+    current = str(root)
+    payload: Dict[str, Any] = {"schema": 1, "root": current,
+                               "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if previous and previous.casefold() != current.casefold():
+        payload["previous"] = previous
+    try:
+        _paths_stamp_file(root).parent.mkdir(parents=True, exist_ok=True)
+        _paths_stamp_file(root).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
+    except OSError:
+        pass
+    # Тот же путь строкой для Launch.bat. Только ASCII: cmd сравнивает байты,
+    # и не-ASCII значение всё равно не совпало бы с %PORTABLE_ROOT%.
+    try:
+        if current.isascii():
+            _paths_stamp_text_file(root).write_text(current + "\\\n",
+                                                    encoding="ascii")
+    except (OSError, UnicodeError):
+        pass
+
+
+def _decode_text_bytes(data: bytes) -> "Optional[tuple[str, str]]":
+    """Текст и кодировка файла или ``None``, если это не текст."""
+    for bom, encoding in _PATHS_BOMS:
+        if data.startswith(bom):
+            try:
+                return data.decode(encoding), encoding
+            except (UnicodeDecodeError, UnicodeError):
+                return None
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except (UnicodeDecodeError, UnicodeError):
+        return None
+
+
+def _iter_paths_files(root: Path, settings: Dict[str, Any]) -> "Iterable[Path]":
+    """Текстовые файлы портатива, в которых может жить абсолютный путь.
+
+    ``PortableData`` (там настройки программы) обходится полностью, ``App`` —
+    только на два уровня вглубь: внутри десятки тысяч файлов программы, и
+    обходить их все ради конфига слишком дорого для запуска.
+    """
+    suffixes = tuple(str(item).casefold()
+                     for item in settings.get("suffixes") or PATHS_TEXT_SUFFIXES)
+    skip = {str(item).casefold()
+            for item in settings.get("skip_dirs") or PATHS_SKIP_DIRS}
+    limit = int(settings.get("max_files") or PATHS_MAX_FILES)
+    include_app = bool(settings.get("include_app", True))
+    yielded = 0
+    app_name = "app"
+    for current, dirs, files in os.walk(root):
+        relative = os.path.relpath(current, root)
+        depth = 0 if relative == "." else relative.count(os.sep) + 1
+        keep = []
+        for name in sorted(dirs):
+            lowered = name.casefold()
+            if lowered in skip or lowered.startswith("$"):
+                continue
+            if lowered == app_name and (not include_app or depth >= 2):
+                continue
+            keep.append(name)
+        dirs[:] = keep
+        for name in sorted(files):
+            if not any(name.casefold().endswith(suffix) for suffix in suffixes):
+                continue
+            path = Path(current) / name
+            try:
+                if path.is_symlink() or path.stat().st_size > int(
+                        settings.get("max_bytes") or PATHS_MAX_BYTES):
+                    continue
+            except OSError:
+                continue
+            yield path
+            yielded += 1
+            if yielded >= limit:
+                return
+
+
+def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
+                 force: bool = False) -> "list[str]":
+    """Переписывает абсолютные пути старого корня новым, если папку перенесли.
+
+    Возвращает строки отчёта (их пишут в ``PortableData\launcher-run.log``).
+    Ничего не делает, если корень не менялся: обычный запуск не платит за
+    перенос ни одной лишней миллисекундой, кроме двух чтений штампа.
+    """
+    settings = _paths_settings(cfg)
+    if not settings.get("enabled", True) and not force:
+        return []
+    current = str(root)
+    stamp = _read_paths_stamp(root)
+    remembered = str(stamp.get("root", "") or "").strip().rstrip("\\/")
+    if not remembered:
+        write_paths_stamp(root)
+        return []
+    if remembered.casefold() == current.casefold():
+        # Штамп мог быть записан старой версией без файла для Launch.bat.
+        if not _paths_stamp_text_file(root).is_file() and current.isascii():
+            write_paths_stamp(root)
+        return []
+    if len(remembered) <= 2 and remembered[1:2] == ":":
+        # Корень «D:» — не путь, а буква диска: восстанавливать нечего.
+        write_paths_stamp(root, previous=remembered)
+        return ["paths: stored root is a bare drive letter, stamp updated"]
+
+    files: "list[str]" = []
+    total = 0
+    for path in _iter_paths_files(root, settings):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        decoded = _decode_text_bytes(data)
+        if decoded is None:
+            continue
+        text, encoding = decoded
+        if remembered.casefold() not in text.casefold():
+            continue
+        fixed = _replace_root_text(text, remembered, current)
+        # Путь мог быть записан и с прямыми слэшами (JSON, URL, XML).
+        fixed = _replace_root_text(fixed, remembered.replace("\\", "/"),
+                                   current.replace("\\", "/"))
+        if fixed == text:
+            continue
+        try:
+            path.write_bytes(fixed.encode(encoding))
+        except (OSError, UnicodeError):
+            continue
+        replaced = 0
+        for form in {remembered, remembered.replace("\\", "\\\\"),
+                     remembered.replace("\\", "/")}:
+            replaced += len(_root_marker_pattern(form).findall(text))
+        total += max(replaced, 1)
+        files.append(str(path.relative_to(root)))
+    write_paths_stamp(root, previous=remembered)
+    note = (f"paths: folder moved from {remembered} to {current}; "
+            f"rewritten {total} absolute path(s) in {len(files)} file(s)")
+    if files:
+        note += ": " + ", ".join(files[:8]) + (" ..." if len(files) > 8 else "")
+    return [note]
+
+
+def repair_paths_command(root: "Optional[Path]" = None) -> int:
+    """``LaunchPortable.exe --repair-paths``: починить пути вручную.
+
+    Нужна после переноса, если программу запускали напрямую из ``App`` (мимо
+    лончера) или если перенос сделали при выключенном автопоиске.
+    """
+    root = root or find_portable_root()
+    try:
+        cfg = json.loads((root / "launcher_config.json")
+                         .read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        cfg = {}
+    lines = repair_paths(root, cfg, force=True)
+    for line in lines or ["paths: nothing to repair"]:
+        _run_log(root, line)
+    return 0
 
 
 def _expand_environment(value: Any, env: Dict[str, str]) -> str:
@@ -5922,6 +6207,16 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # сохранения и меню «Пуск», а стоит проверка один запрос к реестру.
     autoheal_profile(root)
 
+    # Перенос между дисками: если папка переехала с прошлого запуска, пути
+    # старого корня в настройках программы заменяются новыми ДО того, как она
+    # их прочитает. Наши файлы и реестр этого не требуют — там либо
+    # относительные пути, либо маркер корня.
+    try:
+        for line in repair_paths(root, cfg):
+            _run_log(root, line)
+    except Exception as exc:  # noqa: BLE001 - починка не срывает запуск
+        _run_log(root, f"paths: repair failed ({exc})")
+
     # Портатив, собранный прежней версией, мог принести в portable.reg ветки
     # оболочки (меню «Пуск»). Чистим файл на месте — и EXE-, и BAT-лончер
     # тогда импортируют только настройки приложения.
@@ -6362,6 +6657,9 @@ def main() -> int:
         if any(str(arg).casefold() in ("--rollback", "/rollback")
                for arg in sys.argv[1:]):
             return rollback_command(root, sys.argv[1:])
+        if any(str(arg).casefold() in ("--repair-paths", "/repair-paths")
+               for arg in sys.argv[1:]):
+            return repair_paths_command(root)
         if any(str(arg).casefold() in ("--sync-saves", "/sync-saves")
                for arg in sys.argv[1:]):
             return sync_saves(root)
