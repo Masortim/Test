@@ -13,6 +13,7 @@
 """
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -182,9 +183,9 @@ class StampTests(unittest.TestCase):
     def test_move_is_detected(self):
         relpaths.write_stamp(str(self.root))
         other = Path(self.temp.name) / "Moved" / "XD_Portable"
-        other.mkdir(parents=True)
+        other.parent.mkdir(parents=True)
         # Перенос — это копия папки целиком, включая PortableData.
-        os.replace(self.root, other)
+        shutil.move(str(self.root), str(other))
         changed = relpaths.root_changed(str(other))
         self.assertIsNotNone(changed)
         self.assertEqual(changed[0], str(self.root))
@@ -325,7 +326,9 @@ class LauncherRepairTests(unittest.TestCase):
     def _move(self) -> Path:
         new = self.base / "F" / "XD_Portable"
         new.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(self.old, new)
+        # Перенос папки: на Windows os.replace каталога между разными
+        # родительскими папками может вернуть «Access is denied».
+        shutil.move(str(self.old), str(new))
         return new
 
     def test_same_root_does_nothing(self):
@@ -500,7 +503,7 @@ class EndToEndMoveTests(unittest.TestCase):
                 result)
             moved = base / "F" / "XD"
             moved.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(root, moved)
+            shutil.move(str(root), str(moved))
 
             lines = exe_launcher.repair_paths(moved)
             self.assertTrue(lines)
