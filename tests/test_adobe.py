@@ -987,6 +987,44 @@ class AdobeBuildTests(unittest.TestCase):
         self.assertFalse(check(), "первый размер только запоминается")
         self.assertTrue(check(), "размер не меняется — распаковка закончена")
 
+    def test_failure_leaves_a_report_with_what_was_found(self):
+        """Неудача должна оставлять один файл с ответами на все вопросы."""
+        # Внутри установщика есть RAR — именно его и пытается прочитать tar.
+        with open(self.installer, "ab") as handle:
+            handle.write(b"Rar!\x1a\x07\x01\x00" + b"sfx-body" * 64)
+        engine = self._engine(archive_is_empty=True, extractor_rc=1,
+                              extractor_output="tar: Unrecognized format")
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=_extractors(
+                                      unpacker_mod.STYLE_TAR,
+                                      "C:\\Windows\\System32\\tar.exe")):
+            engine._run_attempts(self._plans(), self.opts, self.app,
+                                 self.data, self.portable, "Adobe XD")
+        path = os.path.join(self.portable, adobe_mod.ADOBE_REPORT_NAME)
+        self.assertTrue(os.path.isfile(path), engine.log.text)
+        with open(path, encoding="utf-8") as handle:
+            report = handle.read()
+        self.assertIn("Распаковщики", report.replace("распаковщики", "Распаковщики"))
+        self.assertIn("Содержимое App", report)
+        self.assertIn("исполняемых файлов", report)
+        self.assertIn("код 1", report)
+
+    def test_report_lists_installed_packages_and_exe(self):
+        engine = self._engine()
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=_extractors()):
+            engine._run_attempts(self._plans(), self.opts, self.app,
+                                 self.data, self.portable, "Adobe XD")
+        path = os.path.join(self.portable, adobe_mod.ADOBE_REPORT_NAME)
+        self.assertTrue(os.path.isfile(path))
+        with open(path, encoding="utf-8") as handle:
+            report = handle.read()
+        self.assertIn("MSI разложен: Adobe XD.msi", report)
+        self.assertIn("Adobe XD.exe", report)
+        self.assertIn("UWP пропущен", report)
+
     def test_uwp_package_is_never_installed_through_msiexec(self):
         """Appx ставится не msiexec и не нами: его в командах нет вовсе."""
         engine = self._engine()
