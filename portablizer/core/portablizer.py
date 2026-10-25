@@ -1079,6 +1079,10 @@ class Portablizer:
         self._adobe_failure: Optional[adobe_mod.AdobeFailure] = None
         #: Файл-объяснение про UWP-часть (``adobe-uwp.txt``), если он записан.
         self._adobe_note_rel = ""
+        #: Настоящий установщик внутри контейнера (SFX-обёртка над setup.exe).
+        self._adobe_nested_setup = ""
+        #: Сбор пакетов «на лету», пока установщик работает (см. adobe.py).
+        self._adobe_watcher: Optional[adobe_mod.PayloadWatcher] = None
         #: Копия установщика на локальном диске: Adobe отказывается работать
         #: со съёмного и сетевого носителя (код 1000).
         self._adobe_media_copy = ""
@@ -1828,6 +1832,8 @@ class Portablizer:
             self._adobe_salvage_attempted = False
             self._adobe_failure = None
             self._adobe_note_rel = ""
+            self._adobe_nested_setup = ""
+            self._stop_adobe_watcher()
             self._drop_adobe_media_copy()
             self._adobe_media_copy = ""
             self._adobe_media_dir = ""
@@ -3507,6 +3513,10 @@ class Portablizer:
                     portable_dir=portable_dir, console_log=console_log,
                     progress_from=start, progress_to=stop)
             else:
+                # Adobe успевает распаковать пакеты во временный каталог и
+                # убирает их при откате. Пока установщик работает, копии
+                # снимаются на диск — из них потом собирается портатив.
+                self._start_adobe_watcher(portable_dir, opts)
                 rc = self._run_install(plan, opts, app_dir, data_dir,
                                        progress_from=start, progress_to=stop,
                                        console_log=console_log)
@@ -4003,6 +4013,12 @@ class Portablizer:
         Итоговое окно показывает их пользователю: где установщик брал
         временное место и есть ли отчёт о падении, который стоит открыть.
         """
+        # Наблюдение за пакетами заканчивается вместе со сборкой: поток не
+        # должен продолжать читать чужие временные каталоги после неё.
+        self._stop_adobe_watcher()
+        if result.success:
+            shutil.rmtree(os.path.join(portable_dir, "_adobe_grabbed"),
+                          ignore_errors=True)
         result.installer_temp_dir = self._install_temp_dir
         result.unpacked_with = self._unpacked_with
         result.adobe_note_rel = self._adobe_note_rel
@@ -4330,12 +4346,22 @@ class Portablizer:
                 layout.extend(nearby)
 
         if layout.is_empty:
+            # Пакетов MSI/ZIP нет, но внутри мог оказаться настоящий
+            # установщик программы (SFX-обёртка над setup.exe). Его запуск —
+            # единственный оставшийся путь: обёртка ключей тишины не понимает,
+            # а он понимает.
+            if self._attempt_nested_adobe_setup(
+                    opts, app_dir, data_dir, name, portable_dir=portable_dir,
+                    console_log=console_log, progress_from=progress_from,
+                    progress_to=progress_to):
+                shutil.rmtree(work, ignore_errors=True)
+                return 0
             self.log.warn(
                 "Пакетов программы Adobe найти не удалось: ни внутри "
                 "контейнера, ни в каталоге payloads рядом с установщиком.")
             self._adobe_source = ""
             self._adobe_applied = None
-            shutil.rmtree(work, ignore_errors=True)
+            self._keep_work_for_inspection(work)
             return -1
 
         self.log.info(f"Найдено в установщике Adobe: {layout.summary()}.")
@@ -4353,12 +4379,102 @@ class Portablizer:
             )
             return 0
 
+        if self._attempt_nested_adobe_setup(
+                opts, app_dir, data_dir, name, portable_dir=portable_dir,
+                console_log=console_log, progress_from=progress_to,
+                progress_to=progress_to):
+            shutil.rmtree(work, ignore_errors=True)
+            return 0
+
         self.log.warn(
             "Пакеты Adobe разложены, но исполняемого файла программы в App "
             "нет: возможно, в этой сборке только UWP-часть (Appx) без MSI. "
             f"Распакованное оставлено для проверки: {work}"
         )
         return -1
+
+    def _attempt_nested_adobe_setup(self, opts: PortableOptions, app_dir: str,
+                                    data_dir: str, name: str,
+                                    portable_dir: str = "",
+                                    console_log: Optional[str] = None,
+                                    progress_from: int = 55,
+                                    progress_to: int = 58) -> bool:
+        """Запускает установщик, найденный внутри контейнера, если он есть."""
+        setup = self._adobe_nested_setup
+        if not setup or not os.path.isfile(setup):
+            return False
+        rc = self._run_nested_adobe_setup(
+            setup, opts, app_dir, data_dir, console_log=console_log,
+            progress_from=progress_from, progress_to=progress_to)
+        if self._find_main_exe(app_dir, name):
+            self.log.ok(
+                "Программа поставлена установщиком из контейнера — без "
+                "UWP-шага (Appx не устанавливался).")
+            return True
+        self.log.warn(
+            f"Установщик из контейнера не дал файлов программы (код {rc}).")
+        self._salvage_adobe_payloads(
+            opts, app_dir, data_dir, name, portable_dir=portable_dir,
+            console_log=console_log)
+        return bool(self._find_main_exe(app_dir, name))
+
+    def _keep_work_for_inspection(self, work: str) -> None:
+        """Оставляет распакованное для разбора — или убирает пустую папку.
+
+        Если архиватор всё же что-то распаковал, выбрасывать это нельзя: по
+        folder видно, что внутри сборки, и это же можно поставить вручную.
+        Пустой каталог, наоборот, только мешает.
+        """
+        if not os.path.isdir(work):
+            return
+        try:
+            has_files = any(files for _c, _d, files in os.walk(work))
+        except OSError:
+            has_files = False
+        if has_files:
+            self.log.info(
+                "Распакованное содержимое оставлено для проверки: " + work)
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _run_nested_adobe_setup(self, setup: str, opts: PortableOptions,
+                                app_dir: str, data_dir: str,
+                                console_log: Optional[str] = None,
+                                progress_from: int = 55,
+                                progress_to: int = 58,
+                                ) -> Optional[int]:
+        """Запускает установщик, найденный внутри контейнера.
+
+        Обёртка-SFX не понимает ``--silent``, а её внутренний установщик —
+        понимает: он и есть настоящий установщик Adobe. Ключи те же, что в
+        лестнице, но папка установки указывает на App. Его собственный отказ
+        на UWP-шаге нас не смущает: пакеты он успевает разложить в
+        ``adobeTemp``, откуда их забирает сборка.
+        """
+        self.log.info(
+            f"Запускаю установщик из контейнера: {os.path.basename(setup)} "
+            "(обёртка-SFX ключей тишины не понимает, а он понимает).")
+        # Свой план, а не шаблон движка: у вложенного установщика Adobe свой
+        # разбор командной строки, и подставлять ему чужие ключи (/S, /quiet,
+        # /VERYSILENT) нельзя — он на них отвечает мгновенным отказом.
+        plan = SilentPlan(
+            program=setup,
+            args=["--silent", f"--ADOBEINSTALLDIR={app_dir}"],
+            notes=["Установщик, найденный внутри контейнера: документированные "
+                   "ключи Adobe --silent и --ADOBEINSTALLDIR."],
+            label="Adobe: установщик из контейнера (--silent)",
+            output_dir=app_dir,
+        )
+        try:
+            return self._run_install(
+                plan, opts, app_dir, data_dir,
+                progress_from=progress_from, progress_to=progress_to,
+                console_log=console_log)
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - необязательный шаг
+            self.log.warn(f"Запустить установщик из контейнера не удалось: {exc}")
+            return None
 
     def _adobe_installer_source(self, opts: PortableOptions) -> str:
         """Путь к установщику, с которым можно работать.
@@ -4467,7 +4583,7 @@ class Portablizer:
                 )
             cmd = unpacker_mod.extractor_argv(extractor, archive, work)
             try:
-                code, _output = self._run_unpacker_command(
+                code, output = self._run_unpacker_command(
                     cmd, unpack_log, opts, progress=progress,
                     stage=f"Распаковка пакета Adobe ({extractor.name})")
             except RuntimeError:
@@ -4479,18 +4595,47 @@ class Portablizer:
                         os.remove(carved)
                     except OSError:
                         pass
-            if code not in (0, 1):
+            # У 7-Zip код 1 — это предупреждение («часть файлов не
+            # распакована»), а у tar.exe и UnRAR — обычная ошибка. Раньше это
+            # различие скрывало настоящую причину: архив не читался вовсе, а в
+            # журнале не было ни слова, потому что код 1 считался успехом.
+            ok_codes = (0, 1) if extractor.style == unpacker_mod.STYLE_7ZIP \
+                else (0,)
+            if code not in ok_codes:
+                tail = " ".join((output or "").split())[-300:]
                 self.log.warn(
                     f"{extractor.name} завершился с кодом {code}: контейнер "
-                    "установщика прочитать не удалось.")
+                    "установщика прочитать не удалось."
+                    + (f" Ответ архиватора: {tail}" if tail else ""))
             layout = adobe_mod.find_payloads(
                 work, installer_path=opts.installer_path)
             if layout.has_app_payload:
                 return layout
+            self._log_extracted_tree(work, extractor.name)
             if extractor is not extractors[-1]:
                 self.log.info(
                     f"{extractor.name} не дал пакетов программы — пробую "
                     "следующий распаковщик.")
+
+        # Последний способ, который не зависит от чужих библиотек: попросить
+        # распаковаться сам установщик. WinRAR-SFX понимает -d<папка> и -s,
+        # и файлы остаются в нашей папке даже если его собственная установка
+        # тут же падает (у Adobe она и падает — код 191/1000).
+        nested = self._sfx_self_extract(source, work, opts, unpack_log,
+                                        progress)
+        layout = adobe_mod.find_payloads(
+            work, installer_path=opts.installer_path)
+        if layout.has_app_payload:
+            return layout
+        self._log_extracted_tree(work, "SFX")
+
+        if nested:
+            # Внутри контейнера — обычный установщик программы. Запускает его
+            # отдельный шаг (см. _run_payload_plan), а здесь только сообщаем.
+            self._adobe_nested_setup = nested
+            self.log.info(
+                f"Внутри контейнера лежит установщик программы: "
+                f"{os.path.basename(nested)} — поставлю его отдельным шагом.")
 
         if layout.is_empty:
             self.log.warn(
@@ -4501,6 +4646,136 @@ class Portablizer:
                 "Внутри контейнера нашлись только UWP-пакеты: пакетов "
                 "программы (MSI/ZIP) в этой сборке нет.")
         return layout
+
+    def _log_extracted_tree(self, work: str, who: str) -> None:
+        """Пишет в журнал, что именно оказалось в папке распаковки.
+
+        Без этого «пакетов не нашлось» ничего не объясняет: непонятно, архив
+        не прочитался вовсе или внутри лежит что-то другое. Список верхних
+        уровней отвечает на этот вопрос сразу.
+        """
+        if not os.path.isdir(work):
+            self.log.debug(f"  • {who}: папка распаковки не создана.")
+            return
+        files = 0
+        total = 0
+        tops: List[str] = []
+        for current, dirs, names in os.walk(work):
+            depth = os.path.relpath(current, work).count(os.sep)
+            if os.path.relpath(current, work) == ".":
+                tops.extend(sorted(dirs)[:8])
+            if depth > 2:
+                dirs[:] = []
+                continue
+            for name in names:
+                files += 1
+                try:
+                    total += os.path.getsize(os.path.join(current, name))
+                except OSError:
+                    pass
+        if not files:
+            self.log.debug(f"  • {who}: в папке распаковки пусто.")
+            return
+        sizes = redist_mod.format_size(total)
+        listing = ", ".join(tops[:8]) if tops else "без подкаталогов"
+        self.log.info(
+            f"  • {who}: распаковано файлов {files} ({sizes}); верхний "
+            f"уровень: {listing}.")
+        executables = []
+        for current, _dirs, names in os.walk(work):
+            for name in names:
+                if name.casefold().endswith((".exe", ".msi", ".appx", ".msix",
+                                             ".zip", ".cab")):
+                    executables.append(os.path.join(current, name))
+            if len(executables) > 400:
+                break
+        for path in executables[:8]:
+            self.log.debug(f"  • файл: {os.path.relpath(path, work)}")
+        if len(executables) > 8:
+            self.log.debug(f"  • …и ещё {len(executables) - 8} файлов.")
+
+    def _sfx_self_extract(self, source: str, work: str, opts: PortableOptions,
+                          unpack_log: str,
+                          progress: "Tuple[int, int]" = (30, 56)) -> str:
+        """Просит распаковаться сам установщик (``-s -d<папка>``).
+
+        Это запасной путь для самораспаковывающихся архивов, которые чужие
+        библиотеки не читают (libarchive, например, не понимает часть
+        RAR5-архивов). WinRAR-SFX документированно принимает ``-d<папка>`` и
+        ``-s``: файлы окажутся в нашей папке, а не во временном каталоге,
+        который SFX убирает за собой. Код возврата здесь не важен — важно, что
+        осталось в папке: собственная установка Adobe всё равно падает.
+
+        Возвращает путь к найденному внутри установщику программы (``setup.exe``
+        и подобные) или пустую строку.
+        """
+        if not IS_WINDOWS or not os.path.isfile(source):
+            return ""
+        self.log.info(
+            "Архиваторы контейнер не прочитали. Прошу распаковаться сам "
+            "установщик: WinRAR-SFX понимает «-s -d<папка>», и файлы "
+            "останутся в нашей папке, даже если его установка сразу упадёт.")
+        try:
+            code, output = self._run_unpacker_command(
+                [source, "-s", f"-d{work}"], unpack_log, opts,
+                progress=progress, stage="Распаковка самим установщиком")
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - запасной путь не должен ронять сборку
+            self.log.warn(f"Запустить установщик для распаковки не удалось: {exc}")
+            return ""
+        tail = " ".join((output or "").split())[-200:]
+        self.log.debug(
+            f"  • установщик-распаковщик завершился с кодом {code}"
+            + (f": {tail}" if tail else ""))
+        return self._find_nested_setup(work)
+
+    def _find_nested_setup(self, work: str) -> str:
+        """Настоящий установщик внутри контейнера (SFX-обёртка над setup.exe)."""
+        wanted = ("setup.exe", "set-up.exe", "install.exe", "installer.exe",
+                  "xdsetup.exe", "adobesetup.exe")
+        candidates: List[str] = []
+        for current, _dirs, names in os.walk(work):
+            for name in names:
+                folded = name.casefold()
+                if folded in wanted:
+                    candidates.append(os.path.join(current, name))
+                elif folded.endswith(".exe") and "setup" in folded:
+                    candidates.append(os.path.join(current, name))
+        if not candidates:
+            return ""
+        # Ставим самый «главный» на вид: setup/set-up важнее прочих.
+        candidates.sort(key=lambda path: (
+            os.path.basename(path).casefold() not in wanted, len(path)))
+        return candidates[0]
+
+    def _start_adobe_watcher(self, portable_dir: str,
+                             opts: PortableOptions) -> None:
+        """Начинает снимать пакеты, которые установщик раскладывает на лету."""
+        if not self._adobe_detected or self._adobe_watcher is not None:
+            return
+        target = os.path.join(portable_dir, "_adobe_grabbed")
+        roots: List[str] = []
+        if self._install_temp_dir:
+            roots.append(self._install_temp_dir)
+        roots.extend(adobe_mod.default_temp_roots())
+        watcher = adobe_mod.PayloadWatcher(roots, target)
+        try:
+            watcher.start()
+        except Exception as exc:  # noqa: BLE001 - наблюдение необязательно
+            self.log.debug(f"  • сбор пакетов на лету не запустился: {exc}")
+            return
+        self._adobe_watcher = watcher
+        self.log.debug(
+            "  • пока установщик работает, пакеты снимаются с диска: он "
+            "убирает их при откате.")
+
+    def _stop_adobe_watcher(self) -> None:
+        watcher = self._adobe_watcher
+        if watcher is None:
+            return
+        watcher.stop()
+        self._adobe_watcher = None
 
     def _install_adobe_payloads(self, layout: adobe_mod.AdobeLayout,
                                 opts: PortableOptions, app_dir: str,
@@ -4565,6 +4840,28 @@ class Portablizer:
                 "Пакеты Adobe уже разложены из временного каталога — "
                 "повторять не буду.")
             return False
+
+        # Снятые «на лету» пакеты — самый надёжный источник: при откате
+        # установщик их уже удалил, а копии остались.
+        if self._adobe_watcher is not None:
+            self._adobe_watcher.stop()
+            grabbed = self._adobe_watcher.layout()
+            self._adobe_watcher = None
+            if grabbed.has_app_payload:
+                self.log.info(
+                    "Пока установщик работал, пакеты удалось снять с диска: "
+                    f"{grabbed.summary()}. Ставлю их в App.")
+                self._install_adobe_payloads(
+                    grabbed, opts, app_dir, data_dir, name,
+                    portable_dir=portable_dir, console_log=console_log,
+                    progress_from=56, progress_to=58)
+                self._adobe_source = grabbed.root
+                if self._find_main_exe(app_dir, name):
+                    self.log.ok(
+                        "Программа собрана из пакетов, снятых на лету, — без "
+                        "UWP-шага.")
+                    return True
+
         roots: List[str] = []
         if self._install_temp_dir:
             roots.append(self._install_temp_dir)

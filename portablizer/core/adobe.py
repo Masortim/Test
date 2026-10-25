@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import threading
 import zipfile
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -575,6 +576,152 @@ def materialize(layout: AdobeLayout, app_dir: str,
             "AddUWPAppxCommand, который падает с кодом 191 и регистрирует "
             "приложение на этом компьютере для всех пользователей")
     return result
+
+
+# --- сбор пакетов на лету ----------------------------------------------------
+
+class PayloadWatcher:
+    """Собирает пакеты, которые установщик раскладывает и убирает за собой.
+
+    Установщик Adobe работает так: распаковывает пакеты во временный каталог
+    (``adobeTemp\\ETRxxxx.tmp``) и только потом запускает установку. Если
+    установка падает (код 191 или 1000), он **удаляет** этот каталог при
+    откате — и забирать пакеты становится неоткуда.
+
+    Поэтому пакеты снимаются с диска, пока установщик ещё работает: файл
+    копируется только после того, как его размер перестал меняться между двумя
+    проверками (значит, запись закончена). Копии кладутся в папку сборки, и
+    оттуда их можно поставить в ``App`` обычным путём.
+    """
+
+    #: Что имеет смысл забирать: пакеты программы и UWP-оболочки.
+    SUFFIXES = (".msi", ".appx", ".appxbundle", ".msix", ".msixbundle", ".zip")
+
+    def __init__(self, roots: Iterable[str], target: str,
+                 interval: float = 0.7, min_size: int = 64 * 1024,
+                 max_files: int = 200, max_depth: int = 5) -> None:
+        self.roots = [root for root in roots if root]
+        self.target = target
+        self.interval = float(interval)
+        self.min_size = int(min_size)
+        self.max_files = int(max_files)
+        self.max_depth = int(max_depth)
+        self.captured: List[str] = []
+        self._seen: Dict[str, int] = {}
+        self._stop = threading.Event()
+        self._thread: Optional["threading.Thread"] = None
+        self._lock = threading.Lock()
+
+    # -- жизненный цикл -------------------------------------------------------
+    def start(self) -> None:
+        if not self.roots or self._thread is not None:
+            return
+        try:
+            os.makedirs(self.target, exist_ok=True)
+        except OSError:
+            return
+        self._thread = threading.Thread(target=self._run, name="adobe-payloads",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5.0)
+        self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.scan()
+            except Exception:  # noqa: BLE001 - сбор пакетов не должен падать
+                continue
+
+    # -- сам сбор -------------------------------------------------------------
+    def scan(self) -> List[str]:
+        """Один проход по каталогам. Возвращает список новых копий."""
+        grabbed: List[str] = []
+        for path in self._candidates():
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if size < self.min_size:
+                continue
+            previous = self._seen.get(path)
+            self._seen[path] = size
+            if previous != size:
+                # Файл ещё пишется (или только появился) — проверим в следующий
+                # раз: копировать половину MSI смысла нет.
+                continue
+            if any(os.path.normcase(item) == os.path.normcase(path)
+                   for item in self.captured):
+                continue
+            copy = self._copy(path)
+            if copy:
+                grabbed.append(copy)
+                with self._lock:
+                    self.captured.append(path)
+                if len(self.captured) >= self.max_files:
+                    break
+        return grabbed
+
+    def _candidates(self) -> List[str]:
+        found: List[str] = []
+        for root in self.roots:
+            if not os.path.isdir(root):
+                continue
+            base_depth = os.path.normpath(root).count(os.sep)
+            for current, dirs, files in os.walk(root):
+                depth = os.path.normpath(current).count(os.sep) - base_depth
+                if depth >= self.max_depth:
+                    dirs[:] = []
+                    continue
+                for name in files:
+                    if name.casefold().endswith(self.SUFFIXES):
+                        found.append(os.path.join(current, name))
+                if len(found) > self.max_files * 5:
+                    return found
+        return found
+
+    def _copy(self, path: str) -> str:
+        """Копирует пакет, сохраняя его имя (так его видно в журнале)."""
+        try:
+            os.makedirs(self.target, exist_ok=True)
+            name = os.path.basename(path)
+            target = os.path.join(self.target, name)
+            counter = 2
+            while os.path.exists(target):
+                # Одноимённые пакеты из разных подпапок не должны перетирать
+                # друг друга, но и терять имя нельзя: по нему видно, что снято.
+                stem, suffix = os.path.splitext(name)
+                target = os.path.join(self.target, f"{stem}-{counter}{suffix}")
+                counter += 1
+            shutil.copy2(path, target)
+            return target
+        except OSError:
+            return ""
+
+    def layout(self) -> AdobeLayout:
+        """Собранные пакеты в виде раскладки: их можно ставить в ``App``."""
+        with self._lock:
+            copies = list(self.captured)
+        payloads: List[Payload] = []
+        for name in sorted(os.listdir(self.target)) if os.path.isdir(
+                self.target) else []:
+            path = os.path.join(self.target, name)
+            if not os.path.isfile(path):
+                continue
+            kind = _classify(name)
+            if kind == "other":
+                continue
+            payloads.append(Payload(path=path, kind=kind, product="снято на лету"))
+        layout = AdobeLayout(root=self.target, payloads=payloads)
+        if payloads:
+            layout.notes.append(
+                f"пакеты сняты с диска, пока установщик работал: {len(payloads)}")
+        return layout
 
 
 # --- диагностика кода 191 ----------------------------------------------------

@@ -31,6 +31,7 @@
 """
 import ntpath
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -377,6 +378,75 @@ class AdobeFailureTests(unittest.TestCase):
         self.assertIn("191", engine_mod._exit_code_hint(191) + "191")
 
 
+class PayloadWatcherTests(unittest.TestCase):
+    """Пакеты, которые установщик раскладывает и убирает за собой.
+
+    Установщик Adobe распаковывает пакеты во временный каталог и удаляет их
+    при откате (код 191/1000). Поэтому копии снимаются с диска, пока он ещё
+    работает: только после того, как размер файла перестал меняться.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / "adobeTemp" / "ETR1234.tmp" / "1"
+        self.source.mkdir(parents=True)
+        self.target = str(self.root / "grabbed")
+
+    def _watcher(self):
+        return adobe_mod.PayloadWatcher([str(self.root / "adobeTemp")],
+                                        self.target, min_size=16)
+
+    def _write(self, name: str, size: int) -> str:
+        path = self.source / name
+        with open(path, "wb") as handle:
+            handle.write(b"x" * size)
+        return str(path)
+
+    def test_file_is_copied_only_after_it_stops_growing(self):
+        self._write("Adobe XD.msi", 64)
+        watcher = self._watcher()
+        self.assertEqual(watcher.scan(), [], "первый размер — ещё не приговор")
+        grabbed = watcher.scan()
+        self.assertEqual(len(grabbed), 1)
+        self.assertTrue(os.path.isfile(grabbed[0]))
+        layout = watcher.layout()
+        self.assertEqual([payload.kind for payload in layout.payloads], ["msi"])
+        self.assertTrue(layout.has_app_payload)
+
+    def test_growing_file_is_not_copied(self):
+        path = self._write("Adobe XD.msi", 64)
+        watcher = self._watcher()
+        watcher.scan()
+        with open(path, "wb") as handle:      # файл ещё пишется
+            handle.write(b"x" * 4096)
+        # Первый проход после записи только запоминает новый размер, второй —
+        # убеждается, что файл больше не растёт, и копирует.
+        self.assertEqual(watcher.scan(), [], "размер ещё меняется")
+        self.assertEqual(len(watcher.scan()), 1)
+
+    def test_empty_and_foreign_files_are_ignored(self):
+        self._write("tiny.msi", 4)
+        self._write("readme.txt", 4096)
+        watcher = self._watcher()
+        watcher.scan()
+        self.assertEqual(watcher.scan(), [])
+        self.assertEqual(watcher.layout().payloads, [])
+
+    def test_uwp_packages_are_captured_but_never_installed(self):
+        self._write("SparklerApp.appx", 4096)
+        watcher = self._watcher()
+        watcher.scan()
+        self.assertEqual(len(watcher.scan()), 1)
+        applied = adobe_mod.materialize(watcher.layout(), self.target,
+                                        lambda path: 0)
+        self.assertEqual(applied.msi_ok, [])
+        self.assertEqual([name for name in applied.skipped_uwp
+                          if name.endswith("SparklerApp.appx")],
+                         ["SparklerApp.appx"])
+
+
 # --- что делает сборка -------------------------------------------------------
 
 class _AdobePortablizer(Portablizer):
@@ -388,11 +458,17 @@ class _AdobePortablizer(Portablizer):
     """
 
     def __init__(self, uwp_unpack_dir: str = "", installer_rc: int = 191,
-                 archive_is_empty: bool = False):
+                 archive_is_empty: bool = False, extractor_rc: int = 0,
+                 extractor_output: str = "", sfx_payloads: bool = False,
+                 nested_setup: str = ""):
         super().__init__(Logger())
         self.uwp_unpack_dir = uwp_unpack_dir
         self.installer_rc = installer_rc
         self.archive_is_empty = archive_is_empty
+        self.extractor_rc = extractor_rc
+        self.extractor_output = extractor_output
+        self.sfx_payloads = sfx_payloads
+        self.nested_setup = nested_setup
         self.calls = []
         self.unpacker_commands = []
 
@@ -404,6 +480,11 @@ class _AdobePortablizer(Portablizer):
                 plan.program == "msiexec.exe":
             _touch(app_dir, "Program Files/Adobe/Adobe XD/Adobe XD.exe", "MZ")
             return 0
+        # Установщик, найденный внутри SFX-контейнера: понимает ключи Adobe.
+        if os.path.basename(plan.program).casefold() in ("setup.exe",
+                                                         "set-up.exe"):
+            _touch(app_dir, "Program Files/Adobe/Adobe XD/Adobe XD.exe", "MZ")
+            return 0
         # Сам установщик Adobe: падает на UWP-шаге...
         if self.uwp_unpack_dir:
             _touch(self.uwp_unpack_dir,
@@ -413,14 +494,25 @@ class _AdobePortablizer(Portablizer):
     def _run_unpacker_command(self, cmd, console_log, opts,  # noqa: D102
                               progress=(63, 65), stage="Распаковка установщика"):
         self.unpacker_commands.append(list(cmd))
-        # У 7-Zip папка задаётся ключом -o<папка>, у tar — параметром -C.
+        # У 7-Zip папка задаётся ключом -o<папка>, у tar — параметром -C,
+        # а у самораспаковывающегося EXE — ключом -d<папка>.
         work = next((arg[2:] for arg in cmd if arg.startswith("-o")), "")
         if not work and "-C" in cmd:
             work = cmd[cmd.index("-C") + 1]
+        if not work:
+            work = next((arg[2:] for arg in cmd if arg.startswith("-d")), "")
         assert work, "в команде распаковщика нет папки распаковки"
         os.makedirs(work, exist_ok=True)
-        if self.archive_is_empty:
+
+        if cmd and cmd[0].casefold().endswith(".exe") and "-s" in cmd:
+            # Сам установщик распаковывает себя по просьбе сборки.
+            if self.sfx_payloads:
+                _touch(work, "payloads/AdobeXD61/Adobe XD.msi")
+            elif self.nested_setup:
+                _touch(work, self.nested_setup, "MZ")
             return 0, ""
+        if self.archive_is_empty:
+            return self.extractor_rc, self.extractor_output
         _touch(work, "payloads/AdobeXD61/Adobe XD.msi")
         _touch(work, "payloads/SparklerApp/SparklerApp.appx")
         _touch(work, "Build/Setup.xml", "<Setup/>")
@@ -646,6 +738,117 @@ class AdobeBuildTests(unittest.TestCase):
             self.assertEqual(engine._adobe_installer_source(self.opts),
                              self.installer)
         self.assertEqual(engine._adobe_media_copy, "")
+
+    def test_extractor_failure_is_not_silently_treated_as_success(self):
+        """Код 1 у tar.exe — это ошибка, а не «предупреждение как у 7-Zip».
+
+        Регрессия: сборка «успешно» распаковывала RAR5 встроенным tar.exe,
+        ничего не получала и молчала о причине — в журнале не было ни ответа
+        архиватора, ни кода возврата.
+        """
+        # Внутри установщика есть RAR — именно его и пытается прочитать tar.
+        with open(self.installer, "ab") as handle:
+            handle.write(b"Rar!\x1a\x07\x01\x00" + b"sfx-body" * 64)
+        engine = self._engine(
+            archive_is_empty=True, extractor_rc=1,
+            extractor_output="tar: Unrecognized archive format")
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=_extractors(
+                                      unpacker_mod.STYLE_TAR,
+                                      "C:\\Windows\\System32\\tar.exe")):
+            engine._run_payload_plan(
+                self._plans()[0], self.opts, self.app, self.data,
+                "Adobe XD", portable_dir=self.portable)
+        text = engine.log.text
+        self.assertIn("код 1", text)
+        self.assertIn("Unrecognized archive format", text)
+
+    def test_extracted_tree_is_described_in_the_log(self):
+        """Видно, что именно оказалось в папке распаковки."""
+        engine = self._engine(archive_is_empty=True)
+        engine.archive_is_empty = False
+        work = os.path.join(self.portable, "_adobe_payloads")
+        _touch(work, "Adobe XD/Setup.exe", "MZ")
+        engine._log_extracted_tree(work, "tar.exe")
+        text = engine.log.text
+        self.assertIn("распаковано файлов 1", text)
+        self.assertIn("Setup.exe", text)
+
+    def test_sfx_extracts_itself_when_archive_tools_fail(self):
+        """Последний шанс без чужих библиотек: SFX распаковывается сам."""
+        engine = self._engine(archive_is_empty=True, extractor_rc=1,
+                              extractor_output="tar: Unrecognized format",
+                              sfx_payloads=True)
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=_extractors(
+                                      unpacker_mod.STYLE_TAR,
+                                      "C:\\Windows\\System32\\tar.exe")):
+            rc, used = engine._run_attempts(
+                self._plans(), self.opts, self.app, self.data, self.portable,
+                "Adobe XD")
+        self.assertEqual(rc, 0)
+        self.assertEqual(used.payload_kind, adobe_mod.PAYLOAD_ADOBE)
+        sfx_calls = [cmd for cmd in engine.unpacker_commands
+                     if cmd and cmd[0].casefold().endswith(".exe")
+                     and "-s" in cmd]
+        self.assertTrue(sfx_calls, "установщик не просили распаковаться")
+        self.assertTrue(any(arg.startswith("-d") for arg in sfx_calls[0]))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.app, "Program Files", "Adobe", "Adobe XD",
+                         "Adobe XD.exe")))
+
+    def test_nested_setup_inside_the_container_is_run(self):
+        """В контейнере нет MSI, зато есть настоящий установщик — его и ставим."""
+        engine = self._engine(archive_is_empty=True, nested_setup="XD/Setup.exe")
+        original = engine._run_unpacker_command
+
+        def sfx_only(cmd, console_log, opts, progress=(63, 65),
+                     stage="Распаковка установщика"):
+            # Обычные архиваторы «не читают» архив, а SFX распаковывает себя.
+            if not (cmd and cmd[0].casefold().endswith(".exe") and "-s" in cmd):
+                return 1, "tar: Unrecognized archive format"
+            return original(cmd, console_log, opts, progress=progress,
+                            stage=stage)
+
+        engine._run_unpacker_command = sfx_only  # type: ignore[assignment]
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=_extractors(
+                                      unpacker_mod.STYLE_TAR,
+                                      "C:\\Windows\\System32\\tar.exe")):
+            rc, _used = engine._run_attempts(
+                self._plans(), self.opts, self.app, self.data, self.portable,
+                "Adobe XD")
+        self.assertEqual(rc, 0)
+        labels = [plan.program for plan in engine.calls]
+        self.assertTrue(any(path.casefold().endswith("setup.exe")
+                            for path in labels),
+                        "установщик из контейнера не запускался")
+
+    def test_payloads_grabbed_during_the_run_are_installed(self):
+        """Установщик убрал пакеты при откате — а снятые копии остались."""
+        temp_root = os.path.join(self.data, "Temp", "adobeTemp", "ETR1.tmp")
+        _touch(temp_root, "payloads/Adobe XD.msi", "x" * 4096)
+        engine = self._engine()
+        watcher = adobe_mod.PayloadWatcher(
+            [os.path.join(self.data, "Temp")],
+            os.path.join(self.portable, "_adobe_grabbed"), min_size=16)
+        watcher.scan()
+        self.assertEqual(len(watcher.scan()), 1)
+        engine._adobe_watcher = watcher
+        # Установщик убрал распакованное при откате — копии остались.
+        shutil.rmtree(os.path.join(self.data, "Temp"), ignore_errors=True)
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True):
+            ok = engine._salvage_adobe_payloads(
+                self.opts, self.app, self.data, "Adobe XD",
+                portable_dir=self.portable)
+        self.assertTrue(ok)
+        self.assertIn("снять с диска", engine.log.text)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.app, "Program Files", "Adobe", "Adobe XD",
+                         "Adobe XD.exe")))
 
     def test_uwp_package_is_never_installed_through_msiexec(self):
         """Appx ставится не msiexec и не нами: его в командах нет вовсе."""
