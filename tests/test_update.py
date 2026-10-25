@@ -208,24 +208,27 @@ class InstallerCommandTests(unittest.TestCase):
 
     def test_custom_args_without_a_folder_still_get_the_current_target(self):
         """Свои ключи не должны лишать обновление привязки к портативу."""
+        stage = Path("C:/p/Updates/stage")
         command = exe_launcher.install_commands(
-            Path("a.exe"), Path("C:/p/Updates/stage"), "inno",
+            Path("a.exe"), stage, "inno",
             {"installer_args": ["/SILENT"]})[0][1]
-        self.assertIn("/DIR=C:/p/Updates/stage", command)
+        # Разделители зависят от ОС: на Windows Path печатается с "\".
+        self.assertIn("/DIR=" + str(stage), command)
         self.assertIn("/NOICONS", command)
 
     def test_custom_args_with_the_previous_root_point_to_the_current_portable(self):
         """Перенос на другой диск: установщик не должен ставить по старому пути."""
         old = "C:\\Old\\App_Portable"
+        stage = Path("C:/p/Updates/stage")
         command = exe_launcher.install_commands(
-            Path("a.exe"), Path("C:/p/Updates/stage"), "nsis",
+            Path("a.exe"), stage, "nsis",
             {"installer_args": ["/D=" + old + "\\App",
                                 "--config=" + old + "\\PortableData\\x.ini"]},
             stale_roots=[old], portable_root=Path("C:/p"))[0][1]
         self.assertNotIn("Old", command)
-        self.assertIn("C:/p/Updates/stage", command)
-        self.assertIn("C:/p", command)
-        self.assertTrue(command.endswith("/D=C:/p/Updates/stage"))
+        self.assertIn(str(stage), command)
+        self.assertIn(str(Path("C:/p")), command)
+        self.assertTrue(command.endswith("/D=" + str(stage)))
 
     def test_similar_folder_name_is_not_rewritten(self):
         """Границы пути: ``Foo`` не должен испортить соседнюю ``FooBar``."""
@@ -279,7 +282,10 @@ class UpdatePortabilityTests(unittest.TestCase):
         self.assertTrue(result.ok, result.message)
         self.assertEqual(len(seen), 1)
         self.assertNotIn("OldDrive", seen[0], "путь починен до установки")
-        self.assertIn(str(self.root / "App"), seen[0])
+        # Значение проверяем после разбора JSON: в тексте .json обратные
+        # слэши удвоены, и сравнивать строку «как есть» нельзя.
+        self.assertEqual(json.loads(seen[0])["install_dir"],
+                         str(self.root / "App"))
 
     def test_install_into_the_previous_location_is_adopted(self):
         """Упрямый установщик: новая версия всё равно попадает в портатив."""

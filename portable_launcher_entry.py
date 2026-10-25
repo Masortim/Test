@@ -1161,6 +1161,18 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
             write_paths_stamp(root)
         return []
 
+    # Все начертания запомненных корней. Удвоенная форма (``C:\\\\Apps\\\\Foo``
+    # в JSON и .reg) длиннее обычной, поэтому замены идут от длинной к
+    # короткой: иначе короткая успела бы испортить длинную.
+    pairs: "list[tuple[str, str]]" = []
+    for item in remembered:
+        if "\\" in item:
+            pairs.append((item.replace("\\", "\\\\"),
+                          current.replace("\\", "\\\\")))
+        pairs.append((item, current))
+        pairs.append((item.replace("\\", "/"), current.replace("\\", "/")))
+    pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+
     files: "list[str]" = []
     total = 0
     # Штамп и отчёт о путях пишем мы сами: переписывать их «старый корень»
@@ -1178,20 +1190,15 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
             continue
         text, encoding = decoded
         folded = text.casefold()
-        if not any(item.casefold() in folded for item in remembered):
+        if not any(form.casefold() in folded for form, _ in pairs):
             continue
         fixed = text
         replaced = 0
-        for item in remembered:
-            for form in (item, item.replace("\\", "/"),
-                         item.replace("/", "\\")):
-                if form.casefold() not in fixed.casefold():
-                    continue
-                replaced += len(_root_marker_pattern(form).findall(fixed))
-                fixed = _replace_root_text(fixed, form,
-                                           current.replace("\\", "/")
-                                           if "/" in form and "\\" not in form
-                                           else current)
+        for form, replacement in pairs:
+            if not form or form.casefold() not in fixed.casefold():
+                continue
+            replaced += len(_root_marker_pattern(form).findall(fixed))
+            fixed = _replace_root_text(fixed, form, replacement)
         if fixed == text:
             continue
         try:
