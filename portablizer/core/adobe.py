@@ -55,6 +55,9 @@ PAYLOAD_ADOBE = "adobe"
 #: портатива рядом с ``installer-output.log``).
 ADOBE_NOTE_NAME = "adobe-uwp.txt"
 
+#: Файл с пошаговым отчётом сборки (что читали, что нашли, что поставили).
+ADOBE_REPORT_NAME = "adobe-report.txt"
+
 #: Каталоги, в которых Adobe держит пакеты внутри установщика. У
 #: корпоративного пакета Adobe Admin Console это ``Build\\payloads``.
 PAYLOAD_DIR_NAMES = ("payloads", "payload")
@@ -64,6 +67,11 @@ UWP_SUFFIXES = (".appx", ".appxbundle", ".msix", ".msixbundle")
 
 MSI_SUFFIX = ".msi"
 ZIP_SUFFIX = ".zip"
+
+#: Сжатые контейнеры с пакетами внутри (встречаются в раскладке Adobe и в
+#: собственной распаковке установщика). Распаковываются внешним архиватором —
+#: стандартная библиотека такие форматы не читает.
+PACK_SUFFIXES = (".7z", ".cab", ".rar")
 
 #: Потолки обхода: payload'ов у больших пакетов много, но не бесконечно.
 SCAN_FILE_LIMIT = 20000
@@ -173,6 +181,11 @@ class AdobeLayout:
         return [p for p in self.payloads if p.kind == "zip"]
 
     @property
+    def packs(self) -> List[Payload]:
+        """Вложенные архивы (7z/cab/rar): их надо распаковать до установки."""
+        return [p for p in self.payloads if p.kind == "pack"]
+
+    @property
     def uwp_packages(self) -> List[Payload]:
         return [p for p in self.payloads if p.kind == "uwp"]
 
@@ -214,6 +227,8 @@ class AdobeLayout:
             parts.append(f"MSI: {len(self.msis)}")
         if self.archives:
             parts.append(f"ZIP: {len(self.archives)}")
+        if self.packs:
+            parts.append(f"архивы: {len(self.packs)}")
         if self.uwp_packages:
             parts.append(f"UWP (пропуск): {len(self.uwp_packages)}")
         return ", ".join(parts) or "пакетов не найдено"
@@ -230,6 +245,8 @@ def _classify(name: str) -> str:
         return "zip"
     if folded.endswith(UWP_SUFFIXES):
         return "uwp"
+    if folded.endswith(PACK_SUFFIXES):
+        return "pack"
     return "other"
 
 
@@ -578,6 +595,18 @@ def materialize(layout: AdobeLayout, app_dir: str,
     return result
 
 
+def _inside_payload_dir(current: str, root: str) -> bool:
+    """Лежит ли каталог внутри распаковки установщика (``ETRxxxx.tmp``)."""
+    relative = os.path.relpath(current, root)
+    if relative == ".":
+        return False
+    for part in relative.split(os.sep):
+        folded = part.casefold()
+        if folded.startswith(("etr", "payload")) or "adobe" in folded:
+            return True
+    return False
+
+
 # --- распаковка самораспаковывающегося EXE -----------------------------------
 
 #: Каталоги, которые создают SFX-модули. WinRAR-SFX распаковывает содержимое
@@ -691,8 +720,18 @@ class PayloadWatcher:
     оттуда их можно поставить в ``App`` обычным путём.
     """
 
-    #: Что имеет смысл забирать: пакеты программы и UWP-оболочки.
-    SUFFIXES = (".msi", ".appx", ".appxbundle", ".msix", ".msixbundle", ".zip")
+    #: Что имеет смысл забирать в первую очередь: пакеты программы.
+    SUFFIXES = (".msi", ".appx", ".appxbundle", ".msix", ".msixbundle", ".zip",
+                ".7z", ".cab", ".rar")
+
+    #: Установщик Adobe раскладывает пакеты не всегда с «правильным»
+    #: расширением: встречаются архивы без расширения и файлы вида
+    #: ``payload_<id>``. Поэтому из его собственного временного каталога
+    #: забирается всё, что больше этого порога, — кроме заведомо служебного.
+    KEEP_ALL_MIN = 32 * 1024
+    #: Служебные файлы установщика: их копировать незачем (журналы, помощники).
+    SKIP_SUFFIXES = (".log", ".tmp", ".txt", ".json", ".xml", ".ini", ".dll",
+                     ".pdb", ".etl")
 
     def __init__(self, roots: Iterable[str], target: str,
                  interval: float = 0.7, min_size: int = 64 * 1024,
@@ -775,9 +814,21 @@ class PayloadWatcher:
                 if depth >= self.max_depth:
                     dirs[:] = []
                     continue
+                inside_payload = _inside_payload_dir(current, root)
                 for name in files:
-                    if name.casefold().endswith(self.SUFFIXES):
+                    folded = name.casefold()
+                    if folded.endswith(self.SUFFIXES):
                         found.append(os.path.join(current, name))
+                        continue
+                    # Внутри собственной распаковки установщика расширение
+                    # ничего не значит: пакет может лежать как угодно.
+                    if inside_payload and not folded.endswith(self.SKIP_SUFFIXES):
+                        path = os.path.join(current, name)
+                        try:
+                            if os.path.getsize(path) >= self.KEEP_ALL_MIN:
+                                found.append(path)
+                        except OSError:
+                            continue
                 if len(found) > self.max_files * 5:
                     return found
         return found
@@ -1020,6 +1071,12 @@ def failure_hints(failure: Optional[AdobeFailure] = None,
             "из самого установщика, не запуская его."
         )
 
+    hints.append(
+        "Рядом с папкой портатива лежит adobe-report.txt: в нём пошагово "
+        "записано, чем читали установщик, что нашли, какие MSI разложились и "
+        "что в итоге оказалось в App. По этому файлу видно причину без "
+        "догадок — его и стоит приложить, если понадобится помощь."
+    )
     hints.append(
         "Если Защитник Windows заблокировал помощник из пакета Adobe "
         "(встречается Nsudo.exe: «файл содержит вирус или потенциально "

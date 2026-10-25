@@ -1048,6 +1048,12 @@ class MainWindow(QMainWindow):
                     "(модуль, код исключения) — в "
                     f"{result.crash_report_rel}.",
                 ]
+            if result.adobe_report_rel:
+                details += [
+                    "",
+                    "Подробный отчёт о сборке Adobe (что читали, что нашли и "
+                    f"что в итоге в App): {result.adobe_report_rel}.",
+                ]
             if result.adobe_note_rel:
                 # Adobe ставит программу двумя этапами: пакеты MSI и UWP-пакет.
                 # Второй этап падает с «кодом ошибки 191» и портативу не нужен,

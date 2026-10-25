@@ -723,6 +723,9 @@ class PortableResult:
     #: Объяснение, почему в портативе нет UWP-части Adobe
     #: (``adobe-uwp.txt``), если установщик этой части и требовал.
     adobe_note_rel: str = ""
+    #: Пошаговый отчёт сборки Adobe (``adobe-report.txt``): что читали, что
+    #: нашли и что в итоге лежит в App. По нему разбирают неудачу без догадок.
+    adobe_report_rel: str = ""
     #: Найденные службы, указывающие внутрь портатива. Они только сообщаются;
     #: Portablizer не останавливает и не удаляет системные службы автоматически.
     registered_services: List[str] = field(default_factory=list)
@@ -1083,6 +1086,10 @@ class Portablizer:
         self._adobe_nested_setup = ""
         #: Сбор пакетов «на лету», пока установщик работает (см. adobe.py).
         self._adobe_watcher: Optional[adobe_mod.PayloadWatcher] = None
+        #: Пошаговый след сборки Adobe — основа файла adobe-report.txt.
+        self._adobe_steps: List[str] = []
+        #: Путь к отчёту, если он записан (показывается в итоговом окне).
+        self._adobe_report_rel = ""
         #: Копия установщика на локальном диске: Adobe отказывается работать
         #: со съёмного и сетевого носителя (код 1000).
         self._adobe_media_copy = ""
@@ -1833,6 +1840,8 @@ class Portablizer:
             self._adobe_failure = None
             self._adobe_note_rel = ""
             self._adobe_nested_setup = ""
+            self._adobe_steps = []
+            self._adobe_report_rel = ""
             self._stop_adobe_watcher()
             self._drop_adobe_media_copy()
             self._adobe_media_copy = ""
@@ -3707,6 +3716,12 @@ class Portablizer:
                     )
 
         self._collect_engine_log(opts, data_dir, portable_dir)
+        if self._adobe_detected and portable_dir:
+            # Отчёт пишется и здесь: так он появляется независимо от того,
+            # дошла ли сборка до финальных полей результата.
+            self._installer_path = opts.installer_path
+            self._write_adobe_report(portable_dir, name,
+                                     getattr(self, "_detection", None))
         return last_rc, None
 
     def _queue_crash_recovery(self, plan: SilentPlan, rc: Optional[int],
@@ -4016,12 +4031,17 @@ class Portablizer:
         # Наблюдение за пакетами заканчивается вместе со сборкой: поток не
         # должен продолжать читать чужие временные каталоги после неё.
         self._stop_adobe_watcher()
+        if self._adobe_detected and portable_dir:
+            self._write_adobe_report(portable_dir,
+                                     os.path.basename(portable_dir),
+                                     getattr(self, "_detection", None))
         if result.success:
             shutil.rmtree(os.path.join(portable_dir, "_adobe_grabbed"),
                           ignore_errors=True)
         result.installer_temp_dir = self._install_temp_dir
         result.unpacked_with = self._unpacked_with
         result.adobe_note_rel = self._adobe_note_rel
+        result.adobe_report_rel = self._adobe_report_rel
         if not portable_dir:
             return
         report = os.path.join(portable_dir, crash_mod.CRASH_LOG_NAME)
@@ -4398,6 +4418,10 @@ class Portablizer:
                 "Пакеты Adobe разложены в App без запуска установщика — "
                 "UWP-шаг с кодом 191 не выполнялся."
             )
+            if portable_dir:
+                self._installer_path = opts.installer_path
+                self._write_adobe_report(portable_dir, name,
+                                         getattr(self, "_detection", None))
             return 0
 
         if self._attempt_nested_adobe_setup(
@@ -4424,6 +4448,10 @@ class Portablizer:
         setup = self._adobe_nested_setup
         if not setup or not os.path.isfile(setup):
             return False
+        # Установщик из контейнера — такой же Adobe: он раскладывает пакеты во
+        # временный каталог и убирает их при откате. Значит, наблюдение нужно
+        # и здесь, а не только в общей лестнице попыток.
+        self._start_adobe_watcher(portable_dir, opts)
         rc = self._run_nested_adobe_setup(
             setup, opts, app_dir, data_dir, console_log=console_log,
             progress_from=progress_from, progress_to=progress_to)
@@ -4579,6 +4607,7 @@ class Portablizer:
             "Достаю пакеты Adobe из установщика без его запуска: подойдёт "
             f"любой архиватор ({names}) — UWP-шаг (код 191) при этом не "
             "выполняется вовсе.")
+        self._adobe_steps.append(f"найдены распаковщики: {names}")
 
         unpack_log = console_log or os.path.join(portable_dir,
                                                  "unpacker-output.log")
@@ -4596,6 +4625,9 @@ class Portablizer:
                         f"{extractor.name} не умеет читать PE-обёртку, а "
                         "приклеенного RAR/7z внутри не нашлось — пробую "
                         "следующий способ.")
+                    self._adobe_steps.append(
+                        f"{extractor.name}: в установщике нет приклеенного "
+                        "RAR/7z (только PE-обёртка)")
                     continue
                 carved = archive
                 self.log.info(
@@ -4628,8 +4660,15 @@ class Portablizer:
                     f"{extractor.name} завершился с кодом {code}: контейнер "
                     "установщика прочитать не удалось."
                     + (f" Ответ архиватора: {tail}" if tail else ""))
+                self._adobe_steps.append(
+                    f"{extractor.name}: код {code}"
+                    + (f", ответ: {tail}" if tail else ""))
             layout = adobe_mod.find_payloads(
                 work, installer_path=opts.installer_path)
+            self._adobe_steps.append(
+                f"{extractor.name}: распаковано, пакетов программы "
+                f"{'найдено' if layout.has_app_payload else 'не найдено'}"
+                f" ({layout.summary()})")
             if layout.has_app_payload:
                 return layout
             self._log_extracted_tree(work, extractor.name)
@@ -4901,6 +4940,11 @@ class Portablizer:
                 progress_from=progress_from, progress_to=progress_to,
                 console_log=console_log)
 
+        # Вложенные архивы (7z/cab/rar) сначала раскрываются: внутри них и
+        # лежат пакеты программы. Стандартная библиотека такие форматы не
+        # читает — нужен любой из найденных архиваторов.
+        layout = self._expand_adobe_packs(
+            layout, opts, console_log=console_log, portable_dir=portable_dir)
         self._adobe_layout = layout
         applied = adobe_mod.materialize(layout, app_dir, install_msi)
         self._adobe_applied = applied
@@ -4918,6 +4962,58 @@ class Portablizer:
         if portable_dir:
             self._write_adobe_note(portable_dir, name, applied)
         return applied
+
+    def _expand_adobe_packs(self, layout: adobe_mod.AdobeLayout,
+                            opts: PortableOptions,
+                            console_log: Optional[str] = None,
+                            portable_dir: str = "") -> adobe_mod.AdobeLayout:
+        """Раскрывает вложенные архивы (7z/cab/rar) и добавляет их содержимое.
+
+        В раскладке Adobe пакеты иногда лежат не «голыми» MSI, а сжатыми в
+        архив: сам установщик распаковывает их по ходу. Раз он падает на
+        UWP-шаге, распаковать их должны мы — иначе в App нечего ставить.
+        """
+        packs = layout.packs
+        if not packs:
+            return layout
+        extractors = unpacker_mod.find_extractors()
+        if not extractors:
+            self.log.warn(
+                "Внутри сборки есть архивы с пакетами, но распаковщика нет — "
+                "раскрыть их нечем.")
+            return layout
+        extractor = extractors[0]
+        target = os.path.join(layout.root or portable_dir, "_expanded")
+        unpack_log = console_log or os.path.join(portable_dir,
+                                                 "unpacker-output.log")
+        for pack in packs:
+            self._check_cancel()
+            self.log.info(
+                f"Раскрываю архив с пакетами Adobe: {pack.name} "
+                f"({extractor.name}).")
+            try:
+                code, output = self._run_unpacker_command(
+                    unpacker_mod.extractor_argv(extractor, pack.path, target),
+                    unpack_log, opts, progress=(54, 56),
+                    stage="Раскрытие архива Adobe")
+            except RuntimeError:
+                raise
+            ok_codes = (0,) if extractor.style != unpacker_mod.STYLE_7ZIP \
+                else (0, 1)
+            if code not in ok_codes:
+                tail = " ".join((output or "").split())[-200:]
+                self.log.warn(
+                    f"{extractor.name} не раскрыл {pack.name} (код {code})"
+                    + (f": {tail}" if tail else ""))
+                continue
+            found = adobe_mod.find_payloads(target,
+                                            installer_path=opts.installer_path)
+            if found.is_empty:
+                self.log.debug(f"  • в {pack.name} пакетов не нашлось.")
+                continue
+            self.log.info(f"  • в {pack.name}: {found.summary()}.")
+            layout.extend(found)
+        return layout
 
     def _salvage_adobe_payloads(self, opts: PortableOptions, app_dir: str,
                                 data_dir: str, name: str,
@@ -5029,6 +5125,102 @@ class Portablizer:
             "Пакеты из временного каталога Adobe не дали исполняемого файла "
             f"в App. Что удалось разложить: {applied.summary()}.")
         return False
+
+    def _write_adobe_report(self, portable_dir: str, name: str,
+                            det: Optional[DetectionResult] = None) -> None:
+        """Пишет ``adobe-report.txt`` — что именно происходило со сборкой.
+
+        Adobe — единственный установщик, где «не собралось» может означать
+        десяток разных вещей: архиватор не прочитал контейнер, пакеты удалились
+        при откате, MSI не принял папку. Без общего отчёта каждый такой случай
+        приходится угадывать по длинному журналу, поэтому всё важное
+        складывается в один файл рядом с портативом.
+        """
+        if not portable_dir:
+            return
+        lines: List[str] = [
+            f"Отчёт сборки портатива: {name}",
+            "=" * 60,
+            f"Версия Portablizer: {__version__}",
+        ]
+        if det is not None:
+            lines.append(f"Установщик: {det.installer_type.value} "
+                         f"(уверенность {int(det.confidence * 100)}%)")
+        if opts_path := getattr(self, "_installer_path", ""):
+            lines.append(f"Файл: {opts_path}")
+        lines.append("")
+
+        lines.append("Что было сделано")
+        lines.append("-" * 60)
+        lines.extend(f"  • {step}" for step in self._adobe_steps) if self._adobe_steps \
+            else lines.append("  (шаги не записаны)")
+
+        watcher = self._adobe_watcher
+        if watcher is not None:
+            captured = list(watcher.captured)
+            if captured:
+                lines.append("")
+                lines.append("Пакеты, снятые с диска во время установки")
+                lines.append("-" * 60)
+                lines.extend(f"  • {os.path.basename(path)}" for path in captured)
+
+        layout = self._adobe_layout
+        if layout is not None and not layout.is_empty:
+            lines.append("")
+            lines.append("Найденные пакеты")
+            lines.append("-" * 60)
+            for payload in layout.payloads:
+                lines.append(f"  • {payload.kind}: {payload.path}")
+
+        applied = self._adobe_applied
+        if applied is not None:
+            lines.append("")
+            lines.append("Что получилось")
+            lines.append("-" * 60)
+            lines.append(f"  итог: {applied.summary()}")
+            for name_ok in applied.msi_ok:
+                lines.append(f"  • MSI разложен: {name_ok}")
+            for name_bad, reason in applied.msi_failed:
+                lines.append(f"  • MSI не разложился: {name_bad} — {reason}")
+            for name_ok in applied.archives_ok:
+                lines.append(f"  • архив распакован: {name_ok}")
+            for name_bad, reason in applied.archives_failed:
+                lines.append(f"  • архив не распакован: {name_bad} — {reason}")
+            for name_uwp in applied.skipped_uwp:
+                lines.append(f"  • UWP пропущен (это и есть обход кода 191): "
+                             f"{name_uwp}")
+
+        # Что в итоге лежит в App — главный ответ на вопрос «а собралось ли».
+        app_dir = os.path.join(portable_dir, "App")
+        lines.append("")
+        lines.append("Содержимое App")
+        lines.append("-" * 60)
+        tops: List[str] = []
+        exes: List[str] = []
+        for current, _dirs, files in os.walk(app_dir):
+            relative = os.path.relpath(current, app_dir)
+            if relative == ".":
+                tops.extend(sorted(_dirs)[:12])
+            for item in files:
+                if item.casefold().endswith(".exe"):
+                    exes.append(os.path.relpath(os.path.join(current, item),
+                                                app_dir))
+        if tops:
+            lines.append("  верхний уровень: " + ", ".join(tops))
+        if exes:
+            lines.append(f"  исполняемых файлов: {len(exes)}")
+            lines.extend(f"  • {path}" for path in exes[:25])
+        else:
+            lines.append("  исполняемых файлов нет")
+
+        path = os.path.join(portable_dir, adobe_mod.ADOBE_REPORT_NAME)
+        try:
+            self._write_text(path, "\n".join(lines) + "\n")
+        except OSError as exc:
+            self.log.debug(f"  • отчёт Adobe не записан: {exc}")
+            return
+        self._adobe_report_rel = os.path.relpath(path, portable_dir)
+        self.log.info(f"Подробный отчёт о сборке Adobe: {path}")
 
     def _write_adobe_note(self, portable_dir: str, name: str,
                           applied: adobe_mod.ApplyResult) -> None:
