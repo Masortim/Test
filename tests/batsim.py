@@ -510,6 +510,11 @@ class BatchInterpreter:
             return None
         if low.startswith("powershell"):
             expanded = self.expand(command)
+            if "portable_reg_out" in expanded.lower():
+                # Переписывание .reg: маркер -> путь (unpack) или обратно
+                # (pack). Без этой эмуляции тесты видели только ветку
+                # «PowerShell не сработал».
+                return self._simulate_reg_rewrite()
             if "-verb runas" not in expanded.lower():
                 self.errorlevel = 0
                 return None
@@ -570,6 +575,41 @@ class BatchInterpreter:
             self.env["ERRORLEVEL"] = str(self.program_exit_code)
             return None
         raise BatError(f"неизвестная команда: {command!r}")
+
+    def _simulate_reg_rewrite(self) -> None:
+        """Эмуляция PowerShell-переписывания ``.reg`` (маркер <-> путь).
+
+        ``BATSIM_NO_POWERSHELL=1`` — как на ПК, где PowerShell запрещён
+        политикой: файл не создаётся, errorlevel 1.
+        """
+        if self.env.get("BATSIM_NO_POWERSHELL") == "1":
+            self.errorlevel = 1
+            return
+        source = self.env.get("PORTABLE_REG_SRC", "")
+        target = self.env.get("PORTABLE_REG_OUT", "")
+        token = self.env.get("PORTABLE_REG_TOKEN", "")
+        mode = (self.env.get("PORTABLE_REG_MODE") or "").lower()
+        root = self.env.get("PORTABLE_ROOT", "")
+        if not source or not target or not token:
+            self.errorlevel = 1
+            return
+        try:
+            text = self.fs.files.get(self.fs._norm(source))
+        except Exception:  # noqa: BLE001 - файла нет, как и на Windows
+            text = None
+        if text is None:
+            self.errorlevel = 1
+            return
+        doubled = root.replace("\\", "\\\\")
+        if mode == "pack":
+            text = text.replace(doubled, token).replace(root, token)
+        else:
+            text = text.replace(token, doubled)
+        if token.lower() in text.lower():
+            self.errorlevel = 2  # маркер не развернулся: импорт запрещён
+            return
+        self.fs.add_file(target, text)
+        self.errorlevel = 0
 
     def _exec_start(self, command: str):
         """Упрощённый ``start [/wait] [/b] ["заголовок"] программа аргументы``.

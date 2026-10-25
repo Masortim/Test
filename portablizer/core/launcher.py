@@ -1257,7 +1257,18 @@ if exist "%PORTABLE_REG_OUT%" (
   reg import "%PORTABLE_REG_OUT%" >nul 2>&1
   del /f /q "%PORTABLE_REG_OUT%" >nul 2>&1
 ) else (
-  reg import "%PORTABLE_REG_SRC%" >nul 2>&1
+  rem The rewrite failed: PowerShell is unavailable or blocked by policy.
+  rem Importing the file verbatim would put the literal marker into the
+  rem registry - the program would then see an install folder called
+  rem "@@PORTABLE_ROOT@@\App" and its own updater would fail with "Error
+  rem opening file for writing". Hand the import to the launcher, which
+  rem replaces the marker itself.
+  if exist "%PORTABLE_ROOT%\App\LaunchPortable.exe" (
+    "%PORTABLE_ROOT%\App\LaunchPortable.exe" --import-reg "%~f1" >nul 2>&1
+  ) else (
+    if not exist "%PORTABLE_DATA%" md "%PORTABLE_DATA%" >nul 2>&1
+    echo [registry] skipped the import of a settings file: the location marker could not be replaced. Start the portable through LaunchPortable.exe.>>"%PORTABLE_DATA%\launcher-run.log"
+  )
 )
 goto :eof
 
@@ -1278,7 +1289,7 @@ rem %1 = pack   : absolute path  -> marker
 rem %1 = unpack : marker         -> absolute path
 set "PORTABLE_REG_MODE=%~1"
 set "PORTABLE_REG_TOKEN=%PORTABLE_REG_MARKER%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $p=[IO.File]::ReadAllBytes($env:PORTABLE_REG_SRC); $e=if($p.Length -ge 2 -and $p[0] -eq 255 -and $p[1] -eq 254){[Text.Encoding]::Unicode}else{[Text.Encoding]::UTF8}; $t=$e.GetString($p).TrimStart([char]0xFEFF); $r=$env:PORTABLE_ROOT.Replace('\','\\'); if($env:PORTABLE_REG_MODE -eq 'pack'){ $t=$t.Replace($r,$env:PORTABLE_REG_TOKEN); $t=$t.Replace($env:PORTABLE_ROOT,$env:PORTABLE_REG_TOKEN) } else { $t=$t.Replace($env:PORTABLE_REG_TOKEN,$r) }; [IO.File]::WriteAllText($env:PORTABLE_REG_OUT,$t,[Text.Encoding]::Unicode) } catch { exit 1 }" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $p=[IO.File]::ReadAllBytes($env:PORTABLE_REG_SRC); $e=if($p.Length -ge 2 -and $p[0] -eq 255 -and $p[1] -eq 254){[Text.Encoding]::Unicode}else{[Text.Encoding]::UTF8}; $t=$e.GetString($p).TrimStart([char]0xFEFF); $r=$env:PORTABLE_ROOT.Replace('\','\\'); if($env:PORTABLE_REG_MODE -eq 'pack'){ $t=$t.Replace($r,$env:PORTABLE_REG_TOKEN); $t=$t.Replace($env:PORTABLE_ROOT,$env:PORTABLE_REG_TOKEN) } else { $t=$t.Replace($env:PORTABLE_REG_TOKEN,$r) }; if($t.Contains($env:PORTABLE_REG_TOKEN)){ exit 2 }; [IO.File]::WriteAllText($env:PORTABLE_REG_OUT,$t,[Text.Encoding]::Unicode) } catch { exit 1 }" >nul 2>&1
 goto :eof
 """
 
@@ -1971,6 +1982,65 @@ def reg(*args):
         return 1
 
 
+def _read_reg_text(path):
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16"), "utf-16"
+    return raw.decode("utf-8-sig"), "utf-8"
+
+
+def reg_import(path, root, token, runtime):
+    """Import a .reg file with the location marker expanded to this folder.
+
+    The marker lives in ``portable.reg``/``portable_machine.reg`` and in the
+    session exports.  Importing it verbatim would put the literal text
+    ``@@PORTABLE_ROOT@@\\App`` into the registry; the program's own updater
+    then tries to install into a folder with that name and fails with
+    "Error opening file for writing".  Never import a file that still has it.
+    """
+    if not token:
+        return reg("import", path)
+    try:
+        text, encoding = _read_reg_text(path)
+    except OSError:
+        return 1
+    if token.casefold() not in text.casefold():
+        return reg("import", path)
+    fixed = text.replace(token, root.replace("\\", "\\\\"))
+    fixed = fixed.replace(token, root)
+    if token.casefold() in fixed.casefold():
+        return 1
+    temporary = os.path.join(runtime, "_imported_%d.reg" % os.getpid())
+    os.makedirs(runtime, exist_ok=True)
+    with open(temporary, "w", encoding=encoding, newline="\r\n") as fh:
+        fh.write(fixed)
+    code = reg("import", temporary)
+    try:
+        os.remove(temporary)
+    except OSError:
+        pass
+    return code
+
+
+def reg_export(path, root, token):
+    """Export passthrough: the absolute path is replaced by the marker."""
+    if os.path.exists(path):
+        os.remove(path)
+    code = reg("export", path, "/y")
+    if code != 0 or not token:
+        return code
+    try:
+        text, encoding = _read_reg_text(path)
+    except OSError:
+        return code
+    text = text.replace(root.replace("\\", "\\\\"), token)
+    text = text.replace(root, token)
+    with open(path, "w", encoding=encoding, newline="\r\n") as fh:
+        fh.write(text)
+    return code
+
+
 def main():
     root = portable_root()
     with open(os.path.join(root, "launcher_config.json"), "r",
@@ -2035,30 +2105,21 @@ def main():
             path = os.path.join(backup, "k%02d.reg" % index)
             if not os.path.exists(path):
                 reg("export", key, path, "/y")
+        token = registry.get("root_token") or ""
         saved = [f for f in os.listdir(session) if f.lower().endswith(".reg")]
         machine = os.path.join(root, registry.get("machine_file", ""))
         if saved:
             # A non-elevated run may have no saved HKLM export. Seed it first.
             if registry.get("machine_file") and os.path.exists(machine):
-                reg("import", machine)
+                reg_import(machine, root, token, session)
             for name in sorted(saved):
-                reg("import", os.path.join(session, name))
+                reg_import(os.path.join(session, name), root, token, session)
         else:
             initial = os.path.join(root, registry.get("file", "portable.reg"))
             if os.path.exists(initial):
-                token = registry.get("root_token")
-                if token:
-                    runtime = os.path.join(session, "_imported.reg")
-                    with open(initial, "r", encoding="utf-16") as fh:
-                        text = fh.read()
-                    text = text.replace(token, root.replace("\\", "\\\\"))
-                    with open(runtime, "w", encoding="utf-16",
-                              newline="\r\n") as fh:
-                        fh.write(text)
-                    initial = runtime
-                reg("import", initial)
+                reg_import(initial, root, token, session)
             if registry.get("machine_file") and os.path.exists(machine):
-                reg("import", machine)
+                reg_import(machine, root, token, session)
 
     # Разбор аргументов для выбора цели
     target_rel = cfg["target_exe_rel"]
@@ -2125,11 +2186,10 @@ def main():
                           cwd=os.path.dirname(target), env=env).returncode
 
     if active and registry.get("restore_on_exit", True):
+        token = registry.get("root_token") or ""
         for index, key in enumerate(keys):
             path = os.path.join(session, "k%02d.reg" % index)
-            if os.path.exists(path):
-                os.remove(path)
-            reg("export", key, path, "/y")
+            reg_export(path, root, token)
             if key in created:
                 reg("delete", key, "/f")
             saved_backup = os.path.join(backup, "k%02d.reg" % index)
