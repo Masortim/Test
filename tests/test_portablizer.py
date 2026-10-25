@@ -4064,7 +4064,10 @@ class InstallerShortcutCleanupTests(unittest.TestCase):
     def _guard(self):
         from portablizer.core import shortcuts
 
-        return shortcuts.ShortcutGuard(self.root, folders=[self.desktop])
+        return shortcuts.ShortcutGuard(
+            self.root, folders=[self.desktop],
+            app_names=shortcuts.app_name_candidates(
+                "App", "AppSetup.exe", self.root.name))
 
     def test_shortcut_of_the_installer_is_removed_and_logged(self):
         guard = self._guard()
@@ -4073,6 +4076,32 @@ class InstallerShortcutCleanupTests(unittest.TestCase):
         link.write_bytes(str(self.root / "App" / "app.exe")
                          .encode("utf-16-le"))
         removed = self.engine._report_own_shortcuts(guard)
+        self.assertEqual(removed, [str(link)])
+        self.assertFalse(link.exists())
+        self.assertIn("Убрано ярлыков", self.engine.log.text)
+
+    def test_empty_shortcut_is_removed_even_if_it_existed_before(self):
+        """«Пустой» ярлык: файл остался, цель установщика уже удалена."""
+        import struct
+
+        from portablizer.core import shortcuts
+
+        raw = str(self.base / "gone" / "App.exe").encode("latin-1") + b"\0"
+        size = 0x1C + len(raw) + 1
+        info = struct.pack("<IIIIIII", size, 0x1C, 1, 0, 0x1C, 0, 0x1C + len(raw))
+        info += raw + b"\0"
+        header = bytearray(0x4C)
+        header[0:4] = b"L\x00\x00\x00"
+        header[0x14:0x18] = struct.pack("<I", 0x2)
+        link = self.desktop / "App.lnk"
+        link.write_bytes(bytes(header) + info)
+
+        guard = self._guard()
+        guard.snapshot()          # ярлык уже был: обычная уборка его не тронет
+        self.assertEqual(self.engine._report_own_shortcuts(guard), [])
+        self.assertTrue(link.exists())
+
+        removed = self.engine._report_own_shortcuts(guard, sweep=True)
         self.assertEqual(removed, [str(link)])
         self.assertFalse(link.exists())
         self.assertIn("Убрано ярлыков", self.engine.log.text)
