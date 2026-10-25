@@ -12,11 +12,16 @@ Inno Setup, NSIS и большинство «самораспаковывающ�
 
 Что здесь есть
 --------------
-* :func:`find_unpacker` — поиск уже установленного распаковщика (7-Zip). Свой
-  бинарник Portablizer с собой не носит и в сеть за ним не ходит: сборка не
-  должна молча скачивать исполняемые файлы. Не нашлось — об этом честно
-  говорится в подсказках, и остаются обычные способы.
-* :func:`unpacker_argv` — команда распаковки в папку.
+* :func:`find_extractors` — поиск распаковщиков, которые уже есть на машине.
+  Свой бинарник Portablizer с собой не носит и в сеть за ним не ходит: сборка
+  не должна молча скачивать исполняемые файлы. Годится не только 7-Zip:
+  подойдёт WinRAR (``UnRAR.exe``/``Rar.exe``), а на Windows 10 и новее —
+  **встроенный ``tar.exe``**: это bsdtar из libarchive, он читает ZIP, 7z и
+  RAR/RAR5. Именно поэтому отсутствие 7-Zip больше не тупик.
+* :func:`find_unpacker` — тот же поиск, но только для 7-Zip (совместимость).
+* :func:`unpacker_argv` / :func:`extractor_argv` — команда распаковки в папку.
+* :func:`carve_archive` — вырезает архив (RAR/RAR5/7z) из самораспаковывающегося
+  EXE: сторонние распаковщики читают сам архив, а не PE-обёртку перед ним.
 * :func:`promote_payload` — раскладка распакованного по папке ``App``: Inno
   держит файлы программы под ``{app}``, а рядом лежат ``{tmp}``, ``{sys}``,
   ``{userappdata}`` и прочие места, которые в портатив переносить нельзя.
@@ -29,6 +34,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -55,28 +61,42 @@ RunResult = Tuple[int, str]
 Runner = Callable[[Sequence[str], Optional[float]], RunResult]
 
 
-def find_unpacker(env: Optional[dict] = None,
-                  which: Callable[[str], Optional[str]] = shutil.which,
-                  isfile: Callable[[str], bool] = os.path.isfile) -> str:
-    """Путь к установленному распаковщику или пустая строка.
+#: Стили командной строки. Синтаксис у распаковщиков разный, поэтому одна
+#: «универсальная» команда здесь не работает.
+STYLE_7ZIP = "7zip"
+STYLE_RAR = "rar"
+STYLE_TAR = "tar"
 
-    Сначала смотрим стандартные каталоги 7-Zip (там бинарник лежит рядом с
-    библиотеками, которые ему нужны), затем — ``PATH``: 7-Zip часто ставят
-    «портативно», распаковав в произвольную папку и добавив её в PATH.
-    """
-    environment = os.environ if env is None else env
-    candidates: List[str] = []
-    for variable in UNPACKER_ENV_VARS:
-        root = environment.get(variable, "")
-        if not root:
-            continue
-        for subdir in UNPACKER_SUBDIRS:
-            for name in UNPACKER_NAMES:
-                candidates.append(os.path.join(root, subdir, name))
-    for name in UNPACKER_NAMES:
-        found = which(name)
-        if found:
-            candidates.append(found)
+#: WinRAR и его консольные части. ``WinRAR.exe`` — оконная программа, она
+#: возвращает управление до конца распаковки, поэтому её не берём.
+RAR_NAMES = ("UnRAR.exe", "Rar.exe", "unrar", "rar")
+
+#: Каталоги, куда WinRAR ставится по умолчанию.
+RAR_SUBDIRS = ("WinRAR", "WinRAR-x64")
+
+#: Встроенный в Windows архиватор: с Windows 10 (1803) это bsdtar из
+#: libarchive — читает ZIP, 7z и RAR/RAR5. Ничего доустанавливать не нужно, а
+#: значит отсутствие 7-Zip больше не мешает достать содержимое установщика.
+TAR_NAMES = ("tar.exe", "tar")
+
+
+@dataclass(frozen=True)
+class Extractor:
+    """Найденный распаковщик: стиль командной строки и путь к бинарнику."""
+
+    style: str
+    path: str
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(self.path)
+
+    def __str__(self) -> str:  # для журнала
+        return self.name
+
+
+def _first_existing(candidates: Sequence[str],
+                    isfile: Callable[[str], bool]) -> str:
     for path in candidates:
         try:
             if isfile(path):
@@ -84,6 +104,188 @@ def find_unpacker(env: Optional[dict] = None,
         except OSError:
             continue
     return ""
+
+
+def find_extractors(env: Optional[dict] = None,
+                    which: Callable[[str], Optional[str]] = shutil.which,
+                    isfile: Callable[[str], bool] = os.path.isfile
+                    ) -> List[Extractor]:
+    """Все распаковщики, которыми можно прочитать контейнер установщика.
+
+    Порядок — по удобству и точности: сначала 7-Zip (он лучше всех разбирает
+    самораспаковывающиеся EXE и понимает больше форматов), затем WinRAR
+    (консольные ``UnRAR``/``Rar``), в конце — встроенный в Windows ``tar.exe``
+    (bsdtar). Отсутствие любого из них — не ошибка: важен хотя бы один.
+    """
+    environment = os.environ if env is None else env
+    found: List[Extractor] = []
+
+    seven_zip: List[str] = []
+    for variable in UNPACKER_ENV_VARS:
+        root = environment.get(variable, "")
+        if not root:
+            continue
+        for subdir in UNPACKER_SUBDIRS:
+            for name in UNPACKER_NAMES:
+                seven_zip.append(os.path.join(root, subdir, name))
+    for name in UNPACKER_NAMES:
+        located = which(name)
+        if located:
+            seven_zip.append(located)
+    seven = _first_existing(seven_zip, isfile)
+    if seven:
+        found.append(Extractor(STYLE_7ZIP, seven))
+
+    rar: List[str] = []
+    for variable in UNPACKER_ENV_VARS:
+        root = environment.get(variable, "")
+        if not root:
+            continue
+        for subdir in RAR_SUBDIRS:
+            for name in RAR_NAMES:
+                rar.append(os.path.join(root, subdir, name))
+    for name in RAR_NAMES:
+        located = which(name)
+        if located:
+            rar.append(located)
+    unrar = _first_existing(rar, isfile)
+    if unrar:
+        found.append(Extractor(STYLE_RAR, unrar))
+
+    tar: List[str] = []
+    system_root = environment.get("SystemRoot") or environment.get("windir")
+    if system_root:
+        tar.append(os.path.join(system_root, "System32", "tar.exe"))
+    located_tar = which("tar")
+    if located_tar:
+        tar.append(located_tar)
+    tar_exe = _first_existing(tar, isfile)
+    if tar_exe and all(item.path != tar_exe for item in found):
+        found.append(Extractor(STYLE_TAR, tar_exe))
+    return found
+
+
+def find_unpacker(env: Optional[dict] = None,
+                  which: Callable[[str], Optional[str]] = shutil.which,
+                  isfile: Callable[[str], bool] = os.path.isfile) -> str:
+    """Путь к установленному 7-Zip или пустая строка.
+
+    Оставлено для тех мест, где нужен именно 7-Zip (у него самый точный разбор
+    самораспаковывающихся EXE). Общий поиск — :func:`find_extractors`.
+    """
+    extractors = find_extractors(env=env, which=which, isfile=isfile)
+    return next((item.path for item in extractors if item.style == STYLE_7ZIP),
+                "")
+
+
+def extractor_argv(extractor: Extractor, archive: str,
+                   work_dir: str) -> List[str]:
+    """Команда распаковки ``archive`` в ``work_dir`` для этого распаковщика."""
+    if extractor.style == STYLE_7ZIP:
+        return unpacker_argv(extractor.path, archive, work_dir)
+    if extractor.style == STYLE_RAR:
+        # -o+ перезаписывает без вопросов, -idq убирает служебный вывод,
+        # завершающий разделитель обязателен: иначе UnRAR им не считает.
+        return [extractor.path, "x", "-y", "-o+", "-idq", archive,
+                work_dir + os.sep]
+    if extractor.style == STYLE_TAR:
+        # bsdtar сам определяет формат (ZIP, 7z, RAR/RAR5, CAB).
+        return [extractor.path, "-x", "-f", archive, "-C", work_dir]
+    raise ValueError(f"неизвестный распаковщик: {extractor.style}")
+
+
+#: Подписи архивов, вокруг которых может быть приклеена PE-обёртка SFX.
+#: RAR5 идёт раньше RAR4: у него более длинная подпись, иначе RAR4 «съел» бы
+#: первые байты RAR5.
+_ARCHIVE_SIGNATURES: Tuple[Tuple[bytes, str], ...] = (
+    (b"Rar!\x1a\x07\x01\x00", "rar5"),
+    (b"Rar!\x1a\x07\x00", "rar"),
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+)
+
+#: Размер порции при поиске подписи: файлы установщиков большие, поэтому
+#: читаем кусками, а не целиком в память.
+_CARVE_CHUNK = 1024 * 1024
+
+
+def archive_kind(path: str) -> str:
+    """Тип архива по первым байтам файла (``rar``/``rar5``/``7z``/``zip``)."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(8)
+    except OSError:
+        return ""
+    for signature, kind in _ARCHIVE_SIGNATURES:
+        if head.startswith(signature):
+            return kind
+    if head[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
+        return "zip"
+    return ""
+
+
+def carve_archive(installer: str, destination_dir: str,
+                  limit: Optional[int] = None) -> Tuple[str, str]:
+    """Вырезает архив, приклеенный к EXE, и возвращает ``(путь, тип)``.
+
+    Самораспаковывающийся архив — это PE-загрузчик, к которому просто
+    дописан архив. 7-Zip находит его сам, а libarchive и UnRAR читают **файл
+    архива**, а не EXE: поэтому обёртку нужно отрезать. Копия пишется рядом с
+    папкой распаковки — исходный установщик при этом не меняется.
+
+    Если архив лежит в файле с самого начала (обычный ``.rar``/``.7z``),
+    возвращается он сам, а копия не делается. Пустая строка в первом
+    элементе — подписи не нашлось (например, это ZIP: ``zipfile`` читает EXE
+    с приклеенным ZIP сам, вырезать ничего не нужно).
+    """
+    kind = archive_kind(installer)
+    if kind in ("rar", "rar5", "7z"):
+        return installer, kind
+    if kind == "zip" or not os.path.isfile(installer):
+        return "", ""
+    try:
+        size = os.path.getsize(installer)
+    except OSError:
+        return "", ""
+    if limit is not None and size > limit:
+        return "", ""
+    signature_end = max(len(sig) for sig, _ in _ARCHIVE_SIGNATURES)
+    offset = -1
+    found_kind = ""
+    try:
+        with open(installer, "rb") as handle:
+            position = 0
+            tail = b""
+            while True:
+                chunk = handle.read(_CARVE_CHUNK)
+                if not chunk:
+                    break
+                window = tail + chunk
+                for signature, candidate in _ARCHIVE_SIGNATURES:
+                    index = window.find(signature)
+                    if index >= 0:
+                        offset = position - len(tail) + index
+                        found_kind = candidate
+                        break
+                if offset >= 0:
+                    break
+                position += len(chunk)
+                tail = window[-signature_end:]
+    except OSError:
+        return "", ""
+    if offset < 0:
+        return "", ""
+
+    suffix = ".rar" if found_kind.startswith("rar") else ".7z"
+    target = os.path.join(destination_dir,
+                          os.path.basename(installer) + suffix)
+    try:
+        os.makedirs(destination_dir, exist_ok=True)
+        with open(installer, "rb") as source, open(target, "wb") as sink:
+            source.seek(offset)
+            shutil.copyfileobj(source, sink, _CARVE_CHUNK * 8)
+    except OSError:
+        return "", ""
+    return target, found_kind
 
 
 def unpacker_argv(unpacker: str, installer: str, work_dir: str) -> List[str]:
