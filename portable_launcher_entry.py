@@ -980,6 +980,12 @@ PATHS_SKIP_DIRS = (
 
 #: Потолки одного прохода: починка не должна задерживать запуск программы.
 PATHS_MAX_FILES = 6000
+
+#: Потолок для глубокого обхода (обновление, ручная починка путей).
+PATHS_DEEP_MAX_FILES = 20000
+
+#: Сколько прежних мест портатива помнить в штампе (кроме текущего).
+PATHS_STAMP_HISTORY = 5
 PATHS_MAX_BYTES = 2 * 1024 * 1024
 
 _PATHS_BOMS = (
@@ -1042,15 +1048,47 @@ def _read_paths_stamp(root: Path) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _remembered_root_list(root: Path) -> "list[str]":
+    """Все известные прежние и текущий корни в порядке «свежее -> старее»."""
+    current = str(root)
+    found: "list[str]" = []
+    stamp = _read_paths_stamp(root)
+    values = [stamp.get("root", ""), stamp.get("previous", "")]
+    history = stamp.get("history")
+    if isinstance(history, (list, tuple)):
+        values.extend(history)
+    for value in values:
+        text = str(value or "").strip().strip('"').rstrip("\\/")
+        if not text or text.casefold() == current.casefold():
+            continue
+        if text not in found:
+            found.append(text)
+    return found
+
+
 def write_paths_stamp(root: Path, previous: str = "") -> None:
-    """Запоминает текущий корень портатива (для следующего переноса)."""
+    """Запоминает текущий корень портатива (для следующего переноса).
+
+    Сохраняется не только предыдущее место, но и вся короткая история
+    переездов: папку переносят флешка -> внешний диск -> другой ПК, и путь,
+    записанный в настройках программы два переезда назад, тоже должен
+    находиться — иначе установщик обновления возьмёт каталог установки из
+    этого старого пути (жалоба «обновление поставилось по прежнему адресу»).
+    """
     import time
 
     current = str(root)
-    payload: Dict[str, Any] = {"schema": 1, "root": current,
+    history = _remembered_root_list(root)
+    if previous:
+        older = str(previous).strip().strip('"').rstrip("\\/")
+        if older and older.casefold() != current.casefold() and older not in history:
+            history.insert(0, older)
+    payload: Dict[str, Any] = {"schema": 2, "root": current,
                                "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
-    if previous and previous.casefold() != current.casefold():
-        payload["previous"] = previous
+    if history:
+        payload["previous"] = history[0]
+        if len(history) > 1:
+            payload["history"] = history[1:PATHS_STAMP_HISTORY]
     try:
         _paths_stamp_file(root).parent.mkdir(parents=True, exist_ok=True)
         _paths_stamp_file(root).write_text(
@@ -1082,18 +1120,25 @@ def _decode_text_bytes(data: bytes) -> "Optional[tuple[str, str]]":
         return None
 
 
-def _iter_paths_files(root: Path, settings: Dict[str, Any]) -> "Iterable[Path]":
+def _iter_paths_files(root: Path, settings: Dict[str, Any],
+                      deep: bool = False) -> "Iterable[Path]":
     """Текстовые файлы портатива, в которых может жить абсолютный путь.
 
-    ``PortableData`` (там настройки программы) обходится полностью, ``App`` —
-    только на два уровня вглубь: внутри десятки тысяч файлов программы, и
-    обходить их все ради конфига слишком дорого для запуска.
+    ``PortableData`` (там настройки программы) обходится всегда полностью.
+    ``App`` при обычном запуске читается на два уровня вглубь: внутри бывают
+    десятки тысяч файлов, и обходить их все на каждый старт слишком дорого.
+    ``deep=True`` (обновление, ``--repair-paths``) снимает это ограничение:
+    установщик обновления читает каталог установки из конфига программы,
+    который может лежать глубже, и тогда новая версия встанет по старому
+    адресу. Потолок числа файлов при этом выше, но всё равно есть.
     """
     suffixes = tuple(str(item).casefold()
                      for item in settings.get("suffixes") or PATHS_TEXT_SUFFIXES)
     skip = {str(item).casefold()
             for item in settings.get("skip_dirs") or PATHS_SKIP_DIRS}
     limit = int(settings.get("max_files") or PATHS_MAX_FILES)
+    if deep:
+        limit = max(limit, PATHS_DEEP_MAX_FILES)
     include_app = bool(settings.get("include_app", True))
     yielded = 0
     app_name = "app"
@@ -1105,7 +1150,9 @@ def _iter_paths_files(root: Path, settings: Dict[str, Any]) -> "Iterable[Path]":
             lowered = name.casefold()
             if lowered in skip or lowered.startswith("$"):
                 continue
-            if lowered == app_name and (not include_app or depth >= 2):
+            if lowered == app_name and not include_app:
+                continue
+            if lowered == app_name and not deep and depth >= 2:
                 continue
             keep.append(name)
         dirs[:] = keep
@@ -1126,7 +1173,7 @@ def _iter_paths_files(root: Path, settings: Dict[str, Any]) -> "Iterable[Path]":
 
 
 def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
-                 force: bool = False) -> "list[str]":
+                 force: bool = False, deep: bool = False) -> "list[str]":
     """Переписывает абсолютные пути старого корня новым, если папку перенесли.
 
     Возвращает строки отчёта (их пишут в ``PortableData\\launcher-run.log``).
@@ -1144,10 +1191,7 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
     current = str(root)
     stamp = _read_paths_stamp(root)
     remembered: "list[str]" = []
-    for value in (stamp.get("root", ""), stamp.get("previous", "")):
-        text = str(value or "").strip().strip('"').rstrip("\\/")
-        if not text or text.casefold() == current.casefold():
-            continue
+    for text in _remembered_root_list(root):
         if len(text) <= 2 and text[1:2] == ":":
             # Корень «D:» — не путь, а буква диска: восстанавливать нечего.
             continue
@@ -1178,7 +1222,7 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
     # Штамп и отчёт о путях пишем мы сами: переписывать их «старый корень»
     # бессмысленно, а в отчёте об этом был бы ложный след.
     own = {_paths_stamp_file(root), _paths_stamp_text_file(root)}
-    for path in _iter_paths_files(root, settings):
+    for path in _iter_paths_files(root, settings, deep=deep):
         if path in own:
             continue
         try:
@@ -1231,7 +1275,7 @@ def repair_paths_command(root: "Optional[Path]" = None) -> int:
                          .read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         cfg = {}
-    lines = repair_paths(root, cfg, force=True)
+    lines = repair_paths(root, cfg, force=True, deep=True)
     for line in lines or ["paths: nothing to repair"]:
         _run_log(root, line)
     return 0
@@ -5544,6 +5588,206 @@ def _link_points_into(path: Path, roots: "Iterable[str]",
     return False
 
 
+#: Блок LinkInfo начинается сразу после заголовка Shell Link (0x4C).
+_LNK_LINK_INFO_OFFSET = 0x4C
+#: Смещение Ansi-строки с локальным путём внутри LinkInfo.
+_LNK_LINK_INFO_PATH = 0x10
+#: Минимальный размер заголовка LinkInfo.
+_LNK_LINK_INFO_HEADER = 0x1C
+
+
+def lnk_target(path: Path) -> str:
+    """Локальный путь из ``.lnk`` или пустая строка, если его нет.
+
+    Читается только нужное: заголовок Shell Link, блок LinkInfo (идёт сразу
+    за заголовком, с 0x4C) и Ansi-строка с локальным путём. COM
+    (``WScript.Shell``) и дочерние процессы не используются: уборка ярлыков
+    должна работать на любом ПК и не тратить секунды на каждый файл.
+    """
+    try:
+        if path.stat().st_size > MAX_LINK_BYTES:
+            return ""
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if len(data) < _LNK_LINK_INFO_OFFSET + 4 or not data.startswith(b"L\x00\x00\x00"):
+        return ""
+    flags = int.from_bytes(data[0x14:0x18], "little")
+    if not flags & 0x2:  # HasLinkInfo
+        return ""
+    block = data[_LNK_LINK_INFO_OFFSET:]
+    size = int.from_bytes(block[0:4], "little")
+    header_size = int.from_bytes(block[4:8], "little")
+    if size < _LNK_LINK_INFO_HEADER or header_size < _LNK_LINK_INFO_HEADER:
+        return ""
+    if header_size + 4 > len(block):
+        return ""
+    path_offset = int.from_bytes(
+        block[_LNK_LINK_INFO_PATH:_LNK_LINK_INFO_PATH + 4], "little")
+    if not header_size <= path_offset < min(size, len(block)):
+        return ""
+    raw = block[path_offset:min(size, len(block))]
+    end = raw.find(b"\x00")
+    if end <= 0:
+        return ""
+    codec = "mbcs" if sys.platform == "win32" else "latin-1"
+    try:
+        text = raw[:end].decode(codec, errors="replace")
+    except LookupError:  # pragma: no cover - не-Windows без mbcs
+        text = raw[:end].decode("latin-1", errors="replace")
+    return text.strip()
+
+
+def link_target(path: Path, resolver: "Optional[Any]" = None) -> str:
+    """Цель ярлыка: из самого файла, затем (если нужно) из ``resolver``."""
+    lowered = str(path).casefold()
+    if lowered.endswith(".lnk"):
+        target = lnk_target(path)
+        if target:
+            return target
+    elif lowered.endswith(".url"):
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="ignore")
+        except OSError:
+            text = ""
+        match = re.search(r"^\s*URL\s*=\s*(.+)$", text, re.MULTILINE | re.IGNORECASE)
+        if match:
+            url = match.group(1).strip()
+            if url.casefold().startswith("file:///"):
+                return url[8:].replace("/", "\\")
+            return url
+    if resolver is not None:
+        try:
+            return str(resolver(path) or "")
+        except Exception:  # noqa: BLE001 - разрешатель не срывает уборку
+            return ""
+    return ""
+
+
+def target_is_missing(target: str) -> bool:
+    """Цель заведомо никуда не ведёт.
+
+    ``http(s)``/``shell:`` и UNC-путь недоступного сервера не считаются
+    поломкой: проверить их локально нельзя.
+    """
+    text = str(target or "").strip().strip('"')
+    if not text:
+        return False
+    if text.casefold().startswith(("http://", "https://", "mailto:",
+                                   "shell:", "ms-", "{")):
+        return False
+    if text.startswith("\\\\") and not text.startswith("\\\\?\\"):
+        return False
+    expanded = os.path.expandvars(os.path.expanduser(text))
+    if "%" in expanded:
+        # Переменная не раскрылась — проверить путь нельзя.
+        return False
+    try:
+        return not os.path.exists(expanded)
+    except (OSError, ValueError):
+        return False
+
+
+def app_name_candidates(*values: str) -> "list[str]":
+    """Имена, под которыми установщик мог подписать ярлык этой программы."""
+    names: "list[str]" = []
+    for value in values:
+        text = Path(str(value or "")).name
+        for suffix in (".exe", ".msi", ".lnk", ".url", ".pif"):
+            if text.casefold().endswith(suffix):
+                text = text[: -len(suffix)]
+        text = text.casefold()
+        if text.endswith("_portable"):
+            text = text[: -len("_portable")]
+        if text.endswith(" portable"):
+            text = text[: -len(" portable")]
+        collapsed = " ".join(text.replace("_", " ").split())
+        if collapsed and collapsed not in names:
+            names.append(collapsed)
+    return names
+
+
+def _name_matches(path: Path, names: "Sequence[str]") -> bool:
+    """Похоже ли имя ярлыка на имя программы (см. одноимённую функцию сборщика)."""
+    if not names:
+        return False
+    stem = Path(str(path)).stem
+    normalized = " ".join(stem.replace("_", " ").casefold().split())
+    for name in names:
+        candidate = " ".join(str(name).replace("_", " ").casefold().split())
+        if not candidate:
+            continue
+        if normalized == candidate:
+            return True
+        if (normalized.startswith(candidate + " ")
+                or normalized.startswith(candidate + "(")):
+            return True
+    return False
+
+
+def remove_stale_shortcuts(app_names: "Sequence[str]",
+                           roots: "Sequence[str]" = (),
+                           folders: "Optional[Iterable[Path]]" = None,
+                           resolver: "Optional[Any]" = None) -> "list[str]":
+    """Убирает ярлыки этой программы, которые уже никуда не ведут.
+
+    Жалоба: после сборки на рабочем столе оставался **пустой** ярлык: цель
+    (временный каталог установщика) исчезла, а сам ``.lnk`` остался. Такой
+    ярлык бесполезен при любом раскладе, поэтому удаляется, если:
+
+    * он указывает внутрь портатива (текущего корня или прежнего места) —
+      значит, ведёт на переносимую копию и после переезда папки не работает;
+    * его имя совпадает с именем программы **и** цель не существует.
+    """
+    targets = list(folders) if folders is not None else shortcut_folders()
+    removed: "list[str]" = []
+    for path in _shortcut_files(targets):
+        if _link_points_into(path, [str(item) for item in roots], resolver):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed.append(str(path))
+            continue
+        if not _name_matches(path, app_names):
+            continue
+        if not target_is_missing(link_target(path, resolver)):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(str(path))
+    return removed
+
+
+def _app_shortcut_names(root: Path, cfg: Dict[str, Any]) -> "list[str]":
+    """Имена, под которыми установщик мог назвать ярлык этой программы."""
+    return app_name_candidates(
+        str(cfg.get("app_name", "")),
+        str(cfg.get("target_exe_rel", "")),
+        str(cfg.get("launcher_target_rel", "")),
+        root.name,
+        str(cfg.get("portable_dir_name", "")),
+    )
+
+
+def _shortcut_folders_for(root: Path,
+                          cfg: "Optional[Dict[str, Any]]" = None) -> "list[Path]":
+    """Папки ярлыков: настоящие и «рабочий стол» внутри портатива.
+
+    Внутренний рабочий стол (``PortableData\\User\\Desktop``) — это
+    перенаправленный профиль программы: ярлык, который она создала при первом
+    запуске, лежит там и точно так же подлежит уборке.
+    """
+    found = [Path(item) for item in shortcut_folders()]
+    data = _data_dir(root, cfg or {})
+    for extra in (data / "User" / "Desktop", data / "Public" / "Desktop"):
+        if extra.is_dir() and extra not in found:
+            found.append(extra)
+    return found
+
+
 def remove_host_app_shortcuts(root: Path, cfg: Dict[str, Any],
                               folders: "Optional[Iterable[Path]]" = None,
                               resolver: "Optional[Any]" = None,
@@ -5592,12 +5836,14 @@ class ShortcutGuard:
 
     def __init__(self, root: Path, extra_roots: "Sequence[str]" = (),
                  folders: "Optional[Iterable[Path]]" = None,
-                 resolver: "Optional[Any]" = None) -> None:
+                 resolver: "Optional[Any]" = None,
+                 app_names: "Sequence[str]" = ()) -> None:
         self.root = Path(root)
         self.extra_roots = [str(item) for item in extra_roots if str(item)]
         self._folders = (list(folders) if folders is not None
                          else shortcut_folders())
         self.resolver = resolver
+        self.app_names = [str(item) for item in app_names if str(item).strip()]
         self.before: "Optional[set[str]]" = None
         self.removed: "list[str]" = []
 
@@ -5614,9 +5860,25 @@ class ShortcutGuard:
         found = remove_host_app_shortcuts(
             self.root, {}, folders=self._folders, resolver=self.resolver,
             before=self.before, extra_roots=self.extra_roots)
+        return self._remember(found)
+
+    def sweep(self) -> "list[str]":
+        """Убирает «пустые» ярлыки этой программы (цель уже не существует).
+
+        Нужен там, где снимок «до» невозможен: программа стартовала впервые и
+        сама положила ярлык, чужой апдейтер недописал файл, установщик
+        записал путь во временный каталог. Условия те же, что в
+        :func:`remove_stale_shortcuts`, поэтому чужие ярлыки не страдают.
+        """
+        found = remove_stale_shortcuts(
+            self.app_names, roots=[str(self.root), *self.extra_roots],
+            folders=self._folders, resolver=self.resolver)
+        return self._remember(found)
+
+    def _remember(self, items: "Sequence[str]") -> "list[str]":
         known = {os.path.normcase(os.path.normpath(item))
                  for item in self.removed}
-        fresh = [item for item in found
+        fresh = [item for item in items
                  if os.path.normcase(os.path.normpath(item)) not in known]
         self.removed.extend(fresh)
         return fresh
@@ -5643,6 +5905,143 @@ class HostTraceGuard:
     def restore(self) -> "list[str]":
         """Не удаляет записи, ярлыки, окружение и каталоги пользователя."""
         return []
+
+
+# --- записи установки на этом ПК: где установщик ищет прошлую версию ----------
+
+_APP_PATHS_KEY = r"Software\Microsoft\Windows\CurrentVersion\App Paths"
+
+#: Значения записи об установке, в которых установщик хранит каталог прошлой
+#: версии. Именно оттуда он берёт путь, когда обновляет «уже установленную»
+#: программу, — и ставит новую версию по прежнему адресу.
+_INSTALL_PATH_VALUES = (
+    "InstallLocation", "Inno Setup: App Path", "InstallSource",
+    "UninstallString", "QuietUninstallString", "DisplayIcon",
+)
+
+
+def retarget_record_text(text: str, stale_roots: "Sequence[str]",
+                         current_root: str) -> str:
+    """Заменяет в значении записи прежние места портатива текущим корнем.
+
+    Чистая функция (без реестра): её же проверяют тесты на любой ОС.
+    """
+    result = str(text or "")
+    base = str(current_root or "").strip().rstrip("\\/")
+    if not result or not base:
+        return result
+    for root in stale_roots:
+        stale = str(root or "").strip().strip('"').rstrip("\\/")
+        if not stale or stale.casefold() == base.casefold():
+            continue
+        for form in sorted({stale, stale.replace("\\", "/"),
+                            stale.replace("/", "\\"),
+                            stale.replace("\\", "\\\\")}, key=len, reverse=True):
+            pattern = re.compile(r"(?<![0-9A-Za-z_])" + re.escape(form)
+                                 + r"(?![0-9A-Za-z_.])", re.IGNORECASE)
+            result = pattern.sub(lambda _m: base, result)
+    return result
+
+
+def _registry_views():
+    """Корни реестра, в которых установщик мог оставить запись об установке."""
+    reg = _winreg()
+    if reg is None:
+        return []
+    return [
+        (reg.HKEY_CURRENT_USER, _UNINSTALL_KEY, reg.KEY_READ | reg.KEY_SET_VALUE),
+        (reg.HKEY_CURRENT_USER, _APP_PATHS_KEY, reg.KEY_READ | reg.KEY_SET_VALUE),
+        (reg.HKEY_LOCAL_MACHINE, _UNINSTALL_KEY,
+         reg.KEY_READ | reg.KEY_SET_VALUE | reg.KEY_WOW64_64KEY),
+        (reg.HKEY_LOCAL_MACHINE, _APP_PATHS_KEY,
+         reg.KEY_READ | reg.KEY_SET_VALUE | reg.KEY_WOW64_64KEY),
+        (reg.HKEY_LOCAL_MACHINE, _UNINSTALL_KEY,
+         reg.KEY_READ | reg.KEY_SET_VALUE | reg.KEY_WOW64_32KEY),
+    ]
+
+
+def _winreg():
+    """``winreg`` или ``None`` (модуль импортируется и вне Windows)."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import winreg  # type: ignore
+
+        return winreg
+    except ImportError:  # pragma: no cover - Windows без winreg не бывает
+        return None
+
+
+def retarget_host_install_records(stale_roots: "Sequence[str]",
+                                  current_root: Path) -> "list[str]":
+    """Переводит записи об установке на текущий корень портатива.
+
+    Зачем. Когда программу обновляют, установщик ищет «прошлую установку» в
+    реестре этого ПК (``InstallLocation``, ``Inno Setup: App Path``,
+    ``UninstallString``, ``App Paths``). Запись там могла остаться от прежнего
+    места портатива — например, с диска ``D:``, откуда папку уже перенесли на
+    ``E:``. Тогда установщик честно обновляет то, что знает, и новая версия
+    оказывается по старому адресу, а в текущей папке ничего не меняется.
+
+    Меняются **только** значения, указывающие внутрь известных прежних мест
+    этой же портативной папки; путь программы заменяется текущим корнем.
+    Ничего не удаляется: запись остаётся рабочей, просто ведёт туда, где
+    портатив лежит сейчас.
+
+    Возвращает список изменённых значений (``<ключ> :: <имя>``) для журнала.
+    """
+    if not IS_WINDOWS or not stale_roots:
+        return []
+    reg = _winreg()
+    if reg is None:
+        return []
+    changed: "list[str]" = []
+    for hive, path, access in _registry_views():
+        try:
+            with reg.OpenKey(hive, path, 0, access) as parent:
+                names = []
+                index = 0
+                while True:
+                    try:
+                        names.append(reg.EnumKey(parent, index))
+                    except OSError:
+                        break
+                    index += 1
+        except OSError:
+            continue
+        for name in names:
+            subkey = path + "\\" + name
+            try:
+                with reg.OpenKey(hive, subkey, 0, access) as key:
+                    changed.extend(_retarget_key_values(
+                        reg, key, subkey, stale_roots, current_root))
+            except OSError:
+                continue
+    return changed
+
+
+def _retarget_key_values(reg, key, subkey: str, stale_roots: "Sequence[str]",
+                         current_root: Path) -> "list[str]":
+    """Правит значения одного ключа; возвращает изменённые имена."""
+    changed: "list[str]" = []
+    index = 0
+    while True:
+        try:
+            value_name, value, kind = reg.EnumValue(key, index)
+        except OSError:
+            break
+        index += 1
+        if kind not in (reg.REG_SZ, reg.REG_EXPAND_SZ) or not isinstance(value, str):
+            continue
+        fixed = retarget_record_text(value, stale_roots, str(current_root))
+        if fixed == value:
+            continue
+        try:
+            reg.SetValueEx(key, value_name, 0, kind, fixed)
+        except OSError:
+            continue
+        changed.append(f"{subkey} :: {value_name or '(default)'}")
+    return changed
 
 
 # --- окно «идёт обновление» --------------------------------------------------
@@ -5977,12 +6376,7 @@ def remembered_roots(root: Path,
     указание на «тот самый прежний диск», куда установщик мог запомнить
     каталог установки. Порядок — от свежего к старому.
     """
-    found: "list[str]" = []
-    stamp = _read_paths_stamp(root)
-    for value in (stamp.get("root", ""), stamp.get("previous", "")):
-        text = str(value or "").strip().strip('"').rstrip("\\/")
-        if text:
-            found.append(text)
+    found: "list[str]" = _remembered_root_list(root)
     section = (cfg or {}).get("relative_paths")
     if isinstance(section, dict):
         extra = section.get("previous_roots")
@@ -6052,6 +6446,84 @@ def adopt_stale_install(stale_root: Path, stage: Path, cfg: Dict[str, Any],
     return copied
 
 
+def _copy_tree_into(source: Path, stage: Path,
+                    skip_names: "set[str]") -> "list[str]":
+    """Копирует содержимое ``source`` в ``stage``, не перезаписывая файлы."""
+    copied: "list[str]" = []
+    for current, dirs, files in os.walk(source):
+        dirs[:] = [name for name in dirs
+                   if name.casefold() not in ("saves", "portabledata", "updates",
+                                              "node_modules.cache")]
+        for name in files:
+            if name.casefold() in skip_names:
+                continue
+            src = Path(current) / name
+            relative = src.relative_to(source)
+            destination = stage / relative
+            if destination.exists():
+                continue
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, destination)
+            except OSError:
+                continue
+            copied.append(str(relative).replace("\\", "/"))
+    return copied
+
+
+def adopt_from_redirected_profile(root: Path, cfg: Dict[str, Any], stage: Path,
+                                  since: float) -> "list[str]":
+    """Забирает в ``stage`` программу, поставленную мимо ``/DIR``.
+
+    Установщик обновления запускается с перенаправленным профилем: его
+    ``LOCALAPPDATA``, ``APPDATA``, ``USERPROFILE`` и ``PROGRAMDATA`` указывают
+    внутрь ``PortableData``. Поэтому установщик, который вообще не понимает
+    ключ каталога (или игнорирует его в режиме обновления), всё равно ставит
+    новую версию **внутрь портатива** — но не в ``Updates\\stage``. Раньше
+    это выглядело как «обновление не установилось»: файлы лежали в
+    перенаправленном профиле, а ``App`` оставался прежним.
+
+    Здесь такие свежие файлы находятся и переносятся в ``stage``: дальше
+    работает обычная проверка и подмена ``App`` с откатом.
+    """
+    rel = _app_relative_target(cfg)
+    if not rel:
+        return []
+    parts = rel.split("/")
+    wanted = parts[-1].casefold()
+    depth = len(parts) - 1
+    data = _data_dir(root, cfg)
+    bases = [data / "AppData" / "Local" / "Programs",
+             data / "AppData" / "Local",
+             data / "AppData" / "Roaming",
+             data / "ProgramData",
+             data / "User"]
+    skip = {"temp", "cache", "caches", "gpucache", "codecache", "shadercache",
+            "crashpad", "logs", "registry", "registryhostbackup"}
+    skip_names = {"launchportable.exe", "saves"}
+    for base in bases:
+        if not base.is_dir():
+            continue
+        for current, dirs, files in os.walk(base):
+            dirs[:] = [name for name in dirs if name.casefold() not in skip]
+            matches = [name for name in files if name.casefold() == wanted]
+            if not matches:
+                continue
+            exe = Path(current) / matches[0]
+            try:
+                if exe.stat().st_mtime < since - STALE_MTIME_GRACE:
+                    continue
+            except OSError:
+                continue
+            payload = exe.parent
+            for _ in range(depth):
+                payload = payload.parent
+            copied = _copy_tree_into(payload, stage, skip_names)
+            if copied:
+                return copied
+    return []
+
+
 def _report_removed_shortcuts(root: Path, removed: "Sequence[str]") -> None:
     """Пишет в журнал, какие ярлыки убраны и почему."""
     if not removed:
@@ -6101,7 +6573,7 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
     # может быть первым действием после копирования папки.
     stale_roots = remembered_roots(root, cfg)
     try:
-        for line in repair_paths(root, cfg, force=True):
+        for line in repair_paths(root, cfg, force=True, deep=True):
             _update_log(root, line)
     except Exception as exc:  # noqa: BLE001 - починка не срывает обновление
         _update_log(root, f"paths: repair before update failed ({exc})")
@@ -6117,6 +6589,20 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
         return result.fail(
             "Не удалось закрыть программу из портативной папки. Закройте её "
             "и повторите обновление.")
+
+    # Записи об установке на этом ПК: установщик ищет «прошлую версию»
+    # именно там. Если запись помнит прежний диск портатива, новая версия
+    # встанет по старому адресу — переводим её на текущий корень.
+    try:
+        moved = retarget_host_install_records(stale_roots, root)
+    except Exception as exc:  # noqa: BLE001 - реестр не должен срывать обновление
+        moved = []
+        _update_log(root, f"install records: retarget failed ({exc})")
+    if moved:
+        _update_log(
+            root,
+            f"install records of the previous location now point to {root}: "
+            + ", ".join(moved[:5]) + (" ..." if len(moved) > 5 else ""))
 
     updates.mkdir(parents=True, exist_ok=True)
     _clear_dir(stage)
@@ -6138,7 +6624,10 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
     # Ярлыки: обновление не должно оставлять на рабочем столе статичный
     # ярлык, ведущий в прежнее место папки. Убираются только файлы,
     # появившиеся за время установки и указывающие внутрь портатива.
-    shortcuts = ShortcutGuard(root, extra_roots=stale_roots)
+    shortcuts = ShortcutGuard(
+        root, extra_roots=stale_roots,
+        folders=_shortcut_folders_for(root, cfg),
+        app_names=_app_shortcut_names(root, cfg))
     shortcuts.snapshot()
 
     guard = HostTraceGuard()
@@ -6199,6 +6688,22 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
                 break
 
     if payload is None:
+        # Установщик не понял ключ каталога и поставил программу в
+        # перенаправленный профиль внутри PortableData. Забираем оттуда.
+        try:
+            copied = adopt_from_redirected_profile(root, cfg, stage, started)
+        except Exception as exc:  # noqa: BLE001 - поиск не должен срывать обновление
+            copied = []
+            _update_log(root, f"profile search failed ({exc})")
+        if copied:
+            _update_log(
+                root, "the installer ignored the target folder and wrote "
+                f"{len(copied)} file(s) into the portable profile; adopted "
+                "them into Updates/stage: " + ", ".join(copied[:8])
+                + (" ..." if len(copied) > 8 else ""))
+            payload = locate_payload(stage, cfg)
+
+    if payload is None:
         journal["state"] = "failed"
         _write_journal(root, journal)
         _clear_dir(stage)
@@ -6253,8 +6758,11 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
     _forget_pending(root)
     purge_portable_temp(root, cfg)
     # Установщик мог запустить только что поставленную программу, а она —
-    # положить ярлык на рабочий стол. Проверяем ещё раз уже после подмены.
+    # положить ярлык на рабочий стол. Проверяем ещё раз уже после подмены:
+    # и то, что появилось за время установки, и «пустые» ярлыки этой
+    # программы, чья цель уже не существует.
     _report_removed_shortcuts(root, shortcuts.cleanup())
+    _report_removed_shortcuts(root, shortcuts.sweep())
     result.ok = True
     result.message = ("Программа обновлена внутри портатива."
                       + (" Прежняя версия сохранена в папке Updates\\backup "
@@ -6637,6 +7145,21 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             _run_log(root, line)
     except Exception as exc:  # noqa: BLE001 - починка не срывает запуск
         _run_log(root, f"paths: repair failed ({exc})")
+
+    # «Пустые» ярлыки этой программы на рабочем столе. Установщик мог
+    # записать в ярлык путь временного каталога, которого уже нет, или путь
+    # прежнего места папки — такой ярлык не работает ни при каких условиях и
+    # только путает. Чужие и рабочие ярлыки не трогаются: см.
+    # remove_stale_shortcuts().
+    try:
+        stale_guard = ShortcutGuard(
+            root, extra_roots=remembered_roots(root, cfg),
+            folders=_shortcut_folders_for(root, cfg),
+            app_names=_app_shortcut_names(root, cfg))
+        for path in stale_guard.sweep():
+            _run_log(root, "shortcut: removed a stale shortcut: " + path)
+    except Exception as exc:  # noqa: BLE001 - уборка не срывает запуск
+        _run_log(root, f"shortcut: cleanup failed ({exc})")
 
     # Портатив, собранный прежней версией, мог принести в portable.reg ветки
     # оболочки (меню «Пуск»). Чистим файл на месте — и EXE-, и BAT-лончер

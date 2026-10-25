@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,20 @@ def make_opencode_portable(tmp: str, cfg=None) -> Path:
     _write(root / "App" / "LaunchPortable.exe", "launcher")
     _write(root / "App" / "Saves" / "slot1.sav", "my-save")
     return root
+
+
+def make_lnk(path: Path, target: str) -> Path:
+    """Настоящий ``.lnk`` с блоком LinkInfo — так его пишет установщик."""
+    raw = str(target).encode("latin-1", errors="replace") + b"\0"
+    size = 0x1C + len(raw) + 1
+    info = struct.pack("<IIIIIII", size, 0x1C, 1, 0, 0x1C, 0, 0x1C + len(raw))
+    info += raw + b"\0"
+    header = bytearray(0x4C)
+    header[0:4] = b"L\x00\x00\x00"
+    header[0x14:0x18] = struct.pack("<I", 0x2)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(header) + info)
+    return path
 
 
 def fake_installer(files, code=0, record=None):
@@ -239,6 +254,106 @@ class InstallerCommandTests(unittest.TestCase):
         self.assertIn("FooBar", command)
 
 
+class StaleShortcutTests(unittest.TestCase):
+    """«Пустой» ярлык: файл .lnk остался, цели больше нет."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = make_portable(self._tmp.name)
+        self.desktop = Path(self._tmp.name) / "Desktop"
+        self.desktop.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _names(self):
+        return exe_launcher.app_name_candidates("Ollama", "OllamaSetup.exe")
+
+    def test_lnk_target_is_read_without_com(self):
+        link = make_lnk(self.desktop / "Ollama.lnk",
+                        str(self.root / "App" / "ollama app.exe"))
+        self.assertEqual(exe_launcher.lnk_target(link),
+                         str(self.root / "App" / "ollama app.exe"))
+
+    def test_empty_shortcut_of_the_program_is_removed(self):
+        link = make_lnk(self.desktop / "Ollama.lnk",
+                        str(Path(self._tmp.name) / "gone" / "Ollama.exe"))
+        removed = exe_launcher.remove_stale_shortcuts(
+            self._names(), roots=[str(self.root)], folders=[self.desktop])
+        self.assertEqual(removed, [str(link)])
+        self.assertFalse(link.exists())
+
+    def test_foreign_and_working_shortcuts_are_kept(self):
+        exe = _write(Path(self._tmp.name) / "Programs" / "Ollama" / "Ollama.exe")
+        working = make_lnk(self.desktop / "Ollama.lnk", str(exe))
+        foreign = make_lnk(self.desktop / "Telegram.lnk",
+                           str(Path(self._tmp.name) / "gone" / "Telegram.exe"))
+        self.assertEqual(exe_launcher.remove_stale_shortcuts(
+            self._names(), roots=[str(self.root)], folders=[self.desktop]), [])
+        self.assertTrue(working.exists())
+        self.assertTrue(foreign.exists())
+
+    def test_update_removes_the_empty_shortcut(self):
+        empty = make_lnk(self.desktop / "Ollama.lnk",
+                         str(Path(self._tmp.name) / "gone" / "Ollama.exe"))
+        installer = _write(Path(self._tmp.name) / "OllamaSetup.exe", "installer")
+        with mock.patch.object(exe_launcher, "shortcut_folders",
+                               lambda *a, **k: [self.desktop]):
+            result = exe_launcher.apply_update(
+                self.root, OLLAMA_CFG, installer,
+                runner=fake_installer(NEW_FILES))
+        self.assertTrue(result.ok, result.message)
+        self.assertFalse(empty.exists(), "пустой ярлык убран при обновлении")
+
+
+class InstallRecordRetargetTests(unittest.TestCase):
+    """Записи об установке на этом ПК ведут в текущую папку портатива.
+
+    Жалоба: портатив создан на диске ``D:``, папку перенесли на ``E:``, а
+    обновление поставилось по адресу ``D:...`` — установщик нашёл «прошлую
+    установку» в реестре этого ПК.
+    """
+
+    def test_previous_root_in_a_record_is_replaced(self):
+        old = "D:\\Apps\\Foo_Portable"
+        new = "E:\\Backup\\Foo_Portable"
+        value = old + "\\App\\Foo.exe"
+        self.assertEqual(
+            exe_launcher.retarget_record_text(value, [old], new),
+            new + "\\App\\Foo.exe")
+        self.assertEqual(
+            exe_launcher.retarget_record_text(
+                "\"C:\\Program Files\\Foo\\unins000.exe\" /S", [old], new),
+            "\"C:\\Program Files\\Foo\\unins000.exe\" /S",
+            "чужие пути не меняются")
+
+    def test_forward_slash_and_doubled_forms_are_replaced(self):
+        old = "D:\\Apps\\Foo_Portable"
+        new = "E:\\Foo"
+        for spelling in (old, old.replace("\\", "/"), old.replace("\\", "\\\\")):
+            self.assertEqual(
+                exe_launcher.retarget_record_text(spelling + "\\App",
+                                                 [old], new),
+                new + "\\App", spelling)
+
+    def test_neighbour_folder_is_not_touched(self):
+        self.assertEqual(
+            exe_launcher.retarget_record_text(
+                "D:\\Apps\\Foo_Portable2\\App", ["D:\\Apps\\Foo_Portable"],
+                "E:\\Foo"),
+            "D:\\Apps\\Foo_Portable2\\App")
+
+    def test_no_previous_roots_means_no_changes(self):
+        self.assertEqual(
+            exe_launcher.retarget_record_text("D:\\A\\App", [], "E:\\Foo"),
+            "D:\\A\\App")
+
+    def test_registry_scan_is_a_noop_without_windows(self):
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", False):
+            self.assertEqual(exe_launcher.retarget_host_install_records(
+                ["D:\\Apps\\Foo"], Path("E:/Foo")), [])
+
+
 class UpdatePortabilityTests(unittest.TestCase):
     """Обновление ставится в папку портатива на том диске, где он лежит сейчас."""
 
@@ -321,6 +436,55 @@ class UpdatePortabilityTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual((self.root / "App" / "ollama app.exe").read_text(),
                          "old-app", "чужая папка в портатив не попадает")
+
+    def test_history_of_locations_is_used(self):
+        """Папку переносят не один раз: помнится вся короткая история."""
+        older = Path(self._tmp.name) / "F" / "Ollama_Portable"
+        older.mkdir(parents=True)
+        exe_launcher.write_paths_stamp(self.root, previous=str(older))
+        newer = Path(self._tmp.name) / "G" / "Ollama_Portable"
+        newer.mkdir(parents=True)
+        exe_launcher.write_paths_stamp(self.root, previous=str(newer))
+        roots = exe_launcher.remembered_roots(self.root)
+        self.assertIn(str(newer), roots)
+        self.assertIn(str(older), roots, "прежнее место не забыто")
+
+    def test_config_inside_app_is_repaired_before_the_installer(self):
+        """Установщик читает каталог установки из конфига в глубине App."""
+        old = self._previous_location()
+        # Отключаем починку PortableData, чтобы проверить именно App.
+        _write(self.root / "PortableData" / "portable-root.json",
+               json.dumps({"schema": 1, "root": str(self.root),
+                           "previous": str(old)}))
+        settings = _write(
+            self.root / "App" / "data" / "conf" / "deep" / "settings.json",
+            json.dumps({"install_dir": str(old / "App")}))
+        seen = []
+
+        def installer(command, env, cwd, timeout):
+            seen.append(json.loads(settings.read_text(encoding="utf-8")))
+            return fake_installer(NEW_FILES)(command, env, cwd, timeout)
+
+        result = self._apply(installer)
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(seen[0]["install_dir"], str(self.root / "App"))
+
+    def test_install_ignoring_the_folder_is_adopted_from_the_portable_profile(self):
+        """Установщик не понял ключ каталога — файлы всё равно внутри портатива."""
+        target = (self.root / "PortableData" / "AppData" / "Local" / "Programs"
+                  / "Ollama" / "ollama app.exe")
+
+        def installer(command, env, cwd, timeout):
+            _write(target, "new-app")
+            _write(target.parent / "ollama.exe", "new-cli")
+            return 0
+
+        result = self._apply(installer)
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual((self.root / "App" / "ollama app.exe").read_text(),
+                         "new-app")
+        self.assertEqual((self.root / "App" / "ollama.exe").read_text(),
+                         "new-cli")
 
     def test_shortcut_created_by_the_update_is_removed(self):
         desktop = Path(self._tmp.name) / "Desktop"

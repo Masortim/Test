@@ -2005,7 +2005,10 @@ class Portablizer:
             # Причина уборки: ярлык установщика содержит статичный абсолютный
             # путь, поэтому после переноса папки на другой диск он ведёт в
             # старое место (жалоба: «ярлык остался и указывает не туда»).
-            shortcut_guard = shortcuts_mod.ShortcutGuard(portable_dir)
+            shortcut_guard = shortcuts_mod.ShortcutGuard(
+                portable_dir,
+                app_names=shortcuts_mod.app_name_candidates(
+                    name, opts.installer_path, os.path.basename(portable_dir)))
             shortcut_guard.snapshot()
 
             # 3b. Тихая установка предусловий (vcredist, DirectX, OpenAL,
@@ -2070,7 +2073,8 @@ class Portablizer:
             # Ярлыки, которые установщик успел положить на рабочий стол или в
             # меню «Пуск», убираются сразу после установки: до того, как
             # Portablizer начнёт проверять результат и создавать лончер.
-            self._report_own_shortcuts(shortcut_guard)
+            # sweep убирает и «пустые» ярлыки этой программы.
+            self._report_own_shortcuts(shortcut_guard, sweep=True)
 
             # 4b. Установщик не отдал файлы ни одной командой. Последний
             # honest-шанс: распаковать приклеенный к exe ZIP — так устроены
@@ -2325,7 +2329,7 @@ class Portablizer:
             # этой сборке) уже убраны; повторная проверка ловит те, что
             # появились при автоматическом запуске программы установщиком.
             self.progress(97, "Проверка изменений на этом ПК")
-            self._report_own_shortcuts(shortcut_guard)
+            self._report_own_shortcuts(shortcut_guard, sweep=True)
             self._report_portable_services(portable_dir, result)
             if capture is not None:
                 self._cleanup_host(capture, opts, result)
@@ -3059,9 +3063,16 @@ class Portablizer:
         )
 
     def _report_own_shortcuts(
-        self, guard: "shortcuts_mod.ShortcutGuard",
+        self, guard: "shortcuts_mod.ShortcutGuard", sweep: bool = False,
     ) -> List[str]:
         """Убирает ярлыки, созданные установщиком за время этой сборки.
+
+        ``sweep=True`` дополнительно убирает «пустые» ярлыки этой программы:
+        те, что ведут внутрь портатива или чья цель уже не существует
+        (установщик записал путь временного каталога). Именно такой ярлык
+        остался на рабочем столе в жалобе: файл ``.lnk`` живёт отдельно от
+        своей цели и сам по себе не исчезает.
+        
 
         Удаляются только файлы, которых не было до установки и которые
         указывают внутрь портативной папки. Ярлык пользователя не трогается
@@ -3075,6 +3086,8 @@ class Portablizer:
         """
         try:
             removed = guard.cleanup()
+            if sweep:
+                removed.extend(guard.sweep())
         except OSError as exc:
             self.log.warn(f"Уборка ярлыков не удалась: {exc}")
             return []
