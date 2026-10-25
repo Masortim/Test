@@ -46,6 +46,8 @@ IS_WINDOWS = sys.platform.startswith("win")
 if IS_WINDOWS:
     import winreg  # type: ignore
 
+from . import relpaths
+
 # Константы типов значений продублированы намеренно: модуль должен
 # импортироваться и тестироваться на Linux/macOS, где winreg отсутствует.
 REG_NONE = 0
@@ -677,13 +679,19 @@ def _hex_bytes(raw: bytes) -> str:
 
 
 def _apply_tokens(text: str, tokens: Sequence[Tuple[str, str]]) -> str:
-    """Заменяет абсолютные пути на маркеры (без учёта регистра)."""
+    """Заменяет абсолютные пути на маркеры корня (см. core/relpaths.py).
+
+    Замена идёт с границами пути и во всех начертаниях (``\\``, ``/``,
+    удвоенные обратные слэши внутри значений ``.reg``). Без границ путь
+    ``D:\\Apps\\XD`` находился внутри ``D:\\Apps\\XData\\save.ini`` и портил
+    чужой путь — файл настроек после переноса указывал в никуда.
+    """
+    result = text
     for needle, replacement in tokens:
         if not needle:
             continue
-        text = re.sub(re.escape(needle), replacement.replace("\\", "\\\\"),
-                      text, flags=re.IGNORECASE)
-    return text
+        result = relpaths.tokenize_text(result, needle, replacement)
+    return result
 
 
 def format_value(name: str, typ: int, data,

@@ -402,6 +402,20 @@ class MainWindow(QMainWindow):
             "Снимите галочку для режима общего компонента (драйвер "
             "остаётся в системе, как Visual C++ из Redist) — удобно на "
             "собственном ПК.")
+        self.cb_relative_paths = QCheckBox(
+            "Относительные пути: перенос папки на другой диск")
+        self.cb_relative_paths.setChecked(True)
+        self.cb_relative_paths.setToolTip(
+            "Портатив переносят: с флешки на внешний диск, из одной папки в "
+            "другую. Свои файлы (лончер, конфиг, скрипты) и так хранят пути "
+            "относительно корня, а захваченный реестр — маркером "
+            "@@PORTABLE_ROOT@@. С этой галочкой Portablizer дополнительно "
+            "запоминает корень папки (PortableData\\portable-root.json), и "
+            "лончер при запуске сам заменяет в настройках программы старый "
+            "абсолютный путь новым — иначе после переезда программа ищет свои "
+            "файлы по старому адресу и либо падает, либо создаёт второй "
+            "профиль настроек. Итог проверки — в portability-report.txt в "
+            "корне портатива. Снимите галочку только для отладки.")
         self.cb_autoopen = QCheckBox("Открыть папку результата по окончании")
         self.cb_autoopen.setChecked(True)
         self.cb_autoopen.setToolTip(
@@ -422,6 +436,7 @@ class MainWindow(QMainWindow):
         checks.addWidget(self.cb_integration, 1, 1)
         checks.addWidget(self.cb_exelauncher, 2, 0)
         checks.addWidget(self.cb_assisted, 2, 1)
+        checks.addWidget(self.cb_relative_paths, 10, 0, 1, 2)
         checks.addWidget(self.cb_netstack, 7, 0, 1, 2)
         checks.addWidget(self.cb_netstack_isolated, 8, 0, 1, 2)
         checks.addWidget(self.cb_autoopen, 9, 0, 1, 2)
@@ -868,6 +883,7 @@ class MainWindow(QMainWindow):
             silent_runtime_install=(self.cb_runtimes.isChecked()
                                     and self.cb_silent_redist.isChecked()),
             shared_saves=self.cb_shared_saves.isChecked(),
+            relative_paths=self.cb_relative_paths.isChecked(),
             netstack_components=self.cb_netstack.isChecked(),
             netstack_isolated=self.cb_netstack_isolated.isChecked(),
             extra_install_args=args,
@@ -1047,6 +1063,14 @@ class MainWindow(QMainWindow):
                     "Установщик аварийно завершился; отчёт с причиной "
                     "(модуль, код исключения) — в "
                     f"{result.crash_report_rel}.",
+                ]
+            if result.portability_report_rel:
+                details += [
+                    "",
+                    "Пути внутри портатива относительные: папку можно "
+                    "переносить на другой диск или в другой каталог. Отчёт о "
+                    "проверке (какие абсолютные пути остались и что лончер "
+                    f"сделает при переносе) — в {result.portability_report_rel}.",
                 ]
             if result.adobe_report_rel:
                 details += [

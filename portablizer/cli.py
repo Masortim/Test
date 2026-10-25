@@ -119,6 +119,11 @@ def build_parser() -> argparse.ArgumentParser:
                               "на этом ПК")
     toggles.add_argument("--no-shared-saves", action="store_true",
                          help="выключить сквозные портативные сохранения")
+    toggles.add_argument("--no-relative-paths", action="store_true",
+                         help="не запоминать корень портатива: после переноса "
+                              "папки на другой диск настройки программы могут "
+                              "указывать в старое место (по умолчанию пути "
+                              "остаются переносимыми)")
     toggles.add_argument("--no-netstack", action="store_true",
                          help="не переносить системные сетевые компоненты "
                               "(драйверы TAP-Windows, службы VPN) в "
@@ -188,6 +193,7 @@ def options_from_args(ns: argparse.Namespace) -> "object":
         silent_runtime_install=(bundle and bool(ns.silent_redist)
                                and not ns.no_silent_redist),
         shared_saves=not ns.no_shared_saves,
+        relative_paths=not ns.no_relative_paths,
         netstack_components=not ns.no_netstack,
         netstack_isolated=not ns.shared_netstack,
         extra_install_args=[str(a) for a in (ns.extra_args or [])],

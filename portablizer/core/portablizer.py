@@ -60,6 +60,7 @@ from . import netstack as netstack_mod
 from . import procutil
 from . import redist as redist_mod
 from . import registry as reg_mod
+from . import relpaths as relpaths_mod
 from . import saves as saves_mod
 from . import space as space_mod
 from . import unpacker as unpacker_mod
@@ -632,6 +633,12 @@ class PortableOptions:
     # настоящий профиль Windows, а LaunchPortable.exe — в PortableData, и
     # сохранения одного способа не видны другому (см. core/saves.py).
     shared_saves: bool = True
+    # Держать пути внутри портатива относительными (см. core/relpaths.py):
+    # корень запоминается в PortableData\portable-root.json, реестр хранит
+    # маркер @@PORTABLE_ROOT@@, а лончер при переносе папки на другой диск
+    # сам меняет старый абсолютный путь новым. Выключать стоит только для
+    # отладки: без этого перенос ломает настройки программы.
+    relative_paths: bool = True
 
 
 @dataclass
@@ -726,6 +733,9 @@ class PortableResult:
     #: Пошаговый отчёт сборки Adobe (``adobe-report.txt``): что читали, что
     #: нашли и что в итоге лежит в App. По нему разбирают неудачу без догадок.
     adobe_report_rel: str = ""
+    #: Отчёт о переносимости (``portability-report.txt``): какие абсолютные
+    #: пути остались внутри портатива и что лончер сделает при переносе.
+    portability_report_rel: str = ""
     #: Найденные службы, указывающие внутрь портатива. Они только сообщаются;
     #: Portablizer не останавливает и не удаляет системные службы автоматически.
     registered_services: List[str] = field(default_factory=list)
@@ -2288,6 +2298,14 @@ class Portablizer:
             if os.path.isfile(exe_launcher):
                 result.portable_launcher_exe_rel = os.path.relpath(
                     exe_launcher, portable_dir)
+
+            # 8б. Относительные пути: корень портатива запоминается, текстовые
+            # файлы проверяются, отчёт объясняет, что произойдёт при переносе
+            # папки на другой диск.
+            self._check_cancel()
+            self.progress(94, "Относительные пути и перенос между дисками")
+            result.portability_report_rel = self._make_paths_relative(
+                portable_dir, name, opts, result)
 
             # 9. Только безопасная уборка, выбранная пользователем:
             # не откатываем произвольный реестр и не трогаем ярлыки/службы.
@@ -6230,6 +6248,62 @@ class Portablizer:
                     f"Не удалось сохранить {redist_mod.REPORT_NAME}: {exc}")
         return report
 
+    # -- относительные пути ---------------------------------------------------
+    def _make_paths_relative(self, portable_dir: str, name: str,
+                             opts: PortableOptions,
+                             result: PortableResult) -> str:
+        """Запоминает корень портатива и проверяет пути внутри него.
+
+        Сами по себе файлы портатива переносимы: лончер и конфиг хранят пути
+        относительно корня, реестр — маркер ``@@PORTABLE_ROOT@@``. Проблема в
+        настройках самой программы: их формат не наш, и «относительного» пути
+        там не бывает. Поэтому корень записывается в
+        ``PortableData\\portable-root.json``: при запуске лончер сравнит его с
+        текущим положением папки и, если она переехала на другой диск,
+        заменит старый путь новым до старта программы.
+
+        Заодно составляется ``portability-report.txt`` — список файлов, где
+        абсолютные пути всё-таки есть, с делением на «внутри портатива» и
+        «вне его». Это ответ на вопрос «почему после переноса что-то
+        отвалилось» без догадок.
+        """
+        if not opts.relative_paths:
+            self.log.info(
+                "Относительные пути отключены: корень портатива не "
+                "запоминается, и после переноса настройки программы могут "
+                "указывать в старое место.")
+            return ""
+
+        previous = relpaths_mod.stored_root(portable_dir)
+        relpaths_mod.write_stamp(portable_dir, portable_dir, __version__,
+                                 previous=previous)
+        audit = relpaths_mod.audit(portable_dir, include_app=True)
+        stamp = relpaths_mod.read_stamp(portable_dir)
+        report = relpaths_mod.write_report(
+            portable_dir, audit, version=__version__, stamp=stamp,
+            launcher_exe=os.path.join("App", APP_EXE_LAUNCHER_NAME))
+
+        if audit.is_clean:
+            self.log.ok(
+                "Пути внутри портатива относительные — проверено "
+                f"{audit.scanned} текстовых файлов. Папку можно переносить "
+                "на другой диск или в другой каталог.")
+        else:
+            self.log.info(
+                f"Абсолютные пути старого корня есть в {len(audit.hits)} "
+                f"файлах настройки ({audit.inside_count} путей). При переносе "
+                "лончер заменит их новым путём: запускайте программу через "
+                f"App\\{APP_EXE_LAUNCHER_NAME} или Launch.bat.")
+        if audit.outside_count:
+            self.log.info(
+                f"Пути вне портатива: {audit.outside_count}. Перенести их "
+                "нельзя — подробности в " + relpaths_mod.REPORT_NAME + ".")
+        if not report:
+            self.log.warn(
+                f"Не удалось записать {relpaths_mod.REPORT_NAME}.")
+            return ""
+        return os.path.relpath(report, portable_dir)
+
     # -- лончер ---------------------------------------------------------------
     def _copy_exe_launcher(
         self, portable_dir: str,
@@ -6513,6 +6587,11 @@ class Portablizer:
                       if netstack_report is not None and netstack_report.written
                       else {}),
             language=opts.install_language.strip(),
+            # Относительные пути: секция говорит лончеру, что при переносе
+            # папки надо сверить запомненный корень с текущим. В ней нет ни
+            # одного абсолютного пути — только имена файлов внутри портатива.
+            relative_paths=relpaths_mod.launcher_section(
+                portable_dir, enabled=opts.relative_paths),
         )
         # Launch.bat — CRLF, чистый ASCII и без BOM. cmd.exe читает .bat по
         # байтовым смещениям: BOM, LF-концы строк или многобайтовый символ
