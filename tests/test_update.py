@@ -436,6 +436,25 @@ class PreviousLocationAdoptionTests(unittest.TestCase):
         self.assertEqual((self.root / "App" / "LaunchPortable.exe").read_text(),
                          "launcher")
 
+    def test_a_neighbouring_portable_is_not_a_source(self):
+        import shutil
+
+        shutil.rmtree(self.previous)
+        neighbour = Path(self._tmp.name) / "Other" / "Ollama_Tools"
+        (neighbour / "App").mkdir(parents=True)
+        _write(neighbour / "launcher_config.json",
+               json.dumps({"app_name": "Ollama Tools",
+                           "target_exe_rel": "App/ollama tools.exe"}))
+        _write(neighbour / "App" / "ollama app.exe", "neighbour")
+        exe_launcher.write_paths_stamp(self.root, previous=str(neighbour))
+        self.assertEqual(exe_launcher.stale_app_dirs(self.root, OLLAMA_CFG),
+                         [])
+
+    def test_same_program_previous_location_is_a_source(self):
+        self.assertEqual([str(item) for item in
+                          exe_launcher.stale_app_dirs(self.root, OLLAMA_CFG)],
+                         [str(self.previous / "App")])
+
     def test_session_marker_roundtrip(self):
         started = exe_launcher.write_session_start(self.root)
         self.assertGreater(started, 0)

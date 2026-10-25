@@ -7389,7 +7389,8 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # версию по старому адресу. Перед запуском переводим их на текущий корень
     # — обновление, которое запустит сама программа, попадёт в эту папку.
     try:
-        moved = retarget_host_install_records(remembered_roots(root, cfg), root)
+        moved = retarget_host_install_records(
+            remembered_roots(root, cfg), root, _app_shortcut_names(root, cfg))
         for item in moved:
             _run_log(root, "install records: previous location now points to "
                            f"{root}: {item}")
