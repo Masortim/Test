@@ -52,6 +52,12 @@ from portablizer.core.silentargs import build_attempts
 import pebuild
 
 
+def _extractors(style: str = unpacker_mod.STYLE_7ZIP,
+                path: str = "C:\\7-Zip\\7z.exe"):
+    """Список «найденных» распаковщиков для подмены поиска в тестах."""
+    return [unpacker_mod.Extractor(style, path)]
+
+
 def _touch(root: str, name: str, content: str = "x") -> str:
     path = os.path.join(root, name)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -381,10 +387,12 @@ class _AdobePortablizer(Portablizer):
     временного каталога, если установщик всё же запускался.
     """
 
-    def __init__(self, uwp_unpack_dir: str = "", installer_rc: int = 191):
+    def __init__(self, uwp_unpack_dir: str = "", installer_rc: int = 191,
+                 archive_is_empty: bool = False):
         super().__init__(Logger())
         self.uwp_unpack_dir = uwp_unpack_dir
         self.installer_rc = installer_rc
+        self.archive_is_empty = archive_is_empty
         self.calls = []
         self.unpacker_commands = []
 
@@ -405,8 +413,14 @@ class _AdobePortablizer(Portablizer):
     def _run_unpacker_command(self, cmd, console_log, opts,  # noqa: D102
                               progress=(63, 65), stage="Распаковка установщика"):
         self.unpacker_commands.append(list(cmd))
+        # У 7-Zip папка задаётся ключом -o<папка>, у tar — параметром -C.
         work = next((arg[2:] for arg in cmd if arg.startswith("-o")), "")
-        assert work, "в команде 7-Zip нет папки распаковки"
+        if not work and "-C" in cmd:
+            work = cmd[cmd.index("-C") + 1]
+        assert work, "в команде распаковщика нет папки распаковки"
+        os.makedirs(work, exist_ok=True)
+        if self.archive_is_empty:
+            return 0, ""
         _touch(work, "payloads/AdobeXD61/Adobe XD.msi")
         _touch(work, "payloads/SparklerApp/SparklerApp.appx")
         _touch(work, "Build/Setup.xml", "<Setup/>")
@@ -446,8 +460,8 @@ class AdobeBuildTests(unittest.TestCase):
     def test_builder_packs_payloads_without_running_the_installer(self):
         engine = self._engine()
         with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
-                mock.patch.object(unpacker_mod, "find_unpacker",
-                                  return_value="C:\\7-Zip\\7z.exe"):
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=_extractors()):
             rc, used = engine._run_attempts(
                 self._plans(), self.opts, self.app, self.data, self.portable,
                 "Adobe XD")
@@ -515,8 +529,8 @@ class AdobeBuildTests(unittest.TestCase):
                                adobe_layout_dir=os.path.join(
                                    self.portable, "_adobe_payloads"))
         with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
-                mock.patch.object(unpacker_mod, "find_unpacker",
-                                  return_value=""):
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=[]):
             rc, used = engine._run_attempts(plans, self.opts, self.app,
                                             self.data, self.portable,
                                             "Adobe XD")
@@ -526,20 +540,25 @@ class AdobeBuildTests(unittest.TestCase):
             os.path.join(self.app, "Program Files", "Adobe", "Adobe XD",
                          "Adobe XD.exe")))
 
-    def test_missing_unpacker_is_reported_honestly(self):
+    def test_missing_extractors_are_reported_honestly(self):
+        """Распаковщиков нет вовсе — об этом сказано, но 7-Zip не обязателен."""
         engine = self._engine()
         plan = self._plans()[0]
         with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
-                mock.patch.object(unpacker_mod, "find_unpacker",
-                                  return_value=""):
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=[]):
             rc = engine._run_payload_plan(
                 plan, self.opts, self.app, self.data, "Adobe XD",
                 portable_dir=self.portable)
         self.assertEqual(rc, -1)
         self.assertIn("7-Zip", engine.log.text)
-        with mock.patch.object(unpacker_mod, "find_unpacker", return_value=""):
+        with mock.patch.object(unpacker_mod, "find_extractors", return_value=[]):
             hints = engine._adobe_hints(self.detection, 191, self.portable)
-        self.assertTrue(any("7-Zip" in line for line in hints))
+        joined = "\n".join(hints)
+        self.assertIn("tar.exe", joined)
+        self.assertIn("WinRAR", joined)
+        # Прежний текст требовал установить 7-Zip — теперь его нет.
+        self.assertNotIn("Установите 7-Zip и повторите сборку", joined)
 
     def test_failure_hints_name_the_uwp_step_for_code_191(self):
         engine = self._engine()
@@ -565,12 +584,75 @@ class AdobeBuildTests(unittest.TestCase):
         self.assertIn("Adobe", engine.log.text)
         self.assertEqual(engine.unpacker_commands, [])
 
+    def test_windows_tar_packs_adobe_without_any_7zip(self):
+        """Без 7-Zip: WinRAR-SFX вырезается и распаковывается встроенным tar.exe."""
+        installer = _make_pe(
+            str(self.root / "Adobe.XD.v61.0.12.1.exe"),
+            extra=b"HDPIM\0AddUWPAppxCommand\0adobeTemp\0")
+        with open(installer, "ab") as handle:
+            handle.write(b"Rar!\x1a\x07\x01\x00" + b"sfx-body" * 64)
+        detection = detect_installer(installer)
+        self.assertTrue(detection.adobe_named)
+        engine = _AdobePortablizer()
+        engine._detection = detection
+        engine._adobe_detected = True
+        engine._install_temp_dir = os.path.join(self.data, "Temp")
+        engine.seen_archives = []
+        original = engine._run_unpacker_command
+
+        def remembering(cmd, console_log, opts, progress=(63, 65),
+                        stage="Распаковка установщика"):
+            engine.seen_archives.append(list(cmd))
+            return original(cmd, console_log, opts, progress=progress,
+                            stage=stage)
+
+        engine._run_unpacker_command = remembering  # type: ignore[assignment]
+        plans = build_attempts(detection, installer, self.app,
+                               log_dir=self.portable,
+                               adobe_layout_dir=os.path.join(
+                                   self.portable, "_adobe_payloads"))
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=_extractors(
+                                      unpacker_mod.STYLE_TAR,
+                                      "C:\\Windows\\System32\\tar.exe")):
+            rc, used = engine._run_attempts(plans, self.opts, self.app,
+                                            self.data, self.portable,
+                                            "Adobe XD")
+        self.assertEqual(rc, 0)
+        self.assertEqual(used.payload_kind, adobe_mod.PAYLOAD_ADOBE)
+        self.assertTrue(engine.seen_archives)
+        cmd = engine.seen_archives[0]
+        # tar.exe получил не EXE, а вырезанный из него RAR — иначе libarchive
+        # не увидел бы архив внутри обёртки.
+        self.assertEqual(cmd[0], "C:\\Windows\\System32\\tar.exe")
+        self.assertEqual(cmd[1:3], ["-x", "-f"])
+        self.assertTrue(cmd[3].endswith(".rar"))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.app, "Program Files", "Adobe", "Adobe XD",
+                         "Adobe XD.exe")))
+
+    def test_code_1000_is_explained_as_media_problem(self):
+        """Код 1000 — это не «непонятый ключ»: Adobe не любит сетевой диск."""
+        self.assertIn(1000, adobe_mod.ADOBE_CODES)
+        hint = engine_mod._exit_code_hint(1000)
+        self.assertIn("1000", hint)
+        self.assertIn("диск", hint)
+
+    def test_installer_on_a_plain_disk_is_used_as_is(self):
+        engine = self._engine()
+        with mock.patch.object(adobe_mod, "portable_media_drive",
+                               return_value=False):
+            self.assertEqual(engine._adobe_installer_source(self.opts),
+                             self.installer)
+        self.assertEqual(engine._adobe_media_copy, "")
+
     def test_uwp_package_is_never_installed_through_msiexec(self):
         """Appx ставится не msiexec и не нами: его в командах нет вовсе."""
         engine = self._engine()
         with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
-                mock.patch.object(unpacker_mod, "find_unpacker",
-                                  return_value="C:\\7-Zip\\7z.exe"):
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=_extractors()):
             engine._run_attempts(self._plans(), self.opts, self.app,
                                  self.data, self.portable, "Adobe XD")
         joined = " ".join(plan.display() for plan in engine.calls)

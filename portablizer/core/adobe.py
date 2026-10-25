@@ -42,6 +42,11 @@ import zipfile
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+#: Определяем платформу локально: модуль остаётся листовым (без зависимостей
+#: от остальных частей пакета), чтобы его можно было импортировать откуда
+#: угодно.
+IS_WINDOWS_PLATFORM = os.name == "nt"
+
 #: Имя плана «распаковать пакет без установки» в лестнице попыток.
 PAYLOAD_ADOBE = "adobe"
 
@@ -84,6 +89,12 @@ ADOBE_CODES: Dict[int, str] = {
          "установщиком",
     192: "на компьютере уже установлена более новая версия программы",
     193: "установщик 64-битной программы запущен на 32-битной системе",
+    1000: "установщик не смог начать работу: он сам или его носитель не на "
+          "локальном диске, либо не хватает прав администратора (Adobe "
+          "отказывается ставить программу со съёмного или сетевого диска). "
+          "Код 1000 у Adobe означает именно это, а не «непонятый ключ "
+          "тишины»: перенесите установщик на локальный диск и повторите "
+          "сборку",
     506: "Windows запрещает установку неопубликованных приложений "
          "(политика sideloading / нет лицензии разработчика)",
     507: "служба развёртывания приложений (AppX) не отвечает или "
@@ -322,6 +333,35 @@ def find_payloads(root: str, *, payload_dirs_only: bool = False,
     layout.payloads.sort(key=lambda p: (p.kind != "msi", p.kind != "zip",
                                         p.path.casefold()))
     return layout
+
+
+#: Типы дисков Windows (GetDriveTypeW) — те, с которых Adobe отказывается
+#: работать: код 1000 у него означает «установщик лежит на сетевом диске».
+_DRIVE_REMOVABLE = 2
+_DRIVE_REMOTE = 4
+_DRIVE_CDROM = 5
+
+
+def portable_media_drive(path: str) -> bool:
+    """True, если файл лежит на сетевом, съёмном или оптическом диске.
+
+    Adobe отвечает кодом 1000, когда установщик запущен с сетевого диска
+    (это подтверждено в сообществе Adobe), а со съёмного — часто просто
+    отказывается работать. Поэтому такой файл сначала копируется на локальный
+    диск. Вне Windows функция всегда возвращает False.
+    """
+    if not path or not IS_WINDOWS_PLATFORM:
+        return False
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    if not drive:
+        return False
+    try:
+        import ctypes
+
+        kind = ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(drive + "\\"))
+    except Exception:  # noqa: BLE001 - без WinAPI решаем «не съёмный»
+        return False
+    return int(kind) in (_DRIVE_REMOVABLE, _DRIVE_REMOTE, _DRIVE_CDROM)
 
 
 def default_temp_roots(env: Optional[dict] = None) -> List[str]:
@@ -718,17 +758,21 @@ def failure_hints(failure: Optional[AdobeFailure] = None,
         )
     if unpacker_missing:
         hints.append(
-            "7-Zip на этом компьютере не найден: Portablizer не носит свой "
-            "распаковщик и не скачивает его из сети. Без 7-Zip содержимое "
-            "установщика Adobe достать нечем, и остаётся только запуск "
-            "установщика — а он упирается в UWP-шаг (код 191). Установите "
-            "7-Zip и повторите сборку."
+            "На этом компьютере не нашлось ни одного распаковщика: ни 7-Zip, "
+            "ни WinRAR, ни встроенного tar.exe. 7-Zip при этом не "
+            "обязателен — Portablizer умеет работать через WinRAR "
+            "(UnRAR.exe) и через tar.exe, который есть в Windows 10 и 11 "
+            "начиная с версии 1803 (это bsdtar из libarchive: ZIP, 7z, "
+            "RAR/RAR5). Проверьте, что tar.exe на месте "
+            "(C:\\Windows\\System32\\tar.exe), или установите WinRAR — "
+            "этого достаточно."
         )
     if salvage_attempted and (applied is None or not applied.has_result):
         hints.append(
             "Распакованных пакетов не осталось и во временных каталогах "
-            "Adobe (adobeTemp): установщик убрал их при откате. Запустите "
-            "сборку ещё раз с установленным 7-Zip — тогда пакеты достаются "
+            "Adobe (adobeTemp): установщик убрал их при откате. Повторите "
+            "сборку, когда на месте окажется хоть один распаковщик "
+            "(tar.exe из Windows, WinRAR или 7-Zip) — тогда пакеты достаются "
             "из самого установщика, не запуская его."
         )
 

@@ -44,6 +44,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -1078,6 +1079,10 @@ class Portablizer:
         self._adobe_failure: Optional[adobe_mod.AdobeFailure] = None
         #: Файл-объяснение про UWP-часть (``adobe-uwp.txt``), если он записан.
         self._adobe_note_rel = ""
+        #: Копия установщика на локальном диске: Adobe отказывается работать
+        #: со съёмного и сетевого носителя (код 1000).
+        self._adobe_media_copy = ""
+        self._adobe_media_dir = ""
         #: Fusion может развернуться в перенаправленный LOCALAPPDATA, а не App.
         self._online_profile_main_exe = ""
         self._online_profile_checked = False
@@ -1823,6 +1828,9 @@ class Portablizer:
             self._adobe_salvage_attempted = False
             self._adobe_failure = None
             self._adobe_note_rel = ""
+            self._drop_adobe_media_copy()
+            self._adobe_media_copy = ""
+            self._adobe_media_dir = ""
             self._online_profile_main_exe = ""
             self._online_profile_checked = False
             self._online_profile_deferred = False
@@ -3481,6 +3489,14 @@ class Portablizer:
                     "выполняю, но успех маловероятен"
                 )
 
+            if self._adobe_detected and plan.payload_kind != adobe_mod.PAYLOAD_ADOBE:
+                # Adobe не работает с установщиком на съёмном/сетевом диске
+                # (код 1000), поэтому запускаем локальную копию.
+                source = self._adobe_installer_source(opts)
+                if source and os.path.normcase(source) != os.path.normcase(
+                        plan.program):
+                    plan.program = source
+
             if plan.payload_kind:
                 # План не запускает установщик: он раскладывает его пакеты
                 # своими силами (Adobe: UWP-шаг с кодом 191 тогда просто не
@@ -4237,7 +4253,7 @@ class Portablizer:
     # или прав администратора. При этом он отменяет установку целиком.
     #
     # Портативу этот шаг не нужен: сама программа — обычное Win32-приложение.
-    # Поэтому пакеты берутся из контейнера установщика (7-Zip) или из каталога
+    # Поэтому пакеты берутся из контейнера установщика (любым архиватором) или из каталога
     # payloads рядом с ним, а если контейнер не читается — из adobeTemp, куда
     # установщик успевает их разложить ДО падения на UWP-шаге. Разбор и тексты
     # живут в core/adobe.py, здесь только решения оркестратора.
@@ -4251,7 +4267,8 @@ class Portablizer:
         """Раскладывает пакеты установщика в App, не запуская его.
 
         Источников три, и проверяются они по порядку: сам контейнер
-        установщика (7-Zip, а для ZIP-оболочки — стандартная библиотека),
+        установщика (7-Zip/WinRAR/tar.exe, а для ZIP-оболочки — стандартная
+        библиотека),
         каталог ``payloads`` рядом с установщиком (пакет Adobe Admin Console)
         и — уже после запуска установщика, отдельным шагом —
         ``adobeTemp`` (см. :meth:`_salvage_adobe_payloads`). Возвращает код
@@ -4272,52 +4289,22 @@ class Portablizer:
             return -1
 
         layout = adobe_mod.AdobeLayout(root=work)
-        unpacker = unpacker_mod.find_unpacker()
-        if unpacker:
-            self.log.info(
-                "Достаю пакеты Adobe из установщика без его запуска: "
-                f"{os.path.basename(unpacker)} читает контейнер напрямую, а "
-                "UWP-шаг (код 191) при этом не выполняется вовсе."
-            )
-            cmd = unpacker_mod.unpacker_argv(unpacker, opts.installer_path,
-                                             work)
-            unpack_log = console_log or os.path.join(portable_dir,
-                                                     "unpacker-output.log")
-            try:
-                code, _output = self._run_unpacker_command(
-                    cmd, unpack_log, opts,
-                    progress=(progress_from, max(progress_from,
-                                                 progress_to - 2)),
-                    stage="Распаковка пакета Adobe")
-            except RuntimeError:
-                shutil.rmtree(work, ignore_errors=True)
-                raise
-            if code not in (0, 1):
-                self.log.warn(
-                    f"{os.path.basename(unpacker)} завершился с кодом {code}: "
-                    "контейнер установщика прочитать не удалось.")
-            layout = adobe_mod.find_payloads(
-                work, installer_path=opts.installer_path)
-            if layout.is_empty:
-                self.log.warn(
-                    "Внутри контейнера не нашлось пакетов Adobe "
-                    "(payloads/MSI/ZIP).")
-        else:
-            self.log.info(
-                "Распаковщик (7-Zip) не найден: контейнер установщика Adobe "
-                "достать нечем. Пробую каталог payloads рядом с установщиком."
-            )
+        layout = self._extract_adobe_container(
+            opts, work, layout, console_log=console_log,
+            portable_dir=portable_dir,
+            progress=(progress_from, max(progress_from, progress_to - 2)))
 
         # Контейнер установщика может оказаться обычным ZIP (так устроены
-        # некоторые оболочки Adobe). Тогда 7-Zip не обязателен: стандартная
-        # библиотека распакует его сама — и код установщика снова не
-        # выполняется.
+        # некоторые оболочки Adobe). Тогда внешний распаковщик не обязателен:
+        # стандартная библиотека распакует его сама — и код установщика снова
+        # не выполняется.
         if layout.is_empty and getattr(self._detection, "has_zip_payload",
                                        False):
             self.log.info(
                 "Контейнер установщика — обычный ZIP: распаковываю его без "
-                "7-Zip и без запуска установщика.")
-            ok, text = adobe_mod.extract_zip(opts.installer_path, work)
+                "внешнего распаковщика и без запуска установщика.")
+            ok, text = adobe_mod.extract_zip(
+                self._adobe_installer_source(opts), work)
             if ok:
                 layout = adobe_mod.find_payloads(
                     work, installer_path=opts.installer_path)
@@ -4372,6 +4359,148 @@ class Portablizer:
             f"Распакованное оставлено для проверки: {work}"
         )
         return -1
+
+    def _adobe_installer_source(self, opts: PortableOptions) -> str:
+        """Путь к установщику, с которым можно работать.
+
+        Adobe отвечает кодом 1000, когда установщик лежит на сетевом диске
+        (это подтверждено в сообществе Adobe), и часто отказывается работать
+        со съёмного. Поэтому такой файл один раз копируется на локальный диск
+        — и дальше и распаковка, и запуск идут с копии.
+        """
+        if self._adobe_media_copy:
+            return self._adobe_media_copy
+        source = opts.installer_path
+        if not adobe_mod.portable_media_drive(source):
+            return source
+        try:
+            folder = tempfile.mkdtemp(prefix="PortablizerMedia-")
+            target = os.path.join(folder, os.path.basename(source))
+            self.log.info(
+                "Установщик Adobe лежит на съёмном или сетевом диске, а "
+                "Adobe с таких носителей не работает (код 1000). Копирую его "
+                "на локальный диск — это разово и не меняет исходный файл.")
+            shutil.copy2(source, target)
+        except OSError as exc:
+            self.log.warn(
+                f"Скопировать установщик на локальный диск не удалось: {exc}. "
+                "Работаю с исходного места — Adobe на таком носителе обычно "
+                "отвечает кодом 1000.")
+            return source
+        self._adobe_media_copy = target
+        self._adobe_media_dir = folder
+        self.log.ok(f"Копия установщика для Adobe: {target}")
+        return target
+
+    def _drop_adobe_media_copy(self) -> None:
+        """Убирает локальную копию установщика (гигабайты в TEMP)."""
+        if self._adobe_media_dir:
+            shutil.rmtree(self._adobe_media_dir, ignore_errors=True)
+        self._adobe_media_copy = ""
+        self._adobe_media_dir = ""
+
+    def _extract_adobe_container(self, opts: PortableOptions, work: str,
+                                 layout: adobe_mod.AdobeLayout,
+                                 console_log: Optional[str] = None,
+                                 portable_dir: str = "",
+                                 progress: "Tuple[int, int]" = (30, 56),
+                                 ) -> adobe_mod.AdobeLayout:
+        """Достаёт пакеты из контейнера установщика, не выполняя его код.
+
+        Распаковщиков на машине может не быть вовсе — и это не тупик.
+        Установщик Adobe обычно приходит самораспаковывающимся EXE поверх RAR
+        или 7z, поэтому подойдёт любой архиватор, который уже есть:
+
+        * 7-Zip (самый точный разбор SFX);
+        * WinRAR — консольные ``UnRAR.exe``/``Rar.exe``;
+        * **встроенный в Windows ``tar.exe``** (bsdtar из libarchive): с
+          Windows 10 он читает ZIP, 7z и RAR/RAR5, и доустанавливать ничего
+          не нужно. Именно этот путь работает, когда 7-Zip не установлен.
+
+        libarchive и UnRAR читают сам архив, а не PE-обёртку, поэтому для них
+        архив сначала вырезается из EXE (:func:`unpacker.carve_archive`).
+        """
+        extractors = unpacker_mod.find_extractors()
+        if not extractors:
+            self.log.warn(
+                "Распаковщиков не найдено вовсе: ни 7-Zip, ни WinRAR, ни "
+                "встроенного tar.exe. Пробую каталог payloads рядом с "
+                "установщиком."
+            )
+            return layout
+
+        source = self._adobe_installer_source(opts)
+        if (unpacker_mod.archive_kind(source) == "zip"
+                and getattr(self._detection, "has_zip_payload", False)):
+            self.log.info(
+                "Контейнер установщика — обычный ZIP: его распакует "
+                "стандартная библиотека Python, внешний распаковщик не нужен.")
+            return layout
+
+        names = ", ".join(str(item) for item in extractors)
+        self.log.info(
+            "Достаю пакеты Adobe из установщика без его запуска: подойдёт "
+            f"любой архиватор ({names}) — UWP-шаг (код 191) при этом не "
+            "выполняется вовсе.")
+
+        unpack_log = console_log or os.path.join(portable_dir,
+                                                 "unpacker-output.log")
+        for extractor in extractors:
+            self._check_cancel()
+            archive = source
+            carved = ""
+            if extractor.style in (unpacker_mod.STYLE_RAR,
+                                   unpacker_mod.STYLE_TAR):
+                # Эти инструменты не ищут архив внутри PE-обёртки: отрезаем
+                # обёртку и отдаём им сам архив.
+                archive, kind = unpacker_mod.carve_archive(source, work)
+                if not archive:
+                    self.log.info(
+                        f"{extractor.name} не умеет читать PE-обёртку, а "
+                        "приклеенного RAR/7z внутри не нашлось — пробую "
+                        "следующий способ.")
+                    continue
+                carved = archive
+                self.log.info(
+                    f"{extractor.name} читает сам архив ({kind}), поэтому "
+                    f"вырезаю его из установщика: {os.path.basename(archive)}."
+                )
+            cmd = unpacker_mod.extractor_argv(extractor, archive, work)
+            try:
+                code, _output = self._run_unpacker_command(
+                    cmd, unpack_log, opts, progress=progress,
+                    stage=f"Распаковка пакета Adobe ({extractor.name})")
+            except RuntimeError:
+                shutil.rmtree(work, ignore_errors=True)
+                raise
+            finally:
+                if carved and os.path.isfile(carved):
+                    try:
+                        os.remove(carved)
+                    except OSError:
+                        pass
+            if code not in (0, 1):
+                self.log.warn(
+                    f"{extractor.name} завершился с кодом {code}: контейнер "
+                    "установщика прочитать не удалось.")
+            layout = adobe_mod.find_payloads(
+                work, installer_path=opts.installer_path)
+            if layout.has_app_payload:
+                return layout
+            if extractor is not extractors[-1]:
+                self.log.info(
+                    f"{extractor.name} не дал пакетов программы — пробую "
+                    "следующий распаковщик.")
+
+        if layout.is_empty:
+            self.log.warn(
+                "Внутри контейнера не нашлось пакетов Adobe "
+                "(payloads/MSI/ZIP).")
+        else:
+            self.log.warn(
+                "Внутри контейнера нашлись только UWP-пакеты: пакетов "
+                "программы (MSI/ZIP) в этой сборке нет.")
+        return layout
 
     def _install_adobe_payloads(self, layout: adobe_mod.AdobeLayout,
                                 opts: PortableOptions, app_dir: str,
@@ -4530,7 +4659,7 @@ class Portablizer:
             failure,
             applied=self._adobe_applied,
             payload_extracted=bool(self._adobe_source),
-            unpacker_missing=not bool(unpacker_mod.find_unpacker()),
+            unpacker_missing=not bool(unpacker_mod.find_extractors()),
             salvage_attempted=self._adobe_salvage_attempted,
             layout=self._adobe_layout,
         )

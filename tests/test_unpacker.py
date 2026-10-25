@@ -36,6 +36,112 @@ def _file(path: Path, content: str = "x") -> str:
     return str(path)
 
 
+class FindExtractorsTests(unittest.TestCase):
+    """Распаковщик — не обязательно 7-Zip.
+
+    Регрессия: у пользователя не было 7-Zip, и сборка честно сообщила, что
+    достать содержимое установщика нечем. При этом на любой Windows 10 и 11
+    (1803+) уже есть ``tar.exe`` — bsdtar из libarchive, который читает ZIP,
+    7z и RAR/RAR5, — а у многих стоит WinRAR. Искать нужно всех.
+    """
+
+    def _find(self, env, files, which=None):
+        return unpacker_mod.find_extractors(
+            env=env,
+            which=which or (lambda name: None),
+            isfile=lambda path: path in files)
+
+    def test_tar_shipped_with_windows_is_enough(self):
+        tar = os.path.join("C:\\Windows", "System32", "tar.exe")
+        found = self._find({"SystemRoot": "C:\\Windows"}, {tar})
+        self.assertEqual([item.style for item in found],
+                         [unpacker_mod.STYLE_TAR])
+        self.assertEqual(found[0].path, tar)
+
+    def test_winrar_console_is_found_without_7zip(self):
+        unrar = os.path.join("C:\\Program Files", "WinRAR", "UnRAR.exe")
+        found = self._find({"ProgramFiles": "C:\\Program Files"}, {unrar})
+        self.assertEqual([item.style for item in found],
+                         [unpacker_mod.STYLE_RAR])
+
+    def test_order_is_7zip_then_winrar_then_tar(self):
+        seven = os.path.join("C:\\Program Files", "7-Zip", "7z.exe")
+        unrar = os.path.join("C:\\Program Files", "WinRAR", "UnRAR.exe")
+        tar = os.path.join("C:\\Windows", "System32", "tar.exe")
+        found = self._find(
+            {"ProgramFiles": "C:\\Program Files", "SystemRoot": "C:\\Windows"},
+            {seven, unrar, tar})
+        self.assertEqual([item.style for item in found],
+                         [unpacker_mod.STYLE_7ZIP, unpacker_mod.STYLE_RAR,
+                          unpacker_mod.STYLE_TAR])
+
+    def test_no_extractors_is_an_empty_list_not_an_error(self):
+        self.assertEqual(self._find({}, set()), [])
+
+    def test_each_style_has_its_own_command_line(self):
+        tar_cmd = unpacker_mod.extractor_argv(
+            unpacker_mod.Extractor(unpacker_mod.STYLE_TAR, "tar.exe"),
+            "setup.exe", "/work")
+        self.assertEqual(tar_cmd, ["tar.exe", "-x", "-f", "setup.exe",
+                                   "-C", "/work"])
+        rar_cmd = unpacker_mod.extractor_argv(
+            unpacker_mod.Extractor(unpacker_mod.STYLE_RAR, "UnRAR.exe"),
+            "a.rar", "/work")
+        self.assertEqual(rar_cmd[:5], ["UnRAR.exe", "x", "-y", "-o+", "-idq"])
+        self.assertTrue(rar_cmd[-1].endswith(os.sep))
+
+
+class CarveArchiveTests(unittest.TestCase):
+    """Архив внутри самораспаковывающегося EXE нужно сначала вырезать.
+
+    libarchive (``tar.exe``) и UnRAR читают сам архив, а не PE-обёртку вокруг
+    него. 7-Zip находит архив сам, остальным нужен «голый» RAR/7z.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def _carve(self, payload: bytes):
+        installer = Path(self.root, "setup.exe")
+        installer.write_bytes(b"MZ" + b"\x00" * 500 + payload)
+        target, kind = unpacker_mod.carve_archive(str(installer),
+                                                  str(self.root / "work"))
+        return target, kind, installer
+
+    def test_rar5_inside_an_sfx_exe_is_cut_out(self):
+        body = b"Rar!\x1a\x07\x01\x00" + b"archive-body" * 10
+        target, kind, _installer = self._carve(body)
+        self.assertEqual(kind, "rar5")
+        self.assertTrue(target.endswith(".rar"))
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(8), b"Rar!\x1a\x07\x01\x00")
+            self.assertEqual(handle.read(), b"archive-body" * 10)
+
+    def test_seven_zip_inside_an_sfx_exe_is_cut_out(self):
+        body = b"7z\xbc\xaf\x27\x1c" + b"data" * 20
+        target, kind, _installer = self._carve(body)
+        self.assertEqual(kind, "7z")
+        self.assertTrue(target.endswith(".7z"))
+
+    def test_plain_rar_is_used_as_is(self):
+        installer = Path(self.root, "package.rar")
+        installer.write_bytes(b"Rar!\x1a\x07\x00" + b"x" * 10)
+        target, kind = unpacker_mod.carve_archive(str(installer),
+                                                  str(self.root / "work"))
+        self.assertEqual(target, str(installer))
+        self.assertEqual(kind, "rar")
+
+    def test_zip_sfx_needs_no_carving(self):
+        """ZIP внутри EXE читает сама стандартная библиотека."""
+        installer = Path(self.root, "setup.exe")
+        installer.write_bytes(b"MZ" + b"\x00" * 100)
+        target, kind = unpacker_mod.carve_archive(str(installer),
+                                                  str(self.root / "work"))
+        self.assertEqual((target, kind), ("", ""))
+
+
 class FindUnpackerTests(unittest.TestCase):
     def test_standard_7zip_folder_is_found(self):
         with tempfile.TemporaryDirectory() as temp:
