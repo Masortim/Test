@@ -346,6 +346,47 @@ class LauncherRepairTests(unittest.TestCase):
         # Штамп обновлён: второй запуск уже ничего не правит.
         self.assertEqual(exe_launcher.repair_paths(new), [])
 
+    def test_doubled_backslashes_in_json_are_rewritten(self):
+        """В JSON и .reg обратные слэши удвоены — форма тоже должна ловиться."""
+        new = self._move()
+        old_win = "D:\\Apps\\XD_Portable"
+        data = new / "PortableData" / "User" / "history.json"
+        data.write_text(
+            '{"dir": "' + old_win.replace("\\", "\\\\") + '\\\\App"}',
+            encoding="utf-8")
+        stamp_path = new / "PortableData" / "portable-root.json"
+        stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+        stamp["previous"] = old_win
+        stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
+
+        self.assertTrue(exe_launcher.repair_paths(new))
+        text = data.read_text(encoding="utf-8")
+        self.assertNotIn("D:", text)
+        value = json.loads(text)["dir"]
+        # Разделитель берётся из самого файла (в JSON он экранирован), важно,
+        # что путь теперь указывает в новое место.
+        self.assertTrue(value.startswith(str(new)), value)
+        self.assertTrue(value.endswith("App"), value)
+
+    def test_path_from_two_moves_ago_is_rewritten_too(self):
+        """В настройках мог остаться путь не только прошлого места."""
+        new = self._move()
+        even_older = self.base / "C" / "Old" / "XD_Portable"
+        (new / "PortableData" / "User" / "history.ini").write_text(
+            "[Recent]\\r\\nDir=" + str(even_older) + "\\r\\n", encoding="utf-8")
+        stamp = json.loads((new / "PortableData" / "portable-root.json")
+                           .read_text(encoding="utf-8"))
+        stamp["previous"] = str(even_older)
+        (new / "PortableData" / "portable-root.json").write_text(
+            json.dumps(stamp), encoding="utf-8")
+
+        lines = exe_launcher.repair_paths(new)
+        self.assertTrue(lines)
+        text = (new / "PortableData" / "User" / "history.ini").read_text(
+            encoding="utf-8")
+        self.assertIn(str(new), text)
+        self.assertNotIn(str(even_older), text)
+
     def test_stamp_text_file_is_ascii_copy(self):
         new = self._move()
         exe_launcher.repair_paths(new)
