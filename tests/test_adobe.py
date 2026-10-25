@@ -378,6 +378,71 @@ class AdobeFailureTests(unittest.TestCase):
         self.assertIn("191", engine_mod._exit_code_hint(191) + "191")
 
 
+class SfxHarvestTests(unittest.TestCase):
+    """Самораспаковка: забрать файлы, даже если её установка заблокирована.
+
+    Регрессия: у пользователя WinRAR-SFX распаковался в
+    ``PortableData\\Temp\\RarSFX0``, откуда запустил ``Nsudo.exe``, — и
+    Защитник Windows заблокировал его модальным окном. Файлы при этом на диске
+    остались, но сборка их не забрала: искала только пакеты у себя в папке.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.temp_dir = self.root / "Temp"
+        self.work = self.root / "work"
+        self.work.mkdir()
+
+    def _sfx(self, name="RarSFX0", members=()):
+        base = self.temp_dir / name
+        for relative, content in members:
+            _touch(str(base), relative, content)
+        return str(base)
+
+    def test_rarsfx_folder_is_found_in_temp(self):
+        path = self._sfx(members=[("Nsudo.exe", "MZ"), ("payloads/a.msi", "m")])
+        self.assertEqual(adobe_mod.find_sfx_dirs([str(self.temp_dir)]), [path])
+
+    def test_seven_zip_sfx_and_nested_temp_are_found(self):
+        deep = self.temp_dir / "inner" / "7zSFX01"
+        _touch(str(deep), "setup.exe", "MZ")
+        found = adobe_mod.find_sfx_dirs([str(self.temp_dir)])
+        self.assertEqual([Path(p).name for p in found], ["7zSFX01"])
+
+    def test_ordinary_temp_files_are_not_mistaken_for_sfx(self):
+        _touch(str(self.temp_dir), "some.log", "x")
+        _touch(str(self.temp_dir / "other"), "file.tmp", "x")
+        self.assertEqual(adobe_mod.find_sfx_dirs([str(self.temp_dir)]), [])
+
+    def test_harvest_copies_payloads_and_ignores_the_blocked_helper(self):
+        path = self._sfx(members=[("Nsudo.exe", "MZ"),
+                                  ("payloads/Adobe XD.msi", "msi"),
+                                  ("payloads/SparklerApp.appx", "appx")])
+        copied = adobe_mod.harvest_dirs([path], str(self.work))
+        self.assertEqual(copied, 3)
+        layout = adobe_mod.find_payloads(str(self.work),
+                                         installer_path="setup.exe")
+        self.assertEqual([payload.kind for payload in layout.payloads],
+                         ["msi", "uwp"])
+        self.assertTrue(layout.has_app_payload)
+
+    def test_single_wrapper_folder_is_flattened(self):
+        """Содержимое единственного вложенного каталога поднимается наверх."""
+        path = self._sfx(members=[("XD/payloads/Adobe XD.msi", "msi"),
+                                  ("XD/Setup.xml", "<Setup/>")])
+        adobe_mod.harvest_dirs([path], str(self.work))
+        self.assertTrue(os.path.isfile(
+            os.path.join(str(self.work), "payloads", "Adobe XD.msi")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(str(self.work), "Setup.xml")))
+
+    def test_harvest_of_a_missing_folder_is_not_an_error(self):
+        self.assertEqual(adobe_mod.harvest_dirs(["/nonexistent"], str(self.work)),
+                         0)
+
+
 class PayloadWatcherTests(unittest.TestCase):
     """Пакеты, которые установщик раскладывает и убирает за собой.
 
@@ -492,8 +557,11 @@ class _AdobePortablizer(Portablizer):
         return self.installer_rc
 
     def _run_unpacker_command(self, cmd, console_log, opts,  # noqa: D102
-                              progress=(63, 65), stage="Распаковка установщика"):
+                              progress=(63, 65), stage="Распаковка установщика",
+                              env=None, deadline=None, stop_when=None):
         self.unpacker_commands.append(list(cmd))
+        if env is not None:
+            self.sfx_env = dict(env)
         # У 7-Zip папка задаётся ключом -o<папка>, у tar — параметром -C,
         # а у самораспаковывающегося EXE — ключом -d<папка>.
         work = next((arg[2:] for arg in cmd if arg.startswith("-o")), "")
@@ -805,12 +873,14 @@ class AdobeBuildTests(unittest.TestCase):
         original = engine._run_unpacker_command
 
         def sfx_only(cmd, console_log, opts, progress=(63, 65),
-                     stage="Распаковка установщика"):
+                     stage="Распаковка установщика", env=None, deadline=None,
+                     stop_when=None):
             # Обычные архиваторы «не читают» архив, а SFX распаковывает себя.
             if not (cmd and cmd[0].casefold().endswith(".exe") and "-s" in cmd):
                 return 1, "tar: Unrecognized archive format"
             return original(cmd, console_log, opts, progress=progress,
-                            stage=stage)
+                            stage=stage, env=env, deadline=deadline,
+                            stop_when=stop_when)
 
         engine._run_unpacker_command = sfx_only  # type: ignore[assignment]
         with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
@@ -849,6 +919,73 @@ class AdobeBuildTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(self.app, "Program Files", "Adobe", "Adobe XD",
                          "Adobe XD.exe")))
+
+    def test_sfx_temp_folder_is_harvested_when_its_setup_is_blocked(self):
+        """RarSFX0 с пакетами забирается, даже если установка внутри не пошла.
+
+        Защитник Windows блокирует помощник повышения прав из пакета Adobe
+        (Nsudo.exe) модальным окном. Файлы при этом уже распакованы — их и
+        нужно забрать, не дожидаясь, пока кто-то нажмёт «ОК».
+        """
+        engine = self._engine(archive_is_empty=True)
+        original = engine._run_unpacker_command
+
+        def sfx_extracts(cmd, console_log, opts, progress=(63, 65),
+                         stage="Распаковка установщика", env=None,
+                         deadline=None, stop_when=None):
+            if not (cmd and cmd[0].casefold().endswith(".exe") and "-s" in cmd):
+                return 1, "tar: Unrecognized archive format"
+            # Настоящий SFX раскладывает файлы в RarSFX0 внутри своего TEMP.
+            sfx_temp = (env or {}).get("TEMP") or os.path.dirname(cmd[-1][2:])
+            _touch(sfx_temp, "RarSFX0/Nsudo.exe", "MZ")
+            _touch(sfx_temp, "RarSFX0/payloads/Adobe XD.msi", "msi")
+            _touch(sfx_temp, "RarSFX0/payloads/SparklerApp.appx", "appx")
+            return 0, ""
+
+        engine._run_unpacker_command = sfx_extracts  # type: ignore[assignment]
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=_extractors(
+                                      unpacker_mod.STYLE_TAR,
+                                      "C:\\Windows\\System32\\tar.exe")):
+            rc, used = engine._run_attempts(
+                self._plans(), self.opts, self.app, self.data, self.portable,
+                "Adobe XD")
+        self.assertEqual(rc, 0)
+        self.assertEqual(used.payload_kind, adobe_mod.PAYLOAD_ADOBE)
+        text = engine.log.text
+        self.assertIn("RarSFX0", text)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.app, "Program Files", "Adobe", "Adobe XD",
+                         "Adobe XD.exe")))
+        # Помощник повышения прав не запускается: мы снимаем SFX сами.
+        started = [plan.display() for plan in engine.calls]
+        self.assertFalse(any("Nsudo" in line for line in started), started)
+
+    def test_sfx_folder_left_by_a_failed_run_is_used(self):
+        """RarSFX0 остался после неудачного запуска — собираем портатив из него."""
+        engine = self._engine()
+        _touch(os.path.join(self.data, "Temp"), "RarSFX0/Nsudo.exe", "MZ")
+        _touch(os.path.join(self.data, "Temp"),
+               "RarSFX0/payloads/Adobe XD.msi", "msi")
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True):
+            ok = engine._salvage_adobe_payloads(
+                self.opts, self.app, self.data, "Adobe XD",
+                portable_dir=self.portable)
+        self.assertTrue(ok)
+        self.assertIn("RarSFX0", engine.log.text)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.app, "Program Files", "Adobe", "Adobe XD",
+                         "Adobe XD.exe")))
+
+    def test_sfx_run_is_stopped_once_files_stop_growing(self):
+        """Не ждём «ОК» в окне: как только файлы перестали расти — снимаем."""
+        root = os.path.join(self.portable, "_sfx_temp")
+        check = Portablizer._sfx_extraction_finished([root], calm=0.0)
+        self.assertFalse(check(), "пустой каталог — ещё не готово")
+        _touch(root, "RarSFX0/Nsudo.exe", "MZ")
+        self.assertFalse(check(), "первый размер только запоминается")
+        self.assertTrue(check(), "размер не меняется — распаковка закончена")
 
     def test_uwp_package_is_never_installed_through_msiexec(self):
         """Appx ставится не msiexec и не нами: его в командах нет вовсе."""
