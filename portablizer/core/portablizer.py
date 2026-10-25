@@ -4194,6 +4194,9 @@ class Portablizer:
                               opts: PortableOptions,
                               progress: "Tuple[int, int]" = (63, 65),
                               stage: str = "Распаковка установщика",
+                              env: "Optional[Dict[str, str]]" = None,
+                              deadline: Optional[float] = None,
+                              stop_when: Optional[Callable[[], bool]] = None,
                               ) -> "Tuple[int, str]":
         """Запускает распаковщик с возможностью отмены и отчётом о ходе.
 
@@ -4204,6 +4207,17 @@ class Portablizer:
         ``progress`` — отрезок общей полосы, на котором виден ход распаковки:
         у сценария Adobe он свой (лестница попыток идёт с 30 до 58 %), а не
         63–65 %, где живёт «последний шанс» после установки.
+
+        ``env`` и ``deadline`` нужны самораспаковывающимся архивам: свой
+        временный каталог (чтобы распакованное не уехало в чужой TEMP) и
+        короткий потолок — SFX после распаковки запускает свою программу
+        установки, которая может показать окно и ждать мышку.
+
+        ``stop_when`` — «работа сделана, дальше она ждёт мышку»: если функция
+        вернёт True, процесс снимается вместе с потомками, а распакованное
+        остаётся на диске. Именно так забирается содержимое SFX, чья
+        программа установки заблокирована Защитником Windows: ждать «ОК» в
+        модальном окне бессмысленно.
         """
         handle = None
         try:
@@ -4219,13 +4233,14 @@ class Portablizer:
                 list(cmd), stdin=subprocess.DEVNULL,
                 stdout=handle or subprocess.DEVNULL,
                 stderr=subprocess.STDOUT if handle else subprocess.DEVNULL,
-                creationflags=creationflags)
+                creationflags=creationflags, env=env)
         except OSError as exc:
             if handle is not None:
                 handle.close()
             return -1, str(exc)
 
-        deadline = float(opts.install_deadline) or UNPACK_HARD_LIMIT
+        deadline = (float(deadline) if deadline
+                    else float(opts.install_deadline) or UNPACK_HARD_LIMIT)
         started = time.monotonic()
         timed_out = False
         while proc.poll() is None:
@@ -4246,6 +4261,12 @@ class Portablizer:
                 f"{redist_mod.format_duration(elapsed)}")
             if deadline and elapsed > deadline:
                 timed_out = True
+                self._stop_installer(proc)
+                break
+            if stop_when is not None and stop_when():
+                self.log.debug(
+                    "  • распаковка закончена — снимаю процесс, не дожидаясь "
+                    "его собственной установки.")
                 self._stop_installer(proc)
                 break
             time.sleep(0.5)
@@ -4702,23 +4723,43 @@ class Portablizer:
         Это запасной путь для самораспаковывающихся архивов, которые чужие
         библиотеки не читают (libarchive, например, не понимает часть
         RAR5-архивов). WinRAR-SFX документированно принимает ``-d<папка>`` и
-        ``-s``: файлы окажутся в нашей папке, а не во временном каталоге,
-        который SFX убирает за собой. Код возврата здесь не важен — важно, что
-        осталось в папке: собственная установка Adobe всё равно падает.
+        ``-s``.
 
-        Возвращает путь к найденному внутри установщику программы (``setup.exe``
-        и подобные) или пустую строку.
+        Две тонкости, из-за которых этот шаг раньше пропадал зря:
+
+        * SFX после распаковки **запускает свою программу установки**
+          (у пакета Adobe это ``Nsudo.exe`` — помощник повышения прав). Её
+          может заблокировать Защитник Windows, и тогда показывается модальное
+          окно «файл содержит вирус», а сборка ждёт мышку. Поэтому запуск
+          ограничен по времени, а процесс снимается вместе с потомками.
+        * Временный каталог SFX всё равно создаёт свой (``RarSFX0``). Ему
+          подставляется TEMP внутри папки сборки, а после запуска содержимое
+          ``RarSFX*``/``7zSFX*`` переносится в рабочую папку — даже если
+          установка внутри SFX так и не началась.
         """
         if not IS_WINDOWS or not os.path.isfile(source):
             return ""
         self.log.info(
             "Архиваторы контейнер не прочитали. Прошу распаковаться сам "
-            "установщик: WinRAR-SFX понимает «-s -d<папка>», и файлы "
-            "останутся в нашей папке, даже если его установка сразу упадёт.")
+            "установщик: WinRAR-SFX понимает «-s -d<папка>», а его программу "
+            "установки мы сразу снимем — нам нужны только файлы.")
+        sfx_temp = os.path.join(work, "_sfx_temp")
+        try:
+            os.makedirs(sfx_temp, exist_ok=True)
+        except OSError:
+            sfx_temp = ""
+        env = dict(os.environ)
+        if sfx_temp:
+            # Свой TEMP: иначе SFX распакуется в общий временный каталог, и
+            # найти его можно будет только перебором всей системы.
+            env.update({"TEMP": sfx_temp, "TMP": sfx_temp})
+        watch_roots = [sfx_temp, work] if sfx_temp else [work]
         try:
             code, output = self._run_unpacker_command(
                 [source, "-s", f"-d{work}"], unpack_log, opts,
-                progress=progress, stage="Распаковка самим установщиком")
+                progress=progress, stage="Распаковка самим установщиком",
+                env=env, deadline=adobe_mod.SFX_UNPACK_LIMIT,
+                stop_when=self._sfx_extraction_finished(watch_roots))
         except RuntimeError:
             raise
         except Exception as exc:  # noqa: BLE001 - запасной путь не должен ронять сборку
@@ -4728,7 +4769,66 @@ class Portablizer:
         self.log.debug(
             f"  • установщик-распаковщик завершился с кодом {code}"
             + (f": {tail}" if tail else ""))
+
+        # Забираем то, что SFX успел разложить. Смотрим его собственный TEMP,
+        # TEMP установщика и системные места: модуль может выбрать любое.
+        roots: List[str] = []
+        if sfx_temp:
+            roots.append(sfx_temp)
+        roots.append(work)
+        if self._install_temp_dir:
+            roots.append(self._install_temp_dir)
+        roots.extend(adobe_mod.default_temp_roots())
+        dirs = adobe_mod.find_sfx_dirs(roots)
+        if dirs:
+            copied = adobe_mod.harvest_dirs(dirs, work)
+            self.log.info(
+                "Самораспаковка разложила файлы во временный каталог "
+                f"({os.path.basename(dirs[0])}): забрал оттуда {copied} "
+                "файл(ов) — программа установки внутри SFX нам не нужна.")
+        else:
+            self.log.info(
+                "Самораспаковка не оставила файлов: SFX либо не смог "
+                "распаковаться, либо убрал за собой временный каталог.")
+        shutil.rmtree(sfx_temp, ignore_errors=True)
         return self._find_nested_setup(work)
+
+    @staticmethod
+    def _sfx_extraction_finished(roots: Sequence[str],
+                                 calm: float = 8.0) -> Callable[[], bool]:
+        """Ждёт, когда SFX перестанет писать файлы, и просит снять процесс.
+
+        SFX распаковывается, а потом запускает свою программу установки — и
+        висит, пока кто-нибудь не нажмёт «ОК» в её окне (а если программу
+        заблокировал Защитник Windows — не нажмёт никто). Нам нужны только
+        файлы, поэтому как только их общий размер перестал расти на
+        ``calm`` секунд, распаковка считается законченной.
+        """
+        state: Dict[str, float] = {"size": -1.0, "since": 0.0, "seen": 0.0}
+
+        def check() -> bool:
+            now = time.monotonic()
+            total = 0.0
+            for root in roots:
+                if not root or not os.path.isdir(root):
+                    continue
+                for current, _dirs, files in os.walk(root):
+                    for item in files:
+                        try:
+                            total += os.path.getsize(
+                                os.path.join(current, item))
+                        except OSError:
+                            continue
+            if total <= 0:
+                return False
+            if total != state["size"]:
+                state["size"] = total
+                state["since"] = now
+                state["seen"] = now
+                return False
+            return (now - state["since"]) >= calm
+
+        return check
 
     def _find_nested_setup(self, work: str) -> str:
         """Настоящий установщик внутри контейнера (SFX-обёртка над setup.exe)."""
@@ -4868,6 +4968,39 @@ class Portablizer:
         if portable_dir:
             roots.append(os.path.join(portable_dir, "_adobe_payloads"))
         roots.extend(adobe_mod.default_temp_roots())
+
+        # Внешняя оболочка Adobe — сама WinRAR-SFX: она распаковывает себя в
+        # ``RarSFX0`` и запускает оттуда установку. Если та не пошла (а её
+        # помощник повышения прав ещё и блокирует Защитник Windows —
+        # «файл содержит вирус»), распакованное всё равно остаётся на диске.
+        # Забираем его первым делом: это самый полный набор файлов.
+        sfx_dirs = adobe_mod.find_sfx_dirs(roots)
+        if sfx_dirs:
+            harvest_dir = os.path.join(portable_dir or roots[0],
+                                       "_adobe_grabbed", "sfx")
+            copied = adobe_mod.harvest_dirs(sfx_dirs, harvest_dir)
+            if copied:
+                self.log.info(
+                    "Самораспаковка установщика оставила файлы во временном "
+                    f"каталоге ({os.path.basename(sfx_dirs[0])}): забрал "
+                    f"оттуда {copied} файл(ов).")
+                harvested = adobe_mod.find_payloads(
+                    harvest_dir, installer_path=opts.installer_path)
+                if harvested.has_app_payload:
+                    self.log.info(
+                        "Из них пакеты программы: " + harvested.summary() + ".")
+                    applied = self._install_adobe_payloads(
+                        harvested, opts, app_dir, data_dir, name,
+                        portable_dir=portable_dir, console_log=console_log,
+                        progress_from=56, progress_to=58)
+                    self._adobe_source = harvest_dir
+                    if self._find_main_exe(app_dir, name):
+                        self.log.ok(
+                            "Программа собрана из файлов, распакованных самим "
+                            "установщиком, — без UWP-шага.")
+                        return True
+                roots.append(harvest_dir)
+
         layout = adobe_mod.find_payloads_in_roots(roots)
         if not layout.has_app_payload:
             self.log.debug(

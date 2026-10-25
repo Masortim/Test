@@ -578,6 +578,103 @@ def materialize(layout: AdobeLayout, app_dir: str,
     return result
 
 
+# --- распаковка самораспаковывающегося EXE -----------------------------------
+
+#: Каталоги, которые создают SFX-модули. WinRAR-SFX распаковывает содержимое
+#: в ``RarSFX0`` и запускает оттуда свою программу установки; если её запуск
+#: заблокирован (например, Защитником Windows), распакованное **остаётся** на
+#: диске — и это единственный доступ к пакетам, когда архиватор не читает
+#: архив сам.
+SFX_DIR_PREFIXES = ("rarsfx", "7zsfx", "wrar", "_sfx", "sfx")
+
+#: Сколько ждать самораспаковку: она распаковывает гигабайты, но её
+#: «программа установки» может показать окно и ждать мышку — дольше держать
+#: бессмысленно.
+SFX_UNPACK_LIMIT = 900.0
+
+
+def find_sfx_dirs(roots: Iterable[str], max_depth: int = 3) -> List[str]:
+    """Находит каталоги, в которые распаковался самораспаковывающийся EXE.
+
+    Ищутся ``RarSFX0``, ``7zSFX``, ``wrar*`` и подобные — на любой глубине
+    временного каталога: SFX может создать их и в ``%TEMP%``, и в подпапке
+    своего же временного каталога.
+    """
+    found: List[str] = []
+    seen: set = set()
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        base_depth = os.path.normpath(root).count(os.sep)
+        for current, dirs, _files in os.walk(root):
+            depth = os.path.normpath(current).count(os.sep) - base_depth
+            if depth >= max_depth:
+                dirs[:] = []
+                continue
+            keep: List[str] = []
+            for name in dirs:
+                folded = name.casefold()
+                path = os.path.join(current, name)
+                if folded.startswith(SFX_DIR_PREFIXES):
+                    key = os.path.normcase(os.path.abspath(path))
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(path)
+                    continue
+                keep.append(name)
+            dirs[:] = keep
+    return found
+
+
+def harvest_dirs(sources: Iterable[str], destination: str) -> int:
+    """Переносит распакованное SFX в рабочую папку сборки.
+
+    Содержимое копируется «как есть»: у пакета Adobe внутри лежат ``payloads``,
+    ``Setup.xml`` и сама программа установки. Единственная тонкость: если
+    внутри ровно один каталог (обычная обёртка ``RarSFX0\\XD\\...``), его
+    содержимое поднимается на уровень выше — иначе поиск пакетов не найдёт
+    ``payloads`` там, где его ждёт Adobe.
+    """
+    copied = 0
+    for source in sources:
+        if not source or not os.path.isdir(source):
+            continue
+        base = source
+        try:
+            with os.scandir(source) as scanned:
+                children = [entry for entry in scanned]
+        except OSError:
+            continue
+        directories = [entry for entry in children
+                       if _safe_is_dir(entry)]
+        if len(directories) == 1 and len(directories) == len(children):
+            base = directories[0].path
+        for current, _dirs, files in os.walk(base):
+            relative = os.path.relpath(current, base)
+            target_dir = destination if relative == "." else os.path.join(
+                destination, relative)
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except OSError:
+                continue
+            for name in files:
+                source_file = os.path.join(current, name)
+                target_file = os.path.join(target_dir, name)
+                try:
+                    shutil.copy2(source_file, target_file)
+                    copied += 1
+                except OSError:
+                    continue
+    return copied
+
+
+def _safe_is_dir(entry) -> bool:
+    try:
+        return entry.is_dir()
+    except OSError:
+        return False
+
+
 # --- сбор пакетов на лету ----------------------------------------------------
 
 class PayloadWatcher:
@@ -923,6 +1020,13 @@ def failure_hints(failure: Optional[AdobeFailure] = None,
             "из самого установщика, не запуская его."
         )
 
+    hints.append(
+        "Если Защитник Windows заблокировал помощник из пакета Adobe "
+        "(встречается Nsudo.exe: «файл содержит вирус или потенциально "
+        "нежелательную программу»), портатив всё равно собирается: "
+        "Portablizer забирает уже распакованные файлы и снимает запущенный "
+        "установщик, не дожидаясь нажатия «ОК»."
+    )
     hints.append(
         "Проверить причину на этом ПК можно так: служба «Служба "
         "развёртывания AppX» (AppXSvc) должна запускаться, а установка "
