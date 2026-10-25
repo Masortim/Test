@@ -355,12 +355,14 @@ class InstallRecordRetargetTests(unittest.TestCase):
 
     def test_app_prefix_is_replaced_for_a_missing_folder(self):
         names = exe_launcher.app_name_candidates("Baalda", "Baalda_0.1.87")
+        # Ожидание строится через Path: на Windows разделитель — «\\».
+        root = Path("E:/Backup/Apps/Portable/Baalda_0.1.87_Portable")
+        expected = str(root) + "\\App\\Baalda.exe"
         self.assertEqual(
             exe_launcher.replace_app_prefix(
                 "D:\\Portable\\Baalda_0.1.87_Portable\\App\\Baalda.exe",
-                Path("E:/Backup/Apps/Portable/Baalda_0.1.87_Portable"), names),
-            "E:/Backup/Apps/Portable/Baalda_0.1.87_Portable"
-            "\\App\\Baalda.exe")
+                root, names),
+            expected)
 
     def test_existing_foreign_prefix_is_kept(self):
         names = exe_launcher.app_name_candidates("Baalda")
