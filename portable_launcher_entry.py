@@ -5972,8 +5972,40 @@ def _winreg():
         return None
 
 
+def replace_app_prefix(value: str, current_root: Path,
+                       app_names: "Sequence[str]" = ()) -> str:
+    """Заменяет «...\\<папка>\\App\\...» на текущий ``<корень>\\App``.
+
+    Второй уровень защиты: запись об установке может помнить путь, которого
+    нет в штампе переноса (портатив собран прежней версией, штамп удалён,
+    папку скопировали вместе с чужими настройками). Тогда ориентир — сам
+    вид пути: префикс, ``App`` и остаток. Замена выполняется, только если
+    префикс **уже не существует** или его последняя папка названа как эта
+    программа (``Foo_Portable``) — соседнюю установку не переписываем.
+    """
+    text = str(value or "")
+    base = str(current_root or "").rstrip("\\/")
+    if not text or not base:
+        return text
+    match = re.match(r"^(.*?)[\\/]App[\\/](.+)$", text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return text
+    prefix, rest = match.group(1), match.group(2)
+    if not prefix:
+        return text
+    try:
+        if os.path.exists(prefix) and not _name_matches(prefix, app_names):
+            return text
+    except (OSError, ValueError):
+        return text
+    separator = "\\" if "\\" in text else "/"
+    return base + separator + "App" + separator + rest.lstrip("\\/")
+
+
 def retarget_host_install_records(stale_roots: "Sequence[str]",
-                                  current_root: Path) -> "list[str]":
+                                  current_root: Path,
+                                  app_names: "Sequence[str]" = ()
+                                  ) -> "list[str]":
     """Переводит записи об установке на текущий корень портатива.
 
     Зачем. Когда программу обновляют, установщик ищет «прошлую установку» в
@@ -5984,13 +6016,14 @@ def retarget_host_install_records(stale_roots: "Sequence[str]",
     оказывается по старому адресу, а в текущей папке ничего не меняется.
 
     Меняются **только** значения, указывающие внутрь известных прежних мест
-    этой же портативной папки; путь программы заменяется текущим корнем.
+    этой же портативной папки (или — при совпадении имени программы — внутрь
+    несуществующей папки ``...\\App``). Путь заменяется текущим корнем.
     Ничего не удаляется: запись остаётся рабочей, просто ведёт туда, где
     портатив лежит сейчас.
 
     Возвращает список изменённых значений (``<ключ> :: <имя>``) для журнала.
     """
-    if not IS_WINDOWS or not stale_roots:
+    if not IS_WINDOWS:
         return []
     reg = _winreg()
     if reg is None:
@@ -6014,33 +6047,60 @@ def retarget_host_install_records(stale_roots: "Sequence[str]",
             try:
                 with reg.OpenKey(hive, subkey, 0, access) as key:
                     changed.extend(_retarget_key_values(
-                        reg, key, subkey, stale_roots, current_root))
+                        reg, key, subkey, stale_roots, current_root,
+                        app_names, subkey_name=name))
             except OSError:
                 continue
     return changed
 
 
 def _retarget_key_values(reg, key, subkey: str, stale_roots: "Sequence[str]",
-                         current_root: Path) -> "list[str]":
+                         current_root: Path, app_names: "Sequence[str]" = (),
+                         subkey_name: str = "") -> "list[str]":
     """Правит значения одного ключа; возвращает изменённые имена."""
-    changed: "list[str]" = []
+    values: "list[tuple[str, str, int]]" = []
     index = 0
     while True:
         try:
-            value_name, value, kind = reg.EnumValue(key, index)
+            name, value, kind = reg.EnumValue(key, index)
         except OSError:
             break
         index += 1
+        values.append((name, value, kind))
+
+    display = ""
+    for name, value, kind in values:
+        if str(name).casefold() == "displayname" and isinstance(value, str):
+            display = value
+            break
+    names = [str(item) for item in app_names if str(item).strip()]
+    #: Запись принадлежит этой программе: по DisplayName или по имени ключа
+    #: (``App Paths\\Foo.exe``).
+    belongs = any(
+        set(app_name_candidates(candidate)) & set(names)
+        for candidate in (display, subkey_name)
+        if candidate
+    )
+
+    changed: "list[str]" = []
+    for name, value, kind in values:
         if kind not in (reg.REG_SZ, reg.REG_EXPAND_SZ) or not isinstance(value, str):
             continue
-        fixed = retarget_record_text(value, stale_roots, str(current_root))
+        fixed = value
+        if stale_roots:
+            fixed = retarget_record_text(fixed, stale_roots, str(current_root))
+        if fixed == value and belongs:
+            # Имя программы совпало, а путь остался прежним: заменяем
+            # «...\\папка\\App\\...» на текущий корень, если тот префикс
+            # уже не существует.
+            fixed = replace_app_prefix(fixed, current_root, names)
         if fixed == value:
             continue
         try:
-            reg.SetValueEx(key, value_name, 0, kind, fixed)
+            reg.SetValueEx(key, name, 0, kind, fixed)
         except OSError:
             continue
-        changed.append(f"{subkey} :: {value_name or '(default)'}")
+        changed.append(f"{subkey} :: {name or '(default)'}")
     return changed
 
 
@@ -6522,6 +6582,180 @@ def adopt_from_redirected_profile(root: Path, cfg: Dict[str, Any], stage: Path,
             if copied:
                 return copied
     return []
+
+
+# --- обновление, поставленное в ПРЕЖНЕЕ место портатива -----------------------
+
+#: Файл с временем начала сеанса: по нему видно, что появилось ЗА сеанс.
+SESSION_MARKER_NAME = "session-start.json"
+
+#: Журнал перенесённых файлов (для журнала лончера и разбора).
+ADOPTED_LOG_NAME = "adopted-from-previous.log"
+
+
+def _session_marker(root: Path) -> Path:
+    return _data_dir(root, {}) / SESSION_MARKER_NAME
+
+
+def _read_session_start(root: Path) -> float:
+    """Время начала прошлого сеанса (0.0, если отметки нет)."""
+    try:
+        data = json.loads(_session_marker(root).read_text(encoding="utf-8"))
+        return float(data.get("started", 0.0) or 0.0)
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
+def write_session_start(root: Path,
+                        started: "Optional[float]" = None) -> float:
+    """Отмечает начало сеанса; возвращает записанное время."""
+    import time
+
+    moment = time.time() if started is None else float(started)
+    try:
+        path = _session_marker(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "started": moment,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S",
+                                        time.localtime(moment)),
+            "pid": os.getpid(),
+            "root": str(root),
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return moment
+
+
+def _same_size_different_content(left: Path, right: Path) -> bool:
+    """Сравнивает файлы, когда размер и время совпали (грубая ФС)."""
+    try:
+        with left.open("rb") as one, right.open("rb") as two:
+            while True:
+                block = one.read(65536)
+                if block != two.read(65536):
+                    return True
+                if not block:
+                    return False
+    except OSError:
+        return False
+
+
+def _same_app_location(cfg: "Optional[Dict[str, Any]]", candidate: Path) -> bool:
+    """Прежнее место принадлежит этой же портативной программе.
+
+    Рядом на диске может лежать другой портатив (соседняя папка, другая
+    программа). Его ``App`` — не источник обновления: там свои файлы.
+    Сверяем имя программы и файл запуска из ``launcher_config.json``.
+    """
+    try:
+        with (candidate / "launcher_config.json").open(
+                "r", encoding="utf-8-sig") as handle:
+            other = json.load(handle)
+    except (OSError, ValueError):
+        return True  # своей настройки нет — доверяем штампу переноса
+    if not isinstance(other, dict) or not cfg:
+        return True
+    for key in ("target_exe_rel", "app_name"):
+        mine = str((cfg or {}).get(key) or "").strip().casefold()
+        theirs = str(other.get(key) or "").strip().casefold()
+        if mine and theirs and mine != theirs:
+            return False
+    return True
+
+
+def stale_app_dirs(root: Path,
+                   cfg: "Optional[Dict[str, Any]]" = None) -> "list[Path]":
+    """Каталоги ``App`` в прежних местах этой же портативной папки."""
+    found: "list[Path]" = []
+    for item in remembered_roots(root, cfg):
+        candidate = Path(item)
+        app = candidate / "App"
+        if not app.is_dir():
+            continue
+        if app.resolve() == (root / "App").resolve():
+            continue
+        if not _same_app_location(cfg, candidate):
+            continue
+        found.append(app)
+    return found
+
+
+def adopt_updates_from_previous_locations(root: Path,
+                                          cfg: "Optional[Dict[str, Any]]" = None,
+                                          since: float = 0.0,
+                                          backup: "Optional[Path]" = None
+                                          ) -> "list[str]":
+    """Забирает в ``App`` файлы, которые обновление положило в прежнее место.
+
+    Жалоба: портатив собран в ``D:\\Portable\\Baalda_0.1.87_Portable``,
+    папку перенесли в ``E:\\Backup\\Apps\\Portable``, а встроенное
+    обновление программы поставило новую версию **по прежнему адресу**
+    (``D:\\Portable\\Baalda_0.1.87_Portable\\App``). Предотвратить это
+    удаётся не всегда: установщик может запускать сама программа, со своим
+    файлом ответов и своим пониманием «прошлой установки». Поэтому лончер
+    дополнительно **забирает** свежие файлы из прежнего места в текущее —
+    обновление оказывается там, где портатив лежит сейчас.
+
+    Копируются только файлы, изменённые после ``since`` (начало сеанса):
+    то, что лежало в старой копии давно, не переносится. Заменяемые файлы
+    сохраняются в ``Updates\\backup-previous`` — откат возможен вручную.
+    Файлы прежнего места не удаляются: это решает пользователь.
+    """
+    app_dir = root / "App"
+    if not app_dir.is_dir() or since <= 0:
+        return []
+    backup = backup or (root / UPDATE_DIR_NAME / "backup-previous")
+    protected = {"launchportable.exe", "saves"}
+    copied: "list[str]" = []
+    for stale_app in stale_app_dirs(root, cfg):
+        for current, dirs, files in os.walk(stale_app):
+            dirs[:] = [name for name in dirs
+                       if name.casefold() not in ("saves", "portabledata",
+                                                  "updates")]
+            for name in sorted(files):
+                source = Path(current) / name
+                try:
+                    stat = source.stat()
+                except OSError:
+                    continue
+                if stat.st_mtime < since - STALE_MTIME_GRACE:
+                    continue
+                relative = source.relative_to(stale_app)
+                if relative.parts and relative.parts[0].casefold() in protected:
+                    continue
+                destination = app_dir / relative
+                try:
+                    if destination.exists():
+                        target_stat = destination.stat()
+                        if (target_stat.st_size == stat.st_size
+                                and target_stat.st_mtime >= stat.st_mtime
+                                and not _same_size_different_content(
+                                    source, destination)):
+                            continue
+                        saved = backup / relative
+                        if not saved.exists():
+                            saved.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(destination, saved)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+                except OSError:
+                    continue
+                copied.append(str(relative).replace("\\", "/"))
+    if copied:
+        log = _data_dir(root, {}) / ADOPTED_LOG_NAME
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"[{__import__('time').strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"adopted {len(copied)} file(s) from the previous "
+                    f"location into {app_dir}\n")
+                for item in copied:
+                    handle.write("  " + item + "\n")
+        except OSError:
+            pass
+    return copied
 
 
 def _report_removed_shortcuts(root: Path, removed: "Sequence[str]") -> None:
@@ -7131,6 +7365,9 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
 
 def _run_session(argv: Optional[Sequence[str]], root: Path,
                  cfg: Dict[str, Any], watch: "UpdateWatch") -> int:
+    #: Время начала сеанса (0.0, пока программа не запущена): по нему
+    #: определяется, что установщик положил в прежнее место портатива.
+    session_start = 0.0
     # Самопроверка профиля: прерванный прошлый сеанс мог оставить Known Folder
     # «Документы» направленным внутрь уже удалённой папки портатива. Это ломает
     # сохранения и меню «Пуск», а стоит проверка один запрос к реестру.
@@ -7145,6 +7382,37 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             _run_log(root, line)
     except Exception as exc:  # noqa: BLE001 - починка не срывает запуск
         _run_log(root, f"paths: repair failed ({exc})")
+
+    # Записи об установке на этом ПК (`InstallLocation`, `App Paths`,
+    # `UninstallString` и т. п.) могли остаться от прежнего места портатива:
+    # именно оттуда установщик берёт «прошлую установку» и ставит новую
+    # версию по старому адресу. Перед запуском переводим их на текущий корень
+    # — обновление, которое запустит сама программа, попадёт в эту папку.
+    try:
+        moved = retarget_host_install_records(remembered_roots(root, cfg), root)
+        for item in moved:
+            _run_log(root, "install records: previous location now points to "
+                           f"{root}: {item}")
+    except Exception as exc:  # noqa: BLE001 - реестр не срывает запуск
+        _run_log(root, f"install records: retarget failed ({exc})")
+
+    # Обновление, поставленное в прежнее место портатива (в том числе
+    # предыдущим сеансом, который закрыли аварийно), забирается в App — до
+    # того, как программа прочитает свои файлы.
+    try:
+        previous_start = _read_session_start(root)
+        if previous_start:
+            adopted = adopt_updates_from_previous_locations(
+                root, cfg, since=previous_start)
+            if adopted:
+                _run_log(
+                    root, f"update: adopted {len(adopted)} file(s) that the "
+                    "installer put into the previous location of this "
+                    "portable: " + ", ".join(adopted[:8])
+                    + (" ..." if len(adopted) > 8 else ""))
+    except Exception as exc:  # noqa: BLE001 - перенос не срывает запуск
+        _run_log(root, f"update: adoption from the previous location failed "
+                       f"({exc})")
 
     # «Пустые» ярлыки этой программы на рабочем столе. Установщик мог
     # записать в ярлык путь временного каталога, которого уже нет, или путь
@@ -7292,6 +7560,10 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     for line in shared_saves.before():
         _run_log(root, "shared saves: " + line)
 
+    # Время начала сеанса: по нему определяется, что установщик (в том числе
+    # запущенный самой программой) положил в прежнее место портатива.
+    session_start = write_session_start(root)
+
     shell_folders = ShellFolderSession(root, cfg)
     registry = RegistrySession(root, cfg)
     shutdown = shutdown_settings(cfg)
@@ -7401,6 +7673,28 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
         removed = purge_portable_temp(root, cfg)
         if removed:
             _run_log(root, f"cleared the portable temp folder ({removed})")
+        # Обновление, поставленное в прежнее место портатива, переносится в
+        # текущую папку: пользователь должен получить новую версию там, где
+        # портатив лежит сейчас, а не на прежнем диске.
+        try:
+            adopted = adopt_updates_from_previous_locations(
+                root, cfg, since=session_start)
+            if adopted:
+                _run_log(
+                    root, f"update: the installer wrote {len(adopted)} file(s) "
+                    "into the previous location of this portable; they are "
+                    "copied into the current App: " + ", ".join(adopted[:8])
+                    + (" ..." if len(adopted) > 8 else ""))
+                _show_info(
+                    "Обновление установилось не в эту папку, а по прежнему "
+                    "адресу портатива.\n\n"
+                    f"Свежие файлы ({len(adopted)}) уже скопированы в текущую "
+                    "папку App, прежние версии — в Updates\\backup-previous.\n\n"
+                    "Запустите программу ещё раз, чтобы работать с новой "
+                    "версией. Старую папку на прежнем диске можно удалить: она "
+                    "больше не нужна.")
+        except Exception as exc:  # noqa: BLE001 - уже закрываемся
+            _run_log(root, f"update: adoption at exit failed ({exc})")
         _report_folder_state(root, shutdown)
 
 

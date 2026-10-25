@@ -353,6 +353,104 @@ class InstallRecordRetargetTests(unittest.TestCase):
             self.assertEqual(exe_launcher.retarget_host_install_records(
                 ["D:\\Apps\\Foo"], Path("E:/Foo")), [])
 
+    def test_app_prefix_is_replaced_for_a_missing_folder(self):
+        names = exe_launcher.app_name_candidates("Baalda", "Baalda_0.1.87")
+        self.assertEqual(
+            exe_launcher.replace_app_prefix(
+                "D:\\Portable\\Baalda_0.1.87_Portable\\App\\Baalda.exe",
+                Path("E:/Backup/Apps/Portable/Baalda_0.1.87_Portable"), names),
+            "E:/Backup/Apps/Portable/Baalda_0.1.87_Portable"
+            "\\App\\Baalda.exe")
+
+    def test_existing_foreign_prefix_is_kept(self):
+        names = exe_launcher.app_name_candidates("Baalda")
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "Other"
+            prefix.mkdir()
+            value = str(prefix) + "\\App\\x.exe"
+            self.assertEqual(
+                exe_launcher.replace_app_prefix(value, Path("E:/Foo"), names),
+                value)
+
+
+class PreviousLocationAdoptionTests(unittest.TestCase):
+    """Обновление поставилось в ПРЕЖНЕЕ место — файлы забираются в текущее.
+
+    Сценарий из жалобы: портатив собран в ``D:\\Portable\\Baalda_0.1.87_Portable``,
+    папку перенесли в ``E:\\Backup\\Apps\\Portable``, а обновление (его
+    запускает сама программа) поставило новую версию по прежнему адресу.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = make_portable(self._tmp.name)
+        self.previous = Path(self._tmp.name) / "D" / "Ollama_Portable"
+        (self.previous / "App").mkdir(parents=True)
+        _write(self.previous / "launcher_config.json", json.dumps(OLLAMA_CFG))
+        exe_launcher.write_paths_stamp(self.root, previous=str(self.previous))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _touch(self, relative: str, text: str) -> Path:
+        return _write(self.previous / "App" / relative, text)
+
+    def test_fresh_files_from_the_previous_location_are_copied(self):
+        import time
+
+        started = time.time() - 1
+        self._touch("ollama app.exe", "new-app")
+        self._touch("lib/ollama/new.dll", "new-lib")
+        copied = exe_launcher.adopt_updates_from_previous_locations(
+            self.root, OLLAMA_CFG, since=started)
+        self.assertEqual(sorted(copied), ["lib/ollama/new.dll", "ollama app.exe"])
+        self.assertEqual((self.root / "App" / "ollama app.exe").read_text(),
+                         "new-app")
+        self.assertTrue((self.root / "App" / "lib" / "ollama" / "new.dll").is_file())
+
+    def test_old_files_of_the_previous_copy_are_ignored(self):
+        # Файл лежит в прежней папке давно: это не результат обновления.
+        self._touch("ollama app.exe", "ancient")
+        copied = exe_launcher.adopt_updates_from_previous_locations(
+            self.root, OLLAMA_CFG, since=9_999_999_999)
+        self.assertEqual(copied, [])
+        self.assertEqual((self.root / "App" / "ollama app.exe").read_text(),
+                         "old-app")
+
+    def test_replaced_files_are_backed_up(self):
+        import time
+
+        self._touch("ollama app.exe", "new-app")
+        exe_launcher.adopt_updates_from_previous_locations(
+            self.root, OLLAMA_CFG, since=time.time() - 1)
+        backup = self.root / "Updates" / "backup-previous" / "ollama app.exe"
+        self.assertEqual(backup.read_text(), "old-app", "прежняя версия сохранена")
+
+    def test_launcher_is_never_overwritten(self):
+        import time
+
+        self._touch("LaunchPortable.exe", "hijacked")
+        copied = exe_launcher.adopt_updates_from_previous_locations(
+            self.root, OLLAMA_CFG, since=time.time() - 1)
+        self.assertNotIn("LaunchPortable.exe", copied)
+        self.assertEqual((self.root / "App" / "LaunchPortable.exe").read_text(),
+                         "launcher")
+
+    def test_session_marker_roundtrip(self):
+        started = exe_launcher.write_session_start(self.root)
+        self.assertGreater(started, 0)
+        self.assertEqual(exe_launcher._read_session_start(self.root), started)
+
+    def test_previous_location_of_another_program_is_ignored(self):
+        other = Path(self._tmp.name) / "Other" / "Other_Portable"
+        (other / "App").mkdir(parents=True)
+        _write(other / "launcher_config.json", json.dumps(OPENCODE_CFG))
+        _write(other / "App" / "ollama app.exe", "foreign")
+        exe_launcher.write_paths_stamp(self.root, previous=str(other))
+        copied = exe_launcher.adopt_updates_from_previous_locations(
+            self.root, OLLAMA_CFG, since=1.0)
+        self.assertEqual(copied, [], "чужая папка не источник обновления")
+
 
 class UpdatePortabilityTests(unittest.TestCase):
     """Обновление ставится в папку портатива на том диске, где он лежит сейчас."""
