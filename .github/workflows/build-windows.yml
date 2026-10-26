@@ -96,6 +96,31 @@ jobs:
           }
           exit $testStatus
 
+      # Регрессия 1.20.0: собранный exe не запускался вовсе — на импорте
+      # вызывался inspect.getsource, а исходников в PyInstaller-сборке нет
+      # ("OSError: could not get source code"). Юнит-тесты этого не видели:
+      # они всегда шли из исходников. Здесь запускается именно собранный exe.
+      - name: Smoke test - the built Portablizer.exe starts
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "portablizer-crash.log"
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $env:PORTABLIZER_CRASH_LOG = $log
+          # --version: тот же путь импорта, что и у окна, но без GUI.
+          $output = & .\dist\Portablizer.exe --version 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          if (Test-Path $log) {
+            Write-Host "::error title=Portablizer.exe did not start::"
+            Get-Content $log -Tail 40 | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+          if ($code -ne 0) {
+            Write-Host "::error title=Portablizer.exe exited with $code::"
+            Write-Host $output
+            exit 1
+          }
+          Write-Host "Portablizer.exe started: $($output.Trim())"
+
       - name: Smoke test portable App EXE
         shell: pwsh
         run: |
