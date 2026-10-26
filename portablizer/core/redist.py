@@ -1821,6 +1821,100 @@ def installer_prompt_should_dismiss(title: str, body: str = "") -> bool:
     return False
 
 
+def pending_dialog_titles(pids: "Optional[Sequence[int]]" = None,
+                          limit: int = 5) -> List[str]:
+    """Заголовки видимых диалогов установщика, которые держат его в ожидании.
+
+    Используется только для диагноза: Portablizer такие окна **не нажимает**.
+    У незнакомой кнопки может быть разрушительный смысл («Удалить всё»), а
+    вот сказать человеку «установщик показывает окно „Неверная операция
+    командной строки“ и ждёт ОК» — обязательно: без этого сборка сообщает
+    лишь «нет признаков работы», и причину приходится искать наугад.
+
+    Что попадает в список:
+
+    * видимые окна класса ``#32770`` (стандартный диалог Windows) с хотя бы
+      одной кнопкой;
+    * только окна процессов из ``pids`` — окна чужих программ не наше дело;
+    * **без** полосы прогресса ``msctls_progress32``: окно хода установки с
+      кнопкой «Отмена» — это не вопрос, а нормальная работа.
+
+    Вне Windows возвращается пустой список.
+    """
+    if not IS_WINDOWS:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
+        return []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                     wintypes.LPARAM)
+    wanted = {int(pid) for pid in (pids or ()) if pid}
+    found: List[str] = []
+    seen: set = set()
+
+    def window_text(hwnd) -> str:  # noqa: ANN001 - WinAPI-дескриптор
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value or ""
+
+    def class_name(hwnd) -> str:  # noqa: ANN001 - WinAPI-дескриптор
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        return buf.value or ""
+
+    def pid_of(hwnd) -> int:  # noqa: ANN001 - WinAPI-дескриптор
+        try:
+            value = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(value))
+            return int(value.value)
+        except Exception:  # noqa: BLE001 - cross-process probe
+            return 0
+
+    def each_top(hwnd, _lparam):  # noqa: ANN001 - колбэк EnumWindows
+        if len(found) >= limit:
+            return False
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if wanted and pid_of(hwnd) not in wanted:
+            return True
+        if class_name(hwnd) != "#32770":
+            return True
+        state = {"buttons": 0, "progress": False}
+
+        def collect(child, _lp):  # noqa: ANN001 - колбэк EnumChildWindows
+            cap = class_name(child).lower()
+            if "button" in cap:
+                state["buttons"] += 1
+            elif "msctls_progress32" in cap:
+                state["progress"] = True
+            return True
+
+        user32.EnumChildWindows(hwnd, WNDENUMPROC(collect), 0)
+        if state["progress"] or not state["buttons"]:
+            return True
+        title = " ".join(window_text(hwnd).split())
+        if not title and not state["buttons"]:
+            return True
+        key = title.casefold()
+        if key in seen:
+            return True
+        seen.add(key)
+        found.append(title or "окно без заголовка")
+        return True
+
+    try:
+        user32.EnumWindows(WNDENUMPROC(each_top), 0)
+    except Exception:  # noqa: BLE001 - WinAPI не вправе ронять сборку
+        return found
+    return found
+
+
 def _dismiss_installer_dialogs(
         counter: "Optional[Dict[str, int]]" = None,
         target_dir: str = "",
