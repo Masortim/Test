@@ -1541,6 +1541,13 @@ _PATH_DIALOG_HINTS = (
     "установить в папку", "куда установить", "выберите папку",
     "install directory", "install location", "destination folder",
     "install folder", "select destination",
+    # Multitran и похожие репаки: «Select directory to install Multitran» —
+    # ключевого слова «install directory» там нет, а страница всё равно
+    # требует выбора каталога и не пропускает папку по умолчанию.
+    "directory to install", "select a directory", "select the directory",
+    "select directory", "choose directory", "installation directory",
+    "директорию для установки", "папку для установки", "директорию установки",
+    "выберите директорию",
 )
 #: Заголовки/тексты общих диалогов согласия установщика.
 _CONFIRM_DIALOG_HINTS = (

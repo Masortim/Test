@@ -3512,8 +3512,13 @@ class Portablizer:
                     # target_dir — чтобы на странице выбора папки ввести
                     # путь в App, а не согласиться с C:\\Program Files.
                     # pids — чтобы не трогать окна чужих программ.
+                    # Планов, которые намеренно отдают выбор каталога
+                    # установщику (prefers_installer_default_dir), App во
+                    # вкладку выбора папки не вбиваем: внутренний мастер
+                    # его отклоняет («folder is not accessible») и зависает.
+                    dialog_target = "" if plan.prefers_installer_default_dir else app_dir
                     clicked = redist_mod._dismiss_installer_dialogs(
-                        tally, target_dir=app_dir, pids=tree_pids,
+                        tally, target_dir=dialog_target, pids=tree_pids,
                         state=dialog_state)
                 except TypeError:
                     # Совместимость с заменённой/старой реализацией:
@@ -4568,10 +4573,23 @@ class Portablizer:
             if result is not None:
                 shutil.rmtree(work, ignore_errors=True)
                 return result
-            # Настоящий установщик был, но программу не поставил (например,
-            # ему нужен мастер). Переносить в App его собственные файлы
-            # бессмысленно: там окажется setup.exe, а не программа. Обычная
-            # лестница ключей и распаковка ниже разберутся дальше сами.
+            # Настоящий установщик был, но программу не поставил: либо не
+            # прошёл ни один ключ тишины, либо открыл свой мастер, не
+            # принял переданный путь и завис/вылетел. Перед тем как
+            # бросать распакованное содержимое, даём два отката:
+            # 1) переносим в App само содержимое контейнера, если там
+            #    уже лежит запускаемая программа (у Multitran — файлы
+            #    словаря); 2) достаём payload вложенного контейнера
+            #    (Inno Setup/NSIS) без запуска распаковщиком. Голый
+            #    setup.exe в App не переносим — это не программа.
+            if self._promote_container_payload(
+                    work, app_dir, name, nested):
+                shutil.rmtree(work, ignore_errors=True)
+                return 0, None
+            if self._promote_nested_installer_payload(
+                    nested, app_dir, portable_dir, name):
+                shutil.rmtree(work, ignore_errors=True)
+                return 0, None
             self.log.warn(
                 "Установщик изнутри архива не дал файлов программы. "
                 "Распакованное удаляю, чтобы не занимать гигабайты, и "
@@ -4777,6 +4795,7 @@ class Portablizer:
                        "каталога по умолчанию."],
                 label="Inno Setup внутри SFX без /DIR" + label_suffix,
                 output_dir=app_dir, ignores_target_dir=True,
+                prefers_installer_default_dir=True,
             ))
         elif kind == InstallerType.NSIS:
             plans.append(SilentPlan(
@@ -4842,7 +4861,14 @@ class Portablizer:
                 self.log.ok(f"Сработал сценарий: {plan.label}")
                 return rc, plan
             if plan.ignores_target_dir and recover is not None:
-                if rc in (0, 3010, redist_mod.TIMEOUT_EXIT_CODE) and recover():
+                # Установщик мог поставить программу в каталог по
+                # умолчанию и завершиться нестандартным кодом — особенно
+                # когда он провёл весь мастер через диалоги и вернул 1.
+                # recover() сам ничего не переносит, если не нашёл нового
+                # каталога с именем программы, поэтому зовём без gate по
+                # коду выхода: иначе готовая установка остаётся лежать
+                # в Program Files, а App остаётся пустым.
+                if recover():
                     self.log.ok(
                         "Программа установлена в каталог по умолчанию и "
                         f"перенесена в App. Сценарий: {plan.label}"
@@ -4851,6 +4877,123 @@ class Portablizer:
         return None
 
     # -- распаковка без запуска ------------------------------------------------
+    #: Запускаемые, которые не могут быть «главной программой» при переносе
+    #: распакованного содержимого контейнера: это установщики и их
+    #: служебные утилиты. Их в App переносить нельзя — получается пустой
+    #: портатив, который запускает опять же установщик.
+    _PAYLOAD_INSTALLER_NAMES = frozenset({
+        "setup.exe", "install.exe", "installer.exe", "uninstall.exe",
+        "unins000.exe", "unins001.exe", "setup.bin", "install.bin",
+        "installshield.exe", "vc_redist.exe", "vcredist.exe",
+    })
+
+    @classmethod
+    def _container_payload_program_exe(cls, work: str, name: str,
+                                       nested: str) -> Optional[str]:
+        """Запускаемая программа среди распакованного содержимого контейнера.
+
+        Имя вложенного установщика (``setup.exe``) и прочие имена
+        установщиков исключаются: перенесённый голый установщик — не
+        программа.
+        """
+        best = None
+        best_score = 0
+        for root, _dirs, files in os.walk(work):
+            for f in files:
+                if not f.lower().endswith(".exe"):
+                    continue
+                path = os.path.join(root, f)
+                if os.path.abspath(path) == os.path.abspath(nested):
+                    continue
+                base = f.lower()
+                if base in cls._PAYLOAD_INSTALLER_NAMES or base.startswith("unins"):
+                    continue
+                stem = os.path.splitext(f)[0]
+                score = cls._app_name_score(stem, name)
+                try:
+                    score -= os.path.relpath(path, work).count(os.sep) * 2
+                except ValueError:
+                    pass
+                if score > best_score:
+                    best, best_score = path, score
+        return best
+
+    def _promote_container_payload(self, work: str, app_dir: str,
+                                   name: str, nested: str) -> bool:
+        """Переносим распакованное содержимое контейнера в App.
+
+        Только если внутри уже лежит запускаемая программа: у обёрток
+        вроде Multitran это файлы словаря, а не только setup.exe. Внутренний
+        установщик в App не переносится (``installer_path=nested``).
+        """
+        if self._container_payload_program_exe(work, name, nested) is None:
+            return False
+        try:
+            copied = unpacker_mod.promote_payload(
+                work, app_dir, installer_path=nested)
+        except Exception as exc:  # noqa: BLE001 - перенос не должен ронять сборку
+            self.log.warn(f"Перенос содержимого контейнера в App не удалось: {exc}")
+            return False
+        main_exe = self._find_main_exe(app_dir, name)
+        base = os.path.basename(main_exe or "").lower()
+        if not main_exe or base in self._PAYLOAD_INSTALLER_NAMES or base.startswith("unins"):
+            return False
+        self._unpacked_with = "sfx-content"
+        self.log.ok(
+            "Файлы программы из содержимого контейнера перенесены в App "
+            f"({copied} файлов)."
+        )
+        return True
+
+    def _promote_nested_installer_payload(self, nested: str, app_dir: str,
+                                          portable_dir: str, name: str) -> bool:
+        """Достаём payload вложенного контейнера БЕЗ запуска установщика.
+
+        Внутренний Inno Setup/NSIS — обычный контейнер; установленный
+        распаковщик читает его напрямую, код установщика не выполняется,
+        так что он не спрашивает App и не ломает сборку своим мастером.
+        """
+        kind = self._nested_installer_kind(nested)
+        if kind not in (InstallerType.INNO, InstallerType.NSIS):
+            return False
+        unpacker = unpacker_mod.find_unpacker()
+        if not unpacker:
+            self.log.info(
+                "Распаковщик (7-Zip) на этом компьютере не найден: достать "
+                "содержимое вложенного установщика без запуска нечем."
+            )
+            return False
+        work = os.path.join(portable_dir, "_nested_unpacked")
+        shutil.rmtree(work, ignore_errors=True)
+        self.log.info(
+            "Достаю содержимое вложенного установщика без его запуска: "
+            f"{os.path.basename(unpacker)} читает такие контейнеры напрямую."
+        )
+        try:
+            ok, message = unpacker_mod.unpack_installer(
+                unpacker, nested, app_dir, work, installer_path=nested)
+        except Exception as exc:  # noqa: BLE001 - распаковка не должна ронять сборку
+            self.log.warn(f"Распаковка вложенного установщика не удалось: {exc}")
+            return False
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        if not ok:
+            self.log.warn(
+                "Содержимое вложенного установщика без запуска не дало "
+                f"файлов программы: {message}"
+            )
+            return False
+        main_exe = self._find_main_exe(app_dir, name)
+        base = os.path.basename(main_exe or "").lower()
+        if not main_exe or base in self._PAYLOAD_INSTALLER_NAMES or base.startswith("unins"):
+            return False
+        self._unpacked_with = unpacker
+        self.log.ok(
+            "Содержимое вложенного установщика достали без запуска — "
+            f"файлы программы в App ({message})."
+        )
+        return True
+
     def _unpacker_worth_trying(self, det: DetectionResult) -> bool:
         """Есть ли смысл доставать содержимое установщика распаковщиком."""
         return det.installer_type in UNPACKABLE_TYPES

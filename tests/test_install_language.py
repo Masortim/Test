@@ -1097,6 +1097,19 @@ class DialogDetectionTests(unittest.TestCase):
         self.assertFalse(red.installer_prompt_looks_like_path_consent(
             "", ""))
 
+    def test_path_consent_detected_multitran_directory_page(self):
+        # Screenshot, ради которого добавлено: Multitran показывает
+        # «Select directory to install Multitran» — ни одного слова
+        # «install directory»/«install location» там нет, а страница
+        # всё равно требует выбора каталога и не пропускает по умолчанию.
+        red = redist_mod
+        self.assertTrue(red.installer_prompt_looks_like_path_consent(
+            "Multitran Multilingual single-user version",
+            "Select directory to install Multitran"))
+        self.assertTrue(red.installer_prompt_should_dismiss(
+            "Multitran Multilingual single-user version",
+            "Select directory to install Multitran"))
+
     def test_general_confirm_detected(self):
         red = redist_mod
         self.assertTrue(red.installer_prompt_looks_like_general_confirm(
