@@ -1830,6 +1830,75 @@ class RegistryLocationTests(unittest.TestCase):
         after = {r"HKCU\Software\X": {"InstallLocation": repr(r"C:\X")}}
         self.assertIn(r"C:\X", registry.changed_install_locations(before, after))
 
+    def test_extracts_local_paths_from_custom_app_registry_keys(self):
+        before = {}
+        after = {
+            r"HKCU\Software\Multitran\Directories": {
+                "MainDir": (registry.REG_SZ, repr(r"E:\Backup\Apps\Portable\Multitran 03.11.2023")),
+                "ExeFile": (registry.REG_SZ, repr(r"C:\Multitran\network.exe")),
+            },
+        }
+        locations = registry.changed_install_locations(before, after)
+        self.assertIn(r"E:\Backup\Apps\Portable\Multitran 03.11.2023", locations)
+        self.assertIn(r"C:\Multitran\network.exe", locations)
+
+    def test_retarget_install_paths_rewrites_extra_recovered_roots(self):
+        key = r"HKCU\Software\Multitran\Directories"
+        old_src = r"E:\Backup\Apps\Portable\Multitran 03.11.2023"
+        old_c = r"C:\Multitran"
+        app_dir = r"E:\Backup\Apps\Portable\Multitran 03.11.2023\Multitran_Portable\App"
+        snapshot = {
+            key: {
+                "DictPath": (registry.REG_SZ, repr(old_src + r"\eng.erd")),
+                "ShellExe": (registry.REG_SZ, repr(old_c + r"\network.exe")),
+            },
+        }
+        moved = registry.retarget_install_paths(
+            snapshot, [key], app_dir, extra_roots=[old_src, old_c]
+        )
+        text = registry.render_keys(moved, [key])
+        self.assertIn(r"Multitran_Portable\\App\\eng.erd", text)
+        self.assertIn(r"Multitran_Portable\\App\\network.exe", text)
+
+    def test_unpacked_distribution_with_generic_setup_recovers_on_first_attempt(self):
+        class FakeMultitran(Portablizer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.calls.append(plan)
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            dist = Path(temp, "Multitran 03.11.2023")
+            dist.mkdir(parents=True)
+            setup = dist / "setup.exe"
+            _fake_pe(str(setup), [".text", ".rdata", ".data", ".rsrc"], b"custom setup")
+            (dist / "network.exe").write_bytes(b"MZ" + b"x" * 2048)
+            (dist / "eng.erd").write_bytes(b"dictionary-payload")
+
+            engine = FakeMultitran(Logger())
+            opts = PortableOptions(
+                installer_path=str(setup),
+                output_dir=str(dist),
+                app_name="Multitran",
+                capture_registry=False,
+                bundle_runtimes=False,
+            )
+            res = engine.run(opts)
+            self.assertTrue(res.success, "; ".join(res.messages))
+            self.assertEqual(len(engine.calls), 1)
+            app_dir = Path(res.portable_dir, "App")
+            self.assertTrue((app_dir / "network.exe").is_file())
+            self.assertTrue((app_dir / "eng.erd").is_file())
+            self.assertFalse((app_dir / "setup.exe").exists())
+            self.assertFalse((app_dir / "Multitran_Portable").exists())
+            # Исходная папка пользователя не должна быть удалена!
+            self.assertTrue(dist.is_dir())
+            self.assertTrue(setup.is_file())
+            self.assertTrue((dist / "network.exe").is_file())
+
 
 def _fake_pe(path, sections, payload=b"", dotnet=False):
     """Пишет минимальный, но структурно валидный PE-файл.

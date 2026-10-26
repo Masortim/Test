@@ -798,7 +798,8 @@ def virtualize_machine_snapshot(snapshot: Mapping[str, Mapping[str, object]],
 
 
 def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
-                           keys: Iterable[str], app_dir: str) -> Snapshot:
+                           keys: Iterable[str], app_dir: str,
+                           extra_roots: Sequence[str] = ()) -> Snapshot:
     """Перенаправляет захваченные пути установки в портативную ``App``.
 
     Некоторые установщики (в частности старые игры) не принимают переданную
@@ -810,10 +811,8 @@ def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
     закрывается.
 
     Меняются только общеупотребительные значения каталога установки в явно
-    выбранных ключах приложения. Остальные строковые значения того же ключа
-    (например ``LAUNCHCOMMAND``) получают замену старого корня на новый. Для
-    GOG-подобной схемы значение ``EXE`` считается каталогом только когда рядом
-    присутствует ``EXEFILE`` — это не даёт переписать произвольный путь к exe.
+    выбранных ключах приложения, а также переданные ``extra_roots`` (каталоги,
+    из которых приложение было перенесено в ``App``).
     """
     result: Snapshot = {
         key: {name: _as_entry(entry) for name, entry in values.items()}
@@ -823,6 +822,12 @@ def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
     install_names = {
         "installdir", "installdirectory", "installfolder", "installlocation",
     }
+    explicit_old_roots = sorted(
+        {str(r).strip().rstrip("\\/") for r in (extra_roots or ())
+         if str(r).strip().rstrip("\\/")},
+        key=len,
+        reverse=True,
+    )
 
     for key in keys:
         values = result.get(key)
@@ -832,10 +837,8 @@ def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
         path_names = [names[name] for name in install_names if name in names]
         if "exe" in names and "exefile" in names:
             path_names.append(names["exe"])
-        if not path_names:
-            continue
 
-        old_roots: List[str] = []
+        old_roots: List[str] = list(explicit_old_roots)
         for name in path_names:
             typ, _raw = values[name]
             if typ not in (REG_SZ, REG_EXPAND_SZ):
@@ -846,6 +849,9 @@ def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
             old_roots.append(old.rstrip("\\/"))
             trailing = "\\" if old.endswith(("\\", "/")) else ""
             values[name] = (typ, repr(destination + trailing))
+
+        if not old_roots:
+            continue
 
         # Более длинный корень заменяется первым: C:\\Game\\bin не должен
         # частично совпасть с C:\\Game раньше времени.
@@ -996,18 +1002,60 @@ def write_reg_file(path: str, text: str) -> None:
 
 # --- вспомогательное для поиска установленной программы ------------------------
 
+_EXPLICIT_LOCATION_VALUE_NAMES = (
+    "InstallLocation", "DisplayIcon", "InstallDir", "InstallDirectory",
+    "InstallFolder", "InstallPath", "AppPath", "RootDir", "TargetDir",
+    "HomeDir", "ExePath", "Path", "Directory",
+)
+
+_LOCAL_PATH_VALUE_RE = re.compile(
+    r"^[A-Za-z]:[\\/][^\"<>|?*\r\n;]{2,240}$"
+)
+
+
+def _clean_registry_location(value: str, strip_icon_index: bool = False) -> str:
+    text = os.path.expandvars(str(value or "").strip())
+    if strip_icon_index:
+        text = re.sub(r",\s*-?\d+\s*$", "", text).strip()
+    text = text.strip().strip('"')
+    # Если строка выглядит как командная строка ("C:\\App\\app.exe" /arg),
+    # оставляем только путь к exe.
+    exe_match = re.match(
+        r"^([A-Za-z]:[\\/][^\"<>|?*\r\n]+?\.(?:exe|dll|erd|dat|db|mt))\b",
+        text,
+        re.IGNORECASE,
+    )
+    if exe_match:
+        return exe_match.group(1).strip()
+    return text
+
+
 def changed_install_locations(before: Mapping[str, Mapping[str, object]],
                               after: Mapping[str, Mapping[str, object]]) -> List[str]:
-    """Извлекает InstallLocation/DisplayIcon из новых записей установщика."""
+    """Извлекает пути установки из новых/изменённых записей реестра установщика."""
     locations: List[str] = []
     seen: Set[str] = set()
+
+    def add_location(candidate: str) -> None:
+        if not candidate:
+            return
+        low = candidate.replace("/", "\\").casefold()
+        if any(sys_part in low for sys_part in (
+                "\\windows\\", "\\system32", "\\syswow64", "\\temp\\")):
+            return
+        normalized = os.path.normcase(os.path.normpath(candidate))
+        if normalized not in seen:
+            seen.add(normalized)
+            locations.append(candidate)
+
     for key, values in after.items():
         if is_volatile(key) or is_protected(key, values):
             continue
         if key in before and (is_protected(key, before[key])
                               or dict(values) == dict(before[key])):
             continue
-        for value_name in ("InstallLocation", "DisplayIcon"):
+        before_values = before.get(key, {})
+        for value_name in _EXPLICIT_LOCATION_VALUE_NAMES:
             entry = values.get(value_name)
             if entry is None:
                 entry = next(
@@ -1020,14 +1068,25 @@ def changed_install_locations(before: Mapping[str, Mapping[str, object]],
             value = _entry_value(entry)
             if not isinstance(value, str) or not value.strip():
                 continue
-            value = os.path.expandvars(value.strip())
-            if value_name == "DisplayIcon":
-                # Типичный формат: "C:\\Program Files\\App\\app.exe",0
-                value = re.sub(r",\s*-?\d+\s*$", "", value).strip().strip('"')
-            normalized = os.path.normcase(os.path.normpath(value))
-            if normalized not in seen:
-                seen.add(normalized)
-                locations.append(value)
+            cleaned = _clean_registry_location(
+                value, strip_icon_index=(value_name.casefold() == "displayicon"))
+            if value_name.casefold() in ("path", "directory") and ";" in cleaned:
+                continue
+            add_location(cleaned)
+
+        # Самописные установщики (например, Multitran setup.exe) пишут пути
+        # к программе и словарям в собственные ключи HKCU/HKLM\Software\<App>
+        # под произвольными именами параметров.
+        if categorize(key) == CATEGORY_APP:
+            for name, entry in values.items():
+                if name in before_values and before_values[name] == entry:
+                    continue
+                value = _entry_value(entry)
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                cleaned = _clean_registry_location(value, strip_icon_index=True)
+                if _LOCAL_PATH_VALUE_RE.match(cleaned):
+                    add_location(cleaned)
     return locations
 
 
