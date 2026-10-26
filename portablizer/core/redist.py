@@ -1585,6 +1585,14 @@ _COMMAND_ERROR_HINTS = (
     "command line option syntax error",
     "command-line option syntax error",
     "syntax error in command line",
+    "folder is not accessible",
+    "directory is not accessible",
+    "path is not accessible",
+    "cannot create folder",
+    "cannot create directory",
+    "недоступна",
+    "не доступна",
+    "невозможно создать папку",
 )
 #: Заголовок MessageBox DXSETUP (как на скриншоте: «Установка DirectX»).
 _DIRECTX_WINDOW_TITLES = (
@@ -1799,12 +1807,16 @@ def installer_button_is_proceed(title: str) -> bool:
 
     Используется в диалогах пути установки и общего согласия: там правильный
     ответ — продолжить с текущим (или выбранным) путём, а не отказаться.
+    Заголовки GroupBox (класс «Button» в Win32, например «Select directory to
+    install Multitran») отсекаются по длине и словам «directory»/«folder»/«папк».
     """
     text = (title or "").replace("&", "").strip().lower()
-    if not text:
+    if not text or len(text) > 32:
         return False
     if any(bad in text for bad in ("cancel", "отмена", "abort", "прервать",
-                                    "no", "нет", "назад", "back")):
+                                    "no", "нет", "назад", "back",
+                                    "directory", "folder", "каталог",
+                                    "папк", "директори")):
         return False
     return any(hint in text for hint in _PROCEED_BUTTON_HINTS)
 
@@ -1987,13 +1999,30 @@ def _dismiss_installer_dialogs(
     CB_SELECTSTRING = 0x014D
     LB_FINDSTRING = 0x018F
 
+    WM_GETTEXT = 0x000D
+    WM_GETTEXTLENGTH = 0x000E
+
     def window_text(hwnd) -> str:
         length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
+        if length > 0:
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            if buf.value:
+                return buf.value
+        # GetWindowTextW не читает содержимое Edit/RichEdit в чужом процессе
+        # (возвращает 0). Для таких полей используем WM_GETTEXTLENGTH/WM_GETTEXT.
+        try:
+            msg_len = int(user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0) or 0)
+            if 0 < msg_len <= 4096:
+                buf = ctypes.create_unicode_buffer(msg_len + 2)
+                user32.SendMessageW(
+                    hwnd, WM_GETTEXT, msg_len + 1,
+                    ctypes.cast(buf, ctypes.c_void_p).value,
+                )
+                return buf.value or ""
+        except Exception:  # noqa: BLE001 - чужой процесс или мок без WM_GETTEXT
             return ""
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        return buf.value or ""
+        return ""
 
     def class_name(hwnd) -> str:
         buf = ctypes.create_unicode_buffer(256)
@@ -2157,16 +2186,34 @@ def _dismiss_installer_dialogs(
         if installer_prompt_looks_like_path_consent(title, body):
             interactive_pages += 1
             typed = False
-            if target_dir:
+            if target_dir and edits:
                 for handle in edits:
                     current = window_text(handle).strip()
                     if not current:
                         continue
                     if (":\\" in current or ":/" in current
-                            or current.startswith("\\\\")):
+                            or current.startswith("\\\\")
+                            or current.lstrip().startswith("=")):
                         if set_text(handle, target_dir):
                             typed = True
                         break
+                if not typed:
+                    # Поле пути могло содержать относительный путь («Multitran»)
+                    # или не отдать текст через GetWindowTextW — пишем в первое
+                    # поле Edit страницы выбора каталога.
+                    if set_text(edits[0], target_dir):
+                        typed = True
+            elif edits:
+                # Даже когда выбран каталог по умолчанию, убираем ведущий знак
+                # «=» («= D:\Portable\...» от ключа /D= в WinRAR SFX), иначе
+                # нажатие «Install» вызовет «"= ..." folder is not accessible».
+                for handle in edits:
+                    current = window_text(handle).strip()
+                    if current.startswith("="):
+                        cleaned = current.lstrip("=").strip()
+                        if cleaned and set_text(handle, cleaned):
+                            typed = True
+                            break
             proceed = [item for item in buttons
                        if installer_button_is_proceed(item[1])]
             if proceed and allow_click(hwnd, fingerprint,
