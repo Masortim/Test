@@ -622,6 +622,11 @@ SFX_DIR_PREFIXES = ("rarsfx", "7zsfx", "wrar", "_sfx", "sfx")
 SFX_UNPACK_LIMIT = 900.0
 
 
+#: Служебные папки самого Portablizer (не путать с папками RarSFX0/7zSFX,
+#: которые создаёт установщик внутри TEMP).
+_INTERNAL_SFX_WORK_DIRS = frozenset({"_sfx_temp", "_sfx_content"})
+
+
 def find_sfx_dirs(roots: Iterable[str], max_depth: int = 3) -> List[str]:
     """Находит каталоги, в которые распаковался самораспаковывающийся EXE.
 
@@ -631,8 +636,12 @@ def find_sfx_dirs(roots: Iterable[str], max_depth: int = 3) -> List[str]:
     """
     found: List[str] = []
     seen: set = set()
-    for root in roots:
-        if not root or not os.path.isdir(root):
+    root_list = [r for r in roots if r]
+    root_keys = {
+        os.path.normcase(os.path.abspath(r)) for r in root_list
+    }
+    for root in root_list:
+        if not os.path.isdir(root):
             continue
         base_depth = os.path.normpath(root).count(os.sep)
         for current, dirs, _files in os.walk(root):
@@ -644,8 +653,11 @@ def find_sfx_dirs(roots: Iterable[str], max_depth: int = 3) -> List[str]:
             for name in dirs:
                 folded = name.casefold()
                 path = os.path.join(current, name)
+                key = os.path.normcase(os.path.abspath(path))
+                if folded in _INTERNAL_SFX_WORK_DIRS or key in root_keys:
+                    keep.append(name)
+                    continue
                 if folded.startswith(SFX_DIR_PREFIXES):
-                    key = os.path.normcase(os.path.abspath(path))
                     if key not in seen:
                         seen.add(key)
                         found.append(path)

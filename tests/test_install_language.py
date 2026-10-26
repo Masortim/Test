@@ -1187,6 +1187,17 @@ class DialogDetectionTests(unittest.TestCase):
         self.assertFalse(red.installer_button_is_proceed("Back"))
         self.assertFalse(red.installer_button_is_proceed("Назад"))
         self.assertFalse(red.installer_button_is_proceed(""))
+        self.assertFalse(
+            red.installer_button_is_proceed(
+                "Select directory to install Multitran"))
+
+    def test_folder_is_not_accessible_is_recognised_as_command_error(self):
+        red = redist_mod
+        msg = r'"= D:\Portable\Multitran_Portable\App" folder is not accessible'
+        self.assertTrue(
+            red.installer_prompt_looks_like_command_error("Error", msg))
+        self.assertTrue(
+            red.installer_prompt_should_dismiss("Error", msg))
 
     def test_inno_setup_sfx_ladder_has_language(self):
         """Inno Setup внутри SFX: /VERYSILENT /LANG= /DIR= в лестнице."""

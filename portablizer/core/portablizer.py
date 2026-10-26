@@ -4564,6 +4564,16 @@ class Portablizer:
 
         nested = self._find_nested_setup(work)
         if nested:
+            # Если вложенный setup.exe не принадлежит известному движку
+            # (Inno/NSIS/InstallShield/Burn), а рядом в распакованном архиве
+            # УЖЕ лежит готовый exe самой программы (как в WinRAR SFX со
+            # словарями Multitran), переносим содержимое напрямую в App, не
+            # запуская самописный setup.exe с чужими ключами /DIR= и /D=.
+            if (self._nested_installer_kind(nested) == InstallerType.UNKNOWN
+                    and self._container_payload_program_exe(work, name, nested) is not None
+                    and self._promote_container_payload(work, app_dir, name, nested)):
+                shutil.rmtree(work, ignore_errors=True)
+                return 0, None
             result = self._install_from_container(
                 nested, work, opts, app_dir, data_dir, portable_dir, name,
                 recover=recover,
@@ -4676,6 +4686,9 @@ class Portablizer:
             files = self._count_files(work)
             if code in ok_codes and files:
                 return files, extractor.name
+            # Очищаем обрывки после неудачной попытки (например, tar.exe на
+            # solid RAR успевает создать первый пустой файл и падает с кодом 1).
+            self._reset_work_dir(work)
             tail = " ".join((output or "").split())[-200:]
             self.log.info(
                 f"{extractor.name} не дал файлов (код {code})"
@@ -4700,6 +4713,24 @@ class Portablizer:
                 f"{os.path.basename(nested)}."
             )
         return 0, ""
+
+    @staticmethod
+    def _reset_work_dir(work: str) -> None:
+        """Очищает рабочую папку после неудачной попытки распаковщика."""
+        if not work or not os.path.isdir(work):
+            return
+        try:
+            entries = list(os.scandir(work))
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.path, ignore_errors=True)
+                else:
+                    os.remove(entry.path)
+            except OSError:
+                pass
 
     @staticmethod
     def _tree_has_executable(root: str, limit: int = 2000) -> bool:
@@ -4898,18 +4929,26 @@ class Portablizer:
         """
         best = None
         best_score = 0
+        bad_prefixes = (
+            "unins", "vcredist", "vc_redist", "dxsetup", "ndp", "dotnet",
+            "directx", "physx", "oalinst", "ue4prereq", "crash", "unitycrash",
+        )
         for root, _dirs, files in os.walk(work):
             for f in files:
                 if not f.lower().endswith(".exe"):
                     continue
                 path = os.path.join(root, f)
-                if os.path.abspath(path) == os.path.abspath(nested):
+                if nested and os.path.abspath(path) == os.path.abspath(nested):
                     continue
                 base = f.lower()
-                if base in cls._PAYLOAD_INSTALLER_NAMES or base.startswith("unins"):
+                if base in cls._PAYLOAD_INSTALLER_NAMES or base.startswith(bad_prefixes):
                     continue
                 stem = os.path.splitext(f)[0]
-                score = cls._app_name_score(stem, name)
+                # Даём положительный базовый балл любому не-служебному exe
+                # программы: имя архива («mt_2025-03-06.exe») или папки
+                # («Multitran») может не совпадать с именем exe («mt.exe»,
+                # «multitran.exe», «network.exe»).
+                score = 20 + cls._app_name_score(stem, name)
                 try:
                     score -= os.path.relpath(path, work).count(os.sep) * 2
                 except ValueError:
@@ -5127,13 +5166,23 @@ class Portablizer:
                     else float(opts.install_deadline) or UNPACK_HARD_LIMIT)
         started = time.monotonic()
         timed_out = False
+        last_io_bytes = 0
+        last_cpu_seconds = 0.0
+        last_proc_active = 0.0
+        dialog_state: Dict[Tuple[int, str], Tuple[str, float]] = {}
+        unpack_target_dir = ""
+        for arg in cmd:
+            if isinstance(arg, str) and arg.startswith("-d") and len(arg) > 2:
+                unpack_target_dir = arg[2:]
+                break
         while proc.poll() is None:
             if self.cancel.is_set():
                 self._stop_installer(proc)
                 if handle is not None:
                     handle.close()
                 raise RuntimeError("Операция отменена пользователем.")
-            elapsed = time.monotonic() - started
+            now = time.monotonic()
+            elapsed = now - started
             fraction = creep_fraction(elapsed, scale=120.0)
             # Несколько процентов вместо одного: плавная полоса должна
             # сдвигаться, иначе она замирала бы на всё время распаковки.
@@ -5147,12 +5196,34 @@ class Portablizer:
                 timed_out = True
                 self._stop_installer(proc)
                 break
-            if stop_when is not None and stop_when():
-                self.log.debug(
-                    "  • распаковка закончена — снимаю процесс, не дожидаясь "
-                    "его собственной установки.")
-                self._stop_installer(proc)
-                break
+            if stop_when is not None:
+                activity = procutil.process_activity(proc.pid)
+                if (activity.io_bytes > last_io_bytes
+                        or activity.cpu_seconds - last_cpu_seconds >= 0.05):
+                    last_io_bytes = max(last_io_bytes, activity.io_bytes)
+                    last_cpu_seconds = max(last_cpu_seconds, activity.cpu_seconds)
+                    last_proc_active = now
+                if unpack_target_dir and activity.pids:
+                    try:
+                        redist_mod._dismiss_installer_dialogs(
+                            target_dir=unpack_target_dir,
+                            pids=activity.pids,
+                            state=dialog_state,
+                        )
+                    except Exception:  # noqa: BLE001 - WinAPI необязателен
+                        pass
+                # WinRAR SFX заранее резервирует полный размер крупного файла
+                # через SetEndOfFile и затем десятки секунд пишет в него данные.
+                # Пока процесс активно читает архив или пишет на диск, снимать
+                # его по замершему os.path.getsize() нельзя.
+                proc_busy = (last_proc_active > 0.0
+                             and (now - last_proc_active) < 4.0)
+                if not proc_busy and stop_when():
+                    self.log.debug(
+                        "  • распаковка закончена — снимаю процесс, не дожидаясь "
+                        "его собственной установки.")
+                    self._stop_installer(proc)
+                    break
             time.sleep(0.5)
         rc = proc.returncode if not timed_out else -1
         if handle is not None:
@@ -5646,6 +5717,8 @@ class Portablizer:
             "Архиваторы контейнер не прочитали. Прошу распаковаться сам "
             "установщик: WinRAR-SFX понимает «-s -d<папка>», а его программу "
             "установки мы сразу снимем — нам нужны только файлы.")
+        source = os.path.normpath(source)
+        work = os.path.normpath(work)
         sfx_temp = os.path.join(work, "_sfx_temp")
         try:
             os.makedirs(sfx_temp, exist_ok=True)
@@ -5683,17 +5756,17 @@ class Portablizer:
             roots.append(self._install_temp_dir)
         roots.extend(adobe_mod.default_temp_roots())
         dirs = adobe_mod.find_sfx_dirs(roots)
-        if dirs:
-            copied = adobe_mod.harvest_dirs(dirs, work)
+        copied = adobe_mod.harvest_dirs(dirs, work) if dirs else 0
+        shutil.rmtree(sfx_temp, ignore_errors=True)
+        if copied:
             self.log.info(
                 "Самораспаковка разложила файлы во временный каталог "
                 f"({os.path.basename(dirs[0])}): забрал оттуда {copied} "
                 "файл(ов) — программа установки внутри SFX нам не нужна.")
-        else:
+        elif not self._count_files(work):
             self.log.info(
                 "Самораспаковка не оставила файлов: SFX либо не смог "
                 "распаковаться, либо убрал за собой временный каталог.")
-        shutil.rmtree(sfx_temp, ignore_errors=True)
         return self._find_nested_setup(work)
 
     @staticmethod

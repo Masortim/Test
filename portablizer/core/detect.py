@@ -1254,8 +1254,15 @@ def detect_installer(path: str) -> DetectionResult:
     if result.has_zip_payload:
         result.evidence.append("внутри есть ZIP — возможна распаковка без установки")
 
-    result.inno_language_names = list(scan.inno_language_names)
     result.is_gog = _looks_like_gog(path, scan, layout)
+    has_inno_context = (
+        result.installer_type == InstallerType.INNO
+        or bool(scan.signatures.get(InstallerType.INNO))
+        or result.is_gog
+    )
+    result.inno_language_names = (
+        list(scan.inno_language_names) if has_inno_context else []
+    )
     if result.is_gog:
         why = []
         if scan.gog_hits:

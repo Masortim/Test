@@ -1105,6 +1105,51 @@ def build_attempts(
     )
     generic_types = (InstallerType.UNKNOWN, InstallerType.SELF_EXTRACT,
                      InstallerType.SQUIRREL)
+    winrar_sfx = (
+        itype == InstallerType.SELF_EXTRACT
+        and any("winrar sfx" in e.casefold()
+                for e in (getattr(detection, "evidence", None) or ()))
+    )
+    if winrar_sfx:
+        # WinRAR SFX понимает -s и -d<папка> БЕЗ знака «=». Передача /D=<App>
+        # или /DIR=<App> заставляет обёртку воспринять «= <App>» как имя
+        # каталога и показать окно «"= <App>" folder is not accessible».
+        attempts.extend([
+            SilentPlan(
+                program=installer_path,
+                args=["-s"] + user_extra,
+                raw_tail=f"-d{native_target}",
+                notes=[
+                    "WinRAR SFX: документированные ключи тихой распаковки "
+                    "-s и -d<папка> (без знака «=», иначе «=» попадает в имя "
+                    "папки и вызывает ошибку «folder is not accessible»).",
+                ],
+                label="WinRAR SFX: -s -d<App>",
+                output_dir=native_target,
+                ignores_target_dir=True,
+            ),
+            SilentPlan(
+                program=installer_path,
+                args=["/S"] + list(lang_plan.args) + user_extra,
+                raw_tail=f"-d{native_target}",
+                notes=[
+                    "WinRAR SFX: вариант /S с ключом папки -d<папка> без знака «=».",
+                ],
+                label="WinRAR SFX: /S -d<App>",
+                output_dir=native_target,
+                ignores_target_dir=True,
+            ),
+            SilentPlan(
+                program=installer_path,
+                args=["-s"] + user_extra,
+                notes=[
+                    "WinRAR SFX: тихая распаковка без ключа папки в командной строке.",
+                ],
+                label="WinRAR SFX: -s без пути",
+                output_dir=native_target,
+                ignores_target_dir=True,
+            ),
+        ])
     if weakly_detected or itype in generic_types:
         note = ("Универсальный набор ключей для нераспознанного установщика."
                 if itype in generic_types and not weakly_detected
@@ -1118,18 +1163,16 @@ def build_attempts(
                 # Сворачиваемый архив: ключ языка доходит до внутреннего
                 # установщика коротким ключом (/RU, /EN — см. languages),
                 # а путь установки — /D=<App> последним без кавычек, как
-                # у NSIS. Без /D= внутренний установщик ставит программу
-                # в Program Files этого ПК, а App остаётся пустым — и
-                # следующий сценарий пытается установить её заново.
+                # у NSIS (кроме чистого WinRAR SFX, где «=» ломает путь).
                 args = list(switches) + list(lang_plan.args) + user_extra
-                raw_tail = f"/D={target_dir}"
+                raw_tail = None if winrar_sfx else f"/D={target_dir}"
                 ignores = True
             plan = SilentPlan(
                 program=installer_path, args=args,
                 notes=[note] + ([
                     "Сворачиваемый архив: путь установки /D=<App> передан "
                     "последним без кавычек, как документировано перепаковщиком."
-                ] if itype == InstallerType.SELF_EXTRACT else []),
+                ] if (itype == InstallerType.SELF_EXTRACT and not winrar_sfx) else []),
                 label="Универсальные ключи: " + " ".join(switches),
                 output_dir=native_target, raw_tail=raw_tail,
                 ignores_target_dir=ignores,
@@ -1142,7 +1185,7 @@ def build_attempts(
     # Для него нужна собственная синтаксис: /VERYSILENT /SUPPRESSMSGBOXES
     # /NORESTART /LANG=<язык> /DIR=<App>. Пробуем после универсальной
     # лестницы, чтобы не разбивать уже работающие SFX с NSIS внутри.
-    if itype == InstallerType.SELF_EXTRACT:
+    if itype == InstallerType.SELF_EXTRACT and not winrar_sfx:
         _inno_switches = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
         _inno_language = find_language(language) if (language or "").strip() else None
         # Порядок: сначала с языком и path, потом без языка (если /LANG не

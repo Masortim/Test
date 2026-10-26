@@ -487,6 +487,124 @@ class FlowTests(BaseCase):
                 DetectionResult(InstallerType.INNO, 0.9), "MultiTran"))
         extract.assert_not_called()
 
+    def test_failed_tar_extractor_cleans_leftover_files_before_self_extract(self):
+        """tar.exe на solid RAR оставляет обрывок файла — его надо убрать."""
+        work = self.root / "_sfx_content"
+        work.mkdir()
+
+        def fake_tar(cmd, _log, _opts, **_kwargs):  # noqa: ANN001
+            _write(work / "partial.dat", b"broken")
+            return 1, "tar.exe: RAR solid archive support unavailable"
+
+        def fake_self_extract(_source, work_dir, _opts, _log, _progress=None):
+            self.assertFalse((Path(work_dir) / "partial.dat").exists())
+            pebuild.write_pe(Path(work_dir) / "network.exe",
+                             imports=["kernel32.dll"])
+            return ""
+
+        extractor = unpacker_mod.Extractor(unpacker_mod.STYLE_7ZIP, "tar.exe")
+        extractor = unpacker_mod.Extractor(unpacker_mod.STYLE_TAR, "tar.exe")
+        with mock.patch.object(unpacker_mod, "find_extractors",
+                               return_value=[extractor]), \
+                mock.patch.object(unpacker_mod, "carve_archive",
+                                  return_value=(str(work / "carved.rar"), "rar")), \
+                mock.patch.object(self.engine, "_run_unpacker_command",
+                                  side_effect=fake_tar), \
+                mock.patch.object(self.engine, "_sfx_self_extract",
+                                  side_effect=fake_self_extract):
+            files, method = self.engine._extract_container_to(
+                str(self.root / "mt_2025-03-06.exe"), str(work), self._opts(),
+                self.console)
+        self.assertEqual(files, 1)
+        self.assertIn("-s -d", method)
+        self.assertTrue((work / "network.exe").is_file())
+        self.assertFalse((work / "partial.dat").exists())
+
+    def test_find_sfx_dirs_ignores_internal_sfx_temp_and_sfx_content(self):
+        """Служебные папки _sfx_temp и _sfx_content не должны считаться RarSFX."""
+        from portablizer.core import adobe as adobe_mod
+
+        work = self.portable / "_sfx_content"
+        sfx_temp = work / "_sfx_temp"
+        rarsfx = sfx_temp / "RarSFX0"
+        rarsfx.mkdir(parents=True)
+        _write(rarsfx / "mt.exe", b"MZ")
+
+        found = adobe_mod.find_sfx_dirs([str(sfx_temp), str(work)])
+        self.assertEqual(found, [str(rarsfx)])
+
+    def test_unknown_nested_setup_with_unpacked_program_exe_promotes_directly(self):
+        """Если в архиве рядом с самописным setup.exe уже лежит exe программы,
+        переносим файлы в App напрямую без запуска setup.exe с /DIR= и /D=."""
+        _write(self.root / "mt.exe",
+               b"MZ" + b"WinRAR SFX" + b"\0" * 64)
+        exe = pebuild.write_pe(self.root / "src" / "network.exe",
+                               imports=["kernel32.dll"])
+
+        def fake_extract(_source, work_dir, *_args, **_kwargs):  # noqa: ANN001
+            pebuild.write_pe(Path(work_dir) / "setup.exe",
+                             imports=["kernel32.dll"],
+                             extra=b"custom multitran copy helper")
+            (Path(work_dir) / "network.exe").write_bytes(
+                Path(exe).read_bytes())
+            _write(Path(work_dir) / "dict.erd", b"x" * 2048)
+            return 3, "сама обёртка (-s -d)"
+
+        with mock.patch.object(self.engine, "_extract_container_to",
+                               side_effect=fake_extract), \
+                mock.patch.object(self.engine, "_install_from_container") as run_nested:
+            result = self.engine._run_container_first(
+                self._opts(), str(self.app), str(self.data),
+                str(self.portable),
+                DetectionResult(InstallerType.SELF_EXTRACT, 0.7), "Multitran")
+        self.assertIsNotNone(result)
+        code, plan = result
+        self.assertEqual(code, 0)
+        self.assertIsNone(plan)
+        run_nested.assert_not_called()
+        self.assertTrue((self.app / "network.exe").is_file())
+        self.assertTrue((self.app / "dict.erd").is_file())
+        self.assertFalse((self.app / "setup.exe").exists())
+
+    def test_winrar_sfx_ladder_uses_minus_d_without_equals(self):
+        """WinRAR SFX не должен получать /D=<App> или /DIR=<App> со знаком «=»."""
+        from portablizer.core.silentargs import build_attempts
+
+        det = DetectionResult(
+            InstallerType.SELF_EXTRACT, 0.7,
+            evidence=["найдена сигнатура: WinRAR SFX"],
+        )
+        plans = build_attempts(
+            det, r"E:\Backup\mt_2025-03-06.exe",
+            r"D:\Portable\Multitran_Portable\App",
+        )
+        self.assertTrue(plans)
+        self.assertEqual(plans[0].args, ["-s"])
+        self.assertEqual(
+            plans[0].raw_tail, r"-dD:\Portable\Multitran_Portable\App")
+        self.assertEqual(plans[1].args, ["/S"])
+        self.assertEqual(
+            plans[1].raw_tail, r"-dD:\Portable\Multitran_Portable\App")
+        for plan in plans:
+            tail = plan.raw_tail or ""
+            self.assertFalse(
+                tail.startswith("/D=") or tail.startswith("/DIR="),
+                f"{plan.label} has '=' in raw_tail: {tail}",
+            )
+
+    def test_winrar_sfx_does_not_get_false_inno_languages_from_dictionary_words(self):
+        """Слова english/russian внутри словаря WinRAR SFX — не языки Inno Setup."""
+        from portablizer.core.detect import detect_installer
+
+        installer = _write(
+            self.root / "mt_2025-03-06.exe",
+            b"MZ" + b"\0" * 128 + b"WinRAR SFX"
+            + b"\0english\0russian\0german\0french\0spanish\0italian\0",
+        )
+        det = detect_installer(installer)
+        self.assertEqual(det.installer_type, InstallerType.SELF_EXTRACT)
+        self.assertEqual(det.inno_language_names, [])
+
 
 if __name__ == "__main__":
     unittest.main()
