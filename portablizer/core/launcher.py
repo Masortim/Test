@@ -41,6 +41,7 @@ cmd.exe читает .bat не построчно, а блоками, запом
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import string
@@ -1951,6 +1952,43 @@ def render_menu_bat(cfg: LauncherConfig) -> str:
 
 # --- Python лончер (для сборки launcher.exe) ---------------------------------
 
+def repair_json_escapes(text):
+    r"""Double the "single" backslashes inside JSON strings.
+
+    A Windows path written into a JSON string without escaping
+    (``"root": "E:\Backup"``) turns the file into invalid JSON and every
+    launcher fails with ``Invalid \escape``.  Real escape sequences
+    (``\\``, ``\"``, ``\n``, ``\uXXXX``) are left alone, so a healthy file
+    stays byte for byte the same.
+    """
+    result = []
+    in_string = False
+    index = 0
+    valid = set('"\\/bfnrtu')
+    while index < len(text):
+        symbol = text[index]
+        if not in_string:
+            result.append(symbol)
+            if symbol == '"':
+                in_string = True
+            index += 1
+            continue
+        if symbol == "\\":
+            following = text[index + 1:index + 2]
+            if following and following in valid:
+                result.append(symbol + following)
+                index += 2
+                continue
+            result.append("\\\\")
+            index += 1
+            continue
+        result.append(symbol)
+        if symbol == '"':
+            in_string = False
+        index += 1
+    return "".join(result)
+
+
 _PY_LAUNCHER = r'''#!/usr/bin/env python3
 """Портативный лончер (сгенерировано Portablizer).
 
@@ -2041,11 +2079,30 @@ def reg_export(path, root, token):
     return code
 
 
+@@REPAIR_JSON@@
+
+
+def load_config(root):
+    """Read launcher_config.json, repairing a broken JSON instead of dying."""
+    path = os.path.join(root, "launcher_config.json")
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        text = fh.read()
+    try:
+        return json.loads(text)
+    except ValueError:
+        repaired = repair_json_escapes(text)
+        cfg = json.loads(repaired)  # a truly broken file still raises
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(repaired)
+        except OSError:
+            pass
+        return cfg
+
+
 def main():
     root = portable_root()
-    with open(os.path.join(root, "launcher_config.json"), "r",
-              encoding="utf-8") as fh:
-        cfg = json.load(fh)
+    cfg = load_config(root)
 
     data = os.path.join(root, cfg.get("data_dir_name", "PortableData"))
     appdata = os.path.join(data, "AppData", "Roaming")
@@ -2202,6 +2259,13 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 '''
+
+
+#: Запасной лончер — отдельный скрипт: общие функции вставляются в его текст
+#: исходником, чтобы не держать две копии (и не разъезжаться в поведении).
+_PY_LAUNCHER = _PY_LAUNCHER.replace(
+    "@@REPAIR_JSON@@", inspect.getsource(repair_json_escapes).rstrip(),
+)
 
 
 def render_py_launcher(cfg: LauncherConfig) -> str:

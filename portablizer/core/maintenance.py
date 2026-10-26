@@ -77,6 +77,28 @@ class MaintenanceReport:
     messages: List[str] = field(default_factory=list)
 
 
+def read_config(path: str) -> dict:
+    """Читает ``launcher_config.json``, починив сломанные escape-последовательности.
+
+    Конфиг мог быть испорчен прежней версией (в него подставлялся путь с
+    одиночными обратными слэшами). Обновление такого портатива не должно
+    отказывать: файл чинится на месте, и обновление продолжается.
+    """
+    with open(path, "r", encoding="utf-8-sig") as handle:
+        text = handle.read()
+    try:
+        return json.loads(text)
+    except ValueError:
+        repaired = launcher_mod.repair_json_escapes(text)
+        data = json.loads(repaired)
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(repaired)
+        except OSError:
+            pass
+        return data
+
+
 def looks_like_portable(folder: str) -> bool:
     """Похожа ли папка на портатив, собранный Portablizer."""
     return bool(folder) and os.path.isfile(os.path.join(folder, CONFIG_NAME)) \
