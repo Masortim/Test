@@ -196,13 +196,11 @@ _LNK_LINK_INFO_HEADER = 0x1C
 def lnk_target(path: str) -> str:
     """Локальный путь из ``.lnk`` или пустая строка, если его нет.
 
-    Читается только нужное: заголовок Shell Link, блок LinkInfo (он идёт
-    сразу за заголовком, с 0x4C) и Ansi-строка с локальным путём внутри
-    него. COM (``WScript.Shell``) и дочерние процессы не используются:
-    уборка ярлыков должна работать на любом ПК и не тратить секунды на
-    каждый файл. Ярлык может ссылаться только на том или на сетевой путь —
-    тогда здесь будет пустая строка, а путь всё равно найдётся по тексту
-    файла (UTF-16LE) в :func:`link_points_into`.
+    Читается только нужное: заголовок Shell Link, необязательный
+    LinkTargetIDList (флаг 0x01), блок LinkInfo (флаг 0x02) и строка с
+    локальным путём внутри него (Unicode или ANSI). COM (``WScript.Shell``)
+    и дочерние процессы не используются: уборка ярлыков должна работать на
+    любом ПК и не тратить секунды на каждый файл.
     """
     try:
         if os.path.getsize(path) > MAX_LINK_BYTES:
@@ -216,35 +214,111 @@ def lnk_target(path: str) -> str:
     flags = int.from_bytes(data[0x14:0x18], "little")
     if not flags & 0x2:  # HasLinkInfo
         return ""
-    block = data[_LNK_LINK_INFO_OFFSET:]
+    info_offset = _LNK_LINK_INFO_OFFSET
+    if flags & 0x1:  # HasLinkTargetIDList
+        if len(data) < info_offset + 2:
+            return ""
+        idlist_size = int.from_bytes(
+            data[info_offset:info_offset + 2], "little")
+        info_offset += 2 + idlist_size
+    if len(data) < info_offset + _LNK_LINK_INFO_HEADER:
+        return ""
+    block = data[info_offset:]
     size = int.from_bytes(block[0:4], "little")
     header_size = int.from_bytes(block[4:8], "little")
     if size < _LNK_LINK_INFO_HEADER or header_size < _LNK_LINK_INFO_HEADER:
         return ""
     if header_size + 4 > len(block):
         return ""
+    limit = min(size, len(block))
+    # Если заголовок LinkInfo расширенный (>= 0x24), сначала читаем
+    # Unicode-путь (LocalBasePathOffsetUnicode по смещению 0x1C).
+    if header_size >= 0x24 and limit >= 0x24:
+        uni_offset = int.from_bytes(block[0x1C:0x20], "little")
+        if header_size <= uni_offset < limit:
+            raw_uni = block[uni_offset:limit]
+            # Ищем парный двухбайтовый NUL
+            end_uni = -1
+            for pos in range(0, len(raw_uni) - 1, 2):
+                if raw_uni[pos] == 0 and raw_uni[pos + 1] == 0:
+                    end_uni = pos
+                    break
+            if end_uni > 0:
+                try:
+                    base_uni = raw_uni[:end_uni].decode("utf-16-le", errors="ignore").strip()
+                except UnicodeError:
+                    base_uni = ""
+                if base_uni:
+                    suffix_uni_off = int.from_bytes(block[0x20:0x24], "little")
+                    if header_size <= suffix_uni_off < limit:
+                        raw_suf = block[suffix_uni_off:limit]
+                        end_suf = -1
+                        for pos in range(0, len(raw_suf) - 1, 2):
+                            if raw_suf[pos] == 0 and raw_suf[pos + 1] == 0:
+                                end_suf = pos
+                                break
+                        if end_suf > 0:
+                            suf = raw_suf[:end_suf].decode("utf-16-le", errors="ignore").strip()
+                            if suf:
+                                base_uni = os.path.join(base_uni, suf)
+                    return base_uni
     path_offset = int.from_bytes(
         block[_LNK_LINK_INFO_PATH:_LNK_LINK_INFO_PATH + 4], "little")
-    if not header_size <= path_offset < min(size, len(block)):
+    if not header_size <= path_offset < limit:
         return ""
-    raw = block[path_offset:min(size, len(block))]
+    raw = block[path_offset:limit]
     end = raw.find(b"\x00")
     if end <= 0:
         return ""
-    codec = "mbcs" if sys.platform == "win32" else "latin-1"
+    codec = "mbcs" if sys.platform == "win32" else "cp1251"
     try:
         text = raw[:end].decode(codec, errors="replace")
-    except LookupError:  # pragma: no cover - не-Windows без mbcs
+    except LookupError:  # pragma: no cover - не-Windows без cp1251
         text = raw[:end].decode("latin-1", errors="replace")
+    if len(block) >= 0x1C:
+        suf_offset = int.from_bytes(block[0x18:0x1C], "little")
+        if header_size <= suf_offset < limit:
+            raw_suf = block[suf_offset:limit]
+            end_suf = raw_suf.find(b"\x00")
+            if end_suf > 0:
+                try:
+                    suf_text = raw_suf[:end_suf].decode(codec, errors="replace").strip()
+                except LookupError:
+                    suf_text = raw_suf[:end_suf].decode("latin-1", errors="replace").strip()
+                if suf_text:
+                    text = text.rstrip("\\/") + "\\" + suf_text.lstrip("\\/")
     return text.strip()
+
+
+_EMBEDDED_EXE_PATH_RE = re.compile(
+    r"[A-Za-z]:[\\/][^\x00\"<>|?*\r\n]{1,240}?\.(?:exe|bat|cmd|com)\b",
+    re.IGNORECASE,
+)
+
+
+def _lnk_embedded_target(path: str) -> str:
+    """Запасное извлечение локального пути из тела ``.lnk`` (StringData/IDList)."""
+    try:
+        if os.path.getsize(path) > MAX_LINK_BYTES:
+            return ""
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return ""
+    for view in _decoded_views(data):
+        match = _EMBEDDED_EXE_PATH_RE.search(view)
+        if match:
+            return match.group(0).strip()
+    return ""
 
 
 def link_target(path: str, resolver: Optional[Resolver] = None) -> str:
     """Цель ярлыка: сначала из самого файла, затем (если надо) ``resolver``."""
-    target = lnk_target(path) if path.casefold().endswith(".lnk") else ""
-    if target:
-        return target
     lowered = path.casefold()
+    if lowered.endswith(".lnk"):
+        target = lnk_target(path) or _lnk_embedded_target(path)
+        if target:
+            return target
     if lowered.endswith(".url"):
         try:
             with open(path, "r", encoding="utf-8-sig", errors="ignore") as handle:
@@ -292,9 +366,9 @@ def target_is_missing(target: str) -> bool:
 
 
 def _decoded_views(data: bytes) -> List[str]:
-    """Текстовые представления ярлыка: UTF-16LE (``.lnk``) и UTF-8 (``.url``)."""
+    """Текстовые представления ярлыка: UTF-16LE, UTF-8 и CP1251."""
     views: List[str] = []
-    for encoding in ("utf-16-le", "utf-8"):
+    for encoding in ("utf-16-le", "utf-8", "cp1251"):
         try:
             views.append(data.decode(encoding, errors="ignore"))
         except (UnicodeError, LookupError):  # pragma: no cover - защита
@@ -327,13 +401,9 @@ def link_points_into(path: str, roots: Sequence[str],
                                  + r"(?![0-9A-Za-z_.])", re.IGNORECASE)
             if pattern.search(view):
                 return True
-    if resolver is not None:
-        try:
-            target = resolver(path)
-        except Exception:  # noqa: BLE001 - разрешатель не должен срывать уборку
-            target = None
-        if target:
-            return any(_within(str(target), str(root)) for root in roots)
+    target = link_target(path, resolver)
+    if target:
+        return any(_within(str(target), str(root)) for root in roots)
     return False
 
 
@@ -375,23 +445,97 @@ def swept_folders(root: str,
     return unique
 
 
+_GENERIC_SHORTCUT_STEMS = frozenset({
+    "setup", "install", "installer", "autorun", "uninstall", "unins000",
+    "update", "updater", "portable",
+})
+
+_KNOWN_TRANSLITERATIONS = {
+    "multitran": ("мультитран", "словарь мультитран"),
+    "мультитран": ("multitran",),
+}
+
+
+def _points_to_other_portable(path: str, roots: Sequence[str],
+                              resolver: Optional[Resolver] = None) -> bool:
+    """True, если ярлык ведёт в ДРУГУЮ папку ``*_Portable*``, не входящую в ``roots``."""
+    if link_points_into(path, roots, resolver):
+        return False
+    texts: List[str] = []
+    target = link_target(path, resolver)
+    if target:
+        texts.append(target)
+    try:
+        if os.path.getsize(path) <= MAX_LINK_BYTES:
+            with open(path, "rb") as handle:
+                texts.extend(_decoded_views(handle.read()))
+    except OSError:
+        pass
+    for text in texts:
+        if re.search(r"_portable[0-9A-Za-z_-]*[\\/]", text, re.IGNORECASE):
+            return True
+    return False
+
+
+def _target_matches_app(target: str, names: Sequence[str]) -> bool:
+    """True, если путь цели ярлыка содержит каталог или файл с именем программы."""
+    if not target or not names:
+        return False
+    cleaned_names = [
+        " ".join(str(n).replace("_", " ").casefold().split())
+        for n in names
+        if str(n).strip() and str(n).strip().casefold() not in _GENERIC_SHORTCUT_STEMS
+    ]
+    if not cleaned_names:
+        return False
+    norm_target = target.replace("/", "\\")
+    parts = [p for p in norm_target.split("\\") if p and not p.endswith(":")]
+    for part in parts:
+        stem = os.path.splitext(part)[0]
+        norm_part = " ".join(stem.replace("_", " ").casefold().split())
+        for candidate in cleaned_names:
+            if len(candidate) < 3:
+                continue
+            if (norm_part == candidate
+                    or norm_part.startswith(candidate + " ")
+                    or norm_part.startswith(candidate + "-")):
+                return True
+    return False
+
+
 def remove_own_shortcuts(root: str,
                          extra_roots: Sequence[str] = (),
                          folders: Optional[Sequence[str]] = None,
                          before: Optional[Set[str]] = None,
-                         resolver: Optional[Resolver] = None) -> List[str]:
-    """Удаляет ярлыки, созданные этим запуском и ведущие внутрь портатива.
+                         resolver: Optional[Resolver] = None,
+                         app_names: Sequence[str] = ()) -> List[str]:
+    """Удаляет ярлыки, созданные этим запуском установщика.
 
     ``before`` — снимок :func:`snapshot` до установки. Без него функция ничего
     не делает: без снимка нельзя доказать, что ярлык создали мы, а не
-    пользователь.
+    пользователь. Если установщик проигнорировал целевую папку ``App`` и
+    создал ярлык на каталог по умолчанию (например, ``C:\\Multitran``) или на
+    исходную папку дистрибутива, такой свежий ярлык также опознаётся по
+    ``app_names`` и цели.
     """
     if before is None:
         return []
     roots = [str(root)] + [str(extra) for extra in extra_roots if str(extra)]
+    meaningful_names = [
+        str(n) for n in (app_names or ())
+        if str(n).strip().casefold() not in _GENERIC_SHORTCUT_STEMS
+    ]
     removed: List[str] = []
     for path in created_links(before, folders):
-        if not link_points_into(path, roots, resolver):
+        matched = link_points_into(path, roots, resolver)
+        if not matched and meaningful_names and not _points_to_other_portable(
+                path, roots, resolver):
+            target = link_target(path, resolver)
+            matched = (
+                _name_matches(path, meaningful_names)
+                or _target_matches_app(target, meaningful_names)
+            )
+        if not matched:
             continue
         try:
             os.remove(path)
@@ -408,8 +552,9 @@ def app_name_candidates(*values: str) -> List[str]:
     ``ollama``, ``ollama app.exe`` -> ``ollama app``.
     """
     names: List[str] = []
-    for value in values:
-        text = os.path.basename(str(value or "").strip().strip('"'))
+
+    def add_name(raw: str) -> None:
+        text = str(raw or "").strip().strip('"')
         for suffix in (".exe", ".msi", ".lnk", ".url", ".pif"):
             if text.casefold().endswith(suffix):
                 text = text[: -len(suffix)]
@@ -421,6 +566,31 @@ def app_name_candidates(*values: str) -> List[str]:
         collapsed = " ".join(text.replace("_", " ").split())
         if collapsed and collapsed not in names:
             names.append(collapsed)
+        # Также добавляем основу без даты/версии в хвосте («Multitran 03.11.2023» -> «multitran»)
+        stripped = re.sub(
+            r"[\s._-]+(?:v?\d+(?:[._-]\d+)+|(?:19|20)\d{2})$",
+            "",
+            collapsed,
+            flags=re.IGNORECASE,
+        ).strip()
+        if stripped and stripped not in names:
+            names.append(stripped)
+        for base_name in (collapsed, stripped):
+            for alias in _KNOWN_TRANSLITERATIONS.get(base_name, ()):
+                if alias not in names:
+                    names.append(alias)
+
+    for value in values:
+        raw_val = str(value or "").strip().strip('"')
+        if not raw_val:
+            continue
+        base = os.path.basename(raw_val)
+        add_name(base)
+        # Если передан путь к безликому setup.exe/install.exe, берём и имя
+        # родительской папки («...\Multitran 03.11.2023\setup.exe» -> «multitran»).
+        parent = os.path.basename(os.path.dirname(raw_val))
+        if parent:
+            add_name(parent)
     return names
 
 
@@ -436,14 +606,17 @@ def _name_matches(link_path: str, names: Sequence[str]) -> bool:
         return False
     stem = os.path.splitext(os.path.basename(link_path))[0]
     normalized = " ".join(stem.replace("_", " ").casefold().split())
+    words = normalized.split()
     for name in names:
         candidate = " ".join(str(name).replace("_", " ").casefold().split())
-        if not candidate:
+        if not candidate or candidate in _GENERIC_SHORTCUT_STEMS:
             continue
         if normalized == candidate:
             return True
         if normalized.startswith(candidate + " ") or normalized.startswith(
                 candidate + "("):
+            return True
+        if len(candidate) >= 5 and " " not in candidate and candidate in words:
             return True
     return False
 
@@ -519,20 +692,49 @@ class ShortcutGuard:
         self.app_names = [str(item) for item in app_names if str(item).strip()]
         self.before: Optional[Set[str]] = None
         self.removed: List[str] = []
+        self.captured_targets: List[str] = []
 
     def snapshot(self) -> int:
         """Запоминает текущее содержимое папок; возвращает число ярлыков."""
         self.before = snapshot(self._folders)
         self.removed = []
+        self.captured_targets = []
         return len(self.before)
+
+    def _capture_new_targets(self) -> None:
+        """Сохраняет пути целей новых ярлыков ДО их удаления."""
+        if self.before is None:
+            return
+        seen = {_normalized(item) for item in self.captured_targets}
+        for path in created_links(self.before, self._folders):
+            target = link_target(path, self.resolver)
+            if not target:
+                continue
+            norm = _normalized(target)
+            if norm not in seen:
+                seen.add(norm)
+                self.captured_targets.append(target)
+
+    def created_targets(self) -> List[str]:
+        """Возвращает цели всех ярлыков, созданных за время установки."""
+        self._capture_new_targets()
+        return list(self.captured_targets)
+
+    def has_new_shortcuts(self) -> bool:
+        """Появился ли хотя бы один новый ярлык за время установки."""
+        if self.before is None:
+            return False
+        return bool(created_links(self.before, self._folders))
 
     def cleanup(self) -> List[str]:
         """Убирает созданные этим запуском ярлыки и возвращает их пути."""
         if self.before is None:
             return []
+        self._capture_new_targets()
         found = remove_own_shortcuts(
             self.root, extra_roots=self.extra_roots, folders=self._folders,
-            before=self.before, resolver=self.resolver)
+            before=self.before, resolver=self.resolver,
+            app_names=self.app_names)
         return self._remember(found)
 
     def sweep(self) -> List[str]:

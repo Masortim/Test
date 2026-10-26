@@ -241,6 +241,30 @@ class StaleShortcutTests(unittest.TestCase):
         self.assertIn("ollama", names)
         self.assertIn("ollamasetup", names)
 
+    def test_names_extract_parent_folder_and_transliteration_for_generic_setup(self):
+        names = shortcuts.app_name_candidates(
+            "Multitran",
+            r"E:\Backup\Apps\Portable\Multitran 03.11.2023\setup.exe",
+        )
+        self.assertIn("multitran", names)
+        self.assertIn("мультитран", names)
+
+    def test_guard_captures_target_and_removes_new_app_shortcut_outside_portable(self):
+        names = shortcuts.app_name_candidates(
+            "Multitran",
+            r"E:\Backup\Apps\Portable\Multitran 03.11.2023\setup.exe",
+        )
+        guard = shortcuts.ShortcutGuard(
+            str(self.root), folders=[str(self.desktop)], app_names=names)
+        guard.snapshot()
+        default_exe = self.base / "Multitran" / "network.exe"
+        link = make_lnk(
+            self.desktop / "Словарь Мультитран.lnk", str(default_exe))
+        removed = guard.cleanup()
+        self.assertEqual(removed, [str(link)])
+        self.assertFalse(link.exists())
+        self.assertEqual(guard.created_targets(), [str(default_exe)])
+
 
 class LinkDetectionTests(unittest.TestCase):
     def test_slash_and_backslash_forms_both_match(self):
@@ -258,6 +282,38 @@ class LinkDetectionTests(unittest.TestCase):
                           str(Path("C:/Apps/FooBar/x.exe")).encode("utf-16-le"))
             self.assertFalse(shortcuts.link_points_into(
                 str(path), ["C:\\Apps\\Foo"]))
+
+    def test_lnk_target_parses_real_windows_lnk_with_idlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "Multitran.lnk"
+            header = bytearray(0x4C)
+            header[0:4] = b"L\x00\x00\x00"
+            import struct
+            # HasLinkTargetIDList (0x01) | HasLinkInfo (0x02)
+            struct.pack_into("<I", header, 0x14, 0x03)
+            idlist_body = b"\x14\x00" + b"\x00" * 18 + b"\x00\x00"
+            idlist = struct.pack("<H", len(idlist_body)) + idlist_body
+            base_bytes = b"C:\\Multitran\\\x00"
+            suffix_bytes = b"network.exe\x00"
+            info_header_size = 0x1C
+            base_offset = info_header_size
+            suffix_offset = base_offset + len(base_bytes)
+            info_size = suffix_offset + len(suffix_bytes)
+            link_info = struct.pack(
+                "<IIIIIII",
+                info_size,
+                info_header_size,
+                0x01,
+                info_header_size,
+                base_offset,
+                0,
+                suffix_offset,
+            ) + base_bytes + suffix_bytes
+            path.write_bytes(bytes(header) + idlist + link_info)
+            self.assertEqual(
+                shortcuts.lnk_target(str(path)),
+                r"C:\Multitran\network.exe",
+            )
 
 
 if __name__ == "__main__":
