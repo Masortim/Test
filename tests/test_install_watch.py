@@ -458,6 +458,44 @@ class InstallWaitTests(unittest.TestCase):
         self.assertEqual(rc, engine_mod.redist_mod.TIMEOUT_EXIT_CODE)
         self.assertTrue(proc.killed)
 
+    def test_wizard_gets_no_target_dir_for_default_folder_plan(self):
+        """План «пусть установщик выберет папку» не вбивает App в мастер.
+
+        Регрессия на Multitran: внутренний мастер выбора каталога
+        отклоняет переданный через командную строку путь («folder is not
+        accessible»), а App во вкладку еще и дописывается — поэтому
+        default-папка никогда не используется и recover не срабатывает.
+        """
+        proc = _FakeProc()
+        seen = []
+
+        def fake_dismiss(counter=None, **kwargs):  # noqa: ANN001
+            seen.append(kwargs.get("target_dir"))
+            return 0
+
+        default_plan = SilentPlan(
+            program="setup.exe", args=["/VERYSILENT"], label="без /DIR",
+            ignores_target_dir=True, prefers_installer_default_dir=True)
+        self.plan = default_plan
+        with mock.patch.object(engine_mod.redist_mod,
+                               "_dismiss_installer_dialogs", fake_dismiss):
+            rc = self._run(proc, idle=0.2)
+        self.assertEqual(rc, engine_mod.redist_mod.TIMEOUT_EXIT_CODE)
+        self.assertTrue(seen)
+        self.assertTrue(all(value == "" for value in seen), seen)
+
+        # Обычный план всё ещё вписывает App — иначе установщик уйдёт в
+        # Program Files.
+        normal_plan = SilentPlan(program="setup.exe", args=["/VERYSILENT"],
+                                 label="обычный")
+        self.plan = normal_plan
+        with mock.patch.object(engine_mod.redist_mod,
+                               "_dismiss_installer_dialogs", fake_dismiss):
+            self._run(_FakeProc(), idle=0.2)
+        latter = seen[len(seen) // 2:]
+        self.assertTrue(latter)
+        self.assertTrue(all(value == str(self.app) for value in latter), seen)
+
     def test_wait_loop_clicks_through_directx_warnings(self):
         """DXSETUP «Неверная операция командной строки» закрывается сами."""
         proc = _FakeProc()

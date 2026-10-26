@@ -175,6 +175,16 @@ class NestedPlanTests(BaseCase):
         self.assertTrue(plans[1].ignores_target_dir)
         self.assertIn("без /DIR", plans[1].label)
 
+    def test_inno_second_plan_lets_installer_pick_its_own_folder(self):
+        # Внутренний мастер выбора папки (Multitran) отклоняет переданный
+        # через командную строку путь и не пропускает страницу тишиной.
+        # План без /DIR должен НЕ вбивать App во вкладку выбора каталога,
+        # чтобы установщик прошёл с каталогом по умолчанию.
+        plans = self.engine._plans_for_nested_setup(
+            self._nested(b"Inno Setup"), str(self.app), self._opts())
+        self.assertFalse(plans[0].prefers_installer_default_dir)
+        self.assertTrue(plans[1].prefers_installer_default_dir)
+
     def test_nsis_gets_s_and_the_path_last_without_quotes(self):
         plans = self.engine._plans_for_nested_setup(
             self._nested(b"Nullsoft Install System"), str(self.app),
@@ -345,6 +355,103 @@ class FlowTests(BaseCase):
         self.assertFalse((self.app / "setup.exe").exists())
         self.assertFalse((self.portable / "_sfx_content").exists())
         self.assertIn("не дал файлов программы", self.engine.log.text)
+
+    def test_nested_installer_failure_promotes_container_payload(self):
+        _write(self.root / "mt.exe", b"MZ" + b"WinRAR SFX" + b"\0" * 64)
+        exe = pebuild.write_pe(self.root / "src" / "MultiTran.exe",
+                               imports=["kernel32.dll"])
+
+        def fake_extract(_source, work_dir, *_args, **_kwargs):  # noqa: ANN001
+            pebuild.write_pe(Path(work_dir) / "setup.exe",
+                             imports=["kernel32.dll"],
+                             extra=b"Inno Setup Setup Data")
+            (Path(work_dir) / "MultiTran.exe").write_bytes(
+                Path(exe).read_bytes())
+            return 1, "7z.exe"
+
+        # Установщик изнутри «не поставил» (клики не прошли), но содержимое
+        # контейнера — это файлы программы: они должны переехать в App.
+        with mock.patch.object(self.engine, "_extract_container_to",
+                               side_effect=fake_extract), \
+                mock.patch.object(self.engine, "_run_install",
+                                  return_value=0), \
+                mock.patch.object(unpacker_mod, "find_unpacker",
+                                  return_value=None):
+            result = self.engine._run_container_first(
+                self._opts(), str(self.app), str(self.data),
+                str(self.portable),
+                DetectionResult(InstallerType.SELF_EXTRACT, 0.7), "MultiTran")
+        self.assertIsNotNone(result)
+        code, plan = result
+        self.assertEqual(code, 0)
+        self.assertIsNone(plan)
+        self.assertTrue((self.app / "MultiTran.exe").is_file())
+        self.assertFalse((self.app / "setup.exe").exists())
+
+    def test_nested_installer_failure_extracts_nested_payload(self):
+        _write(self.root / "mt.exe", b"MZ" + b"WinRAR SFX" + b"\0" * 64)
+
+        def fake_extract(_source, work_dir, *_args, **_kwargs):  # noqa: ANN001
+            pebuild.write_pe(Path(work_dir) / "setup.exe",
+                             imports=["kernel32.dll"],
+                             extra=b"Inno Setup Setup Data")
+            return 1, "7z.exe"
+
+        def fake_unpack(_unpacker, _installer, destination,
+                        _work, **_kwargs):  # noqa: ANN001
+            pebuild.write_pe(Path(destination) / "MultiTran.exe",
+                             imports=["kernel32.dll"])
+            return True, "перенесено файлов: 1"
+
+        # Содержимого контейнера мало (только setup.exe), а payload внутри
+        # вложенного Inno Setup — распаковщик его достаёт без запуска.
+        with mock.patch.object(self.engine, "_extract_container_to",
+                               side_effect=fake_extract), \
+                mock.patch.object(self.engine, "_run_install",
+                                  return_value=0), \
+                mock.patch.object(unpacker_mod, "find_unpacker",
+                                  return_value="7z.exe"), \
+                mock.patch.object(unpacker_mod, "unpack_installer",
+                                  side_effect=fake_unpack):
+            result = self.engine._run_container_first(
+                self._opts(), str(self.app), str(self.data),
+                str(self.portable),
+                DetectionResult(InstallerType.SELF_EXTRACT, 0.7), "MultiTran")
+        self.assertIsNotNone(result)
+        code, plan = result
+        self.assertEqual(code, 0)
+        self.assertIsNone(plan)
+        self.assertTrue((self.app / "MultiTran.exe").is_file())
+
+    def test_install_from_container_recovers_nonzero_exit(self):
+        _write(self.root / "mt.exe", b"MZ" + b"WinRAR SFX" + b"\0" * 64)
+        nested = _write(self.root / "setup.exe",
+                        b"MZ" + b"\0" * 512 + b"Inno Setup")
+        recover_calls = []
+
+        def fake_install(_plan, _opts, _app, _data, **_kwargs):  # noqa: ANN001
+            return 1
+
+        def fake_recover():
+            recover_calls.append(True)
+            return True
+
+        # Мастер пошёл, установщик поставил программу в каталог по
+        # умолчанию и вышел с кодом 1 — recovery должен всё равно
+        # перенести её в App.
+        with mock.patch.object(self.engine, "_run_install",
+                               side_effect=fake_install), \
+                mock.patch.object(self.engine, "_find_main_exe",
+                                  return_value=None):
+            result = self.engine._install_from_container(
+                nested, str(self.portable / "_sfx_content"), self._opts(),
+                str(self.app), str(self.data), str(self.portable), "MultiTran",
+                recover=fake_recover)
+        self.assertIsNotNone(result)
+        code, plan = result
+        self.assertEqual(code, 1)
+        self.assertIn("без /DIR", plan.label)
+        self.assertEqual(len(recover_calls), 1)
 
     def test_data_only_archive_is_not_poured_into_app(self):
         _write(self.root / "mt.exe", b"MZ" + b"WinRAR SFX" + b"\0" * 64)
