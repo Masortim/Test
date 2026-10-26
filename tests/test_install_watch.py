@@ -513,6 +513,241 @@ class InstallWaitTests(unittest.TestCase):
         self.assertIn("предел времени", self.engine.log.text)
 
 
+class DeadStartTests(unittest.TestCase):
+    """«Мёртвый старт»: установщик не сделал ничего с самого запуска.
+
+    Регрессия, ради которой написано:
+
+        Попытка портировать MultiTran (3,7 ГБ, WinRAR SFX) шла 47 минут.
+        Установщик не прочитал ни байта и не создал ни одного файла, но
+        сборка спрашивала «ждать ещё?» каждые 15 минут, и человек отвечал
+        «ждать» — потому что по журналу нельзя было понять, что процесс
+        вообще не начинал работу.
+
+    Теперь такой установщик отличается от «медленно распаковывающего» за
+    пять минут, попытка снимается сама, а сборка переходит к следующему
+    сценарию (для SFX — к распаковке содержимого без запуска обёртки).
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.app = Path(self.temp.name, "App")
+        self.app.mkdir()
+        self.activity = mock.patch.object(procutil, "process_activity",
+                                          return_value=None)
+        self.activity.start()
+        self.addCleanup(self.activity.stop)
+
+    def _watch(self, **kwargs):
+        return _InstallWatchdog(1, roots=[str(self.app)],
+                                probe_seconds=0.0, dir_seconds=0.0, **kwargs)
+
+    def test_nothing_known_before_the_first_poll(self):
+        self.assertFalse(self._watch().never_started())
+
+    def test_silent_process_never_started(self):
+        watch = self._watch()
+        watch.poll(now=100.0)
+        watch.poll(now=200.0)
+        self.assertTrue(watch.never_started())
+        self.assertEqual(watch.files, 0)
+
+    def test_files_in_the_target_folder_mean_it_started(self):
+        watch = self._watch()
+        watch.poll(now=100.0)
+        _touch(str(self.app), "data.bin", 1024)
+        watch.poll(now=200.0)
+        self.assertFalse(watch.never_started())
+
+    def test_disk_reads_mean_it_started(self):
+        """Даже без файлов чтение архива видно: это уже работа."""
+        state = {"io": 1000}
+
+        def fake_activity(_pid):  # noqa: ANN001
+            return procutil.ProcessActivity((1,), state["io"], 0.0)
+
+        with mock.patch.object(procutil, "process_activity", fake_activity):
+            watch = self._watch()
+            watch.poll(now=100.0)
+            state["io"] = 500 * 1024 * 1024
+            watch.poll(now=200.0)
+            self.assertFalse(watch.never_started())
+
+    def test_a_few_kilobytes_of_the_loader_are_not_work(self):
+        """Обёртка читает свой заголовок — это не начало установки."""
+        state = {"io": 1000}
+
+        def fake_activity(_pid):  # noqa: ANN001
+            return procutil.ProcessActivity((1,), state["io"], 0.0)
+
+        with mock.patch.object(procutil, "process_activity", fake_activity):
+            watch = self._watch()
+            watch.poll(now=100.0)
+            state["io"] = 1000 + 648 * 1024
+            watch.poll(now=200.0)
+            self.assertTrue(watch.never_started())
+
+    def test_cpu_time_means_it_started(self):
+        state = {"cpu": 0.0}
+
+        def fake_activity(_pid):  # noqa: ANN001
+            return procutil.ProcessActivity((1,), 1000, state["cpu"])
+
+        with mock.patch.object(procutil, "process_activity", fake_activity):
+            watch = self._watch()
+            watch.poll(now=100.0)
+            state["cpu"] = 12.0
+            watch.poll(now=200.0)
+            self.assertFalse(watch.never_started())
+
+
+class DeadStartAbortTests(unittest.TestCase):
+    """Попытка с «мёртвым стартом» снимается сама и без вопроса человеку."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.app = root / "App"
+        self.app.mkdir()
+        self.data = root / "PortableData"
+        self.data.mkdir()
+        self.console = str(root / "installer-output.log")
+        self.engine = Portablizer(Logger())
+        self.plan = SilentPlan(program="setup.exe", args=["/S"],
+                               label="WinRAR SFX: /S /D=")
+        self.patches = [
+            mock.patch.object(engine_mod, "IS_WINDOWS", True),
+            mock.patch.object(engine_mod, "INSTALL_PROBE_SECONDS", 0.02),
+            mock.patch.object(engine_mod, "INSTALL_DIR_SCAN_SECONDS", 0.02),
+            mock.patch.object(engine_mod, "INSTALL_IDLE_FLOOR", 0.2),
+        ]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def _run(self, proc, idle=0.4, deadline=0.0, engine=None):
+        target = engine or self.engine
+        with mock.patch.object(engine_mod.subprocess, "Popen",
+                               return_value=proc):
+            return target._run_install(
+                self.plan, PortableOptions(
+                    installer_path="mt.exe",
+                    output_dir=str(Path(self.temp.name)),
+                    install_timeout=idle, install_deadline=deadline),
+                str(self.app), str(self.data), console_log=self.console)
+
+    def test_dead_start_is_stopped_early_without_asking(self):
+        proc = _FakeProc()
+        asked: list = []
+        engine = Portablizer(Logger(), on_stall=lambda stall: asked.append(stall))
+
+        def fail_if_asked(_stall):  # noqa: ANN001
+            raise AssertionError("о мёртвом старте спрашивать не нужно")
+
+        engine.on_stall = fail_if_asked
+        started = time.monotonic()
+        with mock.patch.object(engine_mod, "INSTALL_DEAD_START_LIMIT", 0.3):
+            rc = self._run(proc, idle=30.0, engine=engine)
+        self.assertEqual(rc, engine_mod.redist_mod.TIMEOUT_EXIT_CODE)
+        self.assertLess(time.monotonic() - started, 10.0)
+        self.assertTrue(proc.killed)
+        self.assertTrue(engine._install_dead_start)
+        self.assertFalse(engine._install_stalled)
+        self.assertIn("не начал работу", engine.log.text)
+        self.assertEqual(asked, [])
+
+    def test_dead_start_hints_say_what_to_check(self):
+        proc = _FakeProc()
+        engine = Portablizer(Logger())
+        engine._install_dialog_titles = ["Неверная операция командной строки"]
+        with mock.patch.object(engine_mod, "INSTALL_DEAD_START_LIMIT", 0.3):
+            self._run(proc, idle=30.0, engine=engine)
+        hints = engine._failure_hints(
+            engine_mod.DetectionResult(engine_mod.InstallerType.SELF_EXTRACT, 0.7),
+            engine_mod.redist_mod.TIMEOUT_EXIT_CODE,
+            PortableOptions(installer_path="setup.exe",
+                            output_dir=self.temp.name))
+        joined = " ".join(hints)
+        self.assertIn("не начавший работу", joined)
+        self.assertIn("Неверная операция командной строки", joined)
+        self.assertIn("UAC", joined)
+        self.assertIn("7-Zip", joined)
+
+    def test_an_installer_that_works_is_not_dead_started(self):
+        """Файлы появляются — значит работа идёт, снимать нечего."""
+        proc = _FakeProc()
+        finished = threading.Event()
+
+        def writer():  # noqa: D401 - фоновая работа установщика
+            for index in range(10):
+                _touch(str(self.app), f"part{index}.bin", 4096)
+                time.sleep(0.1)
+            proc.returncode = 0
+            finished.set()
+
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        with mock.patch.object(engine_mod, "INSTALL_DEAD_START_LIMIT", 0.1):
+            rc = self._run(proc, idle=30.0)
+        thread.join(timeout=5)
+        self.assertTrue(finished.is_set())
+        self.assertEqual(rc, 0)
+        self.assertFalse(self.engine._install_dead_start)
+
+
+    def test_diagnosis_names_the_window_and_the_uac_prompt(self):
+        self.engine._install_dialog_titles = ["Неверная операция командной строки"]
+        with mock.patch.object(procutil, "uac_prompt_pending",
+                               return_value=True):
+            lines = " ".join(self.engine._dead_start_diagnosis())
+        self.assertIn("Неверная операция командной строки", lines)
+        self.assertIn("UAC", lines)
+        self.assertIn("антивирус", lines)
+
+    def test_uac_probe_is_quiet_outside_windows(self):
+        """Диагностика не должна врать на не-Windows и падать без WinAPI."""
+        self.assertFalse(procutil.uac_prompt_pending())
+        self.assertEqual(engine_mod.redist_mod.pending_dialog_titles([1]), [])
+
+
+class DeadStartLadderTests(unittest.TestCase):
+    """Два «мёртвых старта» подряд — перебор ключей больше не нужен."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = self.root / "App"
+        self.data = self.root / "PortableData"
+        self.app.mkdir()
+        self.data.mkdir()
+        self.engine = Portablizer(Logger())
+        self.plans = [
+            SilentPlan(program="setup.exe", args=[], label=f"сценарий {n}")
+            for n in range(5)
+        ]
+
+    def test_ladder_stops_after_two_dead_starts(self):
+        timeout = engine_mod.redist_mod.TIMEOUT_EXIT_CODE
+
+        def dead(_plan, _opts, _app, _data, **_kwargs):
+            self.engine._install_dead_start = True
+            return timeout
+
+        with mock.patch.object(self.engine, "_run_install", side_effect=dead):
+            rc, plan = self.engine._run_attempts(
+                self.plans,
+                PortableOptions(installer_path="setup.exe",
+                                output_dir=str(self.root)),
+                str(self.app), str(self.data), str(self.root), "App")
+        self.assertEqual(rc, timeout)
+        self.assertIsNone(plan)
+        self.assertEqual(self.engine._attempts_made, 2)
+        self.assertIn("ключи тишины до него не доходят", self.engine.log.text)
+
+
 class LadderTests(unittest.TestCase):
     """Что делает лестница попыток, когда установка замолчала."""
 

@@ -129,6 +129,26 @@ INSTALL_IDLE_FLOOR = 30.0
 #: заканчивается через минуту-полторы, а не через INSTALL_IDLE_LIMIT.
 INSTALL_GUI_PROMPT_LIMIT = 90.0
 
+#: Сколько ждать установщик, который не сделал НИЧЕГО с самого запуска
+#: (секунды). Обычный предел паузы (15 минут) рассчитан на честную работу:
+#: там установщик уже распаковал гигабайты и просто задумался. Здесь другое —
+#: ни прочитанного байта, ни созданного файла, ни процессорного времени.
+#: Тяжёлый дистрибутив так себя не ведёт: он читает свой архив, и это видно в
+#: счётчиках ввода-вывода. Значит, процесс стоит на внешнем препятствии
+#: (запрос UAC, модальное окно обёртки-SFX, антивирус, неподходящий ключ), и
+#: ждать четверть часа бессмысленно: сборка простоит час и не сдвинется.
+#: Поэтому «мёртвый старт» распознаётся за пять минут, попытка снимается без
+#: вопроса человеку, а сборка честно переходит к следующему сценарию — в
+#: частности, к распаковке контейнера без запуска его кода.
+INSTALL_DEAD_START_LIMIT = 300.0
+
+#: Сколько сценариев подряд могут закончиться «мёртвым стартом», прежде чем
+#: перебор ключей станет бессмысленным. Две попытки подряд, в которых
+#: установщик не прочитал ни байта, означают, что ключи до него не доходят:
+#: дальше сборка идёт к распаковке содержимого без запуска, а не сжигает по
+#: пять минут на каждый из оставшихся вариантов.
+DEAD_START_ATTEMPTS_LIMIT = 2
+
 #: Короткие быстрые «успехи» без payload обычно означают, что команда
 #: проигнорирована либо перед нами web-downloader. Двух подряд достаточно,
 #: чтобы не запускать остальные случайные ключи (и не менять систему лишний раз).
@@ -900,6 +920,12 @@ class _InstallWatchdog:
         self.files = 0
         self.bytes = 0
         self.log_bytes = 0
+        #: Счётчики на первом опросе: по ним видно, делал ли установщик хоть
+        #: что-нибудь за всю попытку. Именно это отличает «медленно
+        #: распаковывает» от «стоит и ждёт нажатия/подтверждения».
+        self.start_io = 0
+        self.start_cpu = 0.0
+        self.start_known = False
 
     # -- наблюдения -----------------------------------------------------------
     def _log_bytes(self) -> int:
@@ -962,6 +988,14 @@ class _InstallWatchdog:
             return False
         self._next_probe = now + self.probe_seconds
         self._sample_now(now)
+        if not self.start_known:
+            # Точка отсчёта: с ней сравнивается ВСЁ дальнейшее поведение
+            # установщика. Первый опрос всегда считается работой (процесс
+            # только запустился), но если после него счётчики так и не
+            # сдвинулись — установщик не сделал вообще ничего.
+            self.start_known = True
+            self.start_io = self.io_bytes
+            self.start_cpu = self.cpu_seconds
         current = self._fingerprint_now()
         changed = self.samples == 0 or current != self._fingerprint
         self._fingerprint = current
@@ -983,6 +1017,35 @@ class _InstallWatchdog:
         никогда не спросит, что с ним сделать.
         """
         return self._strong_changed
+
+    def never_started(self, cpu_slack: float = 1.0,
+                      io_slack: int = 4 * 1024 * 1024) -> bool:
+        """Установщик запущен, но за всю попытку не сделал НИЧЕГО.
+
+        Отличие от :meth:`strong_changed`: там речь о паузе ПОСЛЕ работы, а
+        здесь — о попытке, в которой работы не было ни секунды. Такое
+        поведение нельзя объяснить размером дистрибутива: 3,7-гигабайтный
+        установщик читает свой архив с диска, и это видно в счётчиках
+        ввода-вывода дерева процессов. Если же ни ввод-вывод, ни процессор,
+        ни целевая папка не сдвинулись даже на мегабайт, процесс стоит на
+        чём-то внешнем:
+
+        * Windows показывает запрос UAC (он принадлежит ``consent.exe``, а не
+          дереву установщика, поэтому наши счётчики его не видят);
+        * обёртка-SFX показала модальное окно «неверная операция командной
+          строки» и ждёт нажатия «ОК»;
+        * антивирус держит файл и не отдаёт его установщику;
+        * ключ установки не подошёл, и обёртка молча ждёт.
+
+        ``cpu_slack``/``io_slack`` — допуск на «дрожание» счётчиков: оболочка
+        успевает прочитать собственный заголовок, и это не работа установки.
+        """
+        if not self.start_known:
+            # Ни одного опроса ещё не было: судить не о чем.
+            return False
+        return (self.files == 0 and self.bytes == 0
+                and self.io_bytes <= self.start_io + max(0, int(io_slack))
+                and self.cpu_seconds <= self.start_cpu + max(0.0, float(cpu_slack)))
 
     # -- отчёт ---------------------------------------------------------------
     def summary(self) -> str:
@@ -1046,6 +1109,18 @@ class Portablizer:
         #: Установщик открывал собственный мастер (язык/папка) и ждал
         #: нажатий — из этого строится отдельная подсказка в отчёте.
         self._install_gui_seen = False
+        #: Попытка снята потому, что установщик не сделал НИЧЕГО с самого
+        #: запуска (ни ввода-вывода, ни файлов). Это не то же самое, что
+        #: затишье после работы: здесь сборка не ждёт 15 минут, а сразу
+        #: переходит к следующему сценарию (см. INSTALL_DEAD_START_LIMIT).
+        self._install_dead_start = False
+        #: Сколько попыток подряд закончились «мёртвым стартом» (см.
+        #: DEAD_START_ATTEMPTS_LIMIT).
+        self._dead_start_attempts = 0
+        #: Заголовки окон установщика, которые Portablizer не закрывает сам
+        #: (незнакомый диалог). Нужны для честного диагноза: «стоит окно с
+        #: таким-то текстом» вместо «нет признаков работы».
+        self._install_dialog_titles: List[str] = []
         #: Папка TEMP, из которой работает установщик. По умолчанию —
         #: ``PortableData\Temp``; может быть перенесена на другой диск, если на
         #: диске портатива для распаковки не хватает места (см.
@@ -1828,6 +1903,9 @@ class Portablizer:
             self._install_stalled = False
             self._install_stall = None
             self._install_gui_seen = False
+            self._install_dead_start = False
+            self._dead_start_attempts = 0
+            self._install_dialog_titles = []
             # Всё, что относится к диагностике падений и временному месту
             # установщика, начинается заново: один и тот же объект может
             # собирать несколько портативов подряд.
@@ -1976,6 +2054,14 @@ class Portablizer:
                 )
                 for extra_plan in attempts[1:]:
                     self.log.debug(f"  • запасной: {extra_plan.label}")
+            if self._container_first_worth_trying(det):
+                self.log.info(
+                    "Этот файл — контейнер (самораспаковывающийся архив). "
+                    "Сначала Portablizer достанет его содержимое, не выполняя "
+                    "код обёртки, и поставит установщик изнутри его "
+                    "собственными ключами; команды выше — запасной вариант, "
+                    "если содержимое достать не удастся."
+                )
 
             # 3. Снимок реестра ДО
             # Профиль чужого пользователя (UAC с вводом чужих учётных данных)
@@ -2048,9 +2134,23 @@ class Portablizer:
                         before=install_locations_before,
                     )
 
-                install_rc, used_plan = self._run_attempts(
-                    attempts, opts, app_dir, data_dir, portable_dir, name,
+                # Самораспаковывающийся архив ставится не «ключами», а
+                # содержимым: сначала достаём его без запуска обёртки, потом
+                # ставим установщик изнутри (или переносим файлы в App).
+                # Только если это не удалось — обычная лестница ключей.
+                container = self._run_container_first(
+                    opts, app_dir, data_dir, portable_dir, det, name,
                     recover=recover)
+                if container is not None:
+                    install_rc, used_plan = container
+                    if used_plan is not None:
+                        self._attempts_made += 1
+                        self._attempt_history.append(
+                            (used_plan.label, install_rc))
+                else:
+                    install_rc, used_plan = self._run_attempts(
+                        attempts, opts, app_dir, data_dir, portable_dir, name,
+                        recover=recover)
             finally:
                 if dx_guard is not None:
                     dx_guard.remove()
@@ -2532,6 +2632,8 @@ class Portablizer:
 
         if self._install_stalled:
             hints.extend(self._stall_hints())
+        if self._install_dead_start:
+            hints.extend(self._dead_start_hints())
 
         repack = getattr(det, "repack_profile", None)
         if isinstance(repack, RepackProfile):
@@ -2695,6 +2797,41 @@ class Portablizer:
             "installer-output.log и журнал установщика (install.log): чаще "
             "всего движок показал модальное окно (не тот ключ тишины, "
             "требование перезагрузки, нехватка места) и ждал нажатия кнопки."
+        )
+        return hints
+
+    def _dead_start_hints(self) -> List[str]:
+        """Подсказки, когда установщик не начал работу вовсе.
+
+        Это не «долго идёт» и не «зависло на середине»: процесс не прочитал
+        ни байта и не создал ни одного файла. Совет «подождите ещё» здесь
+        прямо вреден — он и приводил к часам ожидания на пустом месте.
+        """
+        stall = self._install_stall
+        hints: List[str] = []
+        if stall is not None:
+            hints.append(
+                "Установщик был снят как «не начавший работу»: сценарий "
+                f"«{stall.attempt}» шёл {redist_mod.human_duration(stall.elapsed)}, "
+                "и за это время не появилось ни прочитанных байт, ни файлов "
+                "в App, ни процессорного времени. Это не медленная "
+                "распаковка — процесс стоял на внешнем препятствии."
+            )
+        for title in self._install_dialog_titles[:3]:
+            hints.append(
+                f"Установщик показывал окно «{title}». Обёртка "
+                "самораспаковывающегося архива часто не понимает ключи "
+                "тишины (/S, /VERYSILENT) и сообщает об этом окном, которое "
+                "ждёт нажатия ОК."
+            )
+        hints.append(
+            "Проверьте по порядку: 1) запрос UAC — подтвердите его; "
+            "2) исключения антивируса — добавьте установщик и папку "
+            "портатива; 3) запустите Portablizer от имени администратора. "
+            "Если ни то, ни другое не помогло, самораспаковывающийся архив "
+            "не понимает ключей вовсе: Portablizer сам достаёт его "
+            "содержимое распаковщиком (7-Zip, WinRAR или встроенный tar.exe "
+            "Windows) — установите любой из них и повторите сборку."
         )
         return hints
 
@@ -3196,6 +3333,9 @@ class Portablizer:
             self.log.info("Запуск установщика (тихо, изолированно)...")
         rc: Optional[int] = None
         started = time.monotonic()
+        # Флаг «мёртвого старта» относится к текущей попытке: каждая новая
+        # команда получает свой шанс, даже если предыдущая не началась.
+        self._install_dead_start = False
         try:
             try:
                 if plan.raw_tail:
@@ -3354,6 +3494,7 @@ class Portablizer:
         interactive_since = 0.0
         tree_pids: List[int] = [proc.pid]
         tree_refresh = 0.0
+        last_dialog_probe = 0.0
         while proc.poll() is None:
             now = time.monotonic()
             if self.cancel.is_set():
@@ -3400,6 +3541,27 @@ class Portablizer:
             except Exception:  # noqa: BLE001 — WinAPI не вправе ронять сборку
                 clicked = 0
                 interactive_since = 0.0
+            # Незнакомые окна установщика. Portablizer их не нажимает (у
+            # кнопок может быть разрушительный смысл), но и молчать о них
+            # нельзя: именно такое окно чаще всего и держит процесс, пока
+            # сборка считает, что «нет признаков работы». Заголовки попадают
+            # в журнал и в диагноз «мёртвого старта».
+            if now - last_dialog_probe >= 20.0 and now - last_work >= 30.0:
+                last_dialog_probe = now
+                try:
+                    titles = redist_mod.pending_dialog_titles(tree_pids)
+                except Exception:  # noqa: BLE001 — WinAPI не вправе ронять сборку
+                    titles = []
+                for title in titles:
+                    if title and title not in self._install_dialog_titles:
+                        self._install_dialog_titles.append(title)
+                        self.log.warn(
+                            "Установщик показывает окно «" + title + "» и ждёт "
+                            "нажатия. Portablizer не нажимает незнакомые "
+                            "кнопки сам: подтвердите или закройте это окно, "
+                            "либо дождитесь конца попытки — сборка продолжит "
+                            "другими сценариями."
+                        )
             if clicked:
                 dismissed += clicked
                 if now - last_dismiss_log >= 5.0:
@@ -3440,6 +3602,33 @@ class Portablizer:
             if deadline and elapsed > deadline:
                 self._note_stall(watchdog, plan, elapsed, idle, idle_limit,
                                  deadline, reason="достигнут предел времени")
+                self._stop_installer(proc)
+                return redist_mod.TIMEOUT_EXIT_CODE
+            # «Мёртвый старт»: установщик не прочитал и не записал ни байта,
+            # не потратил ни секунды процессорного времени и не создал ни
+            # одного файла за всю попытку. Тяжёлый дистрибутив так не
+            # выглядит (он читает свой архив), значит процесс стоит на
+            # внешнем препятствии — и тут нечего ждать четверть часа.
+            # Попытка снимается сама, без вопроса человеку: ответ «ждать
+            # ещё» на такой вопрос ничего не меняет, а сборка стоит.
+            if (not plan.interactive and not self._install_dead_start
+                    and elapsed >= INSTALL_DEAD_START_LIMIT
+                    and watchdog.never_started()):
+                self._install_dead_start = True
+                self._install_stall = watchdog.report(
+                    plan.label, elapsed, idle, idle_limit, deadline)
+                self.log.warn(
+                    "Установщик не начал работу за "
+                    f"{redist_mod.human_duration(elapsed)}: ни прочитанных "
+                    "байт, ни созданных файлов, ни процессорного времени. "
+                    "Это не медленная распаковка — так ведёт себя обёртка, "
+                    "которая ждёт подтверждения (запрос UAC или её "
+                    "собственное окно) либо не поняла ключи вовсе. Снимаю "
+                    "эту попытку без ожидания общего предела и перехожу к "
+                    "следующему сценарию."
+                )
+                for line in self._dead_start_diagnosis():
+                    self.log.warn("  • " + line)
                 self._stop_installer(proc)
                 return redist_mod.TIMEOUT_EXIT_CODE
             # Мастер с вопросами: не ждать INSTALL_IDLE_LIMIT. Установщик
@@ -3527,6 +3716,43 @@ class Portablizer:
             "с дочерними процессами — сборка продолжается с тем, что уже "
             "лежит в папке App.")
 
+    def _dead_start_diagnosis(self) -> List[str]:
+        """Почему установщик мог не начать работу: по пунктам, без догадок.
+
+        Диагноз строится только на фактах, которые видно снаружи: открытые
+        окна самого установщика, запущенный ``consent.exe`` (запрос UAC) и
+        права текущего процесса. Придумывать причину «на всякий случай»
+        нельзя: неверный совет стоит пользователю часа.
+        """
+        lines: List[str] = []
+        for title in self._install_dialog_titles[:3]:
+            lines.append(
+                f"Открыто окно установщика «{title}» — если оно ждёт "
+                "нажатия, нажмите кнопку в нём: обёртка-SFX часто не "
+                "понимает переданные ключи и показывает ошибку."
+            )
+        try:
+            uac = procutil.uac_prompt_pending()
+        except Exception:  # noqa: BLE001 - диагностика необязательна
+            uac = False
+        if uac:
+            lines.append(
+                "Windows показывает запрос контроля учётных записей (UAC). "
+                "Подтвердите его — до этого установщик не получит управление "
+                "вовсе."
+            )
+        if IS_WINDOWS and not is_elevated():
+            lines.append(
+                "Portablizer запущен без прав администратора: установщику "
+                "может требоваться повышение, и он ждёт его молча."
+            )
+        lines.append(
+            "Если окон нет и UAC не спрашивает, файл, скорее всего, "
+            "проверяет антивирус: добавьте установщик и папку портатива в "
+            "исключения и повторите сборку."
+        )
+        return lines
+
     @staticmethod
     def _stop_installer(proc: "subprocess.Popen") -> None:
         """Снимает установщик вместе со всеми его дочерними процессами.
@@ -3561,6 +3787,10 @@ class Portablizer:
         queue: List[SilentPlan] = list(attempts)
         self._hollow_note = ""
         hollow_successes = 0
+        # Счётчик «мёртвых стартов» ведётся по попыткам этой лестницы:
+        # распаковка содержимого контейнера (если она была) свои счётчики
+        # сюда не приносит.
+        self._dead_start_attempts = 0
         payload_before = (
             space_mod.payload_signature(app_dir),
             space_mod.payload_signature(data_dir),
@@ -3614,6 +3844,8 @@ class Portablizer:
             self._report_installshield_log(plan)
             self._attempts_made += 1
             self._attempt_history.append((plan.label, rc))
+            if self._install_dead_start:
+                self._dead_start_attempts += 1
             index += 1
 
             # Adobe: установщик успевает разложить пакеты во временный каталог
@@ -3722,6 +3954,21 @@ class Portablizer:
                     f"Сценарий: {plan.label}"
                 )
                 return rc, plan
+
+            # «Мёртвый старт» повторяется: ключи до установщика не доходят
+            # вовсе. Дальше перебирать их бессмысленно — сборка идёт к
+            # распаковке содержимого без запуска установщика.
+            if (rc == redist_mod.TIMEOUT_EXIT_CODE and self._install_dead_start
+                    and not self._app_has_payload(app_dir)
+                    and self._dead_start_attempts >= DEAD_START_ATTEMPTS_LIMIT):
+                self.log.warn(
+                    "Две попытки подряд установщик не прочитал ни байта: "
+                    "ключи тишины до него не доходят (так ведут себя "
+                    "обёртки самораспаковывающихся архивов). Остальные "
+                    "варианты ключей пропускаю — содержимое будет достано "
+                    "распаковкой без запуска."
+                )
+                break
 
             # Установщик замолчал, но уже успел распаковать часть данных.
             # Запускать поверх них следующий сценарий бессмысленно и вредно:
@@ -4207,6 +4454,401 @@ class Portablizer:
         return ("Portablizer уже пробовал этот установщик с окном прогресса "
                 "(/SILENT вместо /VERYSILENT) — падение повторилось, значит "
                 "причина не в отрисовке тихого прогресса.")
+
+    # -- самораспаковывающийся архив: сначала содержимое, потом установка ------
+    #
+    # Обёртка-SFX (WinRAR SFX, 7-Zip SFX, WinZip Self-Extractor, IExpress) —
+    # это не установщик, а программа распаковки. Ключи тишины она не разбирает
+    # и передаёт их своей программе установки как получится; при неизвестном
+    # ключе она может показать модальное окно и ждать нажатия «ОК» — а сборка
+    # в это время видит «процессы живы, работы нет» и ждёт по четверти часа на
+    # каждый сценарий. Ровно так выглядела попытка портировать MultiTran
+    # (3,7 ГБ, WinRAR SFX поверх Inno Setup): 47 минут, ноль файлов, ноль
+    # процессорного времени.
+    #
+    # Поэтому для SFX порядок обратный: сначала достать содержимое, НЕ выполняя
+    # код обёртки (7-Zip/WinRAR/tar.exe или сама обёртка с «-s -d<папка>»), а
+    # затем — если внутри нашёлся настоящий установщик — запустить его
+    # собственными ключами, а не ключами обёртки. Если настоящего установщика
+    # нет, содержимое и есть программа: оно переносится в App как есть.
+
+    def _container_first_worth_trying(self, det: Optional[DetectionResult]) -> bool:
+        """Стоит ли доставать содержимое SFX до запуска его обёртки.
+
+        Только самораспаковывающийся архив и только когда у него нет
+        собственного разбора ключей: у известных перепаков (KpoJIuK и
+        подобных) и у профилей производителей команда документирована
+        автором, и распаковка «в общую кучу» только помешает.
+        """
+        if not IS_WINDOWS or det is None:
+            return False
+        if getattr(det, "is_downloader_stub", False) is True:
+            return False
+        if self._adobe_detected:
+            # Adobe разбирается своим сценарием: его содержимое — пакеты, а не
+            # папка программы (см. _run_payload_plan).
+            return False
+        if det.installer_type != InstallerType.SELF_EXTRACT:
+            return False
+        if det.repack_profile is not None or det.vendor_name:
+            return False
+        return True
+
+    def _run_container_first(self, opts: PortableOptions, app_dir: str,
+                             data_dir: str, portable_dir: str,
+                             det: Optional[DetectionResult], name: str,
+                             recover: Optional[Callable[[], bool]] = None,
+                             progress_from: int = 30,
+                             progress_to: int = 58,
+                             ) -> Optional[Tuple[Optional[int], Optional[SilentPlan]]]:
+        """Достаёт содержимое SFX и ставит программу, не доверяя обёртке.
+
+        Возвращает ``(код, сработавший план)`` при успехе и ``None``, если
+        сценарий не подошёл: тогда сборка идёт обычной лестницей ключей.
+        """
+        if not self._container_first_worth_trying(det):
+            return None
+        source = opts.installer_path
+        if not os.path.isfile(source):
+            return None
+        self._check_cancel()
+        work = os.path.join(portable_dir, "_sfx_content")
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            os.makedirs(work, exist_ok=True)
+        except OSError as exc:
+            self.log.warn(f"Не удалось создать папку распаковки SFX: {exc}")
+            return None
+        console_log = os.path.join(portable_dir, "installer-output.log")
+        self.progress(progress_from, "Распаковка самораспаковывающегося архива")
+        self.log.info(
+            "Это самораспаковывающийся архив: сначала достаю его содержимое, "
+            "не выполняя код обёртки. Ключи тишины обёртка не разбирает — "
+            "именно поэтому она может стоять без работы часами."
+        )
+
+        need = 0
+        try:
+            need = int(space_mod.media_bytes(source))
+        except Exception:  # noqa: BLE001 - оценка размера необязательна
+            need = 0
+        available = space_mod.free_space(portable_dir)
+        if need > 0 and 0 <= available < need:
+            self.log.warn(
+                "Для распаковки содержимого на диске портатива нужно около "
+                f"{redist_mod.format_size(need)}, а свободно "
+                f"{redist_mod.format_size(available)}. Распаковка может "
+                "оборваться — освободите место или собирайте портатив на "
+                "другом диске."
+            )
+        files, method = self._extract_container_to(
+            source, work, opts, console_log,
+            progress=(progress_from, max(progress_from, progress_to - 8)))
+        if not files:
+            self.log.warn(
+                "Достать содержимое архива без запуска не удалось (ни 7-Zip, "
+                "ни WinRAR, ни встроенный tar.exe, ни сама обёртка с «-s -d»). "
+                "Возвращаюсь к обычной лестнице ключей тишины."
+            )
+            shutil.rmtree(work, ignore_errors=True)
+            return None
+        self.log.ok(
+            f"Содержимое архива получено без запуска обёртки ({method}): "
+            f"файлов {files}. Теперь ставлю программу изнутри."
+        )
+
+        nested = self._find_nested_setup(work)
+        if nested:
+            result = self._install_from_container(
+                nested, work, opts, app_dir, data_dir, portable_dir, name,
+                recover=recover,
+                progress_from=max(progress_from, progress_to - 8),
+                progress_to=progress_to,
+                console_log=console_log)
+            if result is not None:
+                shutil.rmtree(work, ignore_errors=True)
+                return result
+            # Настоящий установщик был, но программу не поставил (например,
+            # ему нужен мастер). Переносить в App его собственные файлы
+            # бессмысленно: там окажется setup.exe, а не программа. Обычная
+            # лестница ключей и распаковка ниже разберутся дальше сами.
+            self.log.warn(
+                "Установщик изнутри архива не дал файлов программы. "
+                "Распакованное удаляю, чтобы не занимать гигабайты, и "
+                "возвращаюсь к обычной лестнице сценариев."
+            )
+            shutil.rmtree(work, ignore_errors=True)
+            return None
+
+        if not self._tree_has_executable(work):
+            # Внутри только документы/данные: переносить их в App нельзя —
+            # программой они не являются, а папку они бы засорили.
+            self.log.warn(
+                "Внутри архива нет ни одного запускаемого exe — это не "
+                "программа, а данные. Переносить их в App не буду: "
+                "возвращаюсь к обычной лестнице сценариев."
+            )
+            shutil.rmtree(work, ignore_errors=True)
+            return None
+
+        copied = unpacker_mod.promote_payload(
+            work, app_dir, installer_path=source)
+        if copied and self._find_main_exe(app_dir, name):
+            self._unpacked_with = method
+            self.log.ok(
+                "Содержимое самораспаковывающегося архива перенесено в App "
+                f"напрямую (файлов: {copied}) — код обёртки не выполнялся."
+            )
+            shutil.rmtree(work, ignore_errors=True)
+            return 0, None
+        if copied:
+            self.log.warn(
+                f"В App перенесено файлов: {copied}, но запускаемого exe "
+                "программы среди них не нашлось — папка оставлена для "
+                "проверки: " + work
+            )
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+        return None
+
+    def _extract_container_to(self, source: str, work: str,
+                              opts: PortableOptions, console_log: str,
+                              progress: "Tuple[int, int]" = (30, 50),
+                              ) -> "Tuple[int, str]":
+        """Распаковывает контейнер в ``work``. Возвращает ``(файлов, чем)``.
+
+        Порядок тот же, что у сборки пакетов Adobe, и по той же причине:
+        распаковщиков на машине может не быть ни одного, зато подойдёт любой
+        (7-Zip, WinRAR, встроенный ``tar.exe``), а в самом крайнем случае
+        распакуется сама обёртка документированным ``-s -d<папка>``.
+        """
+        extractors = unpacker_mod.find_extractors()
+        if extractors:
+            names = ", ".join(str(item) for item in extractors)
+            self.log.info(f"Распаковщики на этом компьютере: {names}.")
+        else:
+            self.log.info(
+                "Сторонних распаковщиков нет — попробую саму обёртку с "
+                "«-s -d<папка>»."
+            )
+        for extractor in extractors:
+            self._check_cancel()
+            archive = source
+            carved = ""
+            if extractor.style in (unpacker_mod.STYLE_RAR,
+                                   unpacker_mod.STYLE_TAR):
+                # Эти инструменты читают сам архив, а не PE-обёртку.
+                archive, _kind = unpacker_mod.carve_archive(source, work)
+                if not archive:
+                    continue
+                carved = archive
+            cmd = unpacker_mod.extractor_argv(extractor, archive, work)
+            try:
+                code, output = self._run_unpacker_command(
+                    cmd, console_log, opts, progress=progress,
+                    stage=f"Распаковка архива ({extractor.name})")
+            finally:
+                if carved and os.path.isfile(carved):
+                    try:
+                        os.remove(carved)
+                    except OSError:
+                        pass
+            ok_codes = (0, 1) if extractor.style == unpacker_mod.STYLE_7ZIP \
+                else (0,)
+            files = self._count_files(work)
+            if code in ok_codes and files:
+                return files, extractor.name
+            tail = " ".join((output or "").split())[-200:]
+            self.log.info(
+                f"{extractor.name} не дал файлов (код {code})"
+                + (f": {tail}" if tail else "") + " — пробую дальше."
+            )
+        # Последний способ: пусть распакуется сама обёртка. Её собственную
+        # программу установки мы снимем — нужны только файлы.
+        nested = ""
+        try:
+            nested = self._sfx_self_extract(source, work, opts, console_log,
+                                            progress)
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - запасной путь необязателен
+            self.log.warn(f"Распаковка самой обёрткой не удалась: {exc}")
+        files = self._count_files(work)
+        if files:
+            return files, "сама обёртка (-s -d)"
+        if nested:
+            self.log.info(
+                "Обёртка отдала только установщик без данных рядом: "
+                f"{os.path.basename(nested)}."
+            )
+        return 0, ""
+
+    @staticmethod
+    def _tree_has_executable(root: str, limit: int = 2000) -> bool:
+        """Есть ли в папке хоть один exe (быстрый обход с потолком)."""
+        if not root or not os.path.isdir(root):
+            return False
+        seen = 0
+        for _current, _dirs, names in os.walk(root):
+            for name in names:
+                seen += 1
+                if name.casefold().endswith(".exe"):
+                    return True
+                if seen > limit:
+                    return False
+        return False
+
+    @staticmethod
+    def _count_files(root: str, limit: int = 5000) -> int:
+        """Сколько файлов лежит в папке (быстрый обход с потолком)."""
+        total = 0
+        if not root or not os.path.isdir(root):
+            return 0
+        for _current, _dirs, names in os.walk(root):
+            total += len(names)
+            if total >= limit:
+                return total
+        return total
+
+    def _nested_installer_kind(self, path: str) -> InstallerType:
+        """Какой движок у установщика, найденного внутри архива.
+
+        Читается начало и конец файла: у Inno Setup и NSIS сигнатуры лежат в
+        загрузчике (начало), у InstallShield — тоже рядом с ним. Полный
+        разбор файла здесь не нужен и стоил бы секунд на гигабайтах.
+        """
+        try:
+            size = os.path.getsize(path)
+            chunk = 4 * 1024 * 1024
+            with open(path, "rb") as handle:
+                head = handle.read(chunk)
+                if size > chunk:
+                    handle.seek(max(0, size - chunk))
+                    tail = handle.read(chunk)
+                else:
+                    tail = b""
+        except OSError:
+            return InstallerType.UNKNOWN
+        data = head + tail
+        checks = (
+            (b"Inno Setup", InstallerType.INNO),
+            (b"JR.Inno.Setup", InstallerType.INNO),
+            (b"Nullsoft Install System", InstallerType.NSIS),
+            (b"NullsoftInst", InstallerType.NSIS),
+            (b"InstallShield", InstallerType.INSTALLSHIELD),
+            (b"WixBurn", InstallerType.WIX_BURN),
+        )
+        for needle, kind in checks:
+            if needle in data:
+                return kind
+        return InstallerType.UNKNOWN
+
+    def _plans_for_nested_setup(self, nested: str, app_dir: str,
+                                opts: PortableOptions) -> List[SilentPlan]:
+        """Тихие команды для установщика, найденного внутри SFX.
+
+        Обёртке чужие ключи не подходят, а самому установщику — подходят его
+        собственные: у Inno Setup это ``/VERYSILENT /DIR=``, у NSIS —
+        ``/S /D=``. Порядок — от точного к общему.
+        """
+        kind = self._nested_installer_kind(nested)
+        label_suffix = f" (внутри SFX: {os.path.basename(nested)})"
+        plans: List[SilentPlan] = []
+        if kind == InstallerType.INNO:
+            args = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                    "/NOICONS"]
+            language = (opts.install_language or "").strip()
+            if language:
+                found = find_language(language)
+                if found is not None:
+                    args.append(f"/LANG={found.inno_name}")
+            plans.append(SilentPlan(
+                program=nested, args=args,
+                raw_tail=f'/DIR="{app_dir}"',
+                notes=["Установщик внутри архива — Inno Setup: ему передаются "
+                       "его собственные ключи, а не ключи обёртки."],
+                label="Inno Setup внутри SFX: /VERYSILENT /DIR=" + label_suffix,
+                output_dir=app_dir,
+            ))
+            plans.append(SilentPlan(
+                program=nested, args=args,
+                notes=["Тот же установщик без ключа папки: путь берётся из "
+                       "настроек, а готовую программу сборка заберёт из "
+                       "каталога по умолчанию."],
+                label="Inno Setup внутри SFX без /DIR" + label_suffix,
+                output_dir=app_dir, ignores_target_dir=True,
+            ))
+        elif kind == InstallerType.NSIS:
+            plans.append(SilentPlan(
+                program=nested, args=["/S"], raw_tail=f"/D={app_dir}",
+                notes=["Установщик внутри архива — NSIS: /S и /D=<App> "
+                       "последним без кавычек."],
+                label="NSIS внутри SFX: /S /D=" + label_suffix,
+                output_dir=app_dir,
+            ))
+        elif kind == InstallerType.INSTALLSHIELD:
+            plans.append(SilentPlan(
+                program=nested,
+                args=["/s", "/v/qn", f"/vINSTALLDIR=\"{app_dir}\""],
+                notes=["Установщик внутри архива — InstallShield: тихая "
+                       "установка через /s и свойства MSI."],
+                label="InstallShield внутри SFX: /s /v/qn" + label_suffix,
+                output_dir=app_dir,
+            ))
+        if not plans:
+            # Движок не опознан: пробуем два самых распространённых набора.
+            plans.append(SilentPlan(
+                program=nested,
+                args=["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+                raw_tail=f'/DIR="{app_dir}"',
+                notes=["Движок установщика внутри архива не опознан: сначала "
+                       "ключи Inno Setup."],
+                label="Установщик из архива: /VERYSILENT" + label_suffix,
+                output_dir=app_dir,
+            ))
+            plans.append(SilentPlan(
+                program=nested, args=["/S"], raw_tail=f"/D={app_dir}",
+                notes=["Если это NSIS, работают /S и /D=<App>."],
+                label="Установщик из архива: /S /D=" + label_suffix,
+                output_dir=app_dir,
+            ))
+        return plans
+
+    def _install_from_container(self, nested: str, work: str,
+                                opts: PortableOptions, app_dir: str,
+                                data_dir: str, portable_dir: str, name: str,
+                                recover: Optional[Callable[[], bool]] = None,
+                                progress_from: int = 40,
+                                progress_to: int = 58,
+                                console_log: Optional[str] = None,
+                                ) -> Optional[Tuple[Optional[int], Optional[SilentPlan]]]:
+        """Запускает установщик из архива его собственными ключами."""
+        self.log.info(
+            "Внутри архива лежит настоящий установщик: "
+            f"{os.path.basename(nested)}. Запускаю его своими ключами тишины — "
+            "обёртка их не понимает, а он понимает."
+        )
+        # Установщик из архива лежит в нашей рабочей папке и не является
+        # файлом, который выбрал пользователь: подменять его путь в
+        # логах/отчётах нельзя, поэтому план хранит собственный program.
+        plans = self._plans_for_nested_setup(nested, app_dir, opts)
+        for plan in plans:
+            self._check_cancel()
+            rc = self._run_install(
+                plan, opts, app_dir, data_dir,
+                progress_from=progress_from, progress_to=progress_to,
+                console_log=console_log)
+            if self._find_main_exe(app_dir, name):
+                self.log.ok(f"Сработал сценарий: {plan.label}")
+                return rc, plan
+            if plan.ignores_target_dir and recover is not None:
+                if rc in (0, 3010, redist_mod.TIMEOUT_EXIT_CODE) and recover():
+                    self.log.ok(
+                        "Программа установлена в каталог по умолчанию и "
+                        f"перенесена в App. Сценарий: {plan.label}"
+                    )
+                    return rc, plan
+        return None
 
     # -- распаковка без запуска ------------------------------------------------
     def _unpacker_worth_trying(self, det: DetectionResult) -> bool:
@@ -4922,10 +5564,17 @@ class Portablizer:
         файлы, поэтому как только их общий размер перестал расти на
         ``calm`` секунд, распаковка считается законченной.
         """
-        state: Dict[str, float] = {"size": -1.0, "since": 0.0, "seen": 0.0}
+        state: Dict[str, float] = {"size": -1.0, "since": 0.0, "seen": 0.0,
+                                   "next": 0.0}
 
         def check() -> bool:
             now = time.monotonic()
+            # Обход папки распаковки может стоить секунды (архив на десятки
+            # тысяч файлов), а вызывается эта проверка дважды в секунду.
+            # Поэтому после дорогого обхода следующий откладывается: иначе
+            # наблюдение за распаковкой замедляло бы саму распаковку.
+            if now < state["next"]:
+                return False
             total = 0.0
             for root in roots:
                 if not root or not os.path.isdir(root):
@@ -4937,14 +5586,17 @@ class Portablizer:
                                 os.path.join(current, item))
                         except OSError:
                             continue
+            spent = time.monotonic() - now
+            if spent > 0.2:
+                state["next"] = time.monotonic() + min(5.0, spent * 4)
             if total <= 0:
                 return False
             if total != state["size"]:
                 state["size"] = total
-                state["since"] = now
-                state["seen"] = now
+                state["since"] = time.monotonic()
+                state["seen"] = state["since"]
                 return False
-            return (now - state["since"]) >= calm
+            return (time.monotonic() - state["since"]) >= calm
 
         return check
 
