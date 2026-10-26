@@ -41,7 +41,6 @@ cmd.exe читает .bat не построчно, а блоками, запом
 """
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import string
@@ -1952,7 +1951,13 @@ def render_menu_bat(cfg: LauncherConfig) -> str:
 
 # --- Python лончер (для сборки launcher.exe) ---------------------------------
 
-def repair_json_escapes(text):
+#: Починка испорченного JSON — одна реализация на двух потребителей: сам
+#: Portablizer (``repair_json_escapes`` ниже) и запасной ``launcher.py`` внутри
+#: портатива. Текст хранится **строкой** и вставляется в шаблон при импорте, а
+#: не достаётся через ``inspect.getsource``: в собранном PyInstaller-EXE
+#: исходников на диске нет, и ``getsource`` падал при старте
+#: (``OSError: could not get source code`` — Portablizer.exe не запускался).
+_REPAIR_JSON_SOURCE = r'''def repair_json_escapes(text):
     r"""Double the "single" backslashes inside JSON strings.
 
     A Windows path written into a JSON string without escaping
@@ -1986,7 +1991,11 @@ def repair_json_escapes(text):
         if symbol == '"':
             in_string = False
         index += 1
-    return "".join(result)
+    return "".join(result)'''
+
+#: Выполняем ту же строку — модульная функция и текст в портативе совпадают
+#: побайтно, разъехаться им негде.
+exec(compile(_REPAIR_JSON_SOURCE, "<portable_launcher_repair>", "exec"))
 
 
 _PY_LAUNCHER = r'''#!/usr/bin/env python3
@@ -2261,10 +2270,10 @@ if __name__ == "__main__":
 '''
 
 
-#: Запасной лончер — отдельный скрипт: общие функции вставляются в его текст
-#: исходником, чтобы не держать две копии (и не разъезжаться в поведении).
+#: Запасной лончер — отдельный скрипт: общая функция вставляется в его текст
+#: тем же исходником, что выполняется здесь (двух копий кода нет).
 _PY_LAUNCHER = _PY_LAUNCHER.replace(
-    "@@REPAIR_JSON@@", inspect.getsource(repair_json_escapes).rstrip(),
+    "@@REPAIR_JSON@@", _REPAIR_JSON_SOURCE.strip(),
 )
 
 

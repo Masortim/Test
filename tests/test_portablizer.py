@@ -1,9 +1,11 @@
 import ast
 import json
 import os
+import pathlib
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1082,6 +1084,54 @@ class LaunchBatExecutionTests(unittest.TestCase):
     def _witcher_fs(self):
         return self._fs(exe_rel=r"App\witcher.exe",
                         extra=["portable_machine.reg"])
+
+    def test_frozen_import_does_not_need_source_files(self):
+        """Portablizer.exe не должен зависеть от ``inspect.getsource``.
+
+        Собранный PyInstaller-EXE не содержит исходников: попытка достать текст
+        функции на импорте роняла приложение с
+        ``OSError: could not get source code`` ещё до появления окна.
+        """
+        source = pathlib.Path(launcher_mod.__file__).read_text(encoding="utf-8")
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            self.assertNotIn("getsource", stripped,
+                             "импорт снова зависит от исходников на диске")
+
+    def test_import_works_when_source_access_is_broken(self):
+        """Тот же импорт в окружении, где исходников «нет» (как в EXE)."""
+        code = "\n".join([
+            "import inspect",
+            "def _boom(*a, **k):",
+            "    raise OSError('could not get source code')",
+            "inspect.getsource = _boom",
+            "inspect.getsourcelines = _boom",
+            "inspect.findsource = _boom",
+            "import portablizer.core.launcher as L",
+            "import portablizer.core.portablizer as P",
+            "import portablizer.core.maintenance as M",
+            "assert L.repair_json_escapes('{\"a\": \"E:\\\\B\"}')",
+            "print('ok')",
+        ])
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+            capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr[-1500:])
+        self.assertIn("ok", completed.stdout)
+
+    def test_shared_source_text_matches_the_module_function(self):
+        """Текст для портатива и модульная функция — одно и то же."""
+        namespace: dict = {}
+        exec(compile(launcher_mod._REPAIR_JSON_SOURCE, "<test>", "exec"),
+             namespace)
+        case = '{"p": "E:\\Backup\\Apps"}'
+        self.assertEqual(namespace["repair_json_escapes"](case),
+                         launcher_mod.repair_json_escapes(case))
+        self.assertEqual(json.loads(namespace["repair_json_escapes"](case)),
+                         json.loads(launcher_mod.repair_json_escapes(case)))
 
     def test_fallback_python_launcher_repairs_a_broken_config(self):
         """``launcher.py`` (запасной лончер) не падает на «Invalid \\escape»."""
