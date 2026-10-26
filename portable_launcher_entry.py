@@ -2047,6 +2047,375 @@ class SharedSaveSession:
         return report
 
 
+_DRIVE_ROOT_SYSTEM_DIRS = frozenset({
+    "windows", "program files", "program files (x86)", "programdata",
+    "users", "documents and settings", "perflogs", "recovery", "intel",
+    "amd", "nvidia", "msocache", "system volume information",
+    "$recycle.bin", "boot", "efi", "temp", "tmp", "app", "portabledata",
+    "redist", "_lang_sw",
+})
+
+
+def _pe_unsigned_checksum_offset(data: bytes) -> Optional[int]:
+    """Return optional header CheckSum offset if PE is unsigned, else None."""
+    if len(data) < 0x100 or data[:2] != b"MZ":
+        return None
+    try:
+        e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    except struct.error:
+        return None
+    if e_lfanew < 0x40 or e_lfanew + 0x58 > len(data):
+        return None
+    if data[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
+        return None
+    optional = e_lfanew + 24
+    try:
+        magic = struct.unpack_from("<H", data, optional)[0]
+    except struct.error:
+        return None
+    if magic == 0x10B:
+        sec_dir = optional + 96 + 4 * 8
+    elif magic == 0x20B:
+        sec_dir = optional + 112 + 4 * 8
+    else:
+        return None
+    if sec_dir + 8 > len(data):
+        return None
+    cert_rva, cert_size = struct.unpack_from("<II", data, sec_dir)
+    if cert_rva != 0 or cert_size != 0:
+        return None
+    return optional + 64
+
+
+class DriveRootDataSession:
+    """Keep working folders like ``C:\\multitran`` inside the portable root.
+
+    Programs such as Multitran default to ``C:\\<app_name>`` (storing
+    ``<COMPUTERNAME>\\history.txt``, ``usertra.reu``, and
+    ``Subject Profiles\\subject.act``, ``subject.sel``) when no portable
+    working folder is configured or when a hardcoded ``c:\\<app_name>`` string
+    lives inside an executable or DLL.
+
+    This helper:
+    1. Rewrites hardcoded ``<Drive>:\\<folder>`` literals to ``..\\<folder>``
+       in unsigned ``App`` binaries and configuration files.
+    2. Moves any ``<SystemDrive>:\\<folder>`` into ``<PortableRoot>\\<folder>``
+       and removes ``<SystemDrive>:\\<folder>`` before launch and after exit.
+    3. Synchronises ``<COMPUTERNAME>`` profile subfolders inside
+       ``<PortableRoot>\\<folder>`` so moving the portable folder to another
+       PC, drive, or partition keeps history and user profiles intact.
+    """
+
+    def __init__(self, root: Path, cfg: Dict[str, Any]) -> None:
+        self.root = root
+        self.cfg = cfg
+
+    def _candidate_folders(self) -> List[str]:
+        candidates: List[str] = []
+        seen: set[str] = set()
+
+        def _add(raw: str) -> None:
+            token = raw.strip().strip("\\/\"'")
+            if not token or len(token) < 3:
+                return
+            low = token.casefold()
+            if low in seen or low in _DRIVE_ROOT_SYSTEM_DIRS:
+                return
+            if any(ch in token for ch in (":", "*", "?", "<", ">", "|", "\\", "/")):
+                return
+            seen.add(low)
+            candidates.append(token)
+
+        app_name = str(self.cfg.get("app_name", "")).strip()
+        if app_name:
+            _add(app_name)
+            first_word = re.split(r"[\s_\-\.]+", app_name)[0]
+            _add(first_word)
+
+        reg_cfg = self.cfg.get("registry", {}) or {}
+        for key in reg_cfg.get("keys", []) or []:
+            parts = [p for p in str(key).replace("/", "\\").split("\\") if p]
+            for idx, part in enumerate(parts):
+                if part.casefold() == "software" and idx + 1 < len(parts):
+                    seg = parts[idx + 1]
+                    if seg.casefold() == "wow6432node" and idx + 2 < len(parts):
+                        seg = parts[idx + 2]
+                    _add(seg)
+                    for sub in parts[idx + 1:]:
+                        if sub.casefold() != "wow6432node":
+                            _add(sub)
+
+        for reg_name in (
+            reg_cfg.get("file", "portable.reg"),
+            reg_cfg.get("machine_file", "portable_machine.reg"),
+        ):
+            if not reg_name:
+                continue
+            reg_path = self.root / str(reg_name)
+            if not reg_path.is_file():
+                continue
+            try:
+                text = _decode_reg(reg_path.read_bytes())
+            except OSError:
+                continue
+            for m in re.finditer(
+                re.escape(ROOT_TOKEN) + r"(?:\\\\|\\)([^\\\"\\\r\n]+)",
+                text,
+                re.IGNORECASE,
+            ):
+                _add(m.group(1))
+        return candidates
+
+    def _neutralize_app_binaries_and_configs(self, folders: Sequence[str]) -> int:
+        app_dir = self.root / "App"
+        if not app_dir.is_dir() or not folders:
+            return 0
+        own_names = {
+            "launchportable.exe",
+            "portable_launcher.exe",
+        }
+        pe_exts = {".exe", ".dll"}
+        text_exts = {".ini", ".cfg", ".conf", ".xml", ".json", ".txt", ".cmd", ".bat"}
+        patched = 0
+        for dirpath, _dirnames, filenames in os.walk(app_dir):
+            for fname in filenames:
+                if fname.casefold() in own_names:
+                    continue
+                fpath = Path(dirpath) / fname
+                ext = fpath.suffix.lower()
+                if ext not in pe_exts and ext not in text_exts:
+                    continue
+                try:
+                    if fpath.stat().st_size > 64 * 1024 * 1024:
+                        continue
+                    raw = fpath.read_bytes()
+                except OSError:
+                    continue
+                new_raw = raw
+                if ext in pe_exts:
+                    csum_off = _pe_unsigned_checksum_offset(raw)
+                    if csum_off is None:
+                        continue
+                    for token in folders:
+                        try:
+                            tok_b = token.encode("ascii")
+                        except UnicodeEncodeError:
+                            continue
+                        pat_a = re.compile(
+                            b"(?<![A-Za-z0-9_])([A-Za-z]):(\\\\" + re.escape(tok_b) + b")(?=[\\\\\"'\\x00\\r\\n\\s])",
+                            re.IGNORECASE,
+                        )
+                        new_raw = pat_a.sub(rb"..\2", new_raw)
+                        tok_u = b"".join(bytes([b, 0]) for b in tok_b)
+                        pat_u = re.compile(
+                            b"([A-Za-z])\x00:\x00(\\\\\x00" + re.escape(tok_u) + b")(?=(?:\\\\\x00|\"\x00|'\x00|\x00\x00|\r\x00|\n\x00| \x00))",
+                            re.IGNORECASE,
+                        )
+                        new_raw = pat_u.sub(b".\x00.\x00\\2", new_raw)
+                    if new_raw != raw and len(new_raw) == len(raw):
+                        buf = bytearray(new_raw)
+                        struct.pack_into("<I", buf, csum_off, 0)
+                        new_raw = bytes(buf)
+                else:
+                    for token in folders:
+                        try:
+                            tok_b = token.encode("ascii")
+                        except UnicodeEncodeError:
+                            continue
+                        pat = re.compile(
+                            b"(?<![A-Za-z0-9_])[A-Za-z]:([\\\\/]" + re.escape(tok_b) + b")(?=[\\\\/\"'\\r\\n\\s]|$)",
+                            re.IGNORECASE,
+                        )
+                        new_raw = pat.sub(rb"..\1", new_raw)
+                if new_raw != raw:
+                    try:
+                        fpath.write_bytes(new_raw)
+                        patched += 1
+                    except OSError:
+                        pass
+        return patched
+
+    @staticmethod
+    def _sync_computer_profiles(folder: Path) -> None:
+        if not folder.is_dir():
+            return
+        comp_name = (
+            os.environ.get("COMPUTERNAME")
+            or os.environ.get("HOSTNAME")
+            or ""
+        ).strip()
+        if not comp_name:
+            return
+        profile_dirs: List[Path] = []
+        try:
+            for child in folder.iterdir():
+                if not child.is_dir():
+                    continue
+                has_markers = (
+                    (child / "history.txt").exists()
+                    or (child / "usertra.reu").exists()
+                    or (child / "Subject Profiles").is_dir()
+                )
+                if has_markers or child.name.casefold() == comp_name.casefold():
+                    profile_dirs.append(child)
+        except OSError:
+            return
+        if not profile_dirs:
+            return
+        target_dir: Optional[Path] = None
+        for d in profile_dirs:
+            if d.name.casefold() == comp_name.casefold():
+                target_dir = d
+                break
+        if target_dir is None:
+            target_dir = folder / comp_name
+            target_dir.mkdir(parents=True, exist_ok=True)
+            profile_dirs.append(target_dir)
+
+        def _latest_mtime(d: Path) -> float:
+            latest = 0.0
+            try:
+                for root_d, _dirs, files in os.walk(d):
+                    for f in files:
+                        try:
+                            mt = (Path(root_d) / f).stat().st_mtime
+                            if mt > latest:
+                                latest = mt
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            return latest
+
+        donor = max(profile_dirs, key=_latest_mtime)
+        if _latest_mtime(donor) == 0.0:
+            return
+        for dest in profile_dirs:
+            if dest == donor:
+                continue
+            try:
+                for root_d, dirs, files in os.walk(donor):
+                    rel = Path(root_d).relative_to(donor)
+                    dest_root = dest / rel
+                    dest_root.mkdir(parents=True, exist_ok=True)
+                    for d in dirs:
+                        (dest_root / d).mkdir(parents=True, exist_ok=True)
+                    for f in files:
+                        s_file = Path(root_d) / f
+                        d_file = dest_root / f
+                        try:
+                            if (
+                                not d_file.exists()
+                                or s_file.stat().st_mtime > d_file.stat().st_mtime
+                            ):
+                                shutil.copy2(s_file, d_file)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
+    def _collect_drive_roots(self, folders: Sequence[str]) -> List[str]:
+        report: List[str] = []
+        if not folders:
+            return report
+        drive_roots: List[Path] = []
+        sys_drive = os.environ.get("SystemDrive", "C:").strip()
+        if sys_drive:
+            if not sys_drive.endswith(("\\", "/")):
+                sys_drive += os.sep
+            drive_roots.append(Path(sys_drive))
+        if self.root.drive:
+            cur_drive = Path(self.root.drive + "\\")
+            if all(str(cur_drive).casefold() != str(d).casefold() for d in drive_roots):
+                drive_roots.append(cur_drive)
+
+        try:
+            portable_resolved = str(self.root.resolve()).casefold()
+        except OSError:
+            portable_resolved = str(self.root).casefold()
+
+        for folder_token in folders:
+            dest_dir: Optional[Path] = None
+            try:
+                for child in self.root.iterdir():
+                    if child.is_dir() and child.name.casefold() == folder_token.casefold():
+                        dest_dir = child
+                        break
+            except OSError:
+                pass
+
+            for drv in drive_roots:
+                if not drv.is_dir():
+                    continue
+                matched_src: Optional[Path] = None
+                try:
+                    for child in drv.iterdir():
+                        if child.is_dir() and child.name.casefold() == folder_token.casefold():
+                            matched_src = child
+                            break
+                except OSError:
+                    continue
+                if matched_src is None:
+                    continue
+                try:
+                    src_resolved = str(matched_src.resolve()).casefold()
+                except OSError:
+                    src_resolved = str(matched_src).casefold()
+                if (
+                    src_resolved == portable_resolved
+                    or src_resolved.startswith(portable_resolved + "\\")
+                    or src_resolved.startswith(portable_resolved + "/")
+                ):
+                    continue
+                if dest_dir is None:
+                    dest_dir = self.root / matched_src.name
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                copied_files = 0
+                for root_d, dirs, files in os.walk(matched_src):
+                    rel = Path(root_d).relative_to(matched_src)
+                    target_root = dest_dir / rel
+                    target_root.mkdir(parents=True, exist_ok=True)
+                    for d in dirs:
+                        (target_root / d).mkdir(parents=True, exist_ok=True)
+                    for f in files:
+                        s_file = Path(root_d) / f
+                        d_file = target_root / f
+                        try:
+                            if (
+                                not d_file.exists()
+                                or s_file.stat().st_mtime >= d_file.stat().st_mtime
+                            ):
+                                shutil.copy2(s_file, d_file)
+                                copied_files += 1
+                        except OSError:
+                            pass
+                shutil.rmtree(matched_src, ignore_errors=True)
+                report.append(
+                    f"relocated {matched_src} -> {dest_dir} ({copied_files} file(s))"
+                )
+
+            if dest_dir is not None and dest_dir.is_dir():
+                self._sync_computer_profiles(dest_dir)
+        return report
+
+    def before(self) -> List[str]:
+        folders = self._candidate_folders()
+        if not folders:
+            return []
+        report: List[str] = []
+        patched = self._neutralize_app_binaries_and_configs(folders)
+        if patched:
+            report.append(f"neutralized hardcoded drive paths in {patched} file(s)")
+        report.extend(self._collect_drive_roots(folders))
+        return report
+
+    def after(self) -> List[str]:
+        folders = self._candidate_folders()
+        if not folders:
+            return []
+        return self._collect_drive_roots(folders)
+
+
 class ShellFolderSession:
     """Temporarily point the Windows Documents known folder at PortableData.
 
@@ -2689,6 +3058,15 @@ class RegistrySession:
             v_cf = v_name.casefold()
             base_rhs = base_values.get(t_cf, ("", {}))[1].get(v_cf, ("", ""))[1]
             cur_u_rhs = user_current.get(t_cf, {}).get(v_cf, "")
+            # Никогда не затираем портативный маркер @@PORTABLE_ROOT@@ сырыми
+            # путями из реестра хоста (например, c:\multitran или путём
+            # дистрибутива, оставшимся после работы setup.exe).
+            if ROOT_TOKEN in base_rhs or ROOT_TOKEN in cur_u_rhs:
+                return
+            if source_tag in ("host-export", "host-registry") and re.match(
+                r'^"?[A-Za-z]:[\\/]', v_rhs.strip()
+            ):
+                return
             if v_rhs == base_rhs and (not cur_u_rhs or v_rhs == cur_u_rhs):
                 return
             _, ov_map = overrides.setdefault(t_cf, (tail, {}))
@@ -2808,7 +3186,6 @@ class RegistrySession:
                 )
         for ext_file in created_exports:
             if ext_file.is_file():
-                _reg(("import", str(ext_file)))
                 try:
                     ext_file.unlink()
                 except OSError:
@@ -3149,6 +3526,7 @@ def _machine_file_needs_admin(path: Path) -> bool:
 def _hklm_key_missing(
     keys: Iterable[str],
     machine_path: Optional[Path] = None,
+    root: Optional[Path] = None,
 ) -> bool:
     """True when at least one captured HKLM key or value is absent on this PC.
 
@@ -3197,6 +3575,7 @@ def _hklm_key_missing(
             sections = _parse_reg_sections(_decode_reg(machine_path.read_bytes()))
         except OSError:
             sections = {}
+        escaped_root = str(root).replace("\\", "\\\\") if root is not None else ""
         for header, expected_vals in sections.items():
             head, _, tail = header.partition("\\")
             if head.upper() not in hklm_names or not tail:
@@ -3210,7 +3589,12 @@ def _hklm_key_missing(
                 actual_rhs = host_cf.get(v_name.casefold())
                 if actual_rhs is None:
                     return True
-                if ROOT_TOKEN not in v_rhs and actual_rhs.casefold() != v_rhs.casefold():
+                expected_rhs = (
+                    v_rhs.replace(ROOT_TOKEN, escaped_root)
+                    if (ROOT_TOKEN in v_rhs and escaped_root)
+                    else v_rhs
+                )
+                if ROOT_TOKEN not in expected_rhs and actual_rhs.casefold() != expected_rhs.casefold():
                     return True
 
     return False if checked else False
@@ -8023,6 +8407,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # обязана запомнить настоящие «Документы» этого ПК, пока Known Folder
     # ещё указывает на них, а не внутрь портатива.
     shared_saves = SharedSaveSession(root, cfg)
+    drive_root_data = DriveRootDataSession(root, cfg)
 
     raw_arguments = _arguments_with_executable_alias(
         cfg, list(argv if argv is not None else sys.argv[1:])
@@ -8061,7 +8446,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # real - and that needs administrator rights, once, for this run.
     if not needs_machine and machine_available and bool(registry_cfg.get("enabled")) \
             and _machine_file_needs_admin(machine_path) \
-            and _hklm_key_missing(registry_cfg.get("keys", []), machine_path):
+            and _hklm_key_missing(registry_cfg.get("keys", []), machine_path, root=root):
         needs_machine = True
         _run_log(root, "captured HKLM keys are missing on this PC: "
                        "the machine registry file has to be imported")
@@ -8134,6 +8519,11 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # в портатив ПЕРЕД стартом: иначе программа их просто не увидит.
     for line in shared_saves.before():
         _run_log(root, "shared saves: " + line)
+    try:
+        for line in drive_root_data.before():
+            _run_log(root, "drive-root data: " + line)
+    except Exception as exc:  # noqa: BLE001
+        _run_log(root, f"drive-root data: pre-launch sync failed ({exc})")
 
     # Время начала сеанса: по нему определяется, что установщик (в том числе
     # запущенный самой программой) положил в прежнее место портатива.
@@ -8242,6 +8632,11 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                 _run_log(root, "shared saves: " + line)
         except OSError as exc:
             _run_log(root, f"shared saves: synchronisation failed ({exc})")
+        try:
+            for line in drive_root_data.after():
+                _run_log(root, "drive-root data: " + line)
+        except Exception as exc:  # noqa: BLE001
+            _run_log(root, f"drive-root data: post-exit sync failed ({exc})")
         # Временная папка портатива не должна пережить сеанс: именно
         # распакованные в неё файлы (шрифты установщика, DLL «помощников»)
         # потом подхватывает система и держит их месяцами.
