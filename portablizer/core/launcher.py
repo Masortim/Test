@@ -510,9 +510,6 @@ def _registry_load_block(cfg: LauncherConfig) -> str:
         if key in created:
             backup = f'%PORTABLE_REG_BACKUP%\\k{index:02d}.reg'
             external_overrides.append(
-                f'if exist "{backup}" reg import "{backup}" >nul 2>&1'
-            )
-            external_overrides.append(
                 f'if exist "{backup}" del /f /q "{backup}" >nul 2>&1'
             )
 

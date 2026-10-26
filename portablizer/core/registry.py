@@ -797,10 +797,16 @@ def virtualize_machine_snapshot(snapshot: Mapping[str, Mapping[str, object]],
     return virtual_snapshot, virtual_keys
 
 
+def _normalize_app_token(text: str) -> str:
+    return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+
 def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
                            keys: Iterable[str], app_dir: str,
-                           extra_roots: Sequence[str] = ()) -> Snapshot:
-    """Перенаправляет захваченные пути установки в портативную ``App``.
+                           extra_roots: Sequence[str] = (),
+                           portable_dir: str = "",
+                           app_names: Sequence[str] = ()) -> Snapshot:
+    """Перенаправляет захваченные пути установки в портативную ``App`` и корень портатива.
 
     Некоторые установщики (в частности старые игры) не принимают переданную
     папку и сначала устанавливаются в ``Program Files``. Затем Portablizer
@@ -811,14 +817,20 @@ def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
     закрывается.
 
     Меняются только общеупотребительные значения каталога установки в явно
-    выбранных ключах приложения, а также переданные ``extra_roots`` (каталоги,
-    из которых приложение было перенесено в ``App``).
+    выбранных ключах приложения, переданные ``extra_roots`` (каталоги, из
+    которых приложение было перенесено в ``App``), а также рабочие папки
+    приложения в корне диска вида ``C:\\multitran`` -> ``<PortableDir>\\multitran``.
     """
     result: Snapshot = {
         key: {name: _as_entry(entry) for name, entry in values.items()}
         for key, values in snapshot.items()
     }
-    destination = os.path.normpath(app_dir)
+    destination = os.path.normpath(app_dir).replace("/", "\\")
+    portable_root = (
+        os.path.normpath(portable_dir)
+        if portable_dir
+        else os.path.dirname(destination)
+    ).replace("/", "\\")
     install_names = {
         "installdir", "installdirectory", "installfolder", "installlocation",
     }
@@ -827,6 +839,15 @@ def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
          if str(r).strip().rstrip("\\/")},
         key=len,
         reverse=True,
+    )
+    app_tokens = {
+        _normalize_app_token(name)
+        for name in (app_names or ())
+        if len(_normalize_app_token(name)) >= 4
+    }
+    drive_folder_re = re.compile(
+        r"(?<![A-Za-z0-9_\\/.:-])([A-Za-z]:[\\/])([^\\/:*?\"<>|\r\n;]+)"
+        r"([\\/][^\"<>|?*\r\n;]*)?",
     )
 
     for key in keys:
@@ -850,9 +871,6 @@ def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
             trailing = "\\" if old.endswith(("\\", "/")) else ""
             values[name] = (typ, repr(destination + trailing))
 
-        if not old_roots:
-            continue
-
         # Более длинный корень заменяется первым: C:\\Game\\bin не должен
         # частично совпасть с C:\\Game раньше времени.
         old_roots.sort(key=len, reverse=True)
@@ -872,6 +890,33 @@ def retarget_install_paths(snapshot: Mapping[str, Mapping[str, object]],
                         rewritten,
                         flags=re.IGNORECASE,
                     )
+            if app_tokens and portable_root:
+                def _replace_drive_app_folder(match: "re.Match[str]") -> str:
+                    folder = match.group(2)
+                    tail = match.group(3) or ""
+                    full_matched = match.group(0)
+                    # Не трогаем пути, которые уже ведут внутрь portable_root.
+                    if os.path.normcase(full_matched).startswith(
+                            os.path.normcase(portable_root)):
+                        return full_matched
+                    folder_token = _normalize_app_token(folder)
+                    if folder_token not in app_tokens:
+                        return full_matched
+                    rel_tail = tail.lstrip("\\/")
+                    # Если хвост указывает на файл, лежащий в App (например,
+                    # network.exe или словарь .erd), направляем в App.
+                    # Иначе (рабочая папка данных вида c:\multitran,
+                    # c:\multitran\<PC>\history.txt) — в <PortableDir>\<folder>.
+                    if rel_tail and os.path.exists(
+                            os.path.join(destination, *re.split(r"[\\/]+", rel_tail))):
+                        return destination + ("\\" + rel_tail.replace("/", "\\"))
+                    if name.casefold() in install_names:
+                        return destination + (tail.replace("/", "\\") if tail else "")
+                    target_folder = os.path.join(portable_root, folder).replace("/", "\\")
+                    return target_folder + (tail.replace("/", "\\") if tail else "")
+
+                rewritten = drive_folder_re.sub(
+                    _replace_drive_app_folder, rewritten)
             if rewritten != value:
                 values[name] = (typ, repr(rewritten))
     return result
@@ -1030,11 +1075,117 @@ def _clean_registry_location(value: str, strip_icon_index: bool = False) -> str:
     return text
 
 
+_SHARED_SOFTWARE_VENDORS = frozenset({
+    "microsoft", "classes", "policies", "registeredapplications",
+    "clients", "wow6432node", "khronos", "odbc", "mozilla", "google",
+})
+
+
+def matching_existing_app_keys(
+    after: Mapping[str, Mapping[str, object]],
+    app_names: Sequence[str] = (),
+    source_roots: Sequence[str] = (),
+) -> List[str]:
+    """Находит ветки приложения в ``after``, даже если они уже были в ``before``.
+
+    Если предыдущий запуск установщика (или прошлая попытка сборки) уже создал
+    ключи в реестре хоста, повторный запуск ``setup.exe`` записывает те же
+    значения поверх, и обычный ``compute_diff(before, after)`` видит нулевую
+    разницу. Эта функция находит ключи ``CATEGORY_APP``, принадлежащие
+    приложению по имени ветки или по путям к папке дистрибутива/приложения.
+    """
+    app_tokens = {
+        _normalize_app_token(name)
+        for name in (app_names or ())
+        if len(_normalize_app_token(name)) >= 4
+    }
+    norm_roots = [
+        str(r).strip().rstrip("\\/").replace("/", "\\").casefold()
+        for r in (source_roots or ())
+        if len(str(r).strip().rstrip("\\/")) >= 4
+    ]
+    if not app_tokens and not norm_roots:
+        return []
+
+    matched_prefixes: Set[str] = set()
+    direct_keys: Set[str] = set()
+
+    for key, values in after.items():
+        if is_volatile(key) or is_protected(key, values):
+            continue
+        if categorize(key) != CATEGORY_APP:
+            continue
+        parts = [p for p in key.replace("/", "\\").split("\\") if p]
+        # Ищем сегмент сразу после Software / WOW6432Node.
+        vendor_idx = -1
+        for idx, part in enumerate(parts):
+            low = part.casefold()
+            if low in ("software", "wow6432node"):
+                vendor_idx = idx + 1
+        if 0 < vendor_idx < len(parts):
+            for seg in parts[vendor_idx:]:
+                if _normalize_app_token(seg) in app_tokens:
+                    direct_keys.add(key)
+                    vendor_low = parts[vendor_idx].casefold()
+                    if vendor_low not in _SHARED_SOFTWARE_VENDORS:
+                        matched_prefixes.add(
+                            "\\".join(parts[: vendor_idx + 1]).casefold()
+                        )
+                    break
+
+        if key in direct_keys:
+            continue
+
+        for entry in values.values():
+            val = _entry_value(entry)
+            if not isinstance(val, str) or not val.strip():
+                continue
+            val_low = val.replace("/", "\\").casefold()
+            hit = any(root in val_low for root in norm_roots)
+            if not hit and app_tokens:
+                m = re.match(
+                    r"^[a-z]:\\([^\\/:*?\"<>|\r\n;]+)(?:\\|$)",
+                    val_low.strip().strip('"'),
+                )
+                if m and _normalize_app_token(m.group(1)) in app_tokens:
+                    hit = True
+            if hit:
+                direct_keys.add(key)
+                if 0 < vendor_idx < len(parts):
+                    vendor_low = parts[vendor_idx].casefold()
+                    if vendor_low not in _SHARED_SOFTWARE_VENDORS:
+                        matched_prefixes.add(
+                            "\\".join(parts[: vendor_idx + 1]).casefold()
+                        )
+                break
+
+    if matched_prefixes:
+        for key, values in after.items():
+            if is_volatile(key) or is_protected(key, values):
+                continue
+            if categorize(key) != CATEGORY_APP:
+                continue
+            key_low = key.replace("/", "\\").casefold()
+            if any(
+                key_low == pref or key_low.startswith(pref + "\\")
+                for pref in matched_prefixes
+            ):
+                direct_keys.add(key)
+
+    return sorted(direct_keys)
+
+
 def changed_install_locations(before: Mapping[str, Mapping[str, object]],
-                              after: Mapping[str, Mapping[str, object]]) -> List[str]:
+                              after: Mapping[str, Mapping[str, object]],
+                              app_names: Sequence[str] = (),
+                              source_roots: Sequence[str] = ()) -> List[str]:
     """Извлекает пути установки из новых/изменённых записей реестра установщика."""
     locations: List[str] = []
     seen: Set[str] = set()
+    forced_app_keys = set(
+        matching_existing_app_keys(
+            after, app_names=app_names, source_roots=source_roots)
+    )
 
     def add_location(candidate: str) -> None:
         if not candidate:
@@ -1051,10 +1202,13 @@ def changed_install_locations(before: Mapping[str, Mapping[str, object]],
     for key, values in after.items():
         if is_volatile(key) or is_protected(key, values):
             continue
-        if key in before and (is_protected(key, before[key])
-                              or dict(values) == dict(before[key])):
+        is_forced = key in forced_app_keys
+        if not is_forced and key in before and (
+            is_protected(key, before[key])
+            or dict(values) == dict(before[key])
+        ):
             continue
-        before_values = before.get(key, {})
+        before_values = {} if is_forced else before.get(key, {})
         for value_name in _EXPLICIT_LOCATION_VALUE_NAMES:
             entry = values.get(value_name)
             if entry is None:

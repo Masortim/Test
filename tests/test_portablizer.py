@@ -4847,5 +4847,210 @@ class InstallerPathDialogTests(unittest.TestCase):
             counter, target_dir=r"C:\P\App", pids=[1], state={}), 0)
 
 
+class MultitranDriveRootPortableTests(unittest.TestCase):
+    """Рабочая папка C:\\multitran переносится внутрь портатива и переезжает с ним."""
+
+    @staticmethod
+    def _build_minimal_unsigned_pe(payload: bytes) -> bytes:
+        header = bytearray(0x200)
+        header[0:2] = b"MZ"
+        e_lfanew = 0x80
+        struct.pack_into("<I", header, 0x3C, e_lfanew)
+        header[e_lfanew : e_lfanew + 4] = b"PE\x00\x00"
+        struct.pack_into("<H", header, e_lfanew + 20, 0xE0)  # SizeOfOptionalHeader
+        optional = e_lfanew + 24
+        struct.pack_into("<H", header, optional, 0x10B)  # PE32
+        struct.pack_into("<I", header, optional + 64, 0x12345678)  # CheckSum
+        struct.pack_into("<I", header, optional + 92, 16)  # NumberOfRvaAndSizes
+        # Security directory at optional + 96 + 32 = optional + 128 (0, 0 -> unsigned)
+        struct.pack_into("<II", header, optional + 128, 0, 0)
+        return bytes(header) + payload
+
+    def test_retarget_install_paths_rewrites_c_multitran_to_portable_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable_dir = Path(temp, "Multitran_Portable")
+            app_dir = portable_dir / "App"
+            (app_dir / "network").mkdir(parents=True)
+            (app_dir / "network" / "dict.ert").write_bytes(b"DICT")
+            dist_dir = r"E:\Backup\Apps\Portable\Multitran 03.11.2023"
+
+            key = r"HKCU\Software\Multitran"
+            snap = {
+                key: {
+                    "Dictionary Path": (registry.REG_SZ, repr(dist_dir + r"\network")),
+                    "Work Path": (registry.REG_SZ, repr(r"c:\multitran")),
+                    "History": (registry.REG_SZ, repr(r"c:\multitran\DESKTOP-PC\history.txt")),
+                },
+            }
+            moved = registry.retarget_install_paths(
+                snap,
+                [key],
+                str(app_dir),
+                extra_roots=[dist_dir],
+                portable_dir=str(portable_dir),
+                app_names=["Multitran", "mt"],
+            )
+            tokens = [(str(portable_dir), registry.ROOT_TOKEN)]
+            tokenized = registry.render_keys(moved, [key], tokens=tokens)
+            self.assertIn(
+                f'"{registry.ROOT_TOKEN}\\\\App\\\\network"',
+                tokenized,
+            )
+            self.assertIn(
+                f'"{registry.ROOT_TOKEN}\\\\multitran"',
+                tokenized,
+            )
+            self.assertIn(
+                f'"{registry.ROOT_TOKEN}\\\\multitran\\\\DESKTOP-PC\\\\history.txt"',
+                tokenized,
+            )
+
+    def test_matching_existing_app_keys_captures_preexisting_multitran_key(self):
+        snap = {
+            r"HKCU\Software\Multitran": {
+                "Work Path": (registry.REG_SZ, repr(r"c:\multitran")),
+            },
+            r"HKCU\Software\UnrelatedVendor": {
+                "Path": (registry.REG_SZ, repr(r"c:\unrelated")),
+            },
+        }
+        matched = registry.matching_existing_app_keys(
+            snap, app_names=["Multitran"], source_roots=[]
+        )
+        self.assertEqual(matched, [r"HKCU\Software\Multitran"])
+
+    def test_neutralize_hardcoded_drive_app_paths_patches_pe_and_ini(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable_dir = Path(temp, "Multitran_Portable")
+            app_dir = portable_dir / "App"
+            app_dir.mkdir(parents=True)
+
+            utf16_path = "c:\\multitran\\history.txt".encode("utf-16le") + b"\x00\x00"
+            ascii_path = b'c:\\multitran\\usertra.reu\x00'
+            pe_path = app_dir / "mt.exe"
+            orig_pe = self._build_minimal_unsigned_pe(ascii_path + utf16_path)
+            pe_path.write_bytes(orig_pe)
+
+            ini_path = app_dir / "mt.ini"
+            ini_path.write_text("WorkDir=C:\\multitran\\DESKTOP\r\n", encoding="utf-8")
+
+            engine = Portablizer(Logger())
+            matched = engine._neutralize_hardcoded_drive_app_paths(
+                str(portable_dir), str(app_dir), app_names=["Multitran"]
+            )
+            self.assertTrue(any(m.casefold() == "multitran" for m in matched), matched)
+
+            new_pe = pe_path.read_bytes()
+            self.assertEqual(len(new_pe), len(orig_pe))
+            self.assertIn(b"..\\multitran\\usertra.reu\x00", new_pe)
+            self.assertIn("..\\multitran\\history.txt".encode("utf-16le"), new_pe)
+            self.assertNotIn(b"c:\\multitran", new_pe.lower())
+            # PE CheckSum reset to 0
+            e_lfanew = struct.unpack_from("<I", new_pe, 0x3C)[0]
+            csum = struct.unpack_from("<I", new_pe, e_lfanew + 24 + 64)[0]
+            self.assertEqual(csum, 0)
+
+            self.assertIn("..\\multitran\\DESKTOP", ini_path.read_text(encoding="utf-8"))
+
+    def test_relocate_drive_root_app_folders_and_sync_computer_profiles(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fake_c = Path(temp, "FakeDriveC")
+            old_pc_dir = fake_c / "multitran" / "OLD-PC"
+            subj_dir = old_pc_dir / "Subject Profiles"
+            subj_dir.mkdir(parents=True)
+            (old_pc_dir / "history.txt").write_text("word1\nword2\n", encoding="utf-8")
+            (old_pc_dir / "usertra.reu").write_bytes(b"USERTRA_DATA")
+            (subj_dir / "subject.act").write_text("ACT", encoding="utf-8")
+            (subj_dir / "subject.sel").write_text("SEL", encoding="utf-8")
+
+            portable_dir = Path(temp, "D_Drive", "Multitran_Portable")
+            app_dir = portable_dir / "App"
+            app_dir.mkdir(parents=True)
+
+            cfg = {
+                "app_name": "Multitran",
+                "registry": {
+                    "enabled": True,
+                    "file": "portable.reg",
+                    "keys": [r"HKCU\Software\Multitran"],
+                },
+            }
+            session = exe_launcher.DriveRootDataSession(portable_dir, cfg)
+            with mock.patch.dict(
+                os.environ,
+                {"SystemDrive": str(fake_c), "COMPUTERNAME": "NEW-PC"},
+            ):
+                report = session.before()
+
+            self.assertTrue(any("relocated" in r for r in report), report)
+            self.assertFalse((fake_c / "multitran").exists())
+
+            new_pc_dir = portable_dir / "multitran" / "NEW-PC"
+            self.assertTrue((new_pc_dir / "history.txt").is_file())
+            self.assertEqual(
+                (new_pc_dir / "history.txt").read_text(encoding="utf-8"),
+                "word1\nword2\n",
+            )
+            self.assertEqual(
+                (new_pc_dir / "usertra.reu").read_bytes(),
+                b"USERTRA_DATA",
+            )
+            self.assertEqual(
+                (new_pc_dir / "Subject Profiles" / "subject.act").read_text(encoding="utf-8"),
+                "ACT",
+            )
+            self.assertEqual(
+                (new_pc_dir / "Subject Profiles" / "subject.sel").read_text(encoding="utf-8"),
+                "SEL",
+            )
+
+    def test_launcher_sync_external_changes_never_overwrites_portable_root_token(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "Multitran_Portable")
+            root.mkdir(parents=True)
+            (root / "portable.reg").write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Multitran]\r\n"
+                '"Work Path"="@@PORTABLE_ROOT@@\\\\multitran"\r\n'
+                '"Dictionary Path"="@@PORTABLE_ROOT@@\\\\App\\\\network"\r\n'
+                '"Interface Language"="English"\r\n\r\n',
+                encoding="utf-16",
+            )
+            cfg = {
+                "data_dir_name": "PortableData",
+                "registry": {
+                    "enabled": True,
+                    "file": "portable.reg",
+                    "restore_on_exit": True,
+                    "keys": [r"HKCU\Software\Multitran"],
+                    "created_keys": [r"HKCU\Software\Multitran"],
+                },
+            }
+
+            def fake_host_read(key: str):
+                if "multitran" in key.casefold():
+                    return {
+                        "Work Path": '"c:\\\\multitran"',
+                        "Dictionary Path": '"E:\\\\Dist\\\\network"',
+                        "Interface Language": '"Russian"',
+                    }
+                return {}
+
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(
+                        exe_launcher,
+                        "_read_host_key_reg_values",
+                        side_effect=fake_host_read,
+                    ):
+                session = exe_launcher.RegistrySession(root, cfg)
+                session.sync_external_changes()
+
+            updated = (root / "portable.reg").read_text(encoding="utf-16")
+            self.assertIn('"Work Path"="@@PORTABLE_ROOT@@\\\\multitran"', updated)
+            self.assertIn('"Dictionary Path"="@@PORTABLE_ROOT@@\\\\App\\\\network"', updated)
+            self.assertNotIn("c:\\\\multitran", updated.lower())
+            self.assertIn('"Interface Language"="Russian"', updated)
+
+
 if __name__ == "__main__":
     unittest.main()

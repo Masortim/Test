@@ -42,6 +42,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,7 @@ import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .. import __version__
@@ -2212,8 +2214,20 @@ class Portablizer:
                 self.log.info("Делаю снимок реестра после установки...")
                 after = reg_mod.snapshot(include_user=not switched_user)
 
+            app_names_for_reg = sorted(
+                set(shortcuts_mod.app_name_candidates(name, opts.installer_path))
+                | self._name_keys(name, opts.installer_path)
+            )
+            source_roots_for_reg = [
+                os.path.dirname(os.path.abspath(opts.installer_path)),
+                *self._recovered_sources,
+            ]
             registry_locations = (
-                reg_mod.changed_install_locations(before, after)
+                reg_mod.changed_install_locations(
+                    before, after,
+                    app_names=app_names_for_reg,
+                    source_roots=source_roots_for_reg,
+                )
                 if after else []
             )
 
@@ -2279,6 +2293,13 @@ class Portablizer:
                     self.log.ok(
                         f"Удалено {len(leftover)} брошенных каталог(ов) "
                         "установки из Program Files/профилей.")
+                self._relocate_drive_root_app_folders(
+                    portable_dir=portable_dir,
+                    app_dir=app_dir,
+                    app_name=name,
+                    installer_path=opts.installer_path,
+                    registry_locations=registry_locations,
+                )
                 for src_root in self._recovered_sources:
                     if src_root and src_root not in shortcut_guard.extra_roots:
                         shortcut_guard.extra_roots.append(src_root)
@@ -3041,6 +3062,34 @@ class Portablizer:
             else raw_diff.keys_of(reg_mod.CATEGORY_INTEGRATION)
         )
 
+        safe_app_name = opts.app_name.strip() or self._safe_name(opts)
+        app_names = sorted(
+            set(shortcuts_mod.app_name_candidates(
+                safe_app_name, opts.installer_path))
+            | self._name_keys(safe_app_name, opts.installer_path)
+        )
+        source_roots = [
+            *(
+                [os.path.dirname(os.path.abspath(opts.installer_path))]
+                if opts.installer_path and os.path.dirname(opts.installer_path)
+                else []
+            ),
+            *self._recovered_sources,
+        ]
+        reused_app_keys: List[str] = []
+        if before and not any(
+            reg_mod.categorize(k) == reg_mod.CATEGORY_APP
+            for k in portable_keys
+        ):
+            for existing_key in reg_mod.matching_existing_app_keys(
+                portable_after_in,
+                app_names=app_names,
+                source_roots=source_roots,
+            ):
+                if existing_key not in portable_keys:
+                    portable_keys.append(existing_key)
+                    reused_app_keys.append(existing_key)
+
         # URL-протоколы: браузерные глубокие ссылки («Открыть Figma» после
         # входа) должны открывать портативную программу, а не установленную.
         # Переносим их всегда, даже без --shell-integration: это не ассоциация
@@ -3068,7 +3117,10 @@ class Portablizer:
         # установку недействительной и сразу закрывались.
         portable_after = reg_mod.retarget_install_paths(
             portable_after_in, portable_keys, app_dir,
-            extra_roots=self._recovered_sources)
+            extra_roots=self._recovered_sources,
+            portable_dir=portable_dir,
+            app_names=app_names,
+        )
 
         # Команды открытия протоколов указывают на установленный каталог
         # этого ПК: без замены «Открыть Figma» в браузере вернёт именно его.
@@ -3112,6 +3164,44 @@ class Portablizer:
                 reg_mod.write_reg_file(machine_path, machine_text)
                 capture.machine_reg_file = machine_path
 
+        # На сборочном ПК установщик уже записал в реестр хоста сырые пути
+        # (например, c:\multitran и исходную папку дистрибутива). Сразу
+        # применяем перенаправленные пути в реестр хоста, чтобы первый запуск
+        # программы на этом же ПК не читал старый c:\multitran из HKCU/HKLM.
+        if IS_WINDOWS and (all_user_keys or machine_keys):
+            for snap_view, keys_view in (
+                (after_virtualized, all_user_keys),
+                (portable_after, machine_keys),
+            ):
+                if not keys_view:
+                    continue
+                expanded_text = reg_mod.render_keys(snap_view, keys_view, ())
+                if not reg_mod.has_entries(expanded_text):
+                    continue
+                tmp_reg = ""
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb", suffix=".reg", delete=False
+                    ) as fh:
+                        tmp_reg = fh.name
+                    reg_mod.write_reg_file(tmp_reg, expanded_text)
+                    subprocess.run(
+                        ["reg.exe", "import", tmp_reg],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        timeout=15,
+                        check=False,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    if tmp_reg:
+                        try:
+                            os.remove(tmp_reg)
+                        except OSError:
+                            pass
+
         capture.has_root_token = (
             launcher_mod.ROOT_TOKEN in user_text
             or launcher_mod.ROOT_TOKEN in machine_text
@@ -3121,10 +3211,11 @@ class Portablizer:
         capture.keys = launcher_mod.consolidate_root_keys(all_portable_keys)
         created_machine = [
             mk for mk in machine_keys
-            if mk not in before
+            if mk not in before or mk in set(reused_app_keys)
         ]
         capture.created_keys = launcher_mod.consolidate_root_keys(
             [k for k in diff.new_keys if k in set(portable_keys)]
+            + reused_app_keys
             + created_machine
             + virtual_keys
         )
@@ -7040,6 +7131,423 @@ class Portablizer:
                 f"Не удалось удалить оригинал установки из Program Files "
                 f"({source}): {exc}. Файл оставлен, но портатив уже содержит "
                 "копию в App.")
+
+    @staticmethod
+    def _pe_is_unsigned_and_checksum_offset(data: bytes) -> Tuple[bool, int]:
+        """Возвращает ``(True, checksum_offset)`` для неподписанного PE-файла."""
+        if len(data) < 0x40 or data[:2] != b"MZ":
+            return False, -1
+        e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+        if not 0 < e_lfanew < len(data) - 24:
+            return False, -1
+        if data[e_lfanew: e_lfanew + 4] != b"PE\0\0":
+            return False, -1
+        size_optional = struct.unpack_from("<H", data, e_lfanew + 20)[0]
+        opt_start = e_lfanew + 24
+        if size_optional < 68 or opt_start + size_optional > len(data):
+            return False, -1
+        magic = struct.unpack_from("<H", data, opt_start)[0]
+        if magic not in (0x10B, 0x20B):
+            return False, -1
+        dir_offset = 112 if magic == 0x20B else 96
+        if size_optional >= dir_offset + 5 * 8:
+            count = struct.unpack_from(
+                "<I", data, opt_start + dir_offset - 4
+            )[0]
+            if count > 4:
+                sec_rva, sec_size = struct.unpack_from(
+                    "<II", data, opt_start + dir_offset + 4 * 8
+                )
+                if sec_rva != 0 or sec_size != 0:
+                    return False, -1
+        return True, opt_start + 64
+
+    def _neutralize_hardcoded_drive_app_paths(
+        self,
+        portable_dir: str,
+        app_dir: str,
+        app_names: Sequence[str],
+    ) -> Set[str]:
+        """Заменяет зашитые в exe/dll/ini пути вида ``c:\\multitran`` на ``..\\multitran``.
+
+        Некоторые старые программы (в частности оболочка Multitran ``network.exe``)
+        хранят путь к рабочему каталогу пользовательских профилей, истории и
+        пользовательских словарей прямо внутри бинарника как ``c:\\multitran``.
+        Поскольку ``c:`` и ``..`` имеют одинаковую длину (2 байта в ASCII,
+        4 байта в UTF-16LE), замена ``c:\\multitran`` -> ``..\\multitran``
+        в неподписанном PE-файле не сдвигает ни одного смещения или таблицы
+        секций, а при запуске из ``<PortableDir>\\App`` относительный путь
+        ``..\\multitran`` на любом диске и в любом разделе указывает ровно в
+        ``<PortableDir>\\multitran``.
+        """
+        matched_folders: Set[str] = set()
+        if not os.path.isdir(app_dir):
+            return matched_folders
+        tokens = sorted(
+            {
+                reg_mod._normalize_app_token(name)
+                for name in (app_names or ())
+                if len(reg_mod._normalize_app_token(name)) >= 4
+                and reg_mod._normalize_app_token(name).isascii()
+            },
+            key=len,
+            reverse=True,
+        )
+        if not tokens:
+            return matched_folders
+
+        token_alt_str = "|".join(re.escape(t) for t in tokens)
+        text_re = re.compile(
+            r"(?<![A-Za-z0-9_\\/.:-])([A-Za-z]:)([\\/])("
+            + token_alt_str
+            + r")(?=[\\/\"'\r\n\t ;]|$)",
+            re.IGNORECASE,
+        )
+        ascii_re = re.compile(
+            rb"(?<![A-Za-z0-9_\\/.:-])([A-Za-z]:)([\\/])("
+            + b"|".join(re.escape(t.encode("ascii")) for t in tokens)
+            + rb")(?=[\\/\x00%\"'\r\n\t ;]|$)",
+            re.IGNORECASE,
+        )
+        utf16_patterns = []
+        for t in tokens:
+            char_parts = [
+                rb"[" + re.escape(ch.lower().encode("ascii"))
+                + re.escape(ch.upper().encode("ascii")) + rb"]\x00"
+                for ch in t
+            ]
+            utf16_patterns.append((
+                t,
+                re.compile(
+                    rb"([A-Za-z]\x00:\x00)([\\/]\x00)("
+                    + b"".join(char_parts)
+                    + rb")(?=[\\/\x00%\"'\r\n\t ;]\x00)",
+                ),
+            ))
+
+        portable_abs = os.path.abspath(portable_dir)
+        portable_norm = os.path.normcase(portable_abs)
+        skip_files = {
+            "launchportable.exe", "unins000.exe", "uninstall.exe",
+            "portablizer.log", "installer-output.log", "unpacker-output.log",
+        }
+        text_exts = {".ini", ".cfg", ".conf", ".xml", ".json", ".txt"}
+
+        for current, _dirs, files in os.walk(app_dir, followlinks=False):
+            rel_to_portable = os.path.relpath(
+                portable_abs, os.path.abspath(current)
+            ).replace("/", "\\")
+            for fname in files:
+                low_name = fname.casefold()
+                if low_name in skip_files:
+                    continue
+                fpath = os.path.join(current, fname)
+                ext = os.path.splitext(low_name)[1]
+                try:
+                    fsize = os.path.getsize(fpath)
+                except OSError:
+                    continue
+
+                if ext in text_exts and 0 < fsize <= 4 * 1024 * 1024:
+                    try:
+                        raw = Path(fpath).read_bytes()
+                    except OSError:
+                        continue
+                    for enc in ("utf-8", "utf-16", "cp1251"):
+                        try:
+                            txt = raw.decode(enc)
+                        except UnicodeDecodeError:
+                            continue
+
+                        def _repl_text(m: "re.Match[str]") -> str:
+                            full = m.group(0)
+                            if os.path.normcase(full).startswith(portable_norm):
+                                return full
+                            matched_folders.add(m.group(3))
+                            sep = m.group(2)
+                            prefix = rel_to_portable.replace("\\", sep)
+                            return f"{prefix}{sep}{m.group(3)}"
+
+                        new_txt = text_re.sub(_repl_text, txt)
+                        if new_txt != txt:
+                            try:
+                                Path(fpath).write_bytes(new_txt.encode(enc))
+                            except OSError:
+                                pass
+                        break
+                    continue
+
+                if (ext in (".exe", ".dll")
+                        and rel_to_portable == ".."
+                        and 0 < fsize <= 128 * 1024 * 1024):
+                    try:
+                        raw = Path(fpath).read_bytes()
+                    except OSError:
+                        continue
+                    unsigned, checksum_off = (
+                        self._pe_is_unsigned_and_checksum_offset(raw)
+                    )
+                    if not unsigned:
+                        continue
+                    buf = bytearray(raw)
+                    changed = False
+                    for m in ascii_re.finditer(raw):
+                        folder_str = m.group(3).decode("ascii", "ignore")
+                        matched_folders.add(folder_str)
+                        buf[m.start(1): m.end(1)] = b".."
+                        changed = True
+                    for token_name, u_re in utf16_patterns:
+                        for m in u_re.finditer(raw):
+                            matched_folders.add(token_name)
+                            buf[m.start(1): m.end(1)] = b".\x00.\x00"
+                            changed = True
+                    if changed:
+                        if checksum_off > 0:
+                            struct.pack_into("<I", buf, checksum_off, 0)
+                        try:
+                            Path(fpath).write_bytes(bytes(buf))
+                            self.log.info(
+                                f"Перенаправлен зашитый путь к папке данных в "
+                                f"{os.path.relpath(fpath, app_dir)} -> ..\\{next(iter(matched_folders))}"
+                            )
+                        except OSError:
+                            pass
+        return matched_folders
+
+    @staticmethod
+    def _sync_computer_profile_subfolders(folder_path: str) -> None:
+        """Синхронизирует подпапки ``<COMPUTERNAME>`` внутри рабочей папки портатива.
+
+        В частности, Multitran хранит пользовательские файлы в
+        ``multitran\\<ИМЯ_КОМПЬЮТЕРА>\\history.txt``, ``usertra.reu`` и
+        ``Subject Profiles\\subject.act``, ``subject.sel``. Чтобы при переносе
+        папки портатива на другой компьютер эти файлы подхватывались под новым
+        именем компьютера без потерь, синхронизируем свежие файлы между
+        существующими профилями и текущим ``%COMPUTERNAME%``.
+        """
+        if not os.path.isdir(folder_path):
+            return
+        marker_names = {"history.txt", "usertra.reu", "subject profiles"}
+        comp_dirs: List[str] = []
+        try:
+            entries = list(os.scandir(folder_path))
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                child_names = {c.name.casefold() for c in os.scandir(entry.path)}
+            except OSError:
+                continue
+            if child_names & marker_names:
+                comp_dirs.append(entry.path)
+
+        current_comp = (
+            os.environ.get("COMPUTERNAME")
+            or os.environ.get("HOSTNAME")
+            or ""
+        ).strip()
+        if not current_comp or not comp_dirs:
+            return
+        target_comp_dir = os.path.join(folder_path, current_comp)
+        if all(
+            os.path.normcase(d) != os.path.normcase(target_comp_dir)
+            for d in comp_dirs
+        ):
+            os.makedirs(target_comp_dir, exist_ok=True)
+            comp_dirs.append(target_comp_dir)
+
+        if len(comp_dirs) < 2:
+            return
+
+        # Собираем самую свежую версию каждого относительного файла по всем
+        # профилям компьютеров и раскладываем во все профили (включая текущий).
+        newest: Dict[str, Tuple[float, str]] = {}
+        for cdir in comp_dirs:
+            for cur, _subdirs, files in os.walk(cdir, followlinks=False):
+                for fname in files:
+                    src_file = os.path.join(cur, fname)
+                    rel = os.path.relpath(src_file, cdir)
+                    rel_key = os.path.normcase(rel)
+                    try:
+                        mtime = os.path.getmtime(src_file)
+                    except OSError:
+                        continue
+                    prev = newest.get(rel_key)
+                    if prev is None or mtime > prev[0]:
+                        newest[rel_key] = (mtime, src_file)
+
+        for cdir in comp_dirs:
+            for _rel_key, (src_mtime, src_file) in newest.items():
+                rel = os.path.relpath(
+                    src_file,
+                    next(
+                        d for d in comp_dirs
+                        if os.path.normcase(src_file).startswith(
+                            os.path.normcase(d) + os.sep
+                        )
+                    ),
+                )
+                dst_file = os.path.join(cdir, rel)
+                if os.path.normcase(src_file) == os.path.normcase(dst_file):
+                    continue
+                try:
+                    if os.path.isfile(dst_file):
+                        if os.path.getmtime(dst_file) >= src_mtime - 0.001:
+                            continue
+                    os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+                    shutil.copy2(src_file, dst_file)
+                except OSError:
+                    continue
+
+    def _relocate_drive_root_app_folders(
+        self,
+        portable_dir: str,
+        app_dir: str,
+        app_name: str,
+        installer_path: str,
+        registry_locations: Iterable[str] = (),
+    ) -> List[str]:
+        """Переносит рабочую папку программы вида ``C:\\multitran`` внутрь портатива.
+
+        Если программа или установщик использует каталог в корне диска
+        (например, ``C:\\multitran\\<COMPUTERNAME>\\history.txt``,
+        ``usertra.reu``, ``Subject Profiles\\subject.act``, ``subject.sel``),
+        заменяет жёсткие ссылки в бинарниках ``App`` на ``..\\multitran``,
+        переносит уже существующую папку ``C:\\multitran`` со всем содержимым
+        в ``<PortableDir>\\multitran`` и удаляет оригинал с диска ``C:``.
+        """
+        keys = self._name_keys(app_name, installer_path)
+        app_names = sorted(
+            set(shortcuts_mod.app_name_candidates(app_name, installer_path))
+            | keys
+        )
+        matched_folders = self._neutralize_hardcoded_drive_app_paths(
+            portable_dir, app_dir, app_names
+        )
+
+        portable_abs = os.path.abspath(portable_dir)
+        app_abs = os.path.abspath(app_dir)
+        data_abs = os.path.join(portable_abs, "PortableData")
+        installer_abs = (
+            os.path.abspath(installer_path) if installer_path else ""
+        )
+        protected_targets = [
+            p for p in (portable_abs, app_abs, data_abs, installer_abs) if p
+        ]
+
+        def _is_protected_path(candidate_abs: str) -> bool:
+            cand_norm = os.path.normcase(candidate_abs)
+            for target in protected_targets:
+                target_norm = os.path.normcase(target)
+                if (cand_norm == target_norm
+                        or cand_norm.startswith(target_norm + os.sep)
+                        or target_norm.startswith(cand_norm + os.sep)):
+                    return True
+            return False
+
+        drive_roots: List[str] = []
+        if IS_WINDOWS:
+            sys_drive = os.environ.get("SystemDrive", "C:").strip().rstrip("\\/")
+            if sys_drive:
+                drive_roots.append(sys_drive + "\\")
+        port_drive, _ = os.path.splitdrive(portable_abs)
+        if port_drive:
+            drive_roots.append(port_drive + "\\")
+
+        candidate_dirs: List[str] = []
+        for d_root in dict.fromkeys(drive_roots):
+            if not os.path.isdir(d_root):
+                continue
+            try:
+                for entry in os.scandir(d_root):
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    low = entry.name.casefold()
+                    if (low.startswith("$")
+                            or low in self._SYSTEM_DRIVE_SKIP_DIRS):
+                        continue
+                    if self._name_score(entry.name, keys) >= 200:
+                        candidate_dirs.append(os.path.abspath(entry.path))
+            except OSError:
+                continue
+
+        for loc in registry_locations:
+            loc_str = str(loc or "").strip().strip('"')
+            m = re.match(
+                r"^([A-Za-z]:[\\/])([^\\/:*?\"<>|\r\n;]+)",
+                loc_str,
+            )
+            if not m:
+                continue
+            top_folder = m.group(2)
+            if top_folder.casefold() in self._SYSTEM_DRIVE_SKIP_DIRS:
+                continue
+            if self._name_score(top_folder, keys) >= 200:
+                matched_folders.add(top_folder)
+                top_abs = os.path.abspath(m.group(1) + top_folder)
+                if os.path.isdir(top_abs):
+                    candidate_dirs.append(top_abs)
+
+        relocated: List[str] = []
+        seen_cands: Set[str] = set()
+        for src_dir in candidate_dirs:
+            src_norm = os.path.normcase(src_dir)
+            if src_norm in seen_cands or _is_protected_path(src_dir):
+                continue
+            seen_cands.add(src_norm)
+            if not os.path.isdir(src_dir):
+                continue
+            folder_name = os.path.basename(src_dir)
+            matched_folders.add(folder_name)
+            dest_dir = os.path.join(portable_abs, folder_name)
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.copytree(src_dir, dest_dir, dirs_exist_ok=True)
+                self._remember_recovered_source(src_dir)
+                shutil.rmtree(src_dir, ignore_errors=False)
+                relocated.append(dest_dir)
+                self.log.ok(
+                    f"Рабочая папка программы перенесена в портатив: "
+                    f"{src_dir} -> {dest_dir}"
+                )
+            except OSError as exc:
+                self.log.warn(
+                    f"Не удалось полностью перенести или удалить {src_dir}: {exc}"
+                )
+
+        # Создаём рабочую папку внутри портатива (например, <PortableDir>\multitran),
+        # если на неё ссылаются бинарники или реестр, и синхронизируем профили ПК.
+        chosen_names: Dict[str, str] = {}
+        for fname in matched_folders:
+            clean = fname.strip().strip("\\/")
+            if clean:
+                chosen_names.setdefault(clean.casefold(), clean)
+        for clean_low, folder_name in chosen_names.items():
+            # Предпочитаем нижний регистр для уже известных рабочих папок вроде multitran
+            existing = next(
+                (
+                    entry.name
+                    for entry in (
+                        os.scandir(portable_abs)
+                        if os.path.isdir(portable_abs)
+                        else ()
+                    )
+                    if entry.is_dir(follow_symlinks=False)
+                    and entry.name.casefold() == clean_low
+                ),
+                folder_name.lower(),
+            )
+            target_folder = os.path.join(portable_abs, existing)
+            try:
+                os.makedirs(target_folder, exist_ok=True)
+                self._sync_computer_profile_subfolders(target_folder)
+                if target_folder not in relocated:
+                    relocated.append(target_folder)
+            except OSError:
+                pass
+        return relocated
 
     # -- поиск главного exe ---------------------------------------------------
     # -- поиск и классификация исполняемых файлов -----------------------------
