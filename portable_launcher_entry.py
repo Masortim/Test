@@ -1292,8 +1292,16 @@ def expand_root_token_in_files(root: Path,
     """
     settings = _paths_settings(cfg)
     fixed_files: "list[str]" = []
+    # Свои файлы не трогаем. В ``launcher_config.json`` маркер лежит значением
+    # ``registry.root_token`` — это НАСТОЯЩЕЕ содержимое, а не путь: подстановка
+    # превратила бы его в ``E:\Backup\...`` с одиночными слэшами, и JSON
+    # перестал бы читаться («Invalid \escape: line 120 column 22»). Именно так
+    # ломались все запускалки, пока программа из ``App`` работала.
     own = {_paths_stamp_file(root), _paths_stamp_text_file(root),
-           _token_sweep_file(root, cfg)}
+           _token_sweep_file(root, cfg),
+           _session_marker(root),
+           _data_dir(root, cfg or {}) / ADOPTED_LOG_NAME,
+           root / "launcher_config.json"}
     for path in _iter_paths_files(root, settings, deep=deep):
         if path in own:
             continue
@@ -1310,6 +1318,18 @@ def expand_root_token_in_files(root: Path,
         fixed = expand_root_token_text(text, root)
         if fixed == text:
             continue
+        if path.suffix.casefold() == ".json":
+            # JSON: слэши внутри значения должны быть удвоены, иначе файл
+            # становится нечитаемым. Заменяем маркер сразу на экранированную
+            # форму, а результат проверяем разбором.
+            fixed = _expand_token_json(text, root)
+            if fixed == text:
+                continue
+            if _json_is_valid(text) and not _json_is_valid(fixed):
+                _run_log(root, "paths: skipped " + path.name
+                               + ": the marker in it cannot be replaced "
+                                 "without breaking the JSON")
+                continue
         try:
             path.write_bytes(fixed.encode(encoding))
         except (OSError, UnicodeError):
@@ -1405,6 +1425,123 @@ def import_reg_command(root: "Optional[Path]" = None,
     return 0 if code == 0 else 1
 
 
+CONFIG_NAME = "launcher_config.json"
+
+
+def launcher_config_path(root: Path) -> Path:
+    return root / CONFIG_NAME
+
+
+def read_launcher_config(root: Path) -> "Dict[str, Any]":
+    """Читает ``launcher_config.json`` и чинит его, если JSON испорчен.
+
+    Жалоба: все запускалки (``Launch.bat``, ``LaunchHidden.vbs``,
+    ``LaunchPortable.exe``, ярлык установщика) показывали
+    «Не удалось запустить портативную программу.
+    Invalid \\escape: line 120 column 22 (char 3665)», а сама программа из
+    ``App`` работала.
+
+    Причина была наша: проход по маркеру ``@@PORTABLE_ROOT@@`` подставлял в
+    этот файл путь с одиночными обратными слэшами (``"root_token":
+    "E:\\Backup\\Apps"``). Для JSON это управляющие последовательности, файл
+    перестаёт разбираться — и ни один лончер не может прочитать конфиг.
+
+    Теперь проход этот файл не трогает, но испорченные копии уже существуют:
+    при чтении такой JSON чинится (слэши удваиваются, всё остальное остаётся
+    как было) и записывается обратно. Заодно значение
+    ``registry.root_token`` возвращается к маркеру, если в него попал путь:
+    это не путь, а само содержимое.
+    """
+    path = launcher_config_path(root)
+    data = path.read_bytes()
+    text = data.decode("utf-8-sig")
+    encoding = "utf-8"
+    try:
+        cfg = json.loads(text)
+    except ValueError as first_error:
+        repaired = _repair_json_escapes(text)
+        try:
+            cfg = json.loads(repaired)
+        except ValueError:
+            _run_log(root, f"config: {CONFIG_NAME} cannot be read "
+                           f"({first_error}); restoring from the shipped copy")
+            cfg = _restore_config_from_baseline(root, first_error)
+            if cfg is None:
+                raise
+        else:
+            try:
+                path.write_text(repaired, encoding=encoding,
+                                newline="\n")
+                _run_log(root, "config: repaired invalid escapes in "
+                               + CONFIG_NAME
+                               + " (a Windows path was written with single "
+                                 "backslashes)")
+            except OSError:
+                pass
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{CONFIG_NAME}: ожидался объект JSON")
+    return _sanitize_config(cfg, root)
+
+
+def _restore_config_from_baseline(root: Path,
+                                  error: Exception) -> "Optional[Dict[str, Any]]":
+    """Последняя попытка: собирает минимальный конфиг из того, что уцелело.
+
+    Если файл испорчен так, что и удвоение слэшей не помогает, лончер всё
+    равно должен запустить программу: имя, цель и каталог данных достаются
+    из остатков файла или из соседних наших файлов. Полный конфиг при этом не
+    выдумывается — восстанавливается только необходимое для запуска.
+    """
+    path = launcher_config_path(root)
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
+
+    def find(pattern: str) -> str:
+        match = re.search(pattern, text, re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    target = find(r'"target_exe_rel"\s*:\s*"([^"]+)"')
+    name = find(r'"app_name"\s*:\s*"([^"]*)"')
+    data_dir = find(r'"data_dir_name"\s*:\s*"([^"]*)"') or "PortableData"
+    if not target:
+        return None
+    cfg: Dict[str, Any] = {
+        "app_name": name or root.name,
+        "target_exe_rel": target,
+        "data_dir_name": data_dir,
+        "restored_from_broken_config": str(error)[:200],
+    }
+    _run_log(root, "config: minimal config restored from the broken file "
+                   f"(target={target})")
+    return cfg
+
+
+def _sanitize_config(cfg: "Dict[str, Any]", root: Path) -> "Dict[str, Any]":
+    """Возвращает ``registry.root_token`` к маркеру, если туда попал путь.
+
+    Маркер — это значение настройки, а не путь: ``portable.reg`` содержит его
+    вместо корня. Если подстановка заменила его абсолютным путём, импорт
+    настроек пойдёт «как есть», и маркер перестанет работать после переезда.
+    """
+    registry = cfg.get("registry")
+    if not isinstance(registry, dict):
+        return cfg
+    token = str(registry.get("root_token") or "")
+    if token and ROOT_TOKEN.casefold() not in token.casefold():
+        registry["root_token"] = ROOT_TOKEN
+        _run_log(root, "config: registry.root_token restored to the portable "
+                       "marker (an absolute path had been written there)")
+        try:
+            launcher_config_path(root).write_text(
+                json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+        except OSError:
+            pass
+    return cfg
+
+
 def repair_paths_command(root: "Optional[Path]" = None) -> int:
     """``LaunchPortable.exe --repair-paths``: починить пути вручную.
 
@@ -1413,8 +1550,7 @@ def repair_paths_command(root: "Optional[Path]" = None) -> int:
     """
     root = root or find_portable_root()
     try:
-        cfg = json.loads((root / "launcher_config.json")
-                         .read_text(encoding="utf-8-sig"))
+        cfg = read_launcher_config(root)
     except (OSError, ValueError):
         cfg = {}
     lines = repair_paths(root, cfg, force=True, deep=True)
@@ -2909,8 +3045,7 @@ def identity_report(root: Path, cfg: Dict[str, Any], host_profile: str = "",
 def check_identity(root: Optional[Path] = None) -> int:
     """``LaunchPortable.exe --check-identity``: показать состояние ключа."""
     root = root or find_portable_root()
-    with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
-        cfg: Dict[str, Any] = json.load(fh)
+    cfg: Dict[str, Any] = read_launcher_config(root)
     lines = identity_report(root, cfg, os.environ.get("USERPROFILE", ""),
                             import_from_host=False)
     if not lines:
@@ -6099,6 +6234,82 @@ def expand_root_token_text(text: str, root: Any,
     return re.sub(re.escape(token), _replacement, value, flags=re.IGNORECASE)
 
 
+def _json_is_valid(text: str) -> bool:
+    try:
+        json.loads(text)
+        return True
+    except ValueError:
+        return False
+
+
+def _expand_token_json(text: str, root: Any,
+                       token: str = ROOT_TOKEN) -> str:
+    """Заменяет маркер в JSON-тексте на экранированный путь.
+
+    В JSON обратный слэш — управляющий символ: ``"E:\Backup"`` не читается
+    (``Invalid \escape``). Поэтому путь подставляется в том виде, в каком его
+    записал бы ``json.dumps``: ``"E:\\Backup"``. Если в файле маркер уже был
+    записан с удвоенными слэшами, форма сохраняется.
+    """
+    value = str(text or "")
+    base = str(root or "").strip().strip('"').rstrip("\\/")
+    if not value or not base or not token:
+        return value
+    escaped = json.dumps(base, ensure_ascii=False)[1:-1]
+
+    def _replacement(match: "re.Match[str]") -> str:
+        following = value[match.end():match.end() + 2]
+        if following.startswith("\\\\"):
+            return escaped
+        if following.startswith("\\"):
+            return escaped
+        if following.startswith("/"):
+            return base.replace("\\", "/")
+        return escaped
+
+    result = re.sub(re.escape(token), _replacement, value, flags=re.IGNORECASE)
+    if not _json_is_valid(result):
+        # Файл был испорчен раньше (одиночные слэши): чиним и его.
+        result = _repair_json_escapes(result)
+    return result
+
+
+def _repair_json_escapes(text: str) -> str:
+    r"""Удваивает «одиночные» обратные слэши внутри строк JSON.
+
+    Так выглядит ``launcher_config.json``, испорченный подстановкой пути без
+    экранирования: ``"root_token": "E:\Backup\Apps"``. Настоящие
+    escape-последовательности (``\\``, ``\"``, ``\n``, ``\uXXXX``) не
+    трогаются, поэтому обычный JSON остаётся байт в байт.
+    """
+    result: "list[str]" = []
+    in_string = False
+    index = 0
+    valid = set('"\\/bfnrtu')
+    while index < len(text):
+        symbol = text[index]
+        if not in_string:
+            result.append(symbol)
+            if symbol == '"':
+                in_string = True
+            index += 1
+            continue
+        if symbol == "\\":
+            following = text[index + 1:index + 2]
+            if following in valid and following:
+                result.append(symbol + following)
+                index += 2
+                continue
+            result.append("\\\\")
+            index += 1
+            continue
+        result.append(symbol)
+        if symbol == '"':
+            in_string = False
+        index += 1
+    return "".join(result)
+
+
 def retarget_record_text(text: str, stale_roots: "Sequence[str]",
                          current_root: str) -> str:
     """Заменяет в значении записи прежние места портатива текущим корнем.
@@ -6804,8 +7015,7 @@ def remembered_roots(root: Path,
 def _same_portable(candidate: Path, cfg: Dict[str, Any]) -> bool:
     """Прежнее место принадлежит этой же программе (а не соседней папке)."""
     try:
-        data = json.loads((candidate / "launcher_config.json").read_text(
-            encoding="utf-8-sig"))
+        data = read_launcher_config(candidate)
     except (OSError, ValueError):
         return False
     if not isinstance(data, dict):
@@ -6996,9 +7206,7 @@ def _same_app_location(cfg: "Optional[Dict[str, Any]]", candidate: Path) -> bool
     Сверяем имя программы и файл запуска из ``launcher_config.json``.
     """
     try:
-        with (candidate / "launcher_config.json").open(
-                "r", encoding="utf-8-sig") as handle:
-            other = json.load(handle)
+        other = read_launcher_config(candidate)
     except (OSError, ValueError):
         return True  # своей настройки нет — доверяем штампу переноса
     if not isinstance(other, dict) or not cfg:
@@ -7640,8 +7848,7 @@ def update_command(root: Path, argv: Sequence[str]) -> int:
 
     Коды: 0 - обновлено, 1 - не удалось, 3 - отказ пользователя.
     """
-    with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
-        cfg: Dict[str, Any] = json.load(fh)
+    cfg: Dict[str, Any] = read_launcher_config(root)
     arguments = [str(a) for a in argv]
     quiet = any(a.casefold() in ("--yes", "/yes", "--quiet") for a in arguments)
     rest = [a for a in arguments
@@ -7666,8 +7873,7 @@ def update_command(root: Path, argv: Sequence[str]) -> int:
 
 def rollback_command(root: Path, argv: Sequence[str] = ()) -> int:
     """``LaunchPortable.exe --rollback [--yes]``: вернуть прежнюю версию."""
-    with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
-        cfg: Dict[str, Any] = json.load(fh)
+    cfg: Dict[str, Any] = read_launcher_config(root)
     quiet = any(str(a).casefold() in ("--yes", "/yes", "--quiet") for a in argv)
     result = rollback_update(root, cfg)
     if result.ok:
@@ -7683,8 +7889,7 @@ def rollback_command(root: Path, argv: Sequence[str] = ()) -> int:
 def run(argv: Optional[Sequence[str]] = None) -> int:
     """Запуск программы + обновление внутри портатива, если оно понадобилось."""
     root = find_portable_root()
-    with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
-        cfg: Dict[str, Any] = json.load(fh)
+    cfg: Dict[str, Any] = read_launcher_config(root)
 
     # Следы прерванного обновления (принудительно закрытая программа, зависший
     # «перезапуск для обновления») убираются ДО старта: именно они роняют
@@ -8080,8 +8285,7 @@ def stop(root: Optional[Path] = None) -> int:
     cfg: Dict[str, Any] = {}
     settings = {"close_grace": 5.0, "kill_leftovers": 1.0}
     try:
-        with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
-            cfg = json.load(fh)
+        cfg = read_launcher_config(root)
         settings = shutdown_settings(cfg)
     except (OSError, ValueError):
         pass
@@ -8227,8 +8431,7 @@ def sync_saves(root: Optional[Path] = None) -> int:
     наоборот) не дожидаясь следующего запуска через лончер.
     """
     root = root or find_portable_root()
-    with (root / "launcher_config.json").open("r", encoding="utf-8-sig") as fh:
-        cfg: Dict[str, Any] = json.load(fh)
+    cfg: Dict[str, Any] = read_launcher_config(root)
     session = SharedSaveSession(root, cfg)
     if not session.enabled:
         _run_log(root, "shared saves: disabled for this portable app")

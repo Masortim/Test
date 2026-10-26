@@ -449,6 +449,101 @@ class PortableMarkerTests(unittest.TestCase):
                 Path("E:/Baalda"), OLLAMA_CFG), [])
 
 
+class BrokenConfigTests(unittest.TestCase):
+    """``launcher_config.json`` с путём «в один слэш» должен читаться.
+
+    Жалоба: все запускалки (Launch.bat, LaunchHidden.vbs, LaunchPortable.exe,
+    ярлык установщика) показывали «Не удалось запустить портативную программу.
+    Invalid \\escape: line 120 column 22» — проход по маркеру подставил в конфиг
+    путь ``E:\\Backup\\Apps`` без экранирования. Программа из ``App`` при этом
+    работала: конфиг ей не нужен.
+    """
+
+    BROKEN = ('{\n  "app_name": "Baalda",\n'
+              '  "target_exe_rel": "App/desktop.exe",\n'
+              '  "data_dir_name": "PortableData",\n'
+              '  "registry": {\n    "enabled": true,\n'
+              '    "file": "portable.reg",\n'
+              '    "root_token": "E:\\Backup\\Apps\\Baalda_0.1.87_Portable"\n'
+              '  }\n}')
+
+    def test_invalid_escapes_are_doubled(self):
+        repaired = exe_launcher._repair_json_escapes(self.BROKEN)
+        self.assertEqual(json.loads(repaired)["target_exe_rel"],
+                         "App/desktop.exe")
+
+    def test_healthy_json_is_untouched(self):
+        good = json.dumps({"path": "E:\\Backup", "text": "line\nbreak",
+                           "quote": 'a"b', "rus": "тест"},
+                          ensure_ascii=False, indent=2)
+        self.assertEqual(exe_launcher._repair_json_escapes(good), good)
+
+    def test_broken_config_is_repaired_on_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            path = root / "launcher_config.json"
+            path.write_text(self.BROKEN, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                json.loads(path.read_text(encoding="utf-8"))
+            cfg = exe_launcher.read_launcher_config(root)
+            self.assertEqual(cfg["app_name"], "Baalda")
+            # Файл на диске тоже исправлен — иначе следующая запускалка упадёт.
+            json.loads(path.read_text(encoding="utf-8"))
+
+    def test_root_token_returns_to_the_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            path = root / "launcher_config.json"
+            path.write_text(self.BROKEN, encoding="utf-8")
+            cfg = exe_launcher.read_launcher_config(root)
+            self.assertEqual(cfg["registry"]["root_token"],
+                             exe_launcher.ROOT_TOKEN)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))
+                             ["registry"]["root_token"],
+                             exe_launcher.ROOT_TOKEN)
+
+    def test_marker_sweep_never_touches_the_config(self):
+        """Проход по маркеру не должен ломать наш собственный конфиг."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            cfg = dict(OLLAMA_CFG)
+            cfg["registry"] = {"enabled": True, "file": "portable.reg",
+                               "root_token": exe_launcher.ROOT_TOKEN}
+            path = root / "launcher_config.json"
+            original = json.dumps(cfg, ensure_ascii=False, indent=2)
+            path.write_text(original, encoding="utf-8")
+            root = Path(str(root))
+            exe_launcher.expand_root_token_in_files(root, cfg, deep=True)
+            self.assertEqual(path.read_text(encoding="utf-8"), original,
+                             "конфиг изменён — JSON снова может сломаться")
+            json.loads(path.read_text(encoding="utf-8"))
+
+    def test_foreign_json_gets_escaped_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            path = _write(root / "App" / "settings.json",
+                          '{"install": "@@PORTABLE_ROOT@@\\\\App"}')
+            fixed = exe_launcher.expand_root_token_in_files(
+                root, OLLAMA_CFG, deep=True)
+            self.assertIn("App/settings.json",
+                          [item.replace("\\", "/") for item in fixed])
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertTrue(data["install"].endswith("App"),
+                            data)
+
+    def test_hopeless_config_is_restored_from_what_survives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            path = root / "launcher_config.json"
+            # Сломан не только escape: обрезанный файл.
+            path.write_text('{"app_name": "Baalda", '
+                            '"target_exe_rel": "App/desktop.exe",,}',
+                            encoding="utf-8")
+            cfg = exe_launcher.read_launcher_config(root)
+            self.assertEqual(cfg["target_exe_rel"], "App/desktop.exe")
+            self.assertEqual(cfg["data_dir_name"], "PortableData")
+
+
 class PreviousLocationAdoptionTests(unittest.TestCase):
     """Обновление поставилось в ПРЕЖНЕЕ место — файлы забираются в текущее.
 

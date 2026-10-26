@@ -19,6 +19,7 @@ import batsim
 import portable_launcher_entry as exe_launcher
 from portablizer.core import elevate as elevate_mod
 from portablizer.core import launcher as launcher_mod
+from portablizer.core import maintenance as maintenance_mod
 from portablizer.core import maintenance
 from portablizer.core import procutil
 from portablizer.core import registry
@@ -1081,6 +1082,29 @@ class LaunchBatExecutionTests(unittest.TestCase):
     def _witcher_fs(self):
         return self._fs(exe_rel=r"App\witcher.exe",
                         extra=["portable_machine.reg"])
+
+    def test_fallback_python_launcher_repairs_a_broken_config(self):
+        """``launcher.py`` (запасной лончер) не падает на «Invalid \\escape»."""
+        ns = {"__name__": "launcher_fallback"}
+        exec(compile(launcher_mod._PY_LAUNCHER, "launcher.py", "exec"), ns)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "launcher_config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"root_token": "E:\\Backup\\Apps", '
+                         '"target_exe_rel": "App/app.exe"}')
+            cfg = ns["load_config"](tmp)
+            self.assertEqual(cfg["target_exe_rel"], "App/app.exe")
+            with open(path, "r", encoding="utf-8") as fh:
+                json.loads(fh.read())  # файл на диске снова читается
+
+    def test_maintenance_reads_a_broken_config(self):
+        """Обновление портатива не отказывает из-за испорченного конфига."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "launcher_config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"data_dir_name": "E:\\Apps\\PortableData"}')
+            data = maintenance_mod.read_config(path)
+            self.assertTrue(data["data_dir_name"].endswith("PortableData"))
 
     def test_declined_uac_is_named_as_declined_not_as_generic_failure(self):
         res = self._run(self._witcher_cfg(), fs=self._witcher_fs(),
