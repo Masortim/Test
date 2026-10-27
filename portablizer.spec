@@ -60,6 +60,12 @@ datas = [
     (os.path.join("portablizer", "resources", "portable_launcher.exe"),
      os.path.join("resources")),
 ]
+# Тот же лончер, собранный папкой: он запускается без распаковки во %TEMP%
+# (см. portable_launcher_onedir.spec). Папка есть только после сборки лончера;
+# без неё Portablizer кладёт в App обычный onefile-бинарник.
+_launcher_dir = os.path.join("portablizer", "resources", "portable_launcher")
+if os.path.isdir(_launcher_dir):
+    datas.append((_launcher_dir, os.path.join("resources", "portable_launcher")))
 
 a = Analysis(
     ["app.py"],

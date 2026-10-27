@@ -17,6 +17,10 @@ python -m pip install -r requirements.txt pyinstaller
 echo [3/5] Собираю переносимый LaunchPortable.exe...
 pyinstaller --noconfirm --clean portable_launcher.spec || goto :error
 copy /y "dist\PortableLauncher.exe" "portablizer\resources\portable_launcher.exe" >nul || goto :error
+rem Тот же лончер папкой: запуск без распаковки во временную папку.
+pyinstaller --noconfirm --clean portable_launcher_onedir.spec || goto :error
+if exist "portablizer\resources\portable_launcher" rmdir /s /q "portablizer\resources\portable_launcher"
+xcopy /e /i /q /y "dist\PortableLauncher" "portablizer\resources\portable_launcher" >nul || goto :error
 
 echo [4/5] Собираю Portablizer.exe...
 pyinstaller --noconfirm --clean portablizer.spec || goto :error

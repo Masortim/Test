@@ -177,6 +177,34 @@ def bundled_exe_launcher_path() -> str:
     return os.path.join(package_root, "resources", "portable_launcher.exe")
 
 
+#: Имя папки с содержимым onedir-сборки лончера (см. portable_launcher_onedir.spec).
+LAUNCHER_PAYLOAD_DIR = "_internal"
+
+#: Метка внутри этой папки: по ней видно, что содержимое уже разложено и
+#: относится к той же сборке лончера (после обновления папка перекладывается).
+LAUNCHER_PAYLOAD_MARKER = ".portable-launcher"
+
+
+def bundled_exe_launcher_dir() -> str:
+    """Путь к папке onedir-сборки лончера: exe и ``_internal`` рядом.
+
+    Такая сборка запускается без распаковки во ``%TEMP%``: у onefile каждая
+    распаковка — это десятки файлов, которые антивирус проверяет заново, и
+    окно программы появляется через секунды. Если папки нет (ресурс собран
+    прежней версией), используется обычный onefile-бинарник.
+    """
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    base = (os.path.join(frozen_root, "resources", "portable_launcher")
+            if frozen_root else
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "resources", "portable_launcher"))
+    exe = os.path.join(base, "PortableLauncher.exe")
+    payload = os.path.join(base, LAUNCHER_PAYLOAD_DIR)
+    if os.path.isfile(exe) and os.path.isdir(payload):
+        return base
+    return ""
+
+
 # -- коды возврата установщиков ---------------------------------------------
 #: Типовые коды возврата и их расшифровка (для журнала и итоговой ошибки).
 _EXIT_CODE_HINTS: Dict[int, str] = {
@@ -8050,6 +8078,46 @@ class Portablizer:
         return os.path.relpath(report, portable_dir)
 
     # -- лончер ---------------------------------------------------------------
+    def _copy_launcher_payload(self, source_dir: str, portable_dir: str) -> bool:
+        """Копирует содержимое onedir-сборки лончера рядом с ``App\*.exe``.
+
+        Лончер собран папкой (``portable_launcher_onedir.spec``): exe плюс
+        ``_internal``. Раньше он был собран onefile и при КАЖДОМ запуске
+        распаковывал себя во ``%TEMP%`` — десятки новых файлов, которые
+        антивирус проверяет заново. Отсюда и «фоновый процесс есть, а окно
+        появляется через секунды».
+
+        Содержимое кладётся один раз: если ``App\_internal`` уже на месте и
+        непустая, копирование пропускается (запусков может быть много).
+        """
+        target = os.path.join(portable_dir, "App", LAUNCHER_PAYLOAD_DIR)
+        marker = os.path.join(target, LAUNCHER_PAYLOAD_MARKER)
+        try:
+            stamp = os.stat(os.path.join(source_dir, "PortableLauncher.exe"))
+            wanted = f"{stamp.st_size}:{int(stamp.st_mtime)}"
+            if os.path.isdir(target) and os.path.isfile(marker):
+                with open(marker, "r", encoding="utf-8") as fh:
+                    if fh.read().strip() == wanted:
+                        return True
+        except OSError:
+            wanted = ""
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+            shutil.copytree(os.path.join(source_dir, LAUNCHER_PAYLOAD_DIR), target)
+            if wanted:
+                with open(marker, "w", encoding="utf-8") as fh:
+                    fh.write(wanted)
+        except (OSError, shutil.Error) as exc:
+            self.log.warn(
+                "Не удалось разложить ускоренный лончер рядом с App: "
+                f"{exc}. Будет использован обычный (медленнее стартует).")
+            return False
+        self.log.info(
+            f"Лончер разложен папкой ({LAUNCHER_PAYLOAD_DIR}): запуск без "
+            "распаковки во временную папку.")
+        return True
+
     def _copy_exe_launcher(
         self, portable_dir: str,
         destination_rel: str = os.path.join("App", APP_EXE_LAUNCHER_NAME),
@@ -8061,7 +8129,9 @@ class Portablizer:
         находит своё имя в ``launcher_config.json`` и выбирает относительный
         путь цели, сохраняя изоляцию профиля и переносимость между дисками.
         """
-        source = bundled_exe_launcher_path()
+        onedir = bundled_exe_launcher_dir()
+        source = (os.path.join(onedir, "PortableLauncher.exe") if onedir
+                  else bundled_exe_launcher_path())
         if not os.path.isfile(source):
             self.log.warn(
                 "В сборке Portablizer отсутствует встроенный "
@@ -8079,10 +8149,18 @@ class Portablizer:
             if os.path.commonpath((portable_abs, destination)) != portable_abs:
                 raise RuntimeError("путь EXE-лончера выходит за пределы портатива")
             os.makedirs(os.path.dirname(destination), exist_ok=True)
+            # Содержимое onedir-сборки кладётся РЯДОМ с exe (``App\_internal``):
+            # тогда лончер не распаковывает себя во %TEMP% при каждом запуске.
+            # Если папку скопировать не удалось, остаётся обычный onefile —
+            # он работает всегда, просто стартует медленнее.
+            if not onedir or not self._copy_launcher_payload(onedir, portable_dir):
+                source = bundled_exe_launcher_path()
+                if not os.path.isfile(source):
+                    raise RuntimeError("нет ни onedir-сборки, ни onefile-лончера")
             temporary = destination + ".tmp"
             shutil.copy2(source, temporary)
             os.replace(temporary, destination)
-        except (OSError, RuntimeError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError, shutil.Error) as exc:
             self.log.warn(f"Не удалось создать {destination_rel}: {exc}")
             return ""
         rel = os.path.relpath(destination, portable_dir)
