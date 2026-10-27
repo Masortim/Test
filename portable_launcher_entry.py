@@ -693,9 +693,20 @@ def sanitize_portable_registry_files(root: Path) -> "list[str]":
     вычистить один раз на месте. Возвращает список очищенных файлов.
     """
     cleaned: "list[str]" = []
+    stamps = _sanitize_stamps(root)
     for name in ("portable.reg", "portable_machine.reg"):
         path = root / name
         if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        key = (int(stat.st_size), int(stat.st_mtime_ns))
+        if stamps.get(name) == list(key):
+            # Этот файл уже проверен и переписан: ни читать, ни писать.
+            # На медленном внешнем диске portable.reg бывает в мегабайты, и
+            # каждая лишняя перезапись отодвигала появление окна.
             continue
         try:
             text = _decode_reg(path.read_bytes())
@@ -703,6 +714,7 @@ def sanitize_portable_registry_files(root: Path) -> "list[str]":
             continue
         sanitized, dropped = sanitize_reg_text(text)
         if not dropped:
+            stamps[name] = list(key)
             continue
         try:
             if not sanitized:
@@ -712,11 +724,50 @@ def sanitize_portable_registry_files(root: Path) -> "list[str]":
                 continue
             path.write_text(sanitized, encoding="utf-16", newline="\r\n")
             cleaned.append(name + f" (убрано секций: {len(dropped)})")
+            try:
+                stat = path.stat()
+                stamps[name] = [int(stat.st_size), int(stat.st_mtime_ns)]
+            except OSError:
+                pass
         except OSError:
             continue
+    _write_sanitize_stamps(root, stamps)
     for line in cleaned:
         _run_log(root, "registry: shell sections removed from " + line)
     return cleaned
+
+
+#: Отметка «этот .reg уже вычищен»: имя файла -> [размер, время изменения].
+#: Нужна, чтобы не читать и не перезаписывать многомегабайтный portable.reg
+#: при каждом запуске (на внешнем диске это секунды).
+SANITIZE_STAMPS_NAME = "registry-sanitized.json"
+
+
+def _sanitize_stamps_file(root: Path) -> Path:
+    return root / "PortableData" / SANITIZE_STAMPS_NAME
+
+
+def _sanitize_stamps(root: Path) -> "Dict[str, list]":
+    try:
+        data = json.loads(_sanitize_stamps_file(root).read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return {}
+    return {str(name): list(value) for name, value in files.items()
+            if isinstance(value, (list, tuple)) and len(value) == 2}
+
+
+def _write_sanitize_stamps(root: Path, stamps: "Dict[str, list]") -> None:
+    try:
+        target = _sanitize_stamps_file(root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"files": stamps}, ensure_ascii=False,
+                                     indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def autoheal_profile(root: Optional[Path] = None) -> None:
@@ -821,13 +872,36 @@ class _StageTimer:
     def __init__(self, data: Path) -> None:
         self.data = data
         self.steps: "list[tuple[str, float]]" = []
+        #: Шаги, которые не успели до старта и ушли в фон (см. _run_session).
+        self.deferred: "list[str]" = []
         self._name = ""
         self._started = 0.0
+        self._began = time.monotonic()
+
+    def note_deferred(self, name: str) -> None:
+        """Запоминает отложенный шаг: он попадает и в журнал, и в отчёт."""
+        if name and name not in self.deferred:
+            self.deferred.append(name)
+
+    @property
+    def spent(self) -> float:
+        """Сколько секунд прошло с начала предстартовых шагов."""
+        return time.monotonic() - self._began
+
+    def exceeded(self, budget: float) -> bool:
+        """Вышел ли лончер за отведённое время до старта программы."""
+        return bool(budget) and budget > 0 and self.spent > float(budget)
 
     def add_startup(self, seconds: float) -> None:
-        """Первая строка отчёта: время от создания процесса до этой строки."""
+        """Первая строка отчёта: время от создания процесса до этой строки.
+
+        Отсчёт ``spent`` (= бюджет предстартовых шагов) тоже начинается от
+        создания процесса: сменить оболочку лончера — это уже задержка,
+        которую видит пользователь, и в потолок она входит.
+        """
         if seconds >= 0.02:
             self.steps.append(("exe boot", seconds))
+            self._began = min(self._began, time.monotonic() - seconds)
 
     def tick(self, name: str) -> None:
         now = time.perf_counter()
@@ -864,6 +938,7 @@ class _StageTimer:
                 "total_seconds": round(total, 3),
                 "steps": [[name, round(seconds, 3)]
                           for name, seconds in self.steps],
+                "deferred": list(self.deferred),
             }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         except OSError:
             pass
@@ -914,8 +989,12 @@ class _BackgroundWork:
         self._waited = 0.0
         self._reported = False
 
-    def submit(self, work, name: str = "") -> None:
-        """Запускает ``work()`` в фоне; возвращаемый список — строки журнала."""
+    def submit(self, work, name: str = "", prefix: bool = True) -> None:
+        """Запускает ``work()`` в фоне; возвращаемый список — строки журнала.
+
+        ``prefix=False`` — строки журнала уже сами объясняют, откуда они
+        (``registry: ...``, ``update: ...``): приставку не добавляем.
+        """
         import threading
 
         label = name or self.name
@@ -925,7 +1004,8 @@ class _BackgroundWork:
             try:
                 for line in work():
                     if line:
-                        _run_log(self.root, f"{label}: {line}")
+                        _run_log(self.root, f"{label}: {line}" if prefix
+                                 else line)
             except Exception as exc:  # noqa: BLE001 - уборка не срывает запуск
                 _run_log(self.root, f"{label}: failed ({exc})")
             finally:
@@ -960,6 +1040,31 @@ class _BackgroundWork:
                                "done in parallel with the program start")
 
 
+#: Сколько лончеру отведено на всё, что делается ДО старта программы, секунды.
+#:
+#: Жалоба: «фоновый LaunchPortable.exe появился, а окно программы — через
+#: несколько секунд». Причин может быть много и они разные на разных ПК и
+#: дисках (медленный внешний диск, антивирус, сотни ключей реестра), а сам
+#: пользователь ждёт окно, а не отчёт. Поэтому у предстартовых шагов есть
+#: потолок: всё, что не успело, доделывается в фоне, параллельно с уже
+#: запущенной программой. Обязательные шаги (профиль, пути, реестр настроек)
+#: под потолок не попадают — без них программа стартует неправильно.
+#:
+#: Настраивается в ``launcher_config.json``: ``"prelaunch_budget_seconds"``.
+#: ``0`` — без потолка (прежнее поведение: всё до старта).
+PRELAUNCH_BUDGET_SECONDS = 2.5
+
+
+def prelaunch_budget(cfg: "Optional[Dict[str, Any]]" = None) -> float:
+    """Потолок времени на предстартовые шаги из конфига (или умолчание)."""
+    try:
+        value = float((cfg or {}).get("prelaunch_budget_seconds",
+                                      PRELAUNCH_BUDGET_SECONDS))
+    except (TypeError, ValueError):
+        return PRELAUNCH_BUDGET_SECONDS
+    return max(0.0, value)
+
+
 def _last_launch_timing(data: Path) -> "list[str]":
     """Строки для ``--diagnose``: где прошлый запуск провёл время."""
     try:
@@ -971,6 +1076,10 @@ def _last_launch_timing(data: Path) -> "list[str]":
     lines = [f"всего до старта: {total} s ({payload.get('at', '')})"]
     for name, seconds in payload.get("steps") or []:
         lines.append(f"  {seconds:>7} s  {name}")
+    deferred = payload.get("deferred") or []
+    if deferred:
+        lines.append("в фоне уже после старта: " + ", ".join(
+            str(name) for name in deferred))
     return lines
 
 
@@ -1173,9 +1282,21 @@ def _unpacked_reg(source: Path, runtime_dir: Path, root: Path,
     в файле не осталось ни одного ключа приложения. Возвращать в этом случае
     исходный файл нельзя — он-то как раз и содержит эти секции, и именно их
     импорт раньше ломал меню «Пуск».
+
+    Если заменять нечего (в файле нет маркера корня) и вырезать нечего, файл
+    импортируется как есть: на медленном внешнем диске перезапись
+    многомегабайтного ``portable.reg`` во временную папку стоила секунд.
     """
     destination = runtime_dir / f"import-{index:03d}.reg"
     escaped_root = str(root).replace("\\", "\\\\")
+    try:
+        text = _decode_reg(source.read_bytes())
+    except OSError:
+        return None
+    if ROOT_TOKEN.casefold() not in text.casefold():
+        _sanitized, dropped = sanitize_reg_text(text)
+        if not dropped:
+            return source
     if _rewrite_reg(source, destination, ((ROOT_TOKEN, escaped_root),),
                     sanitize=True, log_root=root):
         return destination
@@ -1188,6 +1309,17 @@ def _pack_reg(path: Path, root: Path) -> None:
     root_text = str(root)
     escaped_root = root_text.replace("\\", "\\\\")
     slashed_root = root_text.replace("\\", "/")
+    # Ни одного вхождения корня — переписывать нечего. Раньше файл всё равно
+    # читался и записывался целиком (в том числе на каждом выходе).
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return
+    lowered = raw.lower()
+    if not any(form.encode("utf-16-le").lower() in lowered
+               or form.encode("utf-8").lower() in lowered
+               for form in (root_text, escaped_root, slashed_root) if form):
+        return
     if _rewrite_reg(
         path,
         temporary,
@@ -1350,22 +1482,46 @@ def _read_paths_stamp(root: Path) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _root_key(text: object) -> str:
+    """Ключ сравнения путей корня: «E:\\A\\B», «E:/A/B», «e:\\a\\b\\» равны.
+
+    Нужен потому, что один и тот же корень попадает в штамп, в конфиг сборки и
+    в записи реестра разными написаниями (разделители, регистр, хвостовой
+    слеш, кавычки, длинный префикс ``\\\\?\\``). Пока каждое место сравнивало
+    по-своему, в ``--diagnose`` один и тот же корень печатался дважды.
+    """
+    value = str(text or "").strip().strip('"').strip()
+    if value[:4] == "\\\\?\\":
+        value = value[4:]
+    value = value.replace("/", "\\").rstrip("\\")
+    return os.path.normcase(os.path.normpath(value)).casefold()
+
+
+def _unique_roots(values: "Sequence[object]") -> "list[str]":
+    """Список корней без повторов (см. :func:`_root_key`), порядок сохранён."""
+    unique: "list[str]" = []
+    seen: "set[str]" = set()
+    for item in values:
+        text = str(item or "").strip().strip('"').rstrip("\\/")
+        if not text:
+            continue
+        key = _root_key(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(text)
+    return unique
+
+
 def _remembered_root_list(root: Path) -> "list[str]":
     """Все известные прежние и текущий корни в порядке «свежее -> старее»."""
-    current = str(root)
-    found: "list[str]" = []
     stamp = _read_paths_stamp(root)
+    current = _root_key(root)
     values = [stamp.get("root", ""), stamp.get("previous", "")]
     history = stamp.get("history")
     if isinstance(history, (list, tuple)):
         values.extend(history)
-    for value in values:
-        text = str(value or "").strip().strip('"').rstrip("\\/")
-        if not text or text.casefold() == current.casefold():
-            continue
-        if text not in found:
-            found.append(text)
-    return found
+    return [text for text in _unique_roots(values) if _root_key(text) != current]
 
 
 def _scan_marker_covers(root: Path, remembered: "Sequence[str]") -> bool:
@@ -3664,6 +3820,12 @@ class RegistrySession:
         self.created = {str(key).casefold() for key in self.cfg.get("created_keys", [])}
         self.active = bool(self.cfg.get("enabled")) and IS_WINDOWS
         self.started = False
+        #: Снимок машины уже снят (см. prepare) — повторно его не делаем.
+        self.prepared = False
+        #: Файлы настроек, которые надо импортировать (заполняет prepare).
+        self.sources: list[Path] = []
+        self.created_exports: list[Path] = []
+        self._prepare_seconds = 0.0
 
     def _apply_tail_overrides_to_files(
         self,
@@ -4035,9 +4197,17 @@ class RegistrySession:
                 created_exports.append(created_file)
         return baseline, created_exports
 
-    def load(self) -> None:
-        if not self.active:
+    def prepare(self) -> None:
+        """Всё, что должно произойти ДО импорта настроек: снимок машины.
+
+        Снимок обязан быть снят, пока программа ещё ничего не записала: по
+        нему машина возвращается в исходное состояние после выхода. Он
+        делается напрямую через winreg (см. ``_snapshot_host``), поэтому
+        дешёв; сам импорт настроек можно отложить (см. ``apply``).
+        """
+        if not self.active or self.prepared:
             return
+        started = time.perf_counter()
         self.session.mkdir(parents=True, exist_ok=True)
         self.backup.mkdir(parents=True, exist_ok=True)
         self.runtime.mkdir(parents=True, exist_ok=True)
@@ -4051,7 +4221,7 @@ class RegistrySession:
         saved = sorted(self.session.glob("*.reg"))
         initial_name = self.cfg.get("file", "portable.reg")
         machine_name = self.cfg.get("machine_file", "portable_machine.reg")
-        sources = []
+        sources: list[Path] = []
         if saved:
             # A prior non-elevated game run can save HKCU/VirtualStore while
             # being unable to export HKLM. Seed the captured machine install
@@ -4064,31 +4234,55 @@ class RegistrySession:
                 sources.append(self.root / str(initial_name))
             if machine_name:
                 sources.append(self.root / str(machine_name))
-        for index, source in enumerate(sources):
-            if source.is_file():
-                imported = _unpacked_reg(source, self.runtime, self.root, index)
-                if imported is None:
-                    _run_log(self.root, "registry import " + source.name
-                             + ": skipped (only shell sections, nothing to "
-                               "apply)")
-                    continue
-                if import_registry_text(_decode_reg(imported.read_bytes())):
-                    _run_log(self.root, f"registry import {source.name}: ok "
-                                        "(direct)")
-                else:
-                    code = _reg(("import", str(imported)))
-                    _run_log(
-                        self.root,
-                        f"registry import {source.name}: "
-                        f"{'ok' if code == 0 else f'FAILED (reg.exe rc={code})'}",
-                    )
-        for ext_file in created_exports:
+        self.sources = [item for item in sources if item.is_file()]
+        self.created_exports = created_exports
+        self.prepared = True
+        self._prepare_seconds = time.perf_counter() - started
+
+    def apply(self) -> None:
+        """Импорт настроек программы из ``portable*.reg`` в реестр этого ПК."""
+        if not self.active or self.started:
+            return
+        self.prepare()
+        started = time.perf_counter()
+        for index, source in enumerate(self.sources):
+            imported = _unpacked_reg(source, self.runtime, self.root, index)
+            if imported is None:
+                _run_log(self.root, "registry import " + source.name
+                         + ": skipped (only shell sections, nothing to "
+                           "apply)")
+                continue
+            try:
+                text = _decode_reg(imported.read_bytes())
+            except OSError:
+                text = ""
+            if import_registry_text(text):
+                _run_log(self.root, f"registry import {source.name}: ok "
+                                    "(direct)")
+            else:
+                code = _reg(("import", str(imported)))
+                _run_log(
+                    self.root,
+                    f"registry import {source.name}: "
+                    f"{'ok' if code == 0 else f'FAILED (reg.exe rc={code})'}",
+                )
+        for ext_file in self.created_exports:
             if ext_file.is_file():
                 try:
                     ext_file.unlink()
                 except OSError:
                     pass
         self.started = True
+        # Итог одного строкой: по нему видно, сколько стоил реестр до старта
+        # программы (в launch-timing.json — отдельным этапом).
+        _run_log(self.root, "registry: snapshot "
+                 f"{getattr(self, '_prepare_seconds', 0.0):.2f}s, import "
+                 f"{time.perf_counter() - started:.2f}s "
+                 f"({len(self.sources)} файл(ов), ключей {len(self.keys)})")
+
+    def load(self) -> None:
+        self.prepare()
+        self.apply()
 
     def save_and_restore(self) -> None:
         if not self.active or not self.started:
@@ -8253,19 +8447,10 @@ def _record_roots(root: Path, cfg: "Optional[Dict[str, Any]]" = None
         roots.extend(remembered_roots(root, cfg))
     except Exception:  # noqa: BLE001 - штамп мог быть нечитаем
         pass
-    current = os.path.normcase(os.path.normpath(str(root)))
-    unique: "list[str]" = [str(root)]
-    seen = {current}
-    for item in roots:
-        text = str(item or "").strip().strip('"').rstrip("\\/")
-        if not text:
-            continue
-        key = os.path.normcase(os.path.normpath(text))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(text)
-    return unique
+    unique = _unique_roots(roots)
+    # Текущий корень — всегда первым и в своём написании.
+    return [str(root)] + [text for text in unique
+                          if _root_key(text) != _root_key(root)]
 
 
 #: Папки, которые портативный лончер подменяет в окружении программы. Значение
@@ -8679,6 +8864,42 @@ def configured_install_records(cfg: "Optional[Dict[str, Any]]"
     return parsed
 
 
+_CLOSING_BRACES_RE = re.compile(r"\}{2,}")
+
+
+def uninstall_name_variants(name: str) -> "list[str]":
+    """Имя записи списка приложений и его «исправленное» написание.
+
+    Установщики на Inno Setup называют ключ ``{GUID}_is1``. В конфиг сборки
+    такое имя попадало и с лишней закрывающей скобкой
+    (``{GUID}}_is1``) — тогда лончер искал ключ, которого нет, и настоящая
+    запись оставалась в списке установленных программ. Поэтому к имени
+    пробуются варианты: как есть, без двойных скобок и с одной парой скобок.
+    """
+    text = str(name or "").strip()
+    variants = [text] if text else []
+    for candidate in ((_CLOSING_BRACES_RE.sub("}", text)),
+                      (_CLOSING_BRACES_RE.sub("}", text)).replace("{", "")):
+        candidate = candidate.strip()
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
+def _read_uninstall_entry_variant(reg, hive, access: int, name: str
+                                  ) -> "Optional[tuple[str, Dict[str, Any]]]":
+    """Значения записи по любому из написаний имени (см. выше).
+
+    Возвращает настоящее имя ключа и его значения — чтобы удалять именно
+    существующий ключ, а не его «исправленное» имя.
+    """
+    for candidate in uninstall_name_variants(name):
+        values = _read_uninstall_entry(reg, hive, access, candidate)
+        if values:
+            return candidate, values
+    return None
+
+
 def _hive_handle(reg, name: str):
     return getattr(reg, name, None)
 
@@ -8764,14 +8985,16 @@ def portable_install_records(root: Path,
             read_access = getattr(reg, "KEY_READ", 0) | view
             write_access = (getattr(reg, "KEY_WRITE", 0)
                             | getattr(reg, "DELETE", 0) | view)
-            values = _read_uninstall_entry(reg, hive, read_access, name)
-            if not values:
+            found_entry = _read_uninstall_entry_variant(reg, hive, read_access,
+                                                        name)
+            if not found_entry:
                 continue
+            real_name, values = found_entry
             if not _record_hidden_by_system(values) and (
-                    _record_belongs_to_app(values, name, app_name)
+                    _record_belongs_to_app(values, real_name, app_name)
                     or _record_is_orphan(values, roots, extra_env)):
-                _add(hive, read_access, write_access, label, name, values,
-                     True)
+                _add(hive, read_access, write_access, label, real_name,
+                     values, True)
             break
     return found
 
@@ -8840,6 +9063,7 @@ def describe_install_records(root: Path,
     ]
     ours = {(record["hive"], record["name"].casefold())
             for record in portable_install_records(root, cfg)}
+    printed: "set[str]" = set()
     seen = 0
     for hive, read_access, _write_access, label in _uninstall_registry_views():
         try:
@@ -8866,13 +9090,54 @@ def describe_install_records(root: Path,
             reason = _record_reason(values, roots, extra_env, remove_orphans)
             verdict = "будет удалена" if mine else "оставлена"
             lines.append(f"{label}\\{name}: «{display}» — {verdict} ({reason})")
+            printed.add(name.casefold())
+    for record in configured_install_records(cfg):
+        state, found = _configured_record_state(reg, record)
+        if found and found[0].casefold() not in printed:
+            real_name, values = found
+            if not _record_hidden_by_system(values):
+                seen += 1
+                display = str(values.get("DisplayName") or real_name)
+                lines.append(f"{record['hive']}\\{real_name}: «{display}» — "
+                             "будет удалена (ключ создан этим установщиком "
+                             "при сборке: сравнение снимков реестра)")
+                printed.add(real_name.casefold())
+                continue
+        lines.append("запись из сборки: " + record["hive"] + "\\"
+                     + record["path"] + state)
     if not seen:
         lines.append("записей с именем этого приложения в списке "
                      "установленных программ нет")
-    for record in configured_install_records(cfg):
-        lines.append("запись из сборки: " + record["hive"] + "\\"
-                     + record["path"])
     return lines
+
+
+def _configured_record_state(reg, record: Dict[str, str]
+                             ) -> "tuple[str, Optional[tuple[str, Dict[str, Any]]]]":
+    """Что с ключом из конфига сборки: уточнение для отчёта и сам ключ.
+
+    Уточнение нужно потому, что «запись из сборки» раньше выглядела как
+    найденная запись, хотя ключа могло уже не быть (его удалили раньше), а имя
+    в конфиге — искажённым (``{GUID}}_is1``). Второй элемент — настоящее имя
+    ключа и его значения, если ключ на этом ПК есть.
+    """
+    hive = _hive_handle(reg, str(record.get("hive") or ""))
+    if hive is None:
+        return "", None
+    for view, _label in _uninstall_view_labels(reg, str(record.get("hive"))):
+        access = getattr(reg, "KEY_READ", 0) | view
+        found = _read_uninstall_entry_variant(reg, hive, access,
+                                              str(record.get("name") or ""))
+        if not found:
+            continue
+        real_name, values = found
+        display = str(values.get("DisplayName") or "")
+        if real_name.casefold() != str(record.get("name") or "").casefold():
+            return (f" — в реестре она называется «{real_name}»"
+                    + (f" ({display})" if display else "")
+                    + ", лончер найдёт её и по этому имени"), found
+        return (" — ключ есть на этом ПК"
+                + (f" («{display}»)" if display else "")), found
+    return " — ключа на этом ПК нет (запись уже удалена)", None
 
 
 def _record_reason(values: Dict[str, Any], roots: "Sequence[str]",
@@ -9551,16 +9816,8 @@ def remembered_roots(root: Path,
         extra = section.get("previous_roots")
         if isinstance(extra, (list, tuple)):
             found.extend(str(item) for item in extra if str(item).strip())
-    current = os.path.normcase(os.path.normpath(str(root)))
-    unique: "list[str]" = []
-    seen: "set[str]" = {current}
-    for item in found:
-        key = os.path.normcase(os.path.normpath(item))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(item)
-    return unique
+    current = _root_key(root)
+    return [text for text in _unique_roots(found) if _root_key(text) != current]
 
 
 def _same_portable(candidate: Path, cfg: Dict[str, Any]) -> bool:
@@ -10497,6 +10754,44 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # Первая строка отчёта — распаковка onefile-сборки до первой строки
     # Python: без неё «медленный запуск» некуда отнести (см. _process_start_age_seconds).
     timings.add_startup(_process_start_age_seconds())
+    #: Потолок времени на предстартовые шаги (см. prelaunch_budget). Всё, что
+    #: не успело, доделывается в фоне, уже после появления окна программы:
+    #: пользователь ждёт программу, а не отчёт. Обязательные шаги (профиль,
+    #: пути, реестр настроек) под потолок не попадают.
+    budget = prelaunch_budget(cfg)
+    background = _BackgroundWork(root, "pre-launch work")
+
+    #: Отложенные шаги: выполняются по очереди в ОДНОМ фоновом потоке.
+    #: По очереди — потому что они правят одни и те же файлы программы
+    #: (маркер корня и старые пути), и два потока на одном файле испортили бы
+    #: его куда надёжнее, чем любая задержка старта.
+    pending: "list[tuple[str, Any]]" = []
+
+    def _defer(name: str, work) -> bool:
+        """Откладывает необязательный шаг, если лончер вышел за потолок."""
+        if not timings.exceeded(budget):
+            return False
+        timings.note_deferred(name)
+        pending.append((name, work))
+        _run_log(root, "pre-launch: budget "
+                 f"{budget:.1f}s reached, «{name}» moves to the background so "
+                 "the program can start")
+        return True
+
+    def _run_now(name: str, work) -> None:
+        """Выполняет шаг на месте: строки результата — в журнал."""
+        try:
+            for line in work():
+                if line:
+                    _run_log(root, line)
+        except Exception as exc:  # noqa: BLE001 - шаг не срывает запуск
+            _run_log(root, f"{name}: failed ({exc})")
+
+    def _run_step(name: str, work) -> None:
+        """Выполняет шаг сейчас или откладывает его (см. _defer)."""
+        if not _defer(name, work):
+            _run_now(name, work)
+
     timings.tick("profile self-check")
     # Самопроверка профиля: прерванный прошлый сеанс мог оставить Known Folder
     # «Документы» направленным внутрь уже удалённой папки портатива. Это ломает
@@ -10513,11 +10808,10 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # старого корня в настройках программы заменяются новыми ДО того, как она
     # их прочитает. Наши файлы и реестр этого не требуют — там либо
     # относительные пути, либо маркер корня.
-    try:
-        for line in repair_paths(root, cfg):
-            _run_log(root, line)
-    except Exception as exc:  # noqa: BLE001 - починка не срывает запуск
-        _run_log(root, f"paths: repair failed ({exc})")
+    def _repair_paths() -> "list[str]":
+        return list(repair_paths(root, cfg))
+
+    _run_step("path repair", _repair_paths)
 
     timings.tick("install records")
     # Записи об установке на этом ПК (`InstallLocation`, `App Paths`,
@@ -10525,13 +10819,11 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # именно оттуда установщик берёт «прошлую установку» и ставит новую
     # версию по старому адресу. Перед запуском переводим их на текущий корень
     # — обновление, которое запустит сама программа, попадёт в эту папку.
-    try:
-        moved = heal_host_registry(root, cfg)
-        for item in moved:
-            _run_log(root, "registry: previous location or portable marker now "
-                           f"points to {root}: {item}")
-    except Exception as exc:  # noqa: BLE001 - реестр не срывает запуск
-        _run_log(root, f"registry: healing failed ({exc})")
+    def _heal_records() -> "list[str]":
+        return ["registry: previous location or portable marker now points "
+                f"to {root}: {item}" for item in heal_host_registry(root, cfg)]
+
+    _run_now("install records", _heal_records)
 
     timings.tick("installed list")
     # Портатив не устанавливается: записи в «Установленные программы» тут не
@@ -10542,12 +10834,13 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     #
     # Работа идёт в фоне: программе она для старта не нужна, а возможный
     # запрос UAC раньше вставал поперёк запуска.
-    background = _BackgroundWork(root, "installed programs")
     try:
         allow_elevation = not _machine_registry_pending(root, cfg)
         background.submit(
-            lambda: clean_installed_programs(root, cfg,
-                                             allow_elevation=allow_elevation))
+            lambda: ["installed programs: " + line
+                     for line in clean_installed_programs(
+                         root, cfg, allow_elevation=allow_elevation)],
+            name="installed programs")
     except Exception as exc:  # noqa: BLE001 - след установки не срывает запуск
         _run_log(root, f"installed programs: cleanup failed ({exc})")
 
@@ -10556,32 +10849,46 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # глубине): тогда установщик обновления читает каталог
     # ``@@PORTABLE_ROOT@@\App`` и падает с «Error opening file for writing».
     # Проход выполняется один раз на каждое положение папки.
-    try:
+    def _sweep_marker() -> "list[str]":
         replaced = sweep_root_token_once(root, cfg)
-        if replaced:
-            _run_log(root, "paths: the portable marker is gone from "
-                           f"{len(replaced)} file(s)")
-    except Exception as exc:  # noqa: BLE001 - проход не срывает запуск
-        _run_log(root, f"paths: marker sweep failed ({exc})")
+        if not replaced:
+            return []
+        return ["paths: the portable marker is gone from "
+                f"{len(replaced)} file(s)"]
+
+    _run_step("marker sweep", _sweep_marker)
 
     timings.tick("update adoption")
     # Обновление, поставленное в прежнее место портатива (в том числе
     # предыдущим сеансом, который закрыли аварийно), забирается в App — до
     # того, как программа прочитает свои файлы.
-    try:
+    def _adopt_updates() -> "list[str]":
         previous_start = _read_session_start(root)
-        if previous_start:
-            adopted = adopt_updates_from_previous_locations(
-                root, cfg, since=previous_start)
-            if adopted:
-                _run_log(
-                    root, f"update: adopted {len(adopted)} file(s) that the "
-                    "installer put into the previous location of this "
-                    "portable: " + ", ".join(adopted[:8])
-                    + (" ..." if len(adopted) > 8 else ""))
-    except Exception as exc:  # noqa: BLE001 - перенос не срывает запуск
-        _run_log(root, f"update: adoption from the previous location failed "
-                       f"({exc})")
+        if not previous_start:
+            return []
+        adopted = adopt_updates_from_previous_locations(
+            root, cfg, since=previous_start)
+        if not adopted:
+            return []
+        return [f"update: adopted {len(adopted)} file(s) that the installer "
+                "put into the previous location of this portable: "
+                + ", ".join(adopted[:8]) + (" ..." if len(adopted) > 8 else "")]
+
+    _run_step("update adoption", _adopt_updates)
+
+    if pending:
+        def _run_deferred_steps() -> "list[str]":
+            lines: "list[str]" = []
+            while pending:
+                name, work = pending.pop(0)
+                try:
+                    lines.extend(line for line in (work() or []) if line)
+                except Exception as exc:  # noqa: BLE001
+                    lines.append(f"{name}: failed ({exc})")
+            return lines
+
+        background.submit(_run_deferred_steps, name="pre-launch work",
+                          prefix=False)
 
     timings.tick("shortcuts")
     # «Пустые» ярлыки этой программы на рабочем столе. Установщик мог
@@ -10606,10 +10913,15 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # Портатив, собранный прежней версией, мог принести в portable.reg ветки
     # оболочки (меню «Пуск»). Чистим файл на месте — и EXE-, и BAT-лончер
     # тогда импортируют только настройки приложения.
-    try:
+    def _sanitize_reg() -> "list[str]":
+        # функция пишет журнал сама («registry: shell sections removed ...»)
         sanitize_portable_registry_files(root)
-    except Exception as exc:  # noqa: BLE001 - чистка не срывает запуск
-        _run_log(root, f"registry sanitize failed: {exc}")
+        return []
+
+    # Санитайзер остаётся предстартовым в любом случае: он переписывает
+    # ``portable.reg``, который тут же импортируется. Читать файл в тот
+    # момент, когда его переписывают, — верный способ импортировать половину.
+    _run_now("registry sanitize", _sanitize_reg)
 
     timings.tick("stale session")
     # Остатки прошлого запуска убираются ДО старта: иначе они так и будут
@@ -10802,10 +11114,46 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
         shell_folders.load()
     except Exception as exc:  # noqa: BLE001 - Known Folder не срывает запуск
         _run_log(root, f"documents redirection failed ({exc})")
+    # Реестр: снимок машины снимается всегда до старта — по нему она
+    # возвращается в исходное состояние, когда программа закроется. Импорт
+    # настроек можно отложить.
+    #
+    # Редакторам (Cursor/VS Code) настройки из реестра для появления окна не
+    # нужны вовсе: они держат всё в JSON-профиле внутри портатива. Зато у
+    # Cursor сборщик захватывает до 256 ключей (ассоциации, записи установки),
+    # и импорт такого набора — это тысячи записей в реестр, каждая из которых
+    # на медленном диске и под антивирусом заметна. Поэтому у них импорт идёт
+    # параллельно с запуском программы, а лончер дожидается его перед возвратом
+    # реестра (см. background.wait на выходе).
+    #
+    # Для прочих программ импорт остаётся предстартовым: их настройки лежат
+    # именно в реестре, и программа прочтёт их сразу при запуске.
     try:
-        registry.load()
+        registry.prepare()
     except Exception as exc:  # noqa: BLE001 - реестр не срывает запуск
-        _run_log(root, f"registry import failed ({exc})")
+        _run_log(root, f"registry snapshot failed ({exc})")
+
+    def _import_registry() -> "list[str]":
+        registry.apply()
+        return []
+
+    editor = budget > 0 and _vscode_product(target.parent) is not None
+    if editor and registry.active:
+        timings.note_deferred("registry import")
+        background.submit(_import_registry, name="registry import",
+                          prefix=False)
+        _run_log(root, "registry: settings are imported in the background "
+                       "while the program starts (the editor keeps them in "
+                       "its own profile inside the portable folder)")
+    else:
+        try:
+            registry.apply()
+        except Exception as exc:  # noqa: BLE001 - реестр не срывает запуск
+            _run_log(root, f"registry import failed ({exc})")
+    timings.tick("registry")
+    if timings.deferred:
+        _run_log(root, "pre-launch: deferred to background: "
+                 + ", ".join(timings.deferred))
     timings.finish(root)
     try:
         try:
@@ -11280,6 +11628,10 @@ def diagnose(root: Optional[Path] = None) -> int:
 
     add("Предстартовые шаги (прошлый запуск)")
     add("-" * 60)
+    budget = prelaunch_budget(cfg)
+    add("потолок до старта: "
+        + (f"{budget:g} s — что не успело, доделывается в фоне"
+           if budget > 0 else "нет (prelaunch_budget_seconds = 0)"))
     lines.extend(_last_launch_timing(data))
     add("")
 

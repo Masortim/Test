@@ -163,6 +163,10 @@ class LauncherConfig:
     # (сравнение снимков реестра до и после). Лончер удаляет именно их, даже
     # если значения уже переписаны апдейтером программы.
     host_cleanup_records: List[Dict[str, str]] = field(default_factory=list)
+    # Потолок времени на предстартовые шаги лончера, секунды. Всё, что не
+    # успело до старта программы, доделывается в фоне: пользователь ждёт
+    # окно, а не отчёт. 0 — без потолка (все шаги до старта, как раньше).
+    prelaunch_budget_seconds: float = 2.5
     # Чистить ли PortableData\Temp между запусками: распакованное туда
     # установщиками и держит потом папку.
     shutdown_purge_temp: bool = True
@@ -1876,6 +1880,12 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         except (TypeError, ValueError):
             return default
 
+    try:
+        prelaunch_budget = max(0.0, float(data.get("prelaunch_budget_seconds",
+                                                   2.5)))
+    except (TypeError, ValueError):
+        prelaunch_budget = 2.5
+
     targets: List[TargetInfo] = []
     raw_targets = data.get("targets")
     if isinstance(raw_targets, list):
@@ -1956,6 +1966,7 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         remove_orphan_entries=(
             host_cleanup.get("remove_orphan_entries", True) is not False),
         host_cleanup_records=cleanup_records,
+        prelaunch_budget_seconds=prelaunch_budget,
         language=text("language"),
         # Секция относительных путей переносится как есть: без неё
         # перевыпущенный лончер забыл бы, что папку можно переносить.
@@ -2731,6 +2742,9 @@ def render_config_json(cfg: LauncherConfig) -> str:
             if isinstance(item, dict) and item.get("path")
         ],
     }
+    # Потолок предстартовых шагов лончера: значение видно в конфиге и его
+    # можно поднять/обнулить для конкретного портатива.
+    payload["prelaunch_budget_seconds"] = cfg.prelaunch_budget_seconds
     if cfg.language:
         payload["language"] = cfg.language
     # Относительные пути: корень портатива нигде в конфиге не записан
