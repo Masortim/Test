@@ -360,6 +360,10 @@ class PortablizerOutputTests(unittest.TestCase):
             with mock.patch(
                 "portablizer.core.portablizer.bundled_exe_launcher_path",
                 return_value=str(template),
+            ), mock.patch(
+                # На CI рядом лежит и onedir-сборка лончера; тест про onefile.
+                "portablizer.core.portablizer.bundled_exe_launcher_dir",
+                return_value="",
             ):
                 rel = self.engine._copy_exe_launcher(str(portable))
 
@@ -377,6 +381,9 @@ class PortablizerOutputTests(unittest.TestCase):
             with mock.patch(
                 "portablizer.core.portablizer.bundled_exe_launcher_path",
                 return_value=str(template),
+            ), mock.patch(
+                "portablizer.core.portablizer.bundled_exe_launcher_dir",
+                return_value="",
             ):
                 rel = self.engine._copy_exe_launcher(str(portable))
 
