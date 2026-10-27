@@ -85,6 +85,12 @@ APP_DIR_NAME = "App"
 SKIP_DIRS: Tuple[str, ...] = (
     "temp", "tmp", "cache", "caches", "cache2", "gpucache", "shadercache",
     "codecache", "crashpad", "crashdumps", "logs",
+    # Пакетные деревья: в них нет настроек программы, зато у Cursor/VS Code
+    # это десятки тысяч package.json. Обход и чтение такого дерева после
+    # каждого переезда папки задерживали запуск на минуты.
+    "node_modules", ".git", ".hg", ".svn",
+    "blob_storage", "indexeddb", "service worker",
+    "cacheddata", "cachedprofilesdata", "workspacestorage",
 )
 
 #: Предел размера файла: конфиг на десятки мегабайт — это не конфиг.

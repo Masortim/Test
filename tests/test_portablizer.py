@@ -1441,8 +1441,15 @@ class RegistryCaptureIntegrationTests(unittest.TestCase):
             if name != "cleanup_host.reg":
                 self.assertNotIn("Uninstall", text, name)
 
-    def test_cleanup_file_is_not_generated_without_explicit_opt_in(self):
+    def test_cleanup_file_is_generated_by_default(self):
+        """Портатив не устанавливается — запись убирается без отдельной галочки."""
         capture, files = self._capture()
+        self.assertIn("cleanup_host.reg", files)
+        self.assertTrue(capture.cleanup_file)
+        self.assertTrue(capture.cleanup_cmd_file.endswith("cleanup_host.cmd"))
+
+    def test_cleanup_can_be_switched_off(self):
+        capture, files = self._capture(cleanup_host=False)
         self.assertNotIn("cleanup_host.reg", files)
         self.assertFalse(capture.cleanup_file)
         self.assertFalse(capture.cleanup_cmd_file)

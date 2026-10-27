@@ -57,7 +57,9 @@ class ParserMappingTests(unittest.TestCase):
         self.assertTrue(opts.redirect_userdirs)
         self.assertTrue(opts.capture_registry)
         self.assertTrue(opts.build_exe_launcher)
-        self.assertFalse(opts.cleanup_host)
+        # Портатив не устанавливается: запись в «Установленные программы»
+        # убирается по умолчанию (отключается --no-cleanup).
+        self.assertTrue(opts.cleanup_host)
         self.assertFalse(opts.include_shell_integration)
         self.assertTrue(opts.bundle_runtimes)
         self.assertTrue(opts.full_runtimes)

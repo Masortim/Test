@@ -594,10 +594,13 @@ class PortableOptions:
     # теми же переносимыми AppData/реестром, что и Launch.bat, но обычным
     # двойным кликом по EXE и без установленного Python.
     build_exe_launcher: bool = True
-    # Опционально удалить только новую запись «Установленные программы»,
-    # если имя совпало с приложением и InstallLocation указывает внутрь
-    # портатива. Общий откат реестра/ярлыков/служб отключён и не выполняется.
-    cleanup_host: bool = False
+    # Удалить запись «Установленные программы», созданную этим же установщиком
+    # внутри портатива: портатив не устанавливается, и в списке приложений его
+    # быть не должно. Критерий строгий — DisplayName совпадает с приложением, а
+    # одно из значений с путём (InstallLocation, DisplayIcon, UninstallString…)
+    # ведёт внутрь созданной папки. Чужие записи и общий откат реестра,
+    # ярлыков и служб не трогаются.
+    cleanup_host: bool = True
     # Переносить ассоциации файлов/COM. По умолчанию выключено: чужому ПК это
     # не нужно, а портативность от этого только страдает.
     include_shell_integration: bool = False
@@ -3295,6 +3298,19 @@ class Portablizer:
 
         rc = self._reg_import(capture.cleanup_file)
         if rc == 0:
+            # Проверяем результат, а не верим коду возврата: запись могла
+            # остаться в другом представлении реестра (WOW64) или её успел
+            # вернуть сам установщик.
+            remaining = reg_mod.existing_uninstall_keys(capture.cleanup_keys)
+            if remaining:
+                self.log.warn(
+                    "Запись приложения всё ещё есть в списке установленных "
+                    "программ: " + ", ".join(remaining)
+                    + ". Лончер уберёт её при первом запуске портатива "
+                      "(он проверяет запись на каждом старте)."
+                )
+                result.cleanup_pending = True
+                return
             result.removed_from_installed_list = list(capture.cleanup_entries)
             if capture.cleanup_entries:
                 self.log.ok(

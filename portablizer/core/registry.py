@@ -986,6 +986,40 @@ def render_host_cleanup(diff: RegistryDiff,
     return _render(lines)
 
 
+def existing_uninstall_keys(keys: Iterable[str]) -> List[str]:
+    """Какие из записей Uninstall ещё существуют на этом ПК.
+
+    Нужно после удаления, чтобы не отчитываться об успехе, которого нет:
+    запись могла остаться из-за прав или потому, что установщик успел
+    создать её в другом представлении (WOW64).
+    """
+    if not IS_WINDOWS:
+        return []
+    try:
+        import winreg  # type: ignore
+    except ImportError:  # pragma: no cover - Windows без winreg не бывает
+        return []
+    alive: List[str] = []
+    for key in keys:
+        if not is_uninstall_entry(key):
+            continue
+        hive_name = _hive_name(key)
+        if not hive_name:
+            continue
+        hive = getattr(winreg, hive_name)
+        path = key.split("\\", 1)[1]
+        for view in (0, getattr(winreg, "KEY_WOW64_64KEY", 0),
+                     getattr(winreg, "KEY_WOW64_32KEY", 0)):
+            try:
+                with winreg.OpenKey(hive, path, 0,
+                                    winreg.KEY_READ | view):
+                    alive.append(key)
+                    break
+            except OSError:
+                continue
+    return alive
+
+
 def has_entries(reg_text: str) -> bool:
     """True, если в .reg есть хотя бы один блок ключа."""
     return any(line.startswith("[") for line in reg_text.splitlines())
@@ -1321,7 +1355,15 @@ def safe_uninstall_entries(
                 display_name = value.strip()
             elif name in {
                     "installdir", "installdirectory", "installfolder",
-                    "installlocation", "displayicon"} and isinstance(value, str):
+                    "installlocation", "installpath", "displayicon",
+                    "uninstallstring", "quietuninstallstring",
+                    "installsource", "inno setup: app path", "apppath",
+                    "path", "modifypath"} and isinstance(value, str):
+                # Не только InstallLocation: Inno Setup (Cursor, VS Code и
+                # прочие установщики на его основе) пишет каталог в
+                # «Inno Setup: App Path», а путь к файлу — в DisplayIcon и
+                # UninstallString. Без них запись «Cursor» оставалась в списке
+                # установленных, хотя указывала внутрь портатива.
                 paths.append(value)
         if _normalised_product_name(display_name) != expected:
             continue

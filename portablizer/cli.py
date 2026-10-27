@@ -93,11 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
     toggles.add_argument("--no-userdirs", action="store_true",
                          help="не изолировать AppData/Temp в PortableData")
     toggles.add_argument("--cleanup-app-entry", action="store_true",
-                         help="по согласию удалить только точную новую запись "
-                              "этого приложения из списка установленных")
+                         help="совместимый флаг: запись приложения из списка "
+                              "установленных удаляется и так (по умолчанию)")
     toggles.add_argument("--no-cleanup", action="store_true",
-                         help="совместимый флаг: не удалять даже эту запись "
-                              "(по умолчанию очистка уже выключена)")
+                         help="оставить в списке установленных запись, которую "
+                              "создал установщик внутри портатива")
     toggles.add_argument("--shell-integration", action="store_true",
                          help="перенести и ассоциации файлов/COM (по умолчанию "
                               "нет: чужому ПК они не нужны)")
@@ -184,7 +184,7 @@ def options_from_args(ns: argparse.Namespace) -> "object":
         redirect_userdirs=not ns.no_userdirs,
         capture_registry=not ns.no_registry,
         build_exe_launcher=not ns.no_exe_launcher,
-        cleanup_host=bool(ns.cleanup_app_entry and not ns.no_cleanup),
+        cleanup_host=not ns.no_cleanup,
         include_shell_integration=bool(ns.shell_integration),
         allow_assisted_install=bool(ns.assisted),
         bundle_runtimes=bundle,
