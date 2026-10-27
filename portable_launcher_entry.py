@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -938,7 +939,17 @@ def _pack_reg(path: Path, root: Path) -> None:
 
 
 def _as_relative_path(root: Path, value: str) -> Path:
+    """Путь цели из конфига: относительный к корню или уже абсолютный.
+
+    Прежние версии Portablizer писали в конфиг абсолютный путь установки.
+    После переноса папки он ведёт в никуда, но сам по себе остаётся путём:
+    приклеивать его к корню нельзя, иначе лончер искал бы
+    ``<root>\\D:\\Apps\\...``.
+    """
     normalized = str(value).replace("\\", os.sep).replace("/", os.sep)
+    path = Path(normalized)
+    if path.is_absolute():
+        return path
     return root / normalized
 
 
@@ -3513,6 +3524,113 @@ def _select_target(cfg: Dict[str, Any], arguments: Sequence[str]
     return target_rel, forwarded, selected_role != "main"
 
 
+#: Служебные exe, которые не могут быть «главной программой».
+_TARGET_JUNK = ("unins", "uninstall", "update", "updater", "setup", "install",
+                "crashpad", "crashhandler", "crashreport", "elevate", "helper",
+                "report", "vc_redist", "dxsetup")
+
+
+def _find_replacement_target(root: Path, wanted: str) -> "Optional[Path]":
+    """Ищет настоящий exe, если записанная в конфиге цель исчезла.
+
+    Так бывает после неудачного обновления (родной апдейтер Cursor уносит
+    ``Cursor.exe`` в промежуточную папку ``_``), после ручного переименования
+    или если конфиг остался от сборки на прежнем диске. Ищем только внутри
+    ``App`` и только то, что похоже на программу: служебные
+    unins/update/crashpad-файлы пропускаются.
+    """
+    app = root / "App"
+    try:
+        if not app.is_dir():
+            return None
+    except OSError:
+        return None
+    wanted_name = Path(str(wanted).replace("\\", "/")).name.casefold()
+    same_name: "list[Path]" = []
+    largest: "Optional[Path]" = None
+    largest_size = 0
+    scanned = 0
+    for current, dirs, files in os.walk(app):
+        try:
+            depth = len(Path(current).relative_to(app).parts)
+        except ValueError:
+            depth = 0
+        if depth >= 4:
+            dirs[:] = []
+        else:
+            dirs[:] = [d for d in dirs
+                       if not d.startswith(("_", "."))
+                       and d.casefold() not in {"resources", "locales",
+                                                "node_modules"}]
+        for name in files:
+            if not name.casefold().endswith(".exe"):
+                continue
+            scanned += 1
+            if scanned > 5000:
+                break
+            path = Path(current) / name
+            folded = name.casefold()
+            if folded == wanted_name:
+                same_name.append(path)
+                continue
+            if any(token in folded for token in _TARGET_JUNK):
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size > largest_size:
+                largest_size = size
+                largest = path
+        if scanned > 5000:
+            break
+    if same_name:
+        return same_name[0]
+    return largest
+
+
+def _remember_target(root: Path, new_rel: str) -> bool:
+    """Persists a repaired target so the next start does not search again."""
+    path = launcher_config_path(root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if str(data.get("target_exe_rel") or "") == new_rel:
+        return False
+    data["target_exe_rel"] = new_rel
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8", newline="\n")
+        return True
+    except OSError:
+        return False
+
+
+def _repair_missing_target(root: Path, cfg: Dict[str, Any], target_rel: str) -> str:
+    """Returns a usable target path, repairing the config when it is stale."""
+    target = _as_relative_path(root, target_rel)
+    try:
+        if target.is_file():
+            return target_rel
+    except OSError:
+        pass
+    replacement = _find_replacement_target(root, target_rel)
+    if replacement is None:
+        return target_rel
+    try:
+        new_rel = str(replacement.relative_to(root)).replace(os.sep, "/")
+    except ValueError:
+        new_rel = str(replacement)
+    _run_log(root, f"target: {target_rel} is missing; found {new_rel} in App")
+    if _remember_target(root, new_rel):
+        _run_log(root, f"target: launcher_config.json now points to {new_rel}")
+    cfg["target_exe_rel"] = new_rel
+    return new_rel
+
+
 def _machine_file_needs_admin(path: Path) -> bool:
     """True when the captured machine file really contains HKLM sections."""
     try:
@@ -3787,8 +3905,12 @@ def is_electron_tree(directory: Path) -> bool:
     try:
         # app.asar бывает только у Electron; chrome_elf.dll у CEF-программ
         # тоже есть, поэтому одного его недостаточно.
-        return ((directory / "resources" / "app.asar").is_file()
-                and "chrome_elf.dll" in names)
+        if (directory / "resources" / "app.asar").is_file() and "chrome_elf.dll" in names:
+            return True
+        # Cursor, VS Code и VSCodium ship the application UNPACKED:
+        # resources\app\package.json, no app.asar at all. Without this branch
+        # the most common Electron app of all is not recognized as Electron.
+        return (directory / "resources" / "app" / "package.json").is_file()
     except OSError:
         return False
 
@@ -3808,6 +3930,8 @@ def is_chromium_tree(directory: Path) -> bool:
         return True
     try:
         if (directory / "resources" / "app.asar").is_file():
+            return True
+        if (directory / "resources" / "app" / "package.json").is_file():
             return True
     except OSError:
         return False
@@ -3842,6 +3966,11 @@ def needs_electron_sandbox_off(target: Path) -> bool:
     name = target.name.casefold()
     if name in {"electron.exe", "nw.exe"}:
         return True
+    # Cursor / VS Code / VSCodium: настоящий Electron, но без app.asar.
+    # Проверяется до чтения exe: Cursor.exe — это сотни мегабайт, а
+    # маркерный проход по 8 МБ на каждом запуске ни к чему.
+    if _vscode_product(target.parent) is not None:
+        return True
     if _exe_is_electron_style(target):
         return True
     # Дальше — только по надёжным признакам Electron (app.asar / nw.dll).
@@ -3874,6 +4003,161 @@ def with_electron_flags(command: Sequence[str], target: Path) -> list[str]:
                             if item not in _ELECTRON_CLI_FLAGS]]
     extra = [flag for flag in _ELECTRON_CLI_FLAGS if flag not in parts]
     return [parts[0], *extra, *parts[1:]]
+
+
+# --- Cursor / VS Code: профиль внутри портатива -------------------------------
+#
+# Cursor и VS Code — Electron, но приложение лежит распакованным
+# (``resources\\app\\package.json``) и в ``product.json`` у Cursor стоит
+# ``"target": "user"``: встроенный portable-режим VS Code (папка ``data``
+# рядом с exe) в такой сборке не включается вообще. Поэтому профиль задаётся
+# переменными, которые понимает сам редактор:
+#
+#   VSCODE_APPDATA        корень, внутри которого лежит ``Cursor``/``Code``;
+#   VSCODE_EXTENSIONS     каталог расширений (``%USERPROFILE%\\.cursor\\extensions``);
+#   VSCODE_LOGS           каталог журналов;
+#   VSCODE_CLI_DATA_DIR   данные CLI (``~/.cursor/cli``), которые иначе
+#                         создаются в настоящем профиле даже в portable-режиме.
+#
+# Значения считаются от текущего корня на каждом запуске, поэтому переезд
+# папки на другой диск ничего не ломает.
+
+_VSCODE_PRODUCT = ("resources", "app", "product.json")
+
+_VSCODE_EXE_NAMES = frozenset({
+    "code.exe", "code - insiders.exe", "cursor.exe", "codium.exe",
+    "vscodium.exe", "windsurf.exe", "trae.exe", "kiro.exe",
+})
+
+_VSCODE_DATA_FOLDERS = {
+    "code.exe": ".vscode",
+    "code - insiders.exe": ".vscode-insiders",
+    "codium.exe": ".vscodium",
+    "vscodium.exe": ".vscodium",
+    "cursor.exe": ".cursor",
+}
+
+#: Ключ ``argv.json``, которым Cursor/VS Code отключают Chromium-песочницу.
+#: Нужен именно в файле: ``--no-sandbox`` действует на один запуск, а после
+#: перезапуска «для обновления» или старта из трея флаг бы терялся, Windows
+#: отказывала helper-процессам, и Cursor завершался, не показав окна.
+VSCODE_SANDBOX_KEY = "disable-chromium-sandbox"
+
+
+def _vscode_product(directory: Path) -> "Optional[Dict[str, str]]":
+    """Описание Cursor/VS Code рядом с exe или ``None`` для прочих программ."""
+    product: Dict[str, Any] = {}
+    path = directory / "resources" / "app" / "product.json"
+    try:
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8-sig",
+                                             errors="replace"))
+            if isinstance(data, dict):
+                product = data
+    except (OSError, ValueError):
+        product = {}
+    name = ""
+    try:
+        names = [item.name.casefold() for item in directory.glob("*.exe")]
+    except OSError:
+        names = []
+    for candidate in names:
+        if candidate in _VSCODE_EXE_NAMES:
+            name = candidate
+            break
+    if not product and not name:
+        return None
+    folder = str(product.get("dataFolderName") or "").strip()
+    if not folder:
+        folder = _VSCODE_DATA_FOLDERS.get(name, "")
+    if not folder:
+        stem = os.path.splitext(name)[0] or "vscode"
+        folder = "." + stem
+    profile = str(product.get("nameShort") or product.get("nameLong") or "").strip()
+    if not profile:
+        profile = os.path.splitext(name)[0].title() or "Code"
+    return {
+        "name": profile,
+        "data_folder": folder,
+        "target": str(product.get("target") or ""),
+    }
+
+
+def _vscode_environment(env: Dict[str, str], root: Path, cfg: Dict[str, Any],
+                        target: Path) -> Dict[str, str]:
+    """Pin Cursor/VS Code profile paths inside the portable folder."""
+    info = _vscode_product(target.parent)
+    if info is None:
+        return env
+    data = root / str(cfg.get("data_dir_name") or "PortableData")
+    folder = str(info.get("data_folder") or ".vscode")
+    defaults = {
+        "VSCODE_APPDATA": str(data / "AppData" / "Roaming"),
+        "VSCODE_EXTENSIONS": str(data / "User" / folder / "extensions"),
+        "VSCODE_LOGS": str(data / "Logs"),
+        "VSCODE_CLI_DATA_DIR": str(data / "User" / folder / "cli"),
+    }
+    configured = cfg.get("extra_env")
+    configured = configured if isinstance(configured, dict) else {}
+    patched = dict(env)
+    for key, value in defaults.items():
+        # Значение из launcher_config.json главнее: его задал человек.
+        if key not in configured:
+            patched[key] = value
+    return patched
+
+
+def _merge_json_file(path: Path, add: Dict[str, Any]) -> bool:
+    """Дописывает ключи в JSON-файл, сохраняя всё остальное."""
+    existing: Dict[str, Any] = {}
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            existing = data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return False
+    changed = False
+    for key, value in add.items():
+        if existing.get(key) != value:
+            existing[key] = value
+            changed = True
+    if not changed:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8", newline="\n")
+        return True
+    except OSError:
+        return False
+
+
+def _apply_vscode_profile(root: Path, cfg: Dict[str, Any],
+                          target: Path) -> "list[str]":
+    """Restores the Cursor/VS Code profile files before every start.
+
+    The portablizer writes them at build time, but they are ordinary files in
+    ``PortableData``: the user may delete them, copy the folder without them,
+    or update the app.  Re-creating the two small files costs two reads and
+    keeps ``--diagnose`` honest about what the app will actually read.
+    """
+    info = _vscode_product(target.parent)
+    if info is None:
+        return []
+    data = root / str(cfg.get("data_dir_name") or "PortableData")
+    notes: "list[str]" = []
+    argv = data / "User" / str(info["data_folder"]) / "argv.json"
+    if _merge_json_file(argv, {VSCODE_SANDBOX_KEY: True}):
+        notes.append("vscode: argv.json now disables the Chromium sandbox "
+                     f"({argv.relative_to(root)})")
+    settings = (data / "AppData" / "Roaming" / str(info["name"])
+                / "User" / "settings.json")
+    if not settings.exists():
+        if _merge_json_file(settings, {"update.mode": "none"}):
+            notes.append("vscode: native auto-update is off for this portable "
+                         f"({settings.relative_to(root)}); updates go through "
+                         "UpdatePortable.cmd")
+    return notes
 
 
 def needs_webview2_bridge(target: Path) -> bool:
@@ -8318,7 +8602,12 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # Самопроверка профиля: прерванный прошлый сеанс мог оставить Known Folder
     # «Документы» направленным внутрь уже удалённой папки портатива. Это ломает
     # сохранения и меню «Пуск», а стоит проверка один запрос к реестру.
-    autoheal_profile(root)
+    # Самопроверка не должна мешать запуску: её ошибка — только строка в
+    # журнале.
+    try:
+        autoheal_profile(root)
+    except Exception as exc:  # noqa: BLE001 - проверка не срывает запуск
+        _run_log(root, f"profile self-check failed ({exc})")
 
     # Перенос между дисками: если папка переехала с прошлого запуска, пути
     # старого корня в настройках программы заменяются новыми ДО того, как она
@@ -8397,11 +8686,15 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
         _run_log(root, f"registry sanitize failed: {exc}")
 
     # Остатки прошлого запуска убираются ДО старта: иначе они так и будут
-    # держать папку, пока пользователь не перезагрузит компьютер.
-    stale = sweep_stale_session(root, cfg)
-    if stale:
-        _run_log(root, "cleaned up after the previous session: "
-                 + ", ".join(sorted(set(stale))))
+    # держать папку, пока пользователь не перезагрузит компьютер. Уборка —
+    # вспомогательный шаг: её сбой не должен мешать запуску программы.
+    try:
+        stale = sweep_stale_session(root, cfg)
+        if stale:
+            _run_log(root, "cleaned up after the previous session: "
+                     + ", ".join(sorted(set(stale))))
+    except Exception as exc:  # noqa: BLE001 - уборка не срывает запуск
+        _run_log(root, f"stale session cleanup failed ({exc})")
 
     # Сквозные сохранения. Сессия создаётся ДО любых перенаправлений: она
     # обязана запомнить настоящие «Документы» этого ПК, пока Known Folder
@@ -8413,6 +8706,11 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
         cfg, list(argv if argv is not None else sys.argv[1:])
     )
     target_rel, forwarded, needs_machine = _select_target(cfg, raw_arguments)
+    # Записанная цель могла исчезнуть: неудачное обновление (родной апдейтер
+    # Cursor уносит exe в промежуточную папку), переименование, конфиг от
+    # сборки на прежнем диске. Ищем программу в App и правим конфиг, вместо
+    # того чтобы показать «файл не найден» и не запустить ничего.
+    target_rel = _repair_missing_target(root, cfg, target_rel)
     already_elevated = any(
         str(arg).casefold() == "--elevated" for arg in raw_arguments)
     registry_cfg = cfg.get("registry", {})
@@ -8488,11 +8786,14 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     target = _as_relative_path(root, target_rel)
     if not target.is_file():
         alternative = root / "App" / str(target_rel).replace("\\", os.sep)
-        if alternative.is_file():
+        if not Path(str(target_rel)).is_absolute() and alternative.is_file():
             target = alternative
         else:
             raise FileNotFoundError(
-                f"Исполняемый файл программы не найден:\n{target}")
+                f"Исполняемый файл программы не найден:\n{target}\n\n"
+                "Похоже, папка App неполная (или программу обновил её "
+                "собственный апдейтер). Запустите Launch.bat --diagnose: "
+                "отчёт покажет, что лежит в App.")
 
     # Предстартовая проверка распространяемых компонентов: лучше назвать
     # пакет, чем оставить пользователя наедине с окном Windows
@@ -8517,8 +8818,13 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
 
     # Сейвы, сделанные мимо лончера (прямой запуск App\Game.exe), забираются
     # в портатив ПЕРЕД стартом: иначе программа их просто не увидит.
-    for line in shared_saves.before():
-        _run_log(root, "shared saves: " + line)
+    # Синхронизация — вспомогательный шаг: её ошибка не должна оставить
+    # пользователя без запущенной программы.
+    try:
+        for line in shared_saves.before():
+            _run_log(root, "shared saves: " + line)
+    except Exception as exc:  # noqa: BLE001 - сейвы не срывают запуск
+        _run_log(root, f"shared saves: pre-launch sync failed ({exc})")
     try:
         for line in drive_root_data.before():
             _run_log(root, "drive-root data: " + line)
@@ -8537,9 +8843,26 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     job = _JobObject(enabled=should_use_job(target))
     env = _electron_environment(env, target)
     env = apply_webview2_bridge(env, target)
-    shell_folders.load()
+    # Cursor/VS Code: профиль и данные расширений — внутри портатива, а
+    # argv.json отключает Chromium-песочницу, которая из папки портатива не
+    # запускается (Windows отказывает helper-процессам, и Cursor выходит, не
+    # показав окна). Применяется на каждом запуске: файлы могли исчезнуть
+    # при копировании папки.
+    env = _vscode_environment(env, root, cfg, target)
+    try:
+        for line in _apply_vscode_profile(root, cfg, target):
+            _run_log(root, "vscode: " + line.split(": ", 1)[-1])
+    except Exception as exc:  # noqa: BLE001 - профиль не срывает запуск
+        _run_log(root, f"vscode: profile setup failed ({exc})")
+    try:
+        shell_folders.load()
+    except Exception as exc:  # noqa: BLE001 - Known Folder не срывает запуск
+        _run_log(root, f"documents redirection failed ({exc})")
     try:
         registry.load()
+    except Exception as exc:  # noqa: BLE001 - реестр не срывает запуск
+        _run_log(root, f"registry import failed ({exc})")
+    try:
         try:
             command = with_electron_flags(
                 [
@@ -8552,6 +8875,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             _run_log(root, "start: " + subprocess.list2cmdline(command)
                      + f" (cwd={target.parent}, elevated={_is_elevated()}, "
                      + f"job={'yes' if job.handle else 'no'})")
+            started_at = time.monotonic()
             try:
                 code = _wait_target(_spawn_target(
                     command, str(target.parent), env, job), watch)
@@ -8579,7 +8903,9 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                     "установит компоненты в тихом режиме и может запросить "
                     "UAC. Подробности и ссылки — в redistributables.txt.")
                 return 14001
-            _run_log(root, f"{target.name} exited with code {code}")
+            duration = time.monotonic() - started_at
+            _run_log(root, f"{target.name} exited with code {code} after "
+                           f"{duration:.1f}s")
             # The official launcher usually starts the game and exits at once.
             # Restoring the registry right now would pull the install keys out
             # from under the game that is just starting, so wait for it.
@@ -8591,6 +8917,22 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             if waited:
                 _run_log(root, f"waited {waited}s for programs started from "
                                f"the portable folder to finish")
+            # «Программа не запускается» на деле часто означает «запустилась и
+            # сразу вышла». Раньше это было видно только в журнале; для
+            # Cursor/VS Code (они не имеют права закрываться сами) пишем и
+            # показываем причину поиска: main.log внутри портативного профиля.
+            elif duration < 5.0:
+                _run_log(root, f"{target.name} closed within {duration:.1f}s "
+                               "and left nothing running")
+                info = _vscode_product(target.parent)
+                if info is not None and code != 0:
+                    _show_warning(
+                        f"{info['name']} завершился сразу после запуска "
+                        f"(код {code}), не показав окна.\n\n"
+                        "Журнал самого редактора лежит внутри портатива:\n"
+                        f"{root / str(cfg.get('data_dir_name') or 'PortableData')}"
+                        f"\\AppData\\Roaming\\{info['name']}\\logs\n\n"
+                        "Полный отчёт: Launch.bat --diagnose")
             # Companion services first: a registered service whose binary
             # lives in App/ keeps the whole folder locked no matter how the
             # processes are closed. Teardown removes ONLY what this portable
@@ -8611,9 +8953,15 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                                "folder: " + ", ".join(sorted(set(stopped))))
             return code
         finally:
-            registry.save_and_restore()
+            try:
+                registry.save_and_restore()
+            except Exception as exc:  # noqa: BLE001 - уже закрываемся
+                _run_log(root, f"registry restore failed ({exc})")
     finally:
-        shell_folders.restore()
+        try:
+            shell_folders.restore()
+        except Exception as exc:  # noqa: BLE001 - уже закрываемся
+            _run_log(root, f"documents restore failed ({exc})")
         # Safety net for every path that skipped the block above (an error,
         # a program that spawned something during shutdown): sweep again and
         # drop the job handle - Windows finishes off anything that ignored
@@ -8839,6 +9187,169 @@ def sync_saves(root: Optional[Path] = None) -> int:
     return 0
 
 
+#: Сколько последних строк журнала попадает в отчёт диагностики.
+DIAGNOSE_LOG_LINES = 80
+
+
+def _tail_lines(path: Path, count: int) -> "list[str]":
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return text.splitlines()[-count:]
+
+
+def diagnose(root: Optional[Path] = None) -> int:
+    """``LaunchPortable.exe --diagnose``: пишет отчёт о состоянии портатива.
+
+    Нужен ровно для жалобы «через Launch.bat и App\\LaunchPortable.exe ничего
+    не запускается, а сам exe программы работает»: обычный пользователь не
+    может открыть журнал лончера, а отчёт собирает в один текстовый файл всё,
+    что нужно для ответа — конфиг, цель, содержимое App, определение Electron/
+    VS Code, пути профиля и хвост журнала.
+    """
+    root = root or find_portable_root()
+    cfg: Dict[str, Any] = {}
+    config_error = ""
+    try:
+        cfg = read_launcher_config(root)
+    except Exception as exc:  # noqa: BLE001 - отчёт нужен именно при ошибке
+        config_error = f"{type(exc).__name__}: {exc}"
+    data = root / str(cfg.get("data_dir_name") or "PortableData")
+    lines: "list[str]" = []
+    add = lines.append
+
+    add("Portablizer — диагностика портативного приложения")
+    add("=" * 60)
+    add(f"Дата:            {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    add(f"Корень:          {root}")
+    add(f"Конфиг:          {launcher_config_path(root)}")
+    if cfg:
+        add(f"Приложение:      {cfg.get('app_name', '')}")
+        add(f"Сборка:          {cfg.get('generated_by', 'неизвестно')}")
+    if config_error:
+        add(f"ОШИБКА КОНФИГА:  {config_error}")
+    add("")
+
+    target_rel = str(cfg.get("target_exe_rel") or "")
+    target = _as_relative_path(root, target_rel) if target_rel else None
+    add("Цель запуска")
+    add("-" * 60)
+    add(f"target_exe_rel:  {target_rel or '(не задан)'}")
+    if target is not None:
+        add(f"полный путь:     {target}")
+        add(f"существует:      {'да' if target.is_file() else 'НЕТ'}")
+    add(f"target_args:     {cfg.get('target_args', [])}")
+    add("")
+
+    add("Pipeline (как лончер будет запускать программу)")
+    add("-" * 60)
+    if target is not None and target.is_file():
+        info = _vscode_product(target.parent)
+        add(f"Electron:        {'да' if is_electron_tree(target.parent) else 'нет'}")
+        add(f"песочница off:   "
+            f"{'да' if needs_electron_sandbox_off(target) else 'нет'}")
+        add(f"kill-on-close:   {'да' if should_use_job(target) else 'нет'}")
+        add(f"VS Code-семейство: "
+            f"{info['name'] + ' (target=' + (info['target'] or 'не задан') + ')' if info else 'нет'}")
+        if info is not None:
+            defaults = {
+                "VSCODE_APPDATA": str(data / "AppData" / "Roaming"),
+                "VSCODE_EXTENSIONS": str(data / "User"
+                                         / info["data_folder"] / "extensions"),
+                "VSCODE_LOGS": str(data / "Logs"),
+                "VSCODE_CLI_DATA_DIR": str(data / "User"
+                                            / info["data_folder"] / "cli"),
+            }
+            configured = cfg.get("extra_env")
+            configured = configured if isinstance(configured, dict) else {}
+            for key, value in defaults.items():
+                add(f"{key}: "
+                    f"{configured.get(key, value)}"
+                    f"{'  (из конфига)' if key in configured else ''}")
+            argv = data / "User" / info["data_folder"] / "argv.json"
+            add(f"argv.json:       {argv} "
+                f"({'есть' if argv.is_file() else 'НЕТ'})")
+    else:
+        add("Цель не найдена — программа запуститься не может.")
+    add("")
+
+    add("App")
+    add("-" * 60)
+    app = root / "App"
+    if app.is_dir():
+        entries = []
+        try:
+            for item in os.scandir(app):
+                if item.is_file():
+                    try:
+                        entries.append((item.stat().st_size, item.name))
+                    except OSError:
+                        entries.append((0, item.name))
+        except OSError as exc:
+            add(f"не удалось прочитать App: {exc}")
+        entries.sort(reverse=True)
+        add(f"файлов в корне App: {len(entries)}")
+        for size, name in entries[:20]:
+            add(f"  {size:>12}  {name}")
+        add(f"resources\\app:    "
+            f"{'есть' if (app / 'resources' / 'app').is_dir() else 'нет'}")
+        add(f"app.asar:         "
+            f"{'есть' if (app / 'resources' / 'app.asar').is_file() else 'нет'}")
+        add(f"data (portable):  {'есть' if (app / 'data').is_dir() else 'нет'} "
+            "(VS Code игнорирует её при target=user)")
+    else:
+        add("Папки App НЕТ — портатив неполный.")
+    add("")
+
+    add("Настройки переноса")
+    add("-" * 60)
+    add(f"data_dir_name:   {cfg.get('data_dir_name', 'PortableData')}")
+    relative = cfg.get("relative_paths")
+    add(f"relative_paths:  {'есть' if relative else 'нет секции'}")
+    stamp = data / PATHS_STAMP_NAME
+    add(f"portable-root:   {stamp} "
+        f"({'есть' if stamp.is_file() else 'нет'})")
+    registry = cfg.get("registry")
+    if isinstance(registry, dict) and registry.get("enabled"):
+        add(f"реестр:          ключей {len(registry.get('keys') or [])}")
+    else:
+        add("реестр:          не применяется")
+    add(f"обновления:      {'секция есть' if cfg.get('update') else 'нет секции'}")
+    add("")
+
+    add("Журнал лончера (последние строки)")
+    add("-" * 60)
+    log_lines = _tail_lines(data / "launcher-run.log", DIAGNOSE_LOG_LINES)
+    lines.extend(log_lines or ["(журнала нет: лончер ещё ни разу не доходил "
+                               "до запуска программы)"])
+    add("")
+    error = data / "launcher-exe-error.log"
+    if error.is_file():
+        add("Ошибка запуска (launcher-exe-error.log)")
+        add("-" * 60)
+        lines.extend(_tail_lines(error, 40))
+        add("")
+
+    report = data / "diagnostics.txt"
+    try:
+        data.mkdir(parents=True, exist_ok=True)
+        report.write_text("\n".join(lines) + "\n", encoding="utf-8",
+                          newline="\n")
+    except OSError as exc:
+        _show_error(f"Не удалось записать отчёт диагностики: {exc}")
+        return 1
+    _run_log(root, f"diagnostics written to {report}")
+    try:
+        if IS_WINDOWS:
+            os.startfile(str(report))  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - отчёт важнее просмотрщика
+        pass
+    _show_info("Отчёт диагностики записан:\n\n" + str(report)
+               + "\n\nЕго можно приложить к сообщению о проблеме.")
+    return 0
+
+
 def main() -> int:
     root: Optional[Path] = None
     arguments = [str(arg).casefold() for arg in sys.argv[1:]]
@@ -8881,10 +9392,30 @@ def main() -> int:
         if any(str(arg).casefold() in ("--check-identity", "/check-identity")
                for arg in sys.argv[1:]):
             return check_identity(root)
+        if any(str(arg).casefold() in ("--diagnose", "/diagnose",
+                                       "--diagnostics", "/diagnostics")
+               for arg in sys.argv[1:]):
+            return diagnose(root)
         return run()
     except Exception as exc:
         details = f"Не удалось запустить портативную программу.\n\n{exc}"
         _write_error_log(root, details + "\n\n" + traceback.format_exc())
+        # Хвост журнала в самом окне: иначе пользователь видит только
+        # «что-то не так» и не знает, где искать. Отчёт --diagnose собирает
+        # то же самое в файл.
+        data_name = "PortableData"
+        if root is not None:
+            try:
+                data_name = str(read_launcher_config(root).get("data_dir_name")
+                                or "PortableData")
+            except Exception:  # noqa: BLE001 - конфиг мог и не читаться
+                pass
+        tail = (_tail_lines(root / data_name / "launcher-run.log", 12)
+                if root is not None else [])
+        if tail:
+            details += "\n\nПоследние строки журнала:\n" + "\n".join(tail)
+        details += ("\n\nПодробный отчёт: Launch.bat --diagnose "
+                    "(PortableData\\diagnostics.txt).")
         _show_error(details)
         return 1
 
