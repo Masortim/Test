@@ -99,7 +99,11 @@ class ScanOnceTests(unittest.TestCase):
                 first = entry.repair_paths(root, {})
             self.assertEqual(counter.calls, 1)
             self.assertTrue(first, "первый запуск обязан починить путь")
-            self.assertIn(str(root), target.read_text(encoding="utf-8"))
+            # Сравниваем разобранное значение, а не текст файла: в JSON
+            # обратные слэши Windows экранированы (``\\``) и строкой пути
+            # подстрока не находится.
+            self.assertIn(str(root), json.loads(
+                target.read_text(encoding="utf-8"))["lastRoot"])
 
             with CountingIter() as counter:
                 second = entry.repair_paths(root, {})
@@ -123,7 +127,8 @@ class ScanOnceTests(unittest.TestCase):
                 report = entry.repair_paths(root, {})
             self.assertEqual(counter.calls, 1)
             self.assertTrue(report)
-            self.assertIn(str(root), target.read_text(encoding="utf-8"))
+            self.assertIn(str(root), json.loads(
+                target.read_text(encoding="utf-8"))["lastRoot"])
 
     def test_force_rescans_on_demand(self):
         """``--repair-paths`` и обновление не полагаются на отметку."""
