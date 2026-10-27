@@ -3471,7 +3471,13 @@ def delete_key_tree(key: str) -> bool:
             pass
 
     _remove(path)
-    return True
+    # Проверяем результат: если ключ остался (нет прав, занят), вызывающий
+    # код успеет убрать его через reg.exe.
+    try:
+        reg.CloseKey(reg.OpenKey(hive, path, 0, reg.KEY_READ))
+    except OSError:
+        return True
+    return False
 
 
 class RegistrySession:
