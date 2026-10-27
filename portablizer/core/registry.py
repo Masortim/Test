@@ -986,6 +986,62 @@ def render_host_cleanup(diff: RegistryDiff,
     return _render(lines)
 
 
+_HIVE_BY_NAME = {
+    "HKEY_CURRENT_USER": "HKEY_CURRENT_USER",
+    "HKCU": "HKEY_CURRENT_USER",
+    "HKEY_LOCAL_MACHINE": "HKEY_LOCAL_MACHINE",
+    "HKLM": "HKEY_LOCAL_MACHINE",
+}
+
+
+def delete_uninstall_keys(keys: Iterable[str]) -> Tuple[List[str], List[str]]:
+    """Удаляет записи Uninstall напрямую через winreg.
+
+    Возвращает ``(удалённые, оставшиеся)``. Импорт ``cleanup_host.reg`` может
+    не сработать (другое представление WOW64, политика импорта, антивирус), а
+    прямой ``RegDeleteKey`` в нужном представлении работает всегда, когда есть
+    права. Ключи принимаются в виде ``HKEY_CURRENT_USER\\Software\\...\\Uninstall\\Имя``.
+    """
+    if not IS_WINDOWS:
+        return [], []
+    try:
+        import winreg  # type: ignore
+    except ImportError:  # pragma: no cover - Windows без winreg не бывает
+        return [], []
+    removed: List[str] = []
+    remaining: List[str] = []
+    for key in keys:
+        hive_name = _hive_name(key)
+        if not hive_name or not is_uninstall_entry(key):
+            continue
+        hive = getattr(winreg, hive_name)
+        # «HKEY_CURRENT_USER\Software\...\Uninstall\Имя» -> путь родителя и имя.
+        _hive_text, _sep, subkey = key.partition("\\")
+        parent_path, _sep, name = subkey.rpartition("\\")
+        if not parent_path or not name:
+            remaining.append(key)
+            continue
+        access = (winreg.KEY_WRITE | winreg.KEY_READ
+                  | getattr(winreg, "DELETE", 0))
+        deleted = False
+        for view in (0, getattr(winreg, "KEY_WOW64_64KEY", 0),
+                     getattr(winreg, "KEY_WOW64_32KEY", 0)):
+            try:
+                with winreg.OpenKey(hive, parent_path, 0, access | view) as parent:
+                    winreg.DeleteKey(parent, name)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            deleted = True
+            break
+        if deleted:
+            removed.append(key)
+        else:
+            remaining.append(key)
+    return removed, remaining
+
+
 def existing_uninstall_keys(keys: Iterable[str]) -> List[str]:
     """Какие из записей Uninstall ещё существуют на этом ПК.
 
@@ -1322,6 +1378,55 @@ def _registry_path_is_inside(value: str, root: str) -> bool:
     return candidate == root or candidate.startswith(root + "\\")
 
 
+#: Значения записи Uninstall, в которых установщики хранят путь установки.
+_UNINSTALL_PATH_VALUE_NAMES = frozenset({
+    "installdir", "installdirectory", "installfolder", "installlocation",
+    "installpath", "displayicon", "uninstallstring", "quietuninstallstring",
+    "installsource", "inno setup: app path", "apppath", "path", "modifypath",
+})
+
+
+def _record_paths(values: "Mapping[str, object]") -> List[str]:
+    """Пути из всех «путевых» значений записи Uninstall (строки, не repr)."""
+    paths: List[str] = []
+    for value_name, entry in values.items():
+        if str(value_name).casefold() not in _UNINSTALL_PATH_VALUE_NAMES:
+            continue
+        value = _entry_value(entry)
+        if isinstance(value, str) and value.strip():
+            paths.append(value)
+    return paths
+
+
+def _path_looks_alive(path: str) -> bool:
+    """Существует ли файл/папка, на которые ссылается значение записи.
+
+    Нужно, чтобы отличить настоящую установку той же программы от следа
+    установки, сделанной внутри портатива: в первом случае файлы на месте.
+    """
+    candidate = str(path or "").strip().strip('"')
+    candidate = re.sub(r",\s*-?\d+\s*$", "", candidate).strip().strip('"')
+    if not candidate:
+        return False
+    expanded = os.path.expandvars(candidate)
+    for item in (candidate, expanded):
+        try:
+            if os.path.exists(item):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _names_look_like_same_product(left: str, right: str) -> bool:
+    """Имена продуктов совпадают с точностью до версии и разделителей."""
+    first = _normalised_product_name(left)
+    second = _normalised_product_name(right)
+    if not first or not second:
+        return False
+    return first == second or first.startswith(second) or second.startswith(first)
+
+
 def safe_uninstall_entries(
         diff: RegistryDiff,
         after: Mapping[str, Mapping[str, object]],
@@ -1347,30 +1452,40 @@ def safe_uninstall_entries(
         if is_protected(key, values):
             continue
         display_name = ""
-        paths: List[str] = []
         for value_name, entry in values.items():
-            name = str(value_name).casefold()
+            if str(value_name).casefold() != "displayname":
+                continue
             value = _entry_value(entry)
-            if name == "displayname" and isinstance(value, str):
+            if isinstance(value, str):
                 display_name = value.strip()
-            elif name in {
-                    "installdir", "installdirectory", "installfolder",
-                    "installlocation", "installpath", "displayicon",
-                    "uninstallstring", "quietuninstallstring",
-                    "installsource", "inno setup: app path", "apppath",
-                    "path", "modifypath"} and isinstance(value, str):
-                # Не только InstallLocation: Inno Setup (Cursor, VS Code и
-                # прочие установщики на его основе) пишет каталог в
-                # «Inno Setup: App Path», а путь к файлу — в DisplayIcon и
-                # UninstallString. Без них запись «Cursor» оставалась в списке
-                # установленных, хотя указывала внутрь портатива.
-                paths.append(value)
-        if _normalised_product_name(display_name) != expected:
+            break
+        key_name = key.rsplit("\\", 1)[-1]
+        # Имя — обязательное условие: чужую программу не трогаем никогда.
+        if not (_names_look_like_same_product(display_name, app_name)
+                or _names_look_like_same_product(key_name, app_name)):
             continue
-        if not any(_registry_path_is_inside(path, portable_dir)
-                   for path in paths):
-            continue
-        safe.append((key, display_name or key.rsplit("\\", 1)[-1]))
+        # Не только InstallLocation: Inno Setup (Cursor, VS Code и прочие
+        # установщики на его основе) пишет каталог в «Inno Setup: App Path», а
+        # путь к файлу — в DisplayIcon и UninstallString. Без них запись
+        # «Cursor» оставалась в списке установленных, хотя указывала внутрь
+        # портатива.
+        paths = _record_paths(values)
+        inside = any(_registry_path_is_inside(path, portable_dir)
+                     for path in paths)
+        if not inside:
+            # Ключ появился именно за эту установку (сравнение снимков реестра
+            # до и после), поэтому он наш, даже если установщик записал в него
+            # путь настоящего профиля (``%LOCALAPPDATA%\\Programs\\cursor`` —
+            # так делает Cursor, устанавливаясь в App портатива). Настоящую
+            # установку той же программы оставляем: её файлы существуют.
+            alive_outside = any(
+                _path_looks_alive(path)
+                and not _registry_path_is_inside(path, portable_dir)
+                for path in paths
+            )
+            if alive_outside:
+                continue
+        safe.append((key, display_name or key_name))
     return safe
 
 

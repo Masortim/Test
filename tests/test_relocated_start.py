@@ -25,6 +25,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -231,13 +232,108 @@ class InstalledProgramRecordTests(unittest.TestCase):
         self.assertTrue(entry.path_points_into_portable(
             entry.ROOT_TOKEN + r"\App\Cursor.exe", [r"D:\Anything"]))
 
-    def test_a_record_with_a_foreign_path_is_not_ours(self):
+    def test_a_live_foreign_installation_is_not_ours(self):
+        """Настоящая установка той же программы остаётся нетронутой."""
+        with tempfile.TemporaryDirectory() as temp:
+            real = Path(temp) / "Local" / "Programs" / "cursor"
+            real.mkdir(parents=True)
+            (real / "Cursor.exe").write_bytes(b"MZ")
+            root = make_portable(Path(temp) / "Cursor_Portable")
+            values = {
+                "DisplayName": "Cursor",
+                "InstallLocation": str(real),
+            }
+            self.assertFalse(entry._record_looks_like_this_portable(
+                values, entry._record_roots(root, {}), "Cursor", "Cursor"))
+
+    def test_a_dead_foreign_path_is_a_leftover_record(self):
+        """След установки внутри портатива: путь есть, программы по нему нет."""
         with tempfile.TemporaryDirectory() as temp:
             root = make_portable(Path(temp) / "Cursor_Portable")
             values = {
                 "DisplayName": "Cursor",
-                "InstallLocation": r"C:\Users\me\AppData\Local\Programs\cursor",
+                "InstallLocation": str(Path(temp) / "never-existed" / "cursor"),
             }
+            roots = entry._record_roots(root, {})
+            self.assertTrue(entry._record_is_orphan(values, roots))
+            self.assertTrue(entry._record_looks_like_this_portable(
+                values, roots, "Cursor", "Cursor"))
+
+    def test_leftover_records_can_be_kept_on_request(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp) / "Cursor_Portable")
+            values = {
+                "DisplayName": "Cursor",
+                "InstallLocation": str(Path(temp) / "never-existed" / "cursor"),
+            }
+            self.assertFalse(entry._record_looks_like_this_portable(
+                values, entry._record_roots(root, {}), "Cursor", "Cursor",
+                remove_orphans=False))
+
+    def test_portable_profile_variables_count_as_the_portable(self):
+        """%LOCALAPPDATA% внутри портатива — это путь внутрь портатива."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp) / "Cursor_Portable")
+            env = entry._portable_env(root, {})
+            values = {
+                "DisplayName": "Cursor",
+                "InstallLocation": r"%LOCALAPPDATA%\Programs\cursor",
+            }
+            roots = entry._record_roots(root, {})
+            self.assertTrue(entry._record_points_into_portable(
+                values, roots, env))
+            self.assertTrue(entry._record_looks_like_this_portable(
+                values, roots, "Cursor", "Cursor", extra_env=env))
+
+    def test_a_variable_record_with_a_live_real_profile_is_kept(self):
+        """%LOCALAPPDATA% раскрывается и в портатив, и в настоящий профиль.
+
+        Если по настоящему адресу лежат файлы — программа действительно
+        установлена, и запись трогать нельзя.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp) / "Cursor_Portable")
+            real = Path(temp) / "Local" / "Programs" / "cursor"
+            real.mkdir(parents=True)
+            (real / "Cursor.exe").write_bytes(b"MZ")
+            values = {
+                "DisplayName": "Cursor",
+                "InstallLocation": r"%LOCALAPPDATA%\Programs\cursor",
+            }
+            roots = entry._record_roots(root, {})
+            env = entry._portable_env(root, {})
+            with mock.patch.dict("os.environ",
+                                 {"LOCALAPPDATA": str(real.parent.parent)}):
+                self.assertFalse(entry._record_looks_like_this_portable(
+                    values, roots, "Cursor", "Cursor", extra_env=env))
+                self.assertIn("настоящую установку",
+                              entry._record_reason(values, roots, env, True))
+
+    def test_a_variable_record_without_files_is_removed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp) / "Cursor_Portable")
+            values = {
+                "DisplayName": "Cursor",
+                "InstallLocation": r"%LOCALAPPDATA%\Programs\cursor",
+            }
+            roots = entry._record_roots(root, {})
+            env = entry._portable_env(root, {})
+            with mock.patch.dict("os.environ",
+                                 {"LOCALAPPDATA": str(Path(temp) / "nowhere")}):
+                self.assertTrue(entry._record_looks_like_this_portable(
+                    values, roots, "Cursor", "Cursor", extra_env=env))
+                self.assertIn("внутрь портатива",
+                              entry._record_reason(values, roots, env, True))
+
+    def test_a_system_component_record_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp) / "Cursor_Portable")
+            values = {
+                "DisplayName": "Cursor",
+                "SystemComponent": "1",
+                "InstallLocation": str(Path(temp) / "never-existed"),
+            }
+            self.assertTrue(entry._record_hidden_by_system(values))
             self.assertFalse(entry._record_looks_like_this_portable(
                 values, entry._record_roots(root, {}), "Cursor", "Cursor"))
 
@@ -310,6 +406,233 @@ class InstalledProgramRecordTests(unittest.TestCase):
         self.assertEqual(len(dropped), 2)
 
 
+class _FakeKey:
+    """Открытый ключ поддельного реестра: контекстный менеджер и описание."""
+
+    def __init__(self, registry: "_FakeRegistry", hive, path: str,
+                 access: int) -> None:
+        self.registry = registry
+        self.hive = hive
+        self.path = path
+        self.access = access
+
+    def __enter__(self) -> "_FakeKey":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        return None
+
+
+class _FakeRegistry:
+    """Минимальный winreg: ровно те вызовы, которые делает лончер.
+
+    Нужен, чтобы проверять уборку записи «Установленные программы» на Linux:
+    правила (имя, путь, мёртвый путь, ключ из конфига сборки) от платформы не
+    зависят, а живой реестр есть только на Windows.
+    """
+
+    HKEY_CURRENT_USER = "HKCU"
+    HKEY_LOCAL_MACHINE = "HKLM"
+    KEY_READ = 1
+    KEY_WRITE = 2
+    DELETE = 4
+    KEY_WOW64_64KEY = 0
+    KEY_WOW64_32KEY = 0
+    REG_SZ = 1
+
+    def __init__(self, entries) -> None:
+        #: (куст, полный путь ключа) -> {имя значения: значение}
+        self.entries = {key: dict(values) for key, values in entries.items()}
+
+    def _names(self, hive, path: str):
+        prefix = path + "\\"
+        names = []
+        for (entry_hive, entry_path) in self.entries:
+            if entry_hive == hive and entry_path.startswith(prefix):
+                names.append(entry_path[len(prefix):])
+        return sorted(names)
+
+    def OpenKey(self, hive, path: str, reserved: int = 0, access: int = 0):
+        full = (hive, path)
+        if full in self.entries:
+            return _FakeKey(self, hive, path, access)
+        if self._names(hive, path):
+            return _FakeKey(self, hive, path, access)
+        raise FileNotFoundError(path)
+
+    def EnumKey(self, key: _FakeKey, index: int) -> str:
+        names = self._names(key.hive, key.path)
+        if index >= len(names):
+            raise OSError("no more data")
+        return names[index]
+
+    def EnumValue(self, key: _FakeKey, index: int):
+        values = list(self.entries[(key.hive, key.path)].items())
+        if index >= len(values):
+            raise OSError("no more data")
+        name, value = values[index]
+        return name, value, self.REG_SZ
+
+    def DeleteKey(self, key: _FakeKey, name: str) -> None:
+        full = (key.hive, key.path + "\\" + name)
+        if full not in self.entries:
+            raise FileNotFoundError(name)
+        del self.entries[full]
+
+
+class InstalledEntryRemovalTests(unittest.TestCase):
+    """Запись «Cursor» из Панели управления действительно уходит."""
+
+    UNINSTALL = entry.UNINSTALL_KEY_PATH
+
+    def setUp(self) -> None:
+        self._real_winreg = entry._winreg
+        self._real_is_windows = entry.IS_WINDOWS
+
+    def tearDown(self) -> None:
+        entry._winreg = self._real_winreg
+        entry.IS_WINDOWS = self._real_is_windows
+
+    def _portable(self, temp: str) -> Path:
+        return make_portable(Path(temp) / "Cursor_Portable")
+
+    def _install_fake(self, entries) -> _FakeRegistry:
+        registry = _FakeRegistry(entries)
+        entry._winreg = lambda: registry
+        entry.IS_WINDOWS = True
+        return registry
+
+    def test_a_leftover_cursor_record_is_removed(self):
+        """Так выглядит настоящая причина: путь записи никогда не существовал."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._portable(temp)
+            key = (self.UNINSTALL + "\\{6F1E}_is1")
+            registry = self._install_fake({("HKCU", key): {
+                "DisplayName": "Cursor",
+                "Inno Setup: App Path": (
+                    r"C:\Users\me\AppData\Local\Programs\cursor"),
+                "InstallLocation": (
+                    r"C:\Users\me\AppData\Local\Programs\cursor"),
+            }})
+
+            lines, needs_admin = entry.remove_portable_install_records(
+                root, {"app_name": "Cursor"})
+
+            self.assertFalse(needs_admin)
+            self.assertEqual(registry.entries, {})
+            self.assertIn("удалена", " ".join(lines))
+
+    def test_a_live_cursor_installation_survives(self):
+        with tempfile.TemporaryDirectory() as temp:
+            real = Path(temp) / "Programs" / "cursor"
+            real.mkdir(parents=True)
+            (real / "Cursor.exe").write_bytes(b"MZ")
+            root = self._portable(temp)
+            key = self.UNINSTALL + "\\Cursor"
+            registry = self._install_fake({("HKCU", key): {
+                "DisplayName": "Cursor",
+                "InstallLocation": str(real),
+            }})
+
+            entry.remove_portable_install_records(root, {"app_name": "Cursor"})
+
+            self.assertIn(("HKCU", key), registry.entries)
+
+    def test_a_record_without_any_path_is_removed_from_the_build_list(self):
+        """Pure-MSI запись: значений с путём нет, но ключ помнит сборка."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._portable(temp)
+            key = self.UNINSTALL + "\\{9C2A}"
+            registry = self._install_fake({("HKCU", key): {
+                "DisplayName": "Cursor",
+                "WindowsInstaller": "1",
+            }})
+            cfg = {"app_name": "Cursor", "host_cleanup": {"records": [{
+                "hive": "HKCU",
+                "path": "Software\\Microsoft\\Windows\\CurrentVersion"
+                        "\\Uninstall\\{9C2A}",
+                "display": "Cursor",
+            }]}}
+
+            entry.remove_portable_install_records(root, cfg)
+
+            self.assertEqual(registry.entries, {})
+
+    def test_a_system_component_record_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._portable(temp)
+            key = self.UNINSTALL + "\\Cursor"
+            registry = self._install_fake({("HKCU", key): {
+                "DisplayName": "Cursor",
+                "SystemComponent": "1",
+                "InstallLocation": r"C:\nowhere\cursor",
+            }})
+
+            entry.remove_portable_install_records(root, {"app_name": "Cursor"})
+
+            self.assertIn(("HKCU", key), registry.entries)
+
+    def test_another_program_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._portable(temp)
+            key = self.UNINSTALL + "\\Notepad++"
+            registry = self._install_fake({("HKCU", key): {
+                "DisplayName": "Notepad++",
+                "InstallLocation": str(root) + "\\App\\notepad",
+            }})
+
+            entry.remove_portable_install_records(root, {"app_name": "Cursor"})
+
+            self.assertIn(("HKCU", key), registry.entries)
+
+    def test_switching_the_cleanup_off_keeps_the_record(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._portable(temp)
+            key = self.UNINSTALL + "\\Cursor"
+            registry = self._install_fake({("HKCU", key): {
+                "DisplayName": "Cursor",
+                "InstallLocation": r"C:\nowhere\cursor",
+            }})
+
+            lines = entry.clean_installed_programs(
+                root, {"app_name": "Cursor",
+                       "host_cleanup": {"hide_installed_entry": False}})
+
+            self.assertEqual(lines, [])
+            self.assertIn(("HKCU", key), registry.entries)
+
+    def test_diagnose_names_the_record_and_the_reason(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._portable(temp)
+            key = self.UNINSTALL + "\\Cursor"
+            self._install_fake({("HKCU", key): {
+                "DisplayName": "Cursor 0.44.11",
+                "InstallLocation": r"C:\nowhere\cursor",
+            }})
+
+            report = "\n".join(entry.describe_install_records(
+                root, {"app_name": "Cursor"}))
+
+            self.assertIn("Cursor 0.44.11", report)
+            self.assertIn("будет удалена", report)
+            self.assertIn("отсутствуют", report)
+
+    def test_the_manual_command_removes_a_record_by_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._portable(temp)
+            key = self.UNINSTALL + "\\{GUID}_is1"
+            registry = self._install_fake({("HKCU", key): {
+                "DisplayName": "Cursor",
+                "WindowsInstaller": "1",
+            }})
+
+            lines = entry.forget_installed_entry("Cursor", root,
+                                                 {"app_name": "Cursor"})
+
+            self.assertEqual(registry.entries, {})
+            self.assertIn("удалена", " ".join(lines))
+
+
 class BuilderDefaultsTests(unittest.TestCase):
     """Установщик по умолчанию не оставляет запись «установлено»."""
 
@@ -357,18 +680,103 @@ class BuilderDefaultsTests(unittest.TestCase):
         self.assertEqual([item[0] for item in entries], [key])
 
     def test_a_separate_installation_is_not_cleaned_by_the_builder(self):
+        """Живая установка той же программы не трогается даже новым ключом."""
+        with tempfile.TemporaryDirectory() as temp:
+            real = Path(temp) / "Programs" / "cursor"
+            real.mkdir(parents=True)
+            (real / "Cursor.exe").write_bytes(b"MZ")
+            key = (r"HKCU\Software\Microsoft\Windows\CurrentVersion"
+                   r"\Uninstall\Cursor")
+            diff = reg_mod.RegistryDiff(new_keys={key})
+            after = {key: {
+                "DisplayName": (reg_mod.REG_SZ, repr("Cursor")),
+                "InstallLocation": (reg_mod.REG_SZ, repr(str(real))),
+            }}
+
+            self.assertEqual(reg_mod.safe_uninstall_entries(
+                diff, after, app_name="Cursor",
+                portable_dir=r"D:\Apps\Cursor_Portable"), [])
+
+    def test_a_new_record_with_a_dead_path_is_cleaned_by_the_builder(self):
+        """Ключ появился за эту установку — он наш, даже если путь «чужой»."""
         key = (r"HKCU\Software\Microsoft\Windows\CurrentVersion"
-               r"\Uninstall\Cursor")
+               r"\Uninstall\{GUID}_is1")
         diff = reg_mod.RegistryDiff(new_keys={key})
         after = {key: {
-            "DisplayName": (reg_mod.REG_SZ, repr("Cursor")),
+            "DisplayName": (reg_mod.REG_SZ, repr("Cursor 0.44.11")),
             "InstallLocation": (
-                reg_mod.REG_SZ, repr(r"C:\Users\me\Programs\cursor")),
+                reg_mod.REG_SZ,
+                repr(r"C:\Users\me\AppData\Local\Programs\cursor")),
         }}
 
-        self.assertEqual(reg_mod.safe_uninstall_entries(
+        entries = reg_mod.safe_uninstall_entries(
             diff, after, app_name="Cursor",
-            portable_dir=r"D:\Apps\Cursor_Portable"), [])
+            portable_dir=r"D:\Apps\Cursor_Portable")
+
+        self.assertEqual([item[0] for item in entries], [key])
+
+    def test_direct_deletion_does_nothing_without_windows(self):
+        if sys.platform.startswith("win"):
+            self.skipTest("на Windows проверяется живой реестр")
+        key = (r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion"
+               r"\Uninstall\Cursor")
+        self.assertEqual(reg_mod.delete_uninstall_keys([key]), ([], []))
+
+    def test_the_build_records_the_keys_for_the_launcher(self):
+        """launcher_config.json помнит ключи: их удалит лончер на месте."""
+        key = (r"HKCU\Software\Microsoft\Windows\CurrentVersion"
+               r"\Uninstall\{GUID}_is1")
+        records = launcher_mod.installed_entry_records([key], ["Cursor"])
+
+        self.assertEqual(records, [{
+            "hive": "HKCU",
+            "path": (r"Software\Microsoft\Windows\CurrentVersion"
+                     r"\Uninstall\{GUID}_is1"),
+            "display": "Cursor",
+        }])
+        payload = json.loads(launcher_mod.render_config_json(
+            launcher_mod.LauncherConfig(
+                app_name="Cursor", target_exe_rel="App/Cursor.exe",
+                host_cleanup_records=records)))
+        self.assertEqual(payload["host_cleanup"]["records"], records)
+        self.assertTrue(payload["host_cleanup"]["remove_orphan_entries"])
+
+    def test_refreshing_the_launcher_keeps_the_cleanup_settings(self):
+        """«Обновить лончер» переписывает конфиг — настройки не теряются."""
+        cfg = launcher_mod.LauncherConfig(
+            app_name="Cursor", target_exe_rel="App/Cursor.exe",
+            hide_installed_entry=False, remove_orphan_entries=False,
+            host_cleanup_records=[{
+                "hive": "HKCU",
+                "path": (r"Software\Microsoft\Windows\CurrentVersion"
+                         r"\Uninstall\{GUID}_is1"),
+                "display": "Cursor",
+            }])
+        restored = launcher_mod.config_from_dict(
+            json.loads(launcher_mod.render_config_json(cfg)))
+
+        self.assertFalse(restored.hide_installed_entry)
+        self.assertFalse(restored.remove_orphan_entries)
+        self.assertEqual(restored.host_cleanup_records,
+                         cfg.host_cleanup_records)
+
+    def test_a_key_outside_uninstall_is_never_recorded(self):
+        records = launcher_mod.installed_entry_records(
+            [r"HKCU\Software\Vendor\App"], ["App"])
+        self.assertEqual(records, [])
+
+    def test_the_launcher_accepts_only_uninstall_records_from_the_config(self):
+        good = {
+            "hive": "HKCU",
+            "path": (r"Software\Microsoft\Windows\CurrentVersion"
+                     r"\Uninstall\{GUID}_is1"),
+        }
+        bad = {"hive": "HKCU", "path": r"Software\Vendor\Run"}
+        parsed = entry.configured_install_records(
+            {"host_cleanup": {"records": [good, bad]}})
+
+        self.assertEqual([item["name"] for item in parsed], ["{GUID}_is1"])
+        self.assertEqual(parsed[0]["hive"], "HKEY_CURRENT_USER")
 
 
 class LaunchTimingTests(unittest.TestCase):

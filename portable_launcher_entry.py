@@ -7463,53 +7463,234 @@ def _record_roots(root: Path, cfg: "Optional[Dict[str, Any]]" = None
     return unique
 
 
-def _expanded_record_value(value: str) -> str:
-    """Раскрывает ``%VAR%`` окружением ЭТОГО ПК (не портативным профилем)."""
+#: Папки, которые портативный лончер подменяет в окружении программы. Значение
+#: записи могло быть записано как ``%LOCALAPPDATA%\\Programs\\cursor`` — при
+#: раскрытии окружением ЭТОГО ПК такой путь ведёт в настоящий профиль
+#: пользователя, хотя установщик работал внутри портатива.
+_PORTABLE_ENV_FOLDERS = (
+    ("APPDATA", ("AppData", "Roaming")),
+    ("LOCALAPPDATA", ("AppData", "Local")),
+    ("USERPROFILE", ("User",)),
+    ("TEMP", ("Temp",)),
+    ("TMP", ("Temp",)),
+    ("PROGRAMDATA", ("ProgramData",)),
+    ("PUBLIC", ("Public",)),
+)
+
+
+def _portable_env(root: Path,
+                  cfg: "Optional[Dict[str, Any]]" = None) -> Dict[str, str]:
+    """Значения подменённых переменных окружения (как в _prepare_environment)."""
+    data_name = str((cfg or {}).get("data_dir_name") or "PortableData")
+    data = Path(root) / data_name
+    env = {name: str(data.joinpath(*parts))
+           for name, parts in _PORTABLE_ENV_FOLDERS}
+    env["PORTABLE_ROOT"] = str(root)
+    return env
+
+
+#: ``%LOCALAPPDATA%``-подобная переменная в значении реестра. Раскрывается
+#: явно, а не через ``os.path.expandvars``: тот понимает ``%VAR%`` только на
+#: Windows, а правила проверки должны вести себя одинаково везде.
+_WINVAR_RE = re.compile(r"%([A-Za-z_][A-Za-z0-9_()#@$ .-]*)%")
+
+
+def _expand_record_value(value: str,
+                         extra_env: "Optional[Dict[str, str]]" = None) -> str:
+    """Раскрывает ``%VAR%``: окружением ПК и (если задано) портативным профилем."""
     text = str(value or "")
     if not text:
         return text
+    env = {str(name).upper(): str(item) for name, item in os.environ.items()}
+    if extra_env:
+        env.update({str(name).upper(): str(item)
+                    for name, item in extra_env.items()})
+
+    def _replace(match: "re.Match[str]") -> str:
+        return env.get(match.group(1).upper(), match.group(0))
+
+    text = _WINVAR_RE.sub(_replace, text)
     try:
         text = os.path.expandvars(text)
     except Exception:  # noqa: BLE001
         pass
-    return text.replace(ROOT_TOKEN, str(os.environ.get("PORTABLE_ROOT", "")))
+    return text.replace(ROOT_TOKEN, env.get("PORTABLE_ROOT", ""))
 
 
-def path_points_into_portable(value: str, roots: "Sequence[str]") -> bool:
-    """Есть ли в значении путь внутрь одного из корней портатива.
+def _fold_record_path(text: str) -> str:
+    """Путь в сравнимом виде: те же разделители, без хвостового слэша."""
+    clean = str(text or "").strip().strip('"').replace("/", "\\")
+    clean = os.path.normpath(clean).rstrip("\\")
+    # Пути Windows регистронезависимы, а сравнение выполняется и в тестах на
+    # Linux, где normcase ничего не меняет.
+    return clean.casefold()
+
+
+def _path_fragments(value: str,
+                   extra_env: "Optional[Dict[str, str]]" = None
+                   ) -> "list[str]":
+    """Все похожие на путь фрагменты значения записи.
 
     Значение записи — не всегда чистый путь: ``"D:\\Apps\\Cursor\\App\\Cursor.exe",0``,
     ``"D:\\...\\unins000.exe" /SILENT``, ``%LOCALAPPDATA%\\Programs\\cursor``.
-    Поэтому из строки достаются все похожие на путь Windows фрагменты, а
-    кавычки и номер значка отбрасываются.
+    Переменные раскрываются дважды: окружением этого ПК и (если известно)
+    портативным профилем. Второй вариант важен, когда установщик работал
+    внутри портатива и записал путь в переменных, а не абсолютом.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return []
+    variants = [text]
+    expanded = _expand_record_value(text, extra_env)
+    if expanded != text:
+        variants.append(expanded)
+    host_only = _expand_record_value(text)
+    if host_only not in variants:
+        variants.append(host_only)
+    fragments: "list[str]" = []
+    for variant in variants:
+        for candidate in _WINDOWS_PATH_RE.findall(variant):
+            clean = re.sub(r",\s*-?\d+\s*$", "", candidate.strip().strip('"'))
+            if clean:
+                fragments.append(clean)
+    return fragments
+
+
+def path_points_into_portable(value: str, roots: "Sequence[str]",
+                              extra_env: "Optional[Dict[str, str]]" = None) -> bool:
+    """Есть ли в значении путь внутрь одного из корней портатива.
+
+    Кавычки, номер значка (``,0``) и переменные окружения отбрасываются или
+    раскрываются — см. :func:`_path_fragments`.
     """
     text = str(value or "").strip()
     if not text:
         return False
     if ROOT_TOKEN.casefold() in text.casefold():
         return True
-    candidates = _WINDOWS_PATH_RE.findall(_expanded_record_value(text))
-    if not candidates:
-        return False
-    def _fold(text: str) -> str:
-        """Путь в сравнимом виде: те же разделители, без хвостового слэша."""
-        clean = str(text or "").strip().strip('"').replace("/", "\\")
-        clean = os.path.normpath(clean).rstrip("\\")
-        # Пути Windows регистронезависимы, а сравнение выполняется и в тестах
-        # на Linux, где normcase ничего не меняет.
-        return clean.casefold()
-
-    normalized_roots = [folded for folded in (_fold(item) for item in roots)
+    normalized_roots = [folded for folded
+                        in (_fold_record_path(item) for item in roots)
                         if folded and len(folded) >= 2]
-    for candidate in candidates:
-        clean = re.sub(r",\s*-?\d+\s*$", "", candidate.strip().strip('"'))
-        folded = _fold(clean)
+    for candidate in _path_fragments(text, extra_env):
+        folded = _fold_record_path(candidate)
         if len(folded) < 3:
             continue
         for root in normalized_roots:
             if folded == root or folded.startswith(root + "\\"):
                 return True
     return False
+
+
+def _record_path_fragments(values: Dict[str, Any],
+                           extra_env: "Optional[Dict[str, str]]" = None
+                           ) -> "list[str]":
+    """Пути из всех «путевых» значений записи Uninstall."""
+    path_values = {item.casefold() for item in UNINSTALL_PATH_VALUES}
+    fragments: "list[str]" = []
+    for name, value in values.items():
+        if str(name).casefold() not in path_values:
+            continue
+        if isinstance(value, str):
+            fragments.extend(_path_fragments(value, extra_env))
+    return fragments
+
+
+def _record_points_into_portable(values: Dict[str, Any],
+                                 roots: "Sequence[str]",
+                                 extra_env: "Optional[Dict[str, str]]" = None
+                                 ) -> bool:
+    """Хотя бы одно путевое значение ведёт внутрь портатива."""
+    path_values = {item.casefold() for item in UNINSTALL_PATH_VALUES}
+    for name, value in values.items():
+        if str(name).casefold() not in path_values:
+            continue
+        if isinstance(value, str) and path_points_into_portable(
+                value, roots, extra_env):
+            return True
+    return False
+
+
+def _variable_values(values: Dict[str, Any]) -> "list[str]":
+    """Путевые значения записи, в которых есть ``%ПЕРЕМЕННАЯ%``."""
+    path_values = {item.casefold() for item in UNINSTALL_PATH_VALUES}
+    found: "list[str]" = []
+    for name, value in values.items():
+        if str(name).casefold() not in path_values:
+            continue
+        if isinstance(value, str) and "%" in value:
+            found.append(value)
+    return found
+
+
+def _record_variables_resolve_into_portable(
+        values: Dict[str, Any], roots: "Sequence[str]",
+        extra_env: "Optional[Dict[str, str]]") -> bool:
+    """Переменная записи раскрывается в путь внутрь портативного профиля."""
+    if not extra_env:
+        return False
+    for value in _variable_values(values):
+        for fragment in _path_fragments(
+                _expand_record_value(value, extra_env)):
+            if path_points_into_portable(fragment, roots):
+                return True
+    return False
+
+
+def _path_exists_on_host(path: str) -> bool:
+    """Существует ли путь на этом ПК (с поправкой на разделители в тестах)."""
+    candidate = str(path or "").strip()
+    if not candidate:
+        return False
+    variants = [candidate]
+    if os.sep != "\\":
+        variants.append(candidate.replace("\\", "/"))
+    for item in variants:
+        try:
+            if os.path.exists(item):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _record_has_live_expanded_path(values: Dict[str, Any],
+                                   roots: "Sequence[str]") -> bool:
+    """Переменная записи ведёт в существующий путь вне портатива.
+
+    Это защита от ложного удаления: ``%LOCALAPPDATA%\\Programs\\cursor``
+    раскрывается и внутрь портатива, и в настоящий профиль пользователя.
+    Если по «настоящему» адресу лежат файлы — программа действительно
+    установлена, запись трогать нельзя.
+    """
+    for value in _variable_values(values):
+        for fragment in _path_fragments(_expand_record_value(value)):
+            if path_points_into_portable(fragment, roots):
+                continue
+            if _path_exists_on_host(fragment):
+                return True
+    return False
+
+
+def _record_is_orphan(values: Dict[str, Any],
+                      roots: "Sequence[str]",
+                      extra_env: "Optional[Dict[str, str]]" = None) -> bool:
+    """Запись ссылается только на пути, которых на этом ПК нет.
+
+    Так выглядит след установки, сделанной внутри портатива: программа
+    установилась в ``App``, а запись помнит каталог, которого на компьютере
+    никогда не было (``%LOCALAPPDATA%\\Programs\\cursor`` — раскрытая
+    переменная настоящего профиля). Настоящая установка той же программы
+    оставляет существующие файлы, поэтому не попадает под правило.
+    """
+    fragments = _record_path_fragments(values, extra_env)
+    if not fragments:
+        return False
+    for fragment in fragments:
+        if path_points_into_portable(fragment, roots, extra_env):
+            continue
+        if _path_exists_on_host(fragment):
+            return False
+    return True
 
 
 def _normalised_record_name(value: str) -> str:
@@ -7532,7 +7713,26 @@ def _record_belongs_to_app(values: Dict[str, Any], key_name: str,
         found = _normalised_record_name(candidate)
         if not found:
             continue
-        if found == expected or expected in found or found in expected:
+        if found == expected:
+            return True
+        # Короткое имя («App», «FX») сравнивается только целиком: иначе
+        # «App» совпало бы с половиной записей списка приложений.
+        if len(expected) < 4 or len(found) < 4:
+            continue
+        if expected in found or found in expected:
+            return True
+    return False
+
+
+def _record_hidden_by_system(values: Dict[str, Any]) -> bool:
+    """Запись-компонент другой программы (``SystemComponent=1``).
+
+    Такие записи Панель управления не показывает, а их ключи принадлежат
+    msi-установке другого продукта — трогать их нельзя.
+    """
+    for name in ("SystemComponent", "NoRemove", "ParentKeyName"):
+        value = values.get(name)
+        if isinstance(value, str) and value.strip() not in ("", "0"):
             return True
     return False
 
@@ -7540,22 +7740,39 @@ def _record_belongs_to_app(values: Dict[str, Any], key_name: str,
 def _record_looks_like_this_portable(values: Dict[str, Any],
                                      roots: "Sequence[str]",
                                      app_name: str = "",
-                                     key_name: str = "") -> bool:
+                                     key_name: str = "",
+                                     extra_env: "Optional[Dict[str, str]]" = None,
+                                     remove_orphans: bool = True) -> bool:
     """Запись Uninstall принадлежит этому портативу.
 
-    Два условия сразу: имя совпадает с приложением и какое-то значение с путём
-    ведёт внутрь папки портатива. Одного пути мало (папка может быть широкой),
-    одного имени тоже (у пользователя бывает настоящая установка той же
-    программы).
+    Имя обязано совпадать с приложением — одного пути мало (папка портатива
+    может быть широкой), одного имени тоже (у пользователя бывает настоящая
+    установка той же программы). Дальше достаточно одного из трёх:
+
+    * какое-то путевое значение ведёт внутрь портатива (текущего или прежнего
+      места);
+    * путь записан переменной (``%LOCALAPPDATA%``), которая внутри портатива
+      означает его собственный профиль, — и по этому адресу в настоящем
+      профиле файлов нет;
+    * все пути записи на этом ПК отсутствуют: это след установки, сделанной
+      внутри портатива, а не работающая программа.
     """
+    if _record_hidden_by_system(values):
+        return False
     if not _record_belongs_to_app(values, key_name, app_name):
         return False
-    path_values = {item.casefold() for item in UNINSTALL_PATH_VALUES}
-    for name, value in values.items():
-        if str(name).casefold() not in path_values:
-            continue
-        if isinstance(value, str) and path_points_into_portable(value, roots):
-            return True
+    # Прямой путь внутрь портатива (в том числе в его прежнее место).
+    if _record_points_into_portable(values, roots):
+        return True
+    # Путь записан переменной (%LOCALAPPDATA% и т. п.), которая внутри
+    # портатива означает его профиль. Настоящую установку по тому же адресу
+    # не трогаем — для неё переменная раскрывается в существующие файлы.
+    if (_record_variables_resolve_into_portable(values, roots, extra_env)
+            and not _record_has_live_expanded_path(values, roots)):
+        return True
+    # Запись ссылается только на несуществующие пути — след установки.
+    if remove_orphans and _record_is_orphan(values, roots, extra_env):
+        return True
     return False
 
 
@@ -7571,7 +7788,9 @@ def _uninstall_registry_views() -> "list[tuple[Any, int, int, str]]":
     if reg is None:
         return []
     read = getattr(reg, "KEY_READ", 0)
-    write = getattr(reg, "KEY_WRITE", 0)
+    # RegDeleteKey требует у родительского ключа право DELETE; KEY_WRITE без
+    # него на некоторых системах даёт «отказано в доступе» даже своему ключу.
+    write = getattr(reg, "KEY_WRITE", 0) | getattr(reg, "DELETE", 0)
     views: "list[tuple[Any, int, int, str]]" = [
         (reg.HKEY_CURRENT_USER, read, write, "HKCU"),
         (reg.HKEY_LOCAL_MACHINE,
@@ -7606,17 +7825,105 @@ def _read_uninstall_entry(reg, hive, access: int, name: str
         return None
 
 
+#: Имя куста в конфиге сборки (``host_cleanup.records``) -> имя в winreg.
+_HIVE_BY_NAME = {
+    "HKCU": "HKEY_CURRENT_USER",
+    "HKEY_CURRENT_USER": "HKEY_CURRENT_USER",
+    "HKLM": "HKEY_LOCAL_MACHINE",
+    "HKEY_LOCAL_MACHINE": "HKEY_LOCAL_MACHINE",
+}
+
+
+def _host_cleanup_settings(cfg: "Optional[Dict[str, Any]]") -> Dict[str, Any]:
+    settings = (cfg or {}).get("host_cleanup")
+    return settings if isinstance(settings, dict) else {}
+
+
+def configured_install_records(cfg: "Optional[Dict[str, Any]]"
+                               ) -> "list[Dict[str, str]]":
+    """Записи, которые сборщик точно видел созданными этим установщиком.
+
+    ``host_cleanup.records`` в ``launcher_config.json`` — страховка на случай,
+    когда значения записи уже переписаны (путь обновлён, переменные не
+    раскрываются, DisplayName заменён апдейтером). Сборщик сравнивал снимки
+    реестра до и после установки, поэтому такой ключ — доказанно наш.
+    """
+    records = _host_cleanup_settings(cfg).get("records")
+    if not isinstance(records, list):
+        return []
+    parsed: "list[Dict[str, str]]" = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip().strip("\\")
+        hive = _HIVE_BY_NAME.get(str(item.get("hive") or "HKCU").upper(), "")
+        if not path or not hive:
+            continue
+        # Удалять можно только записи списка приложений: путь из конфига
+        # обязан лежать внутри Uninstall, иначе он игнорируется.
+        normalised = path.replace("/", "\\").casefold()
+        if not normalised.startswith(UNINSTALL_KEY_PATH.casefold() + "\\"):
+            continue
+        name = path.rsplit("\\", 1)[-1]
+        parsed.append({
+            "hive": hive,
+            "path": path,
+            "name": name,
+            "display": str(item.get("display") or ""),
+        })
+    return parsed
+
+
+def _hive_handle(reg, name: str):
+    return getattr(reg, name, None)
+
+
+def _uninstall_view_labels(reg, hive_name: str) -> "list[tuple[int, str]]":
+    """(флаг представления, подпись) для ключа из конфига: 64 и 32 бита."""
+    views = [(0, "HKCU" if hive_name == "HKEY_CURRENT_USER" else "HKLM")]
+    if hive_name == "HKEY_LOCAL_MACHINE":
+        wow32 = getattr(reg, "KEY_WOW64_32KEY", 0)
+        if wow32:
+            views.append((wow32, "HKLM32"))
+    return views
+
+
 def portable_install_records(root: Path,
                              cfg: "Optional[Dict[str, Any]]" = None
                              ) -> "list[Dict[str, Any]]":
-    """Записи «Установленные программы», которые создал этот портатив."""
+    """Записи «Установленные программы», которые создал этот портатив.
+
+    Два источника: обход списка приложений (с проверкой имени и пути) и
+    готовый список ключей из конфига сборки (``host_cleanup.records``) — он
+    снимает зависимость от того, что установщик записал в значения.
+    """
     reg = _winreg()
     if reg is None:
         return []
+    settings = _host_cleanup_settings(cfg)
+    remove_orphans = settings.get("remove_orphan_entries") is not False
     roots = _record_roots(root, cfg)
+    extra_env = _portable_env(root, cfg)
     app_name = str((cfg or {}).get("app_name") or "")
     found: "list[Dict[str, Any]]" = []
-    for hive, read_access, _write_access, label in _uninstall_registry_views():
+    seen: "set[tuple[str, str]]" = set()
+
+    def _add(hive, read_access: int, write_access: int, label: str,
+             name: str, values: "Dict[str, Any]", explicit: bool) -> None:
+        key = (label, name.casefold())
+        if key in seen:
+            return
+        seen.add(key)
+        found.append({
+            "hive": label,
+            "hive_handle": hive,
+            "write_access": int(write_access),
+            "name": name,
+            "display": str(values.get("DisplayName") or name),
+            "explicit": explicit,
+        })
+
+    for hive, read_access, write_access, label in _uninstall_registry_views():
         try:
             with reg.OpenKey(hive, UNINSTALL_KEY_PATH, 0, read_access) as parent:
                 names = []
@@ -7633,16 +7940,34 @@ def portable_install_records(root: Path,
             values = _read_uninstall_entry(reg, hive, read_access, name)
             if not values:
                 continue
-            if not _record_looks_like_this_portable(values, roots,
-                                                    app_name, name):
+            if not _record_looks_like_this_portable(
+                    values, roots, app_name, name,
+                    extra_env=extra_env, remove_orphans=remove_orphans):
                 continue
-            found.append({
-                "hive": label,
-                "hive_handle": hive,
-                "write_access": _write_access,
-                "name": name,
-                "display": str(values.get("DisplayName") or name),
-            })
+            _add(hive, read_access, write_access, label, name, values, False)
+
+    # Ключи из конфига сборки: их создал именно этот установщик (сравнение
+    # снимков реестра). Даже если значения уже не выглядят «портативными»,
+    # запись остаётся следом установки, а не работающей программой.
+    for record in configured_install_records(cfg):
+        hive_name = record["hive"]
+        hive = _hive_handle(reg, hive_name)
+        if hive is None:
+            continue
+        name = record["name"]
+        for view, label in _uninstall_view_labels(reg, hive_name):
+            read_access = getattr(reg, "KEY_READ", 0) | view
+            write_access = (getattr(reg, "KEY_WRITE", 0)
+                            | getattr(reg, "DELETE", 0) | view)
+            values = _read_uninstall_entry(reg, hive, read_access, name)
+            if not values:
+                continue
+            if not _record_hidden_by_system(values) and (
+                    _record_belongs_to_app(values, name, app_name)
+                    or _record_is_orphan(values, roots, extra_env)):
+                _add(hive, read_access, write_access, label, name, values,
+                     True)
+            break
     return found
 
 
@@ -7680,6 +8005,88 @@ def remove_portable_install_records(root: Path,
         lines.append(f"удалена запись «{display}» из списка установленных "
                      f"приложений ({record['hive']})")
     return lines, needs_admin
+
+
+def describe_install_records(root: Path,
+                             cfg: "Optional[Dict[str, Any]]" = None
+                             ) -> "list[str]":
+    """Что лончер думает о записях этого приложения — для ``--diagnose``.
+
+    Показывает и те записи, которые решено оставить: по строке видно, почему
+    запись не считается следом портатива (например, программа установлена
+    по-настоящему и её файлы существуют). Без этого «не удалилось» выглядит
+    как ошибка, хотя правило сработало верно.
+    """
+    reg = _winreg()
+    if reg is None:
+        return ["реестр Windows недоступен: проверка списка приложений "
+                "выполняется только на Windows"]
+    settings = _host_cleanup_settings(cfg)
+    if settings.get("hide_installed_entry") is False:
+        return ["уборка записи из списка приложений отключена в конфиге "
+                "(host_cleanup.hide_installed_entry = false)"]
+    remove_orphans = settings.get("remove_orphan_entries") is not False
+    roots = _record_roots(root, cfg)
+    extra_env = _portable_env(root, cfg)
+    app_name = str((cfg or {}).get("app_name") or "")
+    lines: "list[str]" = [
+        "приложение: " + (app_name or "(не задано)"),
+        "корни этого портатива: " + "; ".join(roots),
+    ]
+    ours = {(record["hive"], record["name"].casefold())
+            for record in portable_install_records(root, cfg)}
+    seen = 0
+    for hive, read_access, _write_access, label in _uninstall_registry_views():
+        try:
+            with reg.OpenKey(hive, UNINSTALL_KEY_PATH, 0, read_access) as parent:
+                names = []
+                index = 0
+                while len(names) < UNINSTALL_MAX_ENTRIES:
+                    try:
+                        names.append(reg.EnumKey(parent, index))
+                    except OSError:
+                        break
+                    index += 1
+        except OSError:
+            continue
+        for name in names:
+            values = _read_uninstall_entry(reg, hive, read_access, name)
+            if not values:
+                continue
+            if not _record_belongs_to_app(values, name, app_name):
+                continue
+            seen += 1
+            display = str(values.get("DisplayName") or name)
+            mine = (label, name.casefold()) in ours
+            reason = _record_reason(values, roots, extra_env, remove_orphans)
+            verdict = "будет удалена" if mine else "оставлена"
+            lines.append(f"{label}\\{name}: «{display}» — {verdict} ({reason})")
+    if not seen:
+        lines.append("записей с именем этого приложения в списке "
+                     "установленных программ нет")
+    for record in configured_install_records(cfg):
+        lines.append("запись из сборки: " + record["hive"] + "\\"
+                     + record["path"])
+    return lines
+
+
+def _record_reason(values: Dict[str, Any], roots: "Sequence[str]",
+                   extra_env: "Optional[Dict[str, str]]",
+                   remove_orphans: bool) -> str:
+    """Короткое объяснение решения по записи."""
+    if _record_hidden_by_system(values):
+        return "запись-компонент другой программы (SystemComponent)"
+    if _record_points_into_portable(values, roots):
+        return "путь ведёт внутрь портатива"
+    if _record_variables_resolve_into_portable(values, roots, extra_env):
+        if _record_has_live_expanded_path(values, roots):
+            return "файлы установки есть в настоящем профиле: похоже на настоящую установку"
+        return "переменная профиля раскрывается внутрь портатива"
+    if _record_is_orphan(values, roots, extra_env):
+        if remove_orphans:
+            return "все пути записи на этом ПК отсутствуют"
+        return "пути отсутствуют, но уборка таких записей выключена"
+    return "файлы установки есть вне портатива (похоже на настоящую установку)"
 
 
 def _machine_registry_pending(root: Path, cfg: "Dict[str, Any]") -> bool:
@@ -7744,6 +8151,80 @@ def clean_installed_programs_command(root: "Optional[Path]" = None) -> int:
     if needs_admin:
         return 1
     return 0
+
+
+def forget_installed_entry(name: str, root: "Optional[Path]" = None,
+                           cfg: "Optional[Dict[str, Any]]" = None
+                           ) -> "list[str]":
+    """Удаляет записи списка приложений по указанному имени — вручную.
+
+    Нужно, когда запись осталась от сборки прежней версией: в её значениях
+    может не быть ни одного пути (чистый MSI) или путь уже переписан, и
+    автоматическое правило её не опознаёт. Действие явное: пользователь сам
+    назвал программу, поэтому путь не проверяется, но проверяется имя —
+    ``DisplayName`` или имя ключа обязаны содержать запрошенное название.
+    """
+    reg = _winreg()
+    if reg is None:
+        return ["реестр Windows недоступен: действие выполняется только "
+                "на Windows"]
+    needle = _normalised_record_name(name)
+    if not needle:
+        return ["не задано имя записи"]
+    app_name = str((cfg or {}).get("app_name") or name)
+    lines: "list[str]" = []
+    for hive, read_access, write_access, label in _uninstall_registry_views():
+        try:
+            with reg.OpenKey(hive, UNINSTALL_KEY_PATH, 0,
+                             write_access) as parent:
+                names = []
+                index = 0
+                while len(names) < UNINSTALL_MAX_ENTRIES:
+                    try:
+                        names.append(reg.EnumKey(parent, index))
+                    except OSError:
+                        break
+                    index += 1
+        except OSError:
+            continue
+        for key_name in names:
+            values = _read_uninstall_entry(reg, hive, read_access, key_name)
+            if not values:
+                continue
+            display = str(values.get("DisplayName") or key_name)
+            found = (_normalised_record_name(display)
+                     or _normalised_record_name(key_name))
+            if needle not in found:
+                continue
+            try:
+                with reg.OpenKey(hive, UNINSTALL_KEY_PATH, 0,
+                                 write_access) as parent:
+                    reg.DeleteKey(parent, key_name)
+            except OSError as exc:
+                lines.append(f"не удалось удалить «{display}» ({label}): {exc}")
+                continue
+            lines.append(f"удалена запись «{display}» ({label}\\{key_name})")
+    if not lines:
+        lines.append(f"записей с именем «{name}» не найдено "
+                     f"(проверялось приложение «{app_name}»)")
+    return lines
+
+
+def forget_installed_entry_command(name: str,
+                                   root: "Optional[Path]" = None) -> int:
+    """``--remove-installed-entry ИМЯ``: ручная уборка записи из списка."""
+    root = root or find_portable_root()
+    try:
+        cfg = read_launcher_config(root)
+    except Exception:  # noqa: BLE001 - конфиг мог не читаться
+        cfg = {}
+    lines = forget_installed_entry(name, root, cfg)
+    for line in lines:
+        _run_log(root, "installed programs: " + line)
+    report = "\n".join(lines)
+    print(report)
+    _show_info(report, "Список установленных программ")
+    return 0 if all(line.startswith("удалена") for line in lines) else 1
 
 
 # --- маркер в реестре и в настройках программы --------------------------------
@@ -9932,21 +10413,12 @@ def diagnose(root: Optional[Path] = None) -> int:
 
     add("Список «Установленные программы»")
     add("-" * 60)
-    cleanup_settings = cfg.get("host_cleanup") if isinstance(cfg, dict) else None
-    hidden = not (isinstance(cleanup_settings, dict)
-                  and cleanup_settings.get("hide_installed_entry") is False)
-    add(f"запись портатива скрывается: {'да' if hidden else 'нет (host_cleanup)'}")
     try:
-        records = portable_install_records(root, cfg)
+        for line in describe_install_records(root, cfg):
+            add(line)
     except Exception as exc:  # noqa: BLE001 - отчёт не должен падать
-        records = []
         add(f"проверить не удалось: {exc}")
-    if records:
-        for record in records:
-            add(f"  НАЙДЕНА: «{record['display']}» ({record['hive']}) — "
-                "указывает внутрь портатива и будет удалена")
-    else:
-        add("записей этого портатива нет")
+    add("  Ручная уборка: Launch.bat --remove-installed-entry \"Cursor\"")
     add("")
 
     add("Предстартовые шаги (прошлый запуск)")
@@ -10040,6 +10512,17 @@ def main() -> int:
                                        "/clean-installed-entry")
                for arg in sys.argv[1:]):
             return clean_installed_programs_command(root)
+        if any(str(arg).casefold() in ("--remove-installed-entry",
+                                       "/remove-installed-entry")
+               for arg in sys.argv[1:]):
+            value = ""
+            args = list(sys.argv[1:])
+            for index, item in enumerate(args):
+                if str(item).casefold() in ("--remove-installed-entry",
+                                            "/remove-installed-entry"):
+                    value = args[index + 1] if index + 1 < len(args) else ""
+                    break
+            return forget_installed_entry_command(value, root)
         if any(str(arg).casefold() in ("--import-reg", "/import-reg")
                for arg in sys.argv[1:]):
             value = ""

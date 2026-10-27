@@ -153,6 +153,16 @@ class LauncherConfig:
     # внутри портатива (см. core/registry.safe_uninstall_entries). Портатив не
     # устанавливается, поэтому по умолчанию да.
     hide_installed_entry: bool = True
+    # Убирать ли и «осиротевшие» записи с тем же именем, чьи пути на этом ПК
+    # отсутствуют. Так выглядит след установки, сделанной внутри портатива:
+    # файлы легли в App, а запись помнит каталог, которого здесь никогда не
+    # было. Настоящая установка той же программы оставляет существующие файлы
+    # и не трогается.
+    remove_orphan_entries: bool = True
+    # Записи списка приложений, которые этот установщик создал при сборке
+    # (сравнение снимков реестра до и после). Лончер удаляет именно их, даже
+    # если значения уже переписаны апдейтером программы.
+    host_cleanup_records: List[Dict[str, str]] = field(default_factory=list)
     # Чистить ли PortableData\Temp между запусками: распакованное туда
     # установщиками и держит потом папку.
     shutdown_purge_temp: bool = True
@@ -1882,6 +1892,21 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         return [{str(k): str(v) for k, v in item.items()}
                 for item in value if isinstance(item, dict)]
 
+    # Секция host_cleanup: перевыпуск лончера («Обновить лончер») не должен
+    # терять ни выключатель уборки, ни ключи, замеченные при сборке.
+    host_cleanup = data.get("host_cleanup")
+    if not isinstance(host_cleanup, dict):
+        host_cleanup = {}
+    cleanup_records: List[Dict[str, str]] = []
+    for item in host_cleanup.get("records") or []:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        cleanup_records.append({
+            "hive": str(item.get("hive", "")),
+            "path": str(item.get("path", "")),
+            "display": str(item.get("display", "")),
+        })
+
     return LauncherConfig(
         app_name=text("app_name", "Portable"),
         target_exe_rel=text("target_exe_rel"),
@@ -1920,6 +1945,11 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
         shutdown_deep_check=shutdown.get("deep_check", True) is not False,
         shutdown_handle_budget=number("handle_budget", 8.0),
         shutdown_purge_temp=shutdown.get("purge_temp", True) is not False,
+        hide_installed_entry=(
+            host_cleanup.get("hide_installed_entry", True) is not False),
+        remove_orphan_entries=(
+            host_cleanup.get("remove_orphan_entries", True) is not False),
+        host_cleanup_records=cleanup_records,
         language=text("language"),
         # Секция относительных путей переносится как есть: без неё
         # перевыпущенный лончер забыл бы, что папку можно переносить.
@@ -2583,6 +2613,40 @@ def identity_settings(cfg: "LauncherConfig") -> Optional[Dict[str, object]]:
     return None
 
 
+def installed_entry_records(keys: Sequence[str],
+                            displays: Sequence[str] = ()) -> List[Dict[str, str]]:
+    """Записи списка приложений в виде секции ``host_cleanup.records``.
+
+    ``keys`` — полные пути ключей (``HKCU\\Software\\...\\Uninstall\\{GUID}_is1``),
+    ``displays`` — их названия для журнала (порядок совпадает). Путь обязан
+    лежать внутри Uninstall: лончер удаляет только такие ключи.
+    """
+    records: List[Dict[str, str]] = []
+    for index, key in enumerate(keys):
+        text = str(key or "").strip()
+        if not text or "\\" not in text:
+            continue
+        hive, _sep, path = text.partition("\\")
+        hive_key = hive.casefold()
+        short_hive = ("HKCU" if hive_key in {"hkcu", "hkey_current_user"}
+                      else "HKLM" if hive_key in {"hklm", "hkey_local_machine"}
+                      else "")
+        if not short_hive:
+            continue
+        lowered = path.casefold()
+        if "\\currentversion\\uninstall\\" not in "\\" + lowered:
+            continue
+        display = ""
+        if index < len(displays):
+            display = str(displays[index] or "")
+        records.append({
+            "hive": short_hive,
+            "path": path,
+            "display": display,
+        })
+    return records
+
+
 def render_config_json(cfg: LauncherConfig) -> str:
     targets_data = [
         {
@@ -2650,6 +2714,16 @@ def render_config_json(cfg: LauncherConfig) -> str:
     # указывающую внутрь портатива (в том числе в его прежнее место).
     payload["host_cleanup"] = {
         "hide_installed_entry": bool(cfg.hide_installed_entry),
+        "remove_orphan_entries": bool(cfg.remove_orphan_entries),
+        "records": [
+            {
+                "hive": str(item.get("hive") or ""),
+                "path": str(item.get("path") or ""),
+                "display": str(item.get("display") or ""),
+            }
+            for item in cfg.host_cleanup_records
+            if isinstance(item, dict) and item.get("path")
+        ],
     }
     if cfg.language:
         payload["language"] = cfg.language
