@@ -3286,47 +3286,58 @@ class Portablizer:
 
     def _cleanup_host(self, capture: RegistryCapture, opts: PortableOptions,
                       result: PortableResult) -> None:
-        """При согласии удаляет только подтверждённую запись приложения.
+        """Убирает только собственную запись приложения из списка программ.
 
         Никакой общий diff реестра не импортируется: устаревший снимок не
         должен сбрасывать активацию, ассоциации и настройки, изменённые другим
-        процессом. Для единственной разрешённой записи требуется отдельная
-        галочка и её точное подтверждение при создании портатива.
+        процессом. Удаляется ровно то, что установщик создал за эту сборку.
+
+        Два пути: импорт ``cleanup_host.reg`` (работает и без прав на Python —
+        файл остаётся рядом как ручной хелпер) и прямое удаление ключей через
+        ``winreg`` в нужном представлении WOW64. Второй точнее и не зависит от
+        политики импорта .reg.
         """
-        if not opts.cleanup_host or not capture.cleanup_file or not IS_WINDOWS:
+        if not opts.cleanup_host or not IS_WINDOWS:
+            return
+        if not capture.cleanup_keys and not capture.cleanup_file:
             return
 
-        rc = self._reg_import(capture.cleanup_file)
-        if rc == 0:
-            # Проверяем результат, а не верим коду возврата: запись могла
-            # остаться в другом представлении реестра (WOW64) или её успел
-            # вернуть сам установщик.
-            remaining = reg_mod.existing_uninstall_keys(capture.cleanup_keys)
-            if remaining:
+        rc = self._reg_import(capture.cleanup_file) if capture.cleanup_file else 1
+        removed, _left = reg_mod.delete_uninstall_keys(capture.cleanup_keys)
+        if removed:
+            self.log.info(
+                "Записи списка приложений удалены напрямую из реестра: "
+                + ", ".join(removed))
+
+        # Проверяем результат, а не верим коду возврата: запись могла остаться
+        # в другом представлении реестра (WOW64) или её успел вернуть сам
+        # установщик.
+        remaining = reg_mod.existing_uninstall_keys(capture.cleanup_keys)
+        if remaining:
+            self.log.warn(
+                "Запись приложения всё ещё есть в списке установленных "
+                "программ: " + ", ".join(remaining)
+                + ". Лончер уберёт её при первом запуске портатива "
+                  "(он проверяет запись на каждом старте)."
+            )
+            result.cleanup_pending = True
+            if rc != 0:
+                target = capture.cleanup_cmd_file or capture.cleanup_file
                 self.log.warn(
-                    "Запись приложения всё ещё есть в списке установленных "
-                    "программ: " + ", ".join(remaining)
-                    + ". Лончер уберёт её при первом запуске портатива "
-                      "(он проверяет запись на каждом старте)."
-                )
-                result.cleanup_pending = True
-                return
-            result.removed_from_installed_list = list(capture.cleanup_entries)
-            if capture.cleanup_entries:
-                self.log.ok(
-                    "Удалена только новая запись приложения из списка "
-                    "«Установленные программы»: "
-                    + ", ".join(capture.cleanup_entries)
+                    "Импорт cleanup_host.reg не сработал (код "
+                    f"{rc}), возможно, нужны права администратора. Никакие "
+                    "другие ключи реестра не менялись. При необходимости "
+                    f"проверьте: {target}"
                 )
             return
 
-        result.cleanup_pending = True
-        target = capture.cleanup_cmd_file or capture.cleanup_file
-        self.log.warn(
-            "Не удалось удалить подтверждённую запись приложения "
-            "(возможно, нужны права администратора). Никакие другие ключи "
-            f"реестра не менялись. При необходимости проверьте: {target}"
-        )
+        result.removed_from_installed_list = list(capture.cleanup_entries)
+        if capture.cleanup_entries:
+            self.log.ok(
+                "Удалена только новая запись приложения из списка "
+                "«Установленные программы»: "
+                + ", ".join(capture.cleanup_entries)
+            )
 
     def _report_own_shortcuts(
         self, guard: "shortcuts_mod.ShortcutGuard", sweep: bool = False,
@@ -8310,6 +8321,14 @@ class Portablizer:
             registry_keys=list(capture.keys) if capture else [],
             registry_created_keys=list(capture.created_keys) if capture else [],
             registry_has_root_token=bool(capture and capture.has_root_token),
+            # Ключи списка приложений, которые создал этот установщик: лончер
+            # снимает их даже если значения записи потом перепишет апдейтер.
+            host_cleanup_records=(
+                launcher_mod.installed_entry_records(capture.cleanup_keys,
+                                                     capture.cleanup_entries)
+                if capture is not None
+                and getattr(opts, "cleanup_host", True) else []
+            ),
             extra_env=extra_env,
             path_prepend=path_prepend,
             redirect_known_folders=True,
