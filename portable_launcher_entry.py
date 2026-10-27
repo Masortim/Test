@@ -870,6 +870,31 @@ class _StageTimer:
         return total
 
 
+def launcher_packaging_reason(root: Optional[Path] = None) -> str:
+    """Строка для ``--diagnose``: почему лончер стартует быстро или медленно.
+
+    ``LaunchPortable.exe`` бывает собран двумя способами:
+
+    * **папкой** (onedir): рядом лежит ``_internal``, запуск — обычная загрузка
+      DLL, окно программы появляется сразу;
+    * **одним файлом** (onefile): при КАЖДОМ запуске exe распаковывает себя во
+      ``%TEMP%`` — десятки файлов, которые антивирус проверяет заново. Именно
+      это и выглядит как «фоновый процесс появился, а окно через несколько
+      секунд».
+    """
+    base = root if root is not None else find_portable_root()
+    exe = base / "App" / "LaunchPortable.exe"
+    payload = base / "App" / "_internal"
+    if payload.is_dir() and any(payload.iterdir()):
+        return ("упаковка:        папкой (_internal) — запуск без распаковки, "
+                "быстрый")
+    if exe.is_file():
+        return ("упаковка:        ОДНИМ ФАЙЛОМ — при каждом запуске "
+                "распаковывается во временную папку (медленно). Нажмите "
+                "«Обновить лончер» в Portablizer или пересоберите портатив.")
+    return "упаковка:        LaunchPortable.exe не найден"
+
+
 class _BackgroundWork:
     """Уборка на стороне Windows, которая не должна задерживать программу.
 
@@ -1233,6 +1258,9 @@ PATHS_TEXT_SUFFIXES = (
 #: медленнее прямого запуска exe.
 PATHS_SKIP_DIRS = (
     "temp", "tmp", "cache", "caches", "cache2", "gpucache", "shadercache",
+    # Папка содержимого лончера (App\_internal): ни маркера, ни путей
+    # программы там быть не может, а файлов в ней сотни.
+    "_internal",
     "codecache", "crashpad", "crashdumps", "logs",
     "node_modules", ".git", ".hg", ".svn",
     "blob_storage", "indexeddb", "service worker",
@@ -1752,14 +1780,17 @@ def import_reg_command(root: "Optional[Path]" = None,
     except OSError as exc:
         _run_log(root, f"registry: --import-reg: cannot write ({exc})")
         return 1
-    code = _reg(("import", str(target)))
-    _run_log(root, f"registry: --import-reg {path.name}: "
-                   f"{'ok' if code == 0 else f'FAILED (rc={code})'}")
+    if import_registry_file(target, root):
+        _run_log(root, f"registry: --import-reg {path.name}: ok")
+        result = 0
+    else:
+        _run_log(root, f"registry: --import-reg {path.name}: FAILED")
+        result = 1
     try:
         target.unlink()
     except OSError:
         pass
-    return 0 if code == 0 else 1
+    return result
 
 
 CONFIG_NAME = "launcher_config.json"
@@ -3166,6 +3197,9 @@ def _detect_app_reg_file_lang(
 APP_REG_SKIP_DIRS = frozenset({
     "portabledata", "redist", "_redist_cache", "updates",
     "node_modules", ".git", ".hg", ".svn", "cache", "caches", "logs", "temp",
+    # Содержимое onedir-сборки самого лончера (``App\_internal``): .reg-файлов
+    # там нет, а обход стоит времени.
+    "_internal",
 })
 
 #: Результат обхода App в этом процессе: ``sync_external_changes`` вызывается
@@ -3425,6 +3459,134 @@ def export_registry_text(keys: "Sequence[str]",
     return "\r\n".join(header + body)
 
 
+#: Типы значений .reg, которые можно записать напрямую через winreg.
+_REG_PLAIN_STRING_TYPES = {1: "REG_SZ", 2: "REG_EXPAND_SZ"}
+
+
+def _reg_rhs_value(rhs: str) -> "Optional[tuple[int, Any]]":
+    """Значение .reg (правая часть ``"Имя"=...``) -> ``(тип, значение)``.
+
+    Понимает ровно то, что пишут regedit и мы сами: строки, ``dword:`` и
+    ``hex:``/``hex(N):`` (включая UTF-16 строки). ``None`` — тип неизвестен,
+    такой файл лучше отдать ``reg.exe``.
+    """
+    text = rhs.strip()
+    if text.startswith('"') and text.endswith('"') and len(text) >= 2:
+        body = text[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        return REG_TYPE_SZ, body
+    lowered = text.casefold()
+    if lowered.startswith("dword:"):
+        try:
+            return REG_TYPE_DWORD, int(text[6:].strip(), 16) & 0xFFFFFFFF
+        except ValueError:
+            return None
+    if not lowered.startswith("hex"):
+        return None
+    kind: "Optional[int]" = REG_TYPE_BINARY
+    rest = text[3:]
+    if rest.startswith("(") and ")" in rest:
+        spec, _sep, rest = rest[1:].partition(")")
+        try:
+            kind = int(spec.strip(), 0)
+        except ValueError:
+            return None
+    if not rest.startswith(":"):
+        return None
+    digits = "".join(ch for ch in rest[1:] if ch not in " \r\n\t")
+    if not digits:
+        raw = b""
+    else:
+        try:
+            raw = bytes(int(item, 16) for item in digits.split(",") if item)
+        except ValueError:
+            return None
+    if kind in (REG_TYPE_BINARY, 0):
+        return REG_TYPE_BINARY, raw
+    if kind in _REG_PLAIN_STRING_TYPES:
+        value = raw.decode("utf-16-le", "replace").rstrip("\x00")
+        return kind, value
+    if kind == REG_TYPE_MULTI_SZ:
+        parts = raw.decode("utf-16-le", "replace").split("\x00")
+        while parts and not parts[-1]:
+            parts.pop()
+        return REG_TYPE_MULTI_SZ, parts
+    if kind == REG_TYPE_DWORD:
+        if len(raw) >= 4:
+            return REG_TYPE_DWORD, int.from_bytes(raw[:4], "little")
+        return None
+    if kind == REG_TYPE_QWORD:
+        if len(raw) >= 8:
+            return REG_TYPE_QWORD, int.from_bytes(raw[:8], "little")
+        return None
+    return kind, raw
+
+
+def _reg_hive_handle(reg, header: str):
+    """``(куст, путь)`` из заголовка секции; ``None`` — не наш куст."""
+    parts = [part for part in str(header).split("\\") if part]
+    if len(parts) < 2:
+        return None
+    hive_name = _HIVE_BY_NAME.get(parts[0].upper(), "")
+    if not hive_name:
+        return None
+    hive = getattr(reg, hive_name, None)
+    if hive is None:
+        return None
+    return hive, "\\".join(parts[1:])
+
+
+def import_registry_text(text: str) -> bool:
+    """Применяет .reg-документ напрямую через winreg (без процесса reg.exe).
+
+    Возвращает ``True``, только если файл применён целиком. Если в нём есть
+    удаления (``"имя"=-``, ``[-КЛЮЧ]``), тип значения, которого мы не знаем,
+    или машинный куст без прав администратора — ``False``: вызывающий код
+    импортирует файл прежним способом через ``reg.exe`` и получит ровно
+    прежнее поведение.
+    """
+    reg = _winreg()
+    if reg is None or not text:
+        return False
+    lowered = text.casefold()
+    if "=-" in lowered or "[-hkey" in lowered:
+        return False
+    sections = _parse_reg_sections(text)
+    if not sections:
+        return False
+    if "hkey_local_machine" in lowered and not _is_elevated():
+        # Машинные ключи пишет только администратор; запасной путь reg.exe
+        # сообщит об отказе так же, как раньше.
+        return False
+    try:
+        for header, values in sections.items():
+            located = _reg_hive_handle(reg, header)
+            if located is None:
+                continue
+            hive, path = located
+            with reg.CreateKeyEx(hive, path, 0, reg.KEY_WRITE) as handle:
+                for name, rhs in values.items():
+                    parsed = _reg_rhs_value(rhs)
+                    if parsed is None:
+                        return False
+                    kind, value = parsed
+                    reg.SetValueEx(handle, name, 0, kind, value)
+    except OSError:
+        return False
+    return True
+
+
+def import_registry_file(path: Path, root: "Optional[Path]" = None) -> bool:
+    """Импорт .reg напрямую, если это возможно; иначе — обычный ``reg import``."""
+    try:
+        text = _decode_reg(path.read_bytes())
+    except OSError:
+        return False
+    if not import_registry_text(text):
+        return _reg(("import", str(path))) == 0
+    _run_log(root, "registry import " + path.name + ": ok (direct)")
+    return True
+
+
 def write_reg_file(path: Path, text: str) -> bool:
     """Записывает .reg в UTF-16 с BOM и CRLF (так его понимает reg import)."""
     if not text:
@@ -3478,6 +3640,12 @@ def delete_key_tree(key: str) -> bool:
     except OSError:
         return True
     return False
+
+
+#: Результат последнего ``sync_external_changes`` по корню портатива:
+#: ``{корень: (отпечаток_входов, записи)}``. Функция вызывается до трёх раз
+#: за запуск, и повторный разбор тех же файлов — чистая трата времени.
+_REGISTRY_SYNC_CACHE: Dict[str, tuple] = {}
 
 
 class RegistrySession:
@@ -3605,6 +3773,36 @@ class RegistrySession:
                 except OSError:
                     pass
 
+    def _sync_fingerprint(
+            self, extra_files: Sequence[Path] = ()
+    ) -> "tuple":
+        """Отпечаток входных файлов: (путь, размер, время изменения).
+
+        Дешёвый способ понять, что с прошлого вызова ничего не изменилось:
+        сам разбор .reg-файлов (и особенно ``_read_host_key_reg_values``)
+        заметно дороже пары ``stat``.
+        """
+        initial_name = self.cfg.get("file", "portable.reg")
+        machine_name = self.cfg.get("machine_file", "portable_machine.reg")
+        paths: "list[Path]" = []
+        for name in (initial_name, machine_name):
+            if name:
+                paths.append(self.root / str(name))
+        if self.session.is_dir():
+            try:
+                paths.extend(sorted(self.session.glob("*.reg")))
+            except OSError:
+                pass
+        paths.extend(Path(item) for item in extra_files)
+        stamps: "list[tuple[str, int, int]]" = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            stamps.append((str(path), int(stat.st_size), int(stat.st_mtime_ns)))
+        return tuple(stamps)
+
     def sync_external_changes(
         self,
         extra_files: Sequence[Path] = (),
@@ -3612,9 +3810,18 @@ class RegistrySession:
         """Absorb external .reg changes (such as _Lang_SW\\x64\\Rus.reg applied
         on the host PC while the game was closed) into portable.reg,
         portable_machine.reg, and PortableData\\Registry\\*.reg before import.
+
+        Вызывается до трёх раз за запуск (перед стартом, из ``load`` и ещё раз
+        с экспортом созданных ключей). Повторный разбор тех же файлов ничего
+        не меняет, поэтому результат запоминается по отпечатку входов.
         """
         if not self.active:
             return []
+
+        fingerprint = self._sync_fingerprint(extra_files)
+        cached = _REGISTRY_SYNC_CACHE.get(str(self.root))
+        if cached is not None and cached[0] == fingerprint:
+            return list(cached[1])
 
         initial_name = self.cfg.get("file", "portable.reg")
         machine_name = self.cfg.get("machine_file", "portable_machine.reg")
@@ -3760,6 +3967,10 @@ class RegistrySession:
             self._apply_tail_overrides_to_files(overrides, base_values)
             for note in notes:
                 _run_log(self.root, f"registry sync: {note}")
+        # Отпечаток снимается ПОСЛЕ работы: файлы могли быть перезаписаны, и
+        # следующий вызов должен попасть в кэш только с новым отпечатком.
+        _REGISTRY_SYNC_CACHE[str(self.root)] = (
+            self._sync_fingerprint(extra_files), list(notes))
         return notes
 
     def _split_keys(self) -> "tuple[list[str], list[str]]":
@@ -3861,12 +4072,16 @@ class RegistrySession:
                              + ": skipped (only shell sections, nothing to "
                                "apply)")
                     continue
-                code = _reg(("import", str(imported)))
-                _run_log(
-                    self.root,
-                    f"registry import {source.name}: "
-                    f"{'ok' if code == 0 else f'FAILED (reg.exe rc={code})'}",
-                )
+                if import_registry_text(_decode_reg(imported.read_bytes())):
+                    _run_log(self.root, f"registry import {source.name}: ok "
+                                        "(direct)")
+                else:
+                    code = _reg(("import", str(imported)))
+                    _run_log(
+                        self.root,
+                        f"registry import {source.name}: "
+                        f"{'ok' if code == 0 else f'FAILED (reg.exe rc={code})'}",
+                    )
         for ext_file in created_exports:
             if ext_file.is_file():
                 try:
@@ -3913,9 +4128,10 @@ class RegistrySession:
 
         snapshot = self.backup / REGISTRY_SNAPSHOT_NAME
         if snapshot.is_file():
-            code = _reg(("import", str(snapshot)))
-            _run_log(self.root, "registry restore: "
-                               f"{'ok' if code == 0 else f'FAILED (rc={code})'}")
+            if import_registry_file(snapshot, self.root):
+                _run_log(self.root, "registry restore: ok")
+            else:
+                _run_log(self.root, "registry restore: FAILED")
             try:
                 snapshot.unlink()
             except OSError:
@@ -3929,7 +4145,7 @@ class RegistrySession:
                 if not backup_file.is_file():
                     continue
                 if str(key).casefold() not in self.created:
-                    _reg(("import", str(backup_file)))
+                    import_registry_file(backup_file, self.root)
                 try:
                     backup_file.unlink()
                 except OSError:
@@ -5454,7 +5670,8 @@ def _path_of_handle(duplicate) -> str:
         return ""
 
 
-def open_files_in(root: Path, budget: float = 8.0
+def open_files_in(root: Path, budget: float = 8.0,
+                  roots: "Optional[Sequence[Path]]" = None
                   ) -> "list[tuple[int, int, str, str]]":
     """Открытые файлы внутри папки: ``(pid, дескриптор, путь, образ)``.
 
@@ -5471,6 +5688,10 @@ def open_files_in(root: Path, budget: float = 8.0
         return []
     wanted_type = _file_type_index(table)
     prefix = str(root).rstrip("\\").casefold() + "\\"
+    # Пути интересующих папок: дескрипторы чужих файлов отбрасываются сразу,
+    # не доходя до разбора процессов.
+    wanted = [str(item).rstrip("\\").casefold() + "\\"
+              for item in (roots or ()) if str(item).strip()]
     own_images = {image.casefold() for image in _own_executable_images()}
     images = {pid: image for pid, image in _all_processes()}
     skip = {os.getpid()}
@@ -5513,8 +5734,12 @@ def open_files_in(root: Path, budget: float = 8.0
                     path = _path_of_handle(duplicate)
                 finally:
                     kernel32.CloseHandle(duplicate)
-                if path and path.casefold().startswith(prefix):
-                    found.append((pid, value, path, images.get(pid, "")))
+                if not path or not path.casefold().startswith(prefix):
+                    continue
+                if wanted and not any(path.casefold().startswith(item)
+                                      for item in wanted):
+                    continue
+                found.append((pid, value, path, images.get(pid, "")))
         finally:
             for process in opened.values():
                 if process:
@@ -5560,18 +5785,26 @@ def describe_open_files(items: "Sequence[tuple[int, int, str, str]]") -> str:
     return ", ".join(sorted(set(parts)))
 
 
-def busy_files(root: Path, budget: float = 4.0, limit: int = 12
-               ) -> "list[str]":
+def busy_files(root: Path, budget: float = 4.0, limit: int = 12,
+               roots: "Optional[Sequence[Path]]" = None) -> "list[str]":
     """Файлы папки, которые Windows прямо сейчас не отдаёт.
 
     Проверка делом и без всяких прав: файл открывается на монопольный
     доступ. Именно это условие стоит за «файл открыт в другой программе»,
     то есть за невозможностью удалить папку. Файлы самого лончера
     пропускаются - они освободятся, как только лончер выйдет.
+
+    ``roots`` ограничивает обход: у Cursor в ``App`` десятки тысяч файлов, и
+    открывать каждый ради поиска запертого файла во временной папке - это
+    секунды ожидания на ровном месте.
     """
     if not IS_WINDOWS or not root or not os.path.isdir(str(root)):
         return []
     import time
+
+    walk_roots = [str(item) for item in (roots or ()) if os.path.isdir(str(item))]
+    if not walk_roots:
+        walk_roots = [str(root)]
 
     try:
         import ctypes
@@ -5597,16 +5830,19 @@ def busy_files(root: Path, budget: float = 4.0, limit: int = 12
 
         deadline = time.monotonic() + budget
         suspects: list[str] = []
-        for current, _dirs, files in os.walk(str(root)):
-            if time.monotonic() > deadline or len(suspects) >= limit:
-                break
-            for name in files:
-                path = os.path.join(current, name)
-                if locked(path):
-                    suspects.append(path)
-                    if len(suspects) >= limit:
+        for walk_root in walk_roots:
+            for current, _dirs, files in os.walk(walk_root):
+                if time.monotonic() > deadline or len(suspects) >= limit:
+                    break
+                for name in files:
+                    path = os.path.join(current, name)
+                    if locked(path):
+                        suspects.append(path)
+                        if len(suspects) >= limit:
+                            break
+                    if time.monotonic() > deadline:
                         break
-                if time.monotonic() > deadline:
+                if time.monotonic() > deadline or len(suspects) >= limit:
                     break
         if not suspects:
             return []
@@ -5616,7 +5852,8 @@ def busy_files(root: Path, budget: float = 4.0, limit: int = 12
         return []
 
 
-def forget_fonts(root: Path, budget: float = 3.0) -> int:
+def forget_fonts(root: Path, budget: float = 3.0,
+                 roots: "Optional[Sequence[Path]]" = None) -> int:
     """Снимает регистрацию шрифтов, подключённых из папки портатива.
 
     Установщики (Inno Setup с его `is-XXXX.tmp`) подключают свои шрифты
@@ -5639,17 +5876,21 @@ def forget_fonts(root: Path, budget: float = 3.0) -> int:
         extensions = (".ttf", ".ttc", ".otf", ".fon", ".fnt")
         deadline = time.monotonic() + budget
         removed = 0
-        for current, _dirs, files in os.walk(str(root)):
-            if time.monotonic() > deadline:
-                break
-            for name in files:
-                if not name.casefold().endswith(extensions):
-                    continue
-                path = os.path.join(current, name)
-                for _repeat in range(8):
-                    if not gdi32.RemoveFontResourceW(path):
-                        break
-                    removed += 1
+        walk_roots = [str(item) for item in (roots or ()) if os.path.isdir(str(item))]
+        for walk_root in walk_roots or [str(root)]:
+            for current, _dirs, files in os.walk(walk_root):
+                if time.monotonic() > deadline:
+                    break
+                for name in files:
+                    if not name.casefold().endswith(extensions):
+                        continue
+                    path = os.path.join(current, name)
+                    for _repeat in range(8):
+                        if not gdi32.RemoveFontResourceW(path):
+                            break
+                        removed += 1
+                if time.monotonic() > deadline:
+                    break
         if removed:
             user32.PostMessageW(HWND_BROADCAST, WM_FONTCHANGE, 0, 0)
         return removed
@@ -5679,7 +5920,8 @@ def _installed_software_image(image: str) -> bool:
     return False
 
 
-def release_open_files(root: Path, budget: float = 8.0) -> "list[str]":
+def release_open_files(root: Path, budget: float = 8.0,
+                       roots: "Optional[Sequence[Path]]" = None) -> "list[str]":
     """Отпускает файлы папки, открытые кем-то снаружи.
 
     * безымянный фоновый «помощник» (без окна, запущен не из системных
@@ -5695,7 +5937,7 @@ def release_open_files(root: Path, budget: float = 8.0) -> "list[str]":
         return []
     import time
 
-    items = open_files_in(root, budget=budget)
+    items = open_files_in(root, budget=budget, roots=roots)
     if not items:
         return []
     visible = _visible_window_pids()
@@ -5917,7 +6159,8 @@ def release_portable_folder(root: Path,
 
 
 def release_leftover_handles(root: Path,
-                             settings: Optional[Dict[str, float]] = None
+                             settings: Optional[Dict[str, float]] = None,
+                             roots: "Optional[Sequence[Path]]" = None
                              ) -> "list[str]":
     """Добивает то, что держит папку уже без своего процесса.
 
@@ -5944,16 +6187,18 @@ def release_leftover_handles(root: Path,
     # папку чистой, второй не нужен.
     if time.monotonic() - _LAST_CLEAN_SWEEP < 10.0:
         return []
-    if not busy_files(root, budget=float(cfg.get("busy_budget", 4.0))):
+    if not busy_files(root, budget=float(cfg.get("busy_budget", 4.0)),
+                      roots=roots):
         _LAST_CLEAN_SWEEP = time.monotonic()
         return []
 
     stopped: list[str] = []
-    if forget_fonts(root):
+    if forget_fonts(root, roots=roots):
         stopped.append("сняты с регистрации шрифты портатива")
     stopped.extend(release_open_files(root, budget=float(
-        cfg.get("handle_budget", 8.0))))
-    if not busy_files(root, budget=float(cfg.get("busy_budget", 4.0))):
+        cfg.get("handle_budget", 8.0)), roots=roots))
+    if not busy_files(root, budget=float(cfg.get("busy_budget", 4.0)),
+                      roots=roots):
         _LAST_CLEAN_SWEEP = time.monotonic()
     return stopped
 
@@ -6367,17 +6612,111 @@ def sweep_stale_session(root: Path, cfg: "Dict[str, Any]") -> "list[str]":
     """
     if not IS_WINDOWS:
         return []
-    if _portable_process_list(root):
-        return []
-    done: list[str] = []
-    removed = purge_portable_temp(root, cfg)
-    if removed:
-        done.append(f"очищена временная папка портатива ({removed})")
-    if temp_leftovers(root, cfg):
-        done.extend(release_leftover_handles(root, shutdown_settings(cfg)))
-        if purge_portable_temp(root, cfg):
-            done.append("временная папка освобождена принудительно")
+    sweep = StaleSessionSweep(root, cfg)
+    sweep.prepare()
+    done = sweep.run()
     return done
+
+
+def _temp_dirs(root: Path,
+               cfg: "Optional[Dict[str, Any]]" = None) -> "list[Path]":
+    """Временные папки портатива (там и только там ждут своей очереди остатки)."""
+    config = cfg or {}
+    data_name = str(config.get("data_dir_name", "PortableData"))
+    return [root.joinpath(*relative) for relative in (
+        (data_name, "Temp"),
+        (data_name, "AppData", "Local", "Temp"),
+    )]
+
+
+class StaleSessionSweep:
+    """Остатки прошлого запуска: найти ДО старта, убрать ПОСЛЕ него.
+
+    Уборка временных папок — самая дорогая часть запуска на Windows: файлов
+    там бывают тысячи (Electron и установщики пишут в ``%TEMP%`` постоянно),
+    и каждый приходится удалять отдельным вызовом, мимо антивируса. Программе
+    эта уборка для появления окна не нужна, поэтому до старта выполняется
+    только дешёвая часть — проверка «из папки ничего не работает» и список
+    того, что надо удалить (один обход каталога). Само удаление идёт в фоне,
+    одновременно с запуском программы.
+
+    Если же что-то удалить не далось, разбор «кто держит файл» ограничивается
+    временными папками: раньше он открывал на монопольный доступ КАЖДЫЙ файл
+    всего портатива (у Cursor это десятки тысяч) и мог занять секунды.
+    """
+
+    def __init__(self, root: Path,
+                 cfg: "Optional[Dict[str, Any]]" = None) -> None:
+        self.root = root
+        self.cfg = cfg or {}
+        self.entries: "list[Path]" = []
+        self.skip = False
+        self.skip_reason = ""
+
+    def _dirs(self) -> "list[Path]":
+        return [folder for folder in _temp_dirs(self.root, self.cfg)
+                if folder.is_dir()]
+
+    def prepare(self) -> None:
+        """Дешёвая часть: можно ли трогать папку и что именно удалять."""
+        if not IS_WINDOWS:
+            self.skip = True
+            return
+        try:
+            if _portable_process_list(self.root):
+                # Из портатива уже что-то работает - это второй экземпляр
+                # программы, и его временные файлы трогать нельзя.
+                self.skip = True
+                self.skip_reason = "the program is already running"
+                return
+        except Exception:  # noqa: BLE001 - уборка не срывает запуск
+            pass
+        # Достаточно верхнего уровня: содержимое папки удалится вместе с ней.
+        for folder in self._dirs():
+            try:
+                self.entries.extend(folder.iterdir())
+            except OSError:
+                continue
+
+    def run(self) -> "list[str]":
+        """Дорогая часть — в фоне, пока программа уже запускается."""
+        if self.skip or not self.entries:
+            if self.skip_reason:
+                _run_log(self.root, "stale session cleanup skipped: "
+                         + self.skip_reason)
+            return []
+        removed = 0
+        for entry in self.entries:
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink()
+                removed += 1
+            except OSError:
+                continue
+        done: list[str] = []
+        if removed:
+            done.append(f"очищена временная папка портатива ({removed})")
+        left = [entry for entry in self.entries if entry.exists()]
+        if left:
+            # Что-то держат: разбираемся, но только во временных папках.
+            dirs = self._dirs()
+            done.extend(release_leftover_handles(
+                self.root, shutdown_settings(self.cfg), roots=dirs))
+            again = 0
+            for entry in left:
+                try:
+                    if entry.is_dir() and not entry.is_symlink():
+                        shutil.rmtree(entry, ignore_errors=True)
+                    else:
+                        entry.unlink()
+                    again += 1
+                except OSError:
+                    continue
+            if again:
+                done.append("временная папка освобождена принудительно")
+        return done
 
 
 # --- обновление программы внутри портатива ------------------------------------
@@ -8835,12 +9174,21 @@ def heal_host_registry(root: Path,
     """
     if not IS_WINDOWS:
         return []
-    reg = _winreg()
-    if reg is None:
-        return []
     settings = cfg or {}
     stale = list(stale_roots if stale_roots is not None
                  else remembered_roots(root, cfg))
+    # Быстрая отсечка: править нечего, если папку не переносили (нет прежних
+    # мест) и в захваченном реестре не осталось маркера корня. Обход ключей
+    # даже с бюджетом в 4000 значений — это тысячи вызовов winreg, и раньше
+    # он выполнялся при каждом запуске.
+    section = settings.get("registry")
+    token_possible = bool(isinstance(section, dict)
+                          and section.get("has_root_token"))
+    if not stale and not token_possible:
+        return []
+    reg = _winreg()
+    if reg is None:
+        return []
     names = _app_shortcut_names(root, settings)
     changed: "list[str]" = []
     try:
@@ -9467,6 +9815,16 @@ def adopt_updates_from_previous_locations(root: Path,
     protected = {"launchportable.exe", "saves"}
     copied: "list[str]" = []
     for stale_app in stale_app_dirs(root, cfg):
+        # Дешёвая отсечка: у папки, в которую ничего не писали с начала
+        # сеанса, время изменения старше этого начала. Обход всего прежнего
+        # App (у Cursor — сотни тысяч файлов, и каждый ещё и stat) выполнялся
+        # при КАЖДОМ запуске и занимал секунды; теперь он нужен только тогда,
+        # когда установщик действительно что-то туда положил.
+        try:
+            if stale_app.stat().st_mtime < since - STALE_MTIME_GRACE:
+                continue
+        except OSError:
+            continue
         for current, dirs, files in os.walk(stale_app):
             dirs[:] = [name for name in dirs
                        if name.casefold() not in ("saves", "portabledata",
@@ -10257,13 +10615,23 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # Остатки прошлого запуска убираются ДО старта: иначе они так и будут
     # держать папку, пока пользователь не перезагрузит компьютер. Уборка —
     # вспомогательный шаг: её сбой не должен мешать запуску программы.
+    # До старта — только наметка: что удалять и не работает ли уже второй
+    # экземпляр программы (трогать его временные файлы нельзя). Само удаление
+    # идёт в фоне вместе с запуском: в PortableData\Temp бывают тысячи
+    # файлов, и каждый — отдельный вызов, мимо антивируса.
+    stale_sweep = None
     try:
-        stale = sweep_stale_session(root, cfg)
-        if stale:
-            _run_log(root, "cleaned up after the previous session: "
-                     + ", ".join(sorted(set(stale))))
+        stale_sweep = StaleSessionSweep(root, cfg)
+        stale_sweep.prepare()
     except Exception as exc:  # noqa: BLE001 - уборка не срывает запуск
-        _run_log(root, f"stale session cleanup failed ({exc})")
+        _run_log(root, f"stale session check failed ({exc})")
+        stale_sweep = None
+    if stale_sweep is not None:
+        def _sweep_temporaries() -> "list[str]":
+            return ["cleaned up after the previous session: " + line
+                    for line in stale_sweep.run()]
+
+        background.submit(_sweep_temporaries, name="stale session")
 
     # Сквозные сохранения. Сессия создаётся ДО любых перенаправлений: она
     # обязана запомнить настоящие «Документы» этого ПК, пока Known Folder
@@ -10833,6 +11201,11 @@ def diagnose(root: Optional[Path] = None) -> int:
         add(f"полный путь:     {target}")
         add(f"существует:      {'да' if target.is_file() else 'НЕТ'}")
     add(f"target_args:     {cfg.get('target_args', [])}")
+    add("")
+
+    add("Сам лончер")
+    add("-" * 60)
+    add(launcher_packaging_reason(root))
     add("")
 
     add("Pipeline (как лончер будет запускать программу)")

@@ -360,6 +360,10 @@ class PortablizerOutputTests(unittest.TestCase):
             with mock.patch(
                 "portablizer.core.portablizer.bundled_exe_launcher_path",
                 return_value=str(template),
+            ), mock.patch(
+                # На CI рядом лежит и onedir-сборка лончера; тест про onefile.
+                "portablizer.core.portablizer.bundled_exe_launcher_dir",
+                return_value="",
             ):
                 rel = self.engine._copy_exe_launcher(str(portable))
 
@@ -377,6 +381,9 @@ class PortablizerOutputTests(unittest.TestCase):
             with mock.patch(
                 "portablizer.core.portablizer.bundled_exe_launcher_path",
                 return_value=str(template),
+            ), mock.patch(
+                "portablizer.core.portablizer.bundled_exe_launcher_dir",
+                return_value="",
             ):
                 rel = self.engine._copy_exe_launcher(str(portable))
 
@@ -4363,20 +4370,28 @@ class LauncherLeftoverCleanupTests(unittest.TestCase):
             root = Path(temp, "P")
             (root / "PortableData" / "Temp" / "is-1.tmp").mkdir(parents=True)
             calls = []
+
+            def fake_release(_root, _settings=None, roots=None):
+                # Разбор ограничен временными папками: обход всего портатива
+                # (у Cursor — десятки тысяч файлов) на старте недопустим.
+                calls.append([str(item) for item in (roots or [])])
+                return ["svchost.exe: файл"]
+
             with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
                     mock.patch.object(exe_launcher, "_portable_process_list",
                                       return_value=[]), \
-                    mock.patch.object(
-                        exe_launcher, "purge_portable_temp",
-                        side_effect=lambda *_a, **_k:
-                        calls.append("purge") or 0), \
                     mock.patch.object(exe_launcher, "release_leftover_handles",
-                                      return_value=["svchost.exe: файл"]):
+                                      side_effect=fake_release), \
+                    mock.patch.object(exe_launcher.shutil, "rmtree",
+                                      side_effect=OSError("файл занят")), \
+                    mock.patch.object(Path, "unlink",
+                                      side_effect=OSError("файл занят")):
                 done = exe_launcher.sweep_stale_session(root, {})
 
             self.assertIn("svchost.exe: файл", done)
-            # Удаление пробуется до разбора и ещё раз после него.
-            self.assertEqual(calls, ["purge", "purge"])
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0])
+            self.assertTrue(all("Temp" in item for item in calls[0]))
 
     def test_verdict_refuses_to_call_a_locked_folder_free(self):
         with tempfile.TemporaryDirectory() as temp:
