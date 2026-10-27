@@ -149,6 +149,10 @@ class LauncherConfig:
     # Сколько секунд отводится на обход дескрипторов: лучше неполный
     # разбор, чем лончер, который не выходит.
     shutdown_handle_budget: float = 8.0
+    # Убирать ли запись «Установленные программы», созданную установщиком
+    # внутри портатива (см. core/registry.safe_uninstall_entries). Портатив не
+    # устанавливается, поэтому по умолчанию да.
+    hide_installed_entry: bool = True
     # Чистить ли PortableData\Temp между запусками: распакованное туда
     # установщиками и держит потом папку.
     shutdown_purge_temp: bool = True
@@ -2640,6 +2644,12 @@ def render_config_json(cfg: LauncherConfig) -> str:
             "keys": consolidate_root_keys(cfg.registry_keys),
             "created_keys": consolidate_root_keys(cfg.registry_created_keys),
         },
+    }
+    # Следы установки на компьютере-сборщике: запись в списке приложений и
+    # проверка при каждом запуске. Лончер удаляет только запись, доказуемо
+    # указывающую внутрь портатива (в том числе в его прежнее место).
+    payload["host_cleanup"] = {
+        "hide_installed_entry": bool(cfg.hide_installed_entry),
     }
     if cfg.language:
         payload["language"] = cfg.language

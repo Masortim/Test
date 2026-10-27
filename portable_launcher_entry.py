@@ -770,6 +770,79 @@ def _run_log(root: Optional[Path], message: str) -> None:
         pass
 
 
+#: Шаги, которые лончер выполняет ДО старта программы. Замеры пишутся в
+#: журнал и в ``PortableData\\launch-timing.json``: по ним видно, что именно
+#: задерживает запуск, не гадая по жалобе «стартует очень медленно».
+LAUNCH_TIMING_NAME = "launch-timing.json"
+
+
+class _StageTimer:
+    """Секундомер предстартовых шагов: ``tick()`` закрывает предыдущий шаг.
+
+    Такой способ не требует оборачивать каждый блок в ``with``: достаточно
+    одной строки перед шагом, а диффы остаются читаемыми.
+    """
+
+    def __init__(self, data: Path) -> None:
+        self.data = data
+        self.steps: "list[tuple[str, float]]" = []
+        self._name = ""
+        self._started = 0.0
+
+    def tick(self, name: str) -> None:
+        now = time.perf_counter()
+        if self._name:
+            self.steps.append((self._name, now - self._started))
+        self._name = name
+        self._started = now
+
+    @property
+    def total(self) -> float:
+        finished = sum(seconds for _name, seconds in self.steps)
+        if self._name:
+            finished += time.perf_counter() - self._started
+        return finished
+
+    def finish(self, root: Optional[Path]) -> float:
+        """Пишет итог в журнал и в JSON; возвращает длительность, секунды."""
+        self.tick("")
+        total = sum(seconds for _name, seconds in self.steps)
+        if not self.steps:
+            return total
+        slowest = sorted(self.steps, key=lambda item: item[1], reverse=True)[:4]
+        summary = ", ".join(f"{name} {seconds:.2f}s"
+                            for name, seconds in slowest if seconds >= 0.05)
+        line = f"pre-launch: {total:.2f}s before the program starts"
+        if summary:
+            line += " (slowest: " + summary + ")"
+        _run_log(root, line)
+        try:
+            self.data.mkdir(parents=True, exist_ok=True)
+            (self.data / LAUNCH_TIMING_NAME).write_text(json.dumps({
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "total_seconds": round(total, 3),
+                "steps": [[name, round(seconds, 3)]
+                          for name, seconds in self.steps],
+            }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        return total
+
+
+def _last_launch_timing(data: Path) -> "list[str]":
+    """Строки для ``--diagnose``: где прошлый запуск провёл время."""
+    try:
+        payload = json.loads((data / LAUNCH_TIMING_NAME).read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        return ["(замеров нет: лончер ещё не запускал программу)"]
+    total = payload.get("total_seconds")
+    lines = [f"всего до старта: {total} s ({payload.get('at', '')})"]
+    for name, seconds in payload.get("steps") or []:
+        lines.append(f"  {seconds:>7} s  {name}")
+    return lines
+
+
 def _reg(args: Sequence[str]) -> int:
     """Run reg.exe without flashing a console window."""
     if not IS_WINDOWS:
@@ -835,8 +908,30 @@ _SHELL_PROTECTED_SUBKEYS = (
 )
 
 
-def _reg_section_is_shell_owned(header: str) -> bool:
-    """Секция .reg принадлежит оболочке Windows (импортировать нельзя)."""
+#: Следы установки. Портатив не устанавливается, поэтому эти ветки из
+#: ``portable.reg`` нельзя импортировать ни в каком виде: именно запись в
+#: ``Uninstall`` и рисует «Cursor» в списке «Установленные программы» на
+#: компьютере, где программу никогда не ставили (старые сборки переносили
+#: такие ключи в портатив, и лончер послушно их импортировал).
+_REG_TRACE_SUBKEYS = (
+    r"software\microsoft\windows\currentversion\uninstall",
+    r"software\microsoft\windows\currentversion\run",
+    r"software\microsoft\windows\currentversion\runonce",
+    r"software\microsoft\windows\currentversion\runservices",
+    r"software\microsoft\windows\currentversion\runservicesonce",
+    r"software\microsoft\windows\currentversion\installer",
+    r"software\microsoft\windows\currentversion\shareddlls",
+    r"software\microsoft\installer",
+    r"software\classes\installer",
+)
+
+#: Всё, что вырезается из .reg перед импортом: оболочка и следы установки.
+_REG_DROPPED_SUBKEYS = tuple(dict.fromkeys(
+    _SHELL_PROTECTED_SUBKEYS + _REG_TRACE_SUBKEYS))
+
+
+def _reg_section_is_dropped(header: str) -> bool:
+    """Секция .reg непригодна для импорта: оболочка Windows или след установки."""
     parts = [p for p in str(header or "").strip().strip("[]").split("\\") if p]
     if len(parts) < 2:
         return False
@@ -846,11 +941,21 @@ def _reg_section_is_shell_owned(header: str) -> bool:
     elif up in ("HKEY_USERS",):
         # HKEY_USERS\<SID>\Software\... — та же ветка пользователя.
         rest = parts[2:] if len(parts) > 2 else []
+    elif up in ("HKEY_LOCAL_MACHINE", "HKLM"):
+        # Следы установки бывают и в машинной ветке (установка «для всех»).
+        rest = parts[1:]
     else:
         return False
     path = "\\".join(rest).casefold()
+    if path.startswith("software\\wow6432node\\"):
+        path = "software\\" + path[len("software\\wow6432node\\"):]
     return any(path == prefix or path.startswith(prefix + "\\")
-               for prefix in _SHELL_PROTECTED_SUBKEYS)
+               for prefix in _REG_DROPPED_SUBKEYS)
+
+
+def _reg_section_is_shell_owned(header: str) -> bool:
+    """Секция .reg непригодна для импорта (старое имя, см. выше)."""
+    return _reg_section_is_dropped(header)
 
 
 def sanitize_reg_text(text: str) -> "tuple[str, list[str]]":
@@ -861,7 +966,7 @@ def sanitize_reg_text(text: str) -> "tuple[str, list[str]]":
     for line in (text or "").splitlines():
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
-            skip = _reg_section_is_shell_owned(stripped)
+            skip = _reg_section_is_dropped(stripped)
             if skip:
                 dropped.append(stripped.strip("[]"))
                 continue
@@ -1012,10 +1117,20 @@ PATHS_TEXT_SUFFIXES = (
     ".settings", ".prefs", ".toml", ".local", ".dat",
 )
 
-#: Каталоги, которые меняются каждую секунду и к переносу отношения не имеют.
+#: Каталоги, которые меняются каждую секунду и к переносу отношения не имеют,
+#: а также деревья пакетов, где настроек программы заведомо нет.
+#:
+#: ``node_modules`` — не мелочь: у Cursor/VS Code (``resources\\app\\node_modules``
+#: и ещё одно такое дерево в каждой распакованной папке расширения) это десятки
+#: тысяч ``package.json``. Пока каталог не пропускался, после переноса папки
+#: лончер читал их все при КАЖДОМ запуске, и программа открывалась в разы
+#: медленнее прямого запуска exe.
 PATHS_SKIP_DIRS = (
     "temp", "tmp", "cache", "caches", "cache2", "gpucache", "shadercache",
     "codecache", "crashpad", "crashdumps", "logs",
+    "node_modules", ".git", ".hg", ".svn",
+    "blob_storage", "indexeddb", "service worker",
+    "cacheddata", "cachedprofilesdata", "workspacestorage",
 )
 
 #: Потолки одного прохода: починка не должна задерживать запуск программы.
@@ -1024,9 +1139,22 @@ PATHS_MAX_FILES = 6000
 #: Потолок для глубокого обхода (обновление, ручная починка путей).
 PATHS_DEEP_MAX_FILES = 20000
 
+#: Сколько всего можно прочитать за один проход. Потолок на файл (2 МБ) сам по
+#: себе не спасает: 6000 файлов по 2 МБ — это 12 ГБ чтения, то есть минуты на
+#: обычном диске. 64 МБ — уже с запасом, а запуск остаётся предсказуемым.
+PATHS_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+
 #: Сколько прежних мест портатива помнить в штампе (кроме текущего).
 PATHS_STAMP_HISTORY = 5
 PATHS_MAX_BYTES = 2 * 1024 * 1024
+
+#: Отметка «проход по этому положению папки уже сделан».
+#:
+#: Штамп помнит прежние места портатива ВСЕГДА (на них смотрит установщик
+#: обновления), поэтому без этой отметки починка путей обходила и читала файлы
+#: при каждом запуске — вечно. Отметка хранится в том же штампе (``scan``) и
+#: сверяется с текущим набором прежних корней.
+PATHS_SCAN_VERSION = 2
 
 _PATHS_BOMS = (
     (b"\xef\xbb\xbf", "utf-8-sig"),
@@ -1106,7 +1234,29 @@ def _remembered_root_list(root: Path) -> "list[str]":
     return found
 
 
-def write_paths_stamp(root: Path, previous: str = "") -> None:
+def _scan_marker_covers(root: Path, remembered: "Sequence[str]") -> bool:
+    """Просмотрены ли файлы для этого положения папки.
+
+    Починка путей нужна только после переезда, но прежние места остаются в
+    штампе навсегда (на них смотрит установщик обновления). Поэтому «уже
+    смотрели» хранится отдельно и сверяется с набором прежних корней: новый
+    переезд меняет набор — и проход выполняется снова.
+    """
+    scan = _read_paths_stamp(root).get("scan")
+    if not isinstance(scan, dict):
+        return False
+    if int(scan.get("version") or 0) != PATHS_SCAN_VERSION:
+        return False
+    if str(scan.get("root", "")).casefold() != str(root).casefold():
+        return False
+    stored = [str(item) for item in scan.get("roots") or []]
+    if len(stored) != len(remembered):
+        return False
+    return all(a.casefold() == b.casefold() for a, b in zip(stored, remembered))
+
+
+def write_paths_stamp(root: Path, previous: str = "",
+                      scan_marker: "Optional[Sequence[str]]" = None) -> None:
     """Запоминает текущий корень портатива (для следующего переноса).
 
     Сохраняется не только предыдущее место, но и вся короткая история
@@ -1114,6 +1264,11 @@ def write_paths_stamp(root: Path, previous: str = "") -> None:
     записанный в настройках программы два переезда назад, тоже должен
     находиться — иначе установщик обновления возьмёт каталог установки из
     этого старого пути (жалоба «обновление поставилось по прежнему адресу»).
+
+    ``scan_marker`` — набор прежних корней, для которых файлы уже просмотрены
+    (см. :func:`repair_paths`). Без этой отметки починка путей выполняла полный
+    обход и чтение файлов при КАЖДОМ запуске: прежние места остаются в штампе
+    навсегда.
     """
     import time
 
@@ -1129,6 +1284,18 @@ def write_paths_stamp(root: Path, previous: str = "") -> None:
         payload["previous"] = history[0]
         if len(history) > 1:
             payload["history"] = history[1:PATHS_STAMP_HISTORY]
+    previous_scan = _read_paths_stamp(root).get("scan")
+    scan: Optional[Dict[str, Any]] = None
+    if scan_marker is not None:
+        scan = {"version": PATHS_SCAN_VERSION, "root": current,
+                "roots": [str(item) for item in scan_marker],
+                "at": payload["updated"]}
+    elif (isinstance(previous_scan, dict)
+          and str(previous_scan.get("root", "")).casefold() == current.casefold()):
+        # Отметка действует, пока папка лежит на месте.
+        scan = dict(previous_scan)
+    if scan:
+        payload["scan"] = scan
     try:
         _paths_stamp_file(root).parent.mkdir(parents=True, exist_ok=True)
         _paths_stamp_file(root).write_text(
@@ -1174,13 +1341,19 @@ def _iter_paths_files(root: Path, settings: Dict[str, Any],
     """
     suffixes = tuple(str(item).casefold()
                      for item in settings.get("suffixes") or PATHS_TEXT_SUFFIXES)
-    skip = {str(item).casefold()
-            for item in settings.get("skip_dirs") or PATHS_SKIP_DIRS}
+    # Встроенный список объединяется с настройками, а не заменяется ими:
+    # конфиг старого портатива содержит собственный ``skip_dirs``, и без
+    # объединения новые исключения (``node_modules``) к нему бы не пришли.
+    skip = {str(item).casefold() for item in PATHS_SKIP_DIRS}
+    skip.update(str(item).casefold()
+                for item in settings.get("skip_dirs") or ())
     limit = int(settings.get("max_files") or PATHS_MAX_FILES)
     if deep:
         limit = max(limit, PATHS_DEEP_MAX_FILES)
     include_app = bool(settings.get("include_app", True))
+    total_budget = int(settings.get("max_total_bytes") or 0) or PATHS_MAX_TOTAL_BYTES
     yielded = 0
+    read_bytes = 0
     app_name = "app"
     for current, dirs, files in os.walk(root):
         relative = os.path.relpath(current, root)
@@ -1201,11 +1374,16 @@ def _iter_paths_files(root: Path, settings: Dict[str, Any],
                 continue
             path = Path(current) / name
             try:
-                if path.is_symlink() or path.stat().st_size > int(
-                        settings.get("max_bytes") or PATHS_MAX_BYTES):
+                if path.is_symlink():
                     continue
+                size = path.stat().st_size
             except OSError:
                 continue
+            if size > int(settings.get("max_bytes") or PATHS_MAX_BYTES):
+                continue
+            if read_bytes + size > total_budget:
+                return
+            read_bytes += size
             yield path
             yielded += 1
             if yielded >= limit:
@@ -1239,10 +1417,17 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
             remembered.append(text)
     if not remembered:
         if not stamp:
-            write_paths_stamp(root)
+            write_paths_stamp(root, scan_marker=[])
         elif not _paths_stamp_text_file(root).is_file() and current.isascii():
             # Штамп мог быть записан старой версией без файла для Launch.bat.
             write_paths_stamp(root)
+        return []
+
+    if not force and _scan_marker_covers(root, remembered):
+        # Файлы уже просмотрены для этого места папки и этого набора прежних
+        # корней: ничего не читаем. Именно этот случай — обычный запуск
+        # портатива, который когда-то переносили, и раньше он стоил полного
+        # обхода дерева с чтением тысяч файлов на каждом старте.
         return []
 
     # Все начертания запомненных корней. Удвоенная форма (``C:\\\\Apps\\\\Foo``
@@ -1295,8 +1480,14 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
         except (OSError, UnicodeError):
             continue
         total += max(replaced, 1)
-        files.append(str(path.relative_to(root)))
-    write_paths_stamp(root, previous=remembered[0])
+        try:
+            files.append(str(path.relative_to(root)))
+        except ValueError:
+            files.append(str(path))
+    # Отметка «смотрели» ставится и тогда, когда ничего не нашлось: иначе
+    # следующий запуск снова обошёл бы всё дерево.
+    write_paths_stamp(root, previous=remembered[0],
+                      scan_marker=remembered)
     if not files:
         # Запомненный путь остался только в штампе и ни в одном файле
         # настроек не встретился: сообщать нечего.
@@ -2863,14 +3054,34 @@ def _detect_app_reg_file_lang(
     return None
 
 
+#: Каталоги внутри App, где .reg-файлов программы заведомо нет. Обход дерева
+#: пакетов (``node_modules`` у Cursor/VS Code — десятки тысяч файлов) на каждом
+#: запуске стоил секунд на медленном диске, а результата не давал.
+APP_REG_SKIP_DIRS = frozenset({
+    "portabledata", "redist", "_redist_cache", "updates",
+    "node_modules", ".git", ".hg", ".svn", "cache", "caches", "logs", "temp",
+})
+
+#: Результат обхода App в этом процессе: ``sync_external_changes`` вызывается
+#: дважды за запуск, и второй раз обходить дерево незачем.
+_APP_REG_CACHE: Dict[str, tuple] = {}
+
+
 def _discover_app_reg_files(
     root: Path,
 ) -> list[tuple[Path, Dict[str, Dict[str, str]], Optional[str]]]:
     app_dir = root / "App"
     if not app_dir.is_dir():
         return []
+    try:
+        stamp = os.stat(app_dir).st_mtime_ns
+    except OSError:
+        stamp = 0
+    cached = _APP_REG_CACHE.get(str(app_dir))
+    if cached is not None and cached[0] == stamp:
+        return list(cached[1])
     out: list[tuple[Path, Dict[str, Dict[str, str]], Optional[str]]] = []
-    skip = {"portabledata", "redist", "_redist_cache", "updates"}
+    skip = APP_REG_SKIP_DIRS
     for cur_root, dirs, files in os.walk(app_dir):
         dirs[:] = sorted(d for d in dirs if d.casefold() not in skip)
         for fname in sorted(files):
@@ -2889,6 +3100,7 @@ def _discover_app_reg_files(
             rel = str(fpath.relative_to(app_dir))
             lang = _detect_app_reg_file_lang(sections, rel)
             out.append((fpath, sections, lang))
+    _APP_REG_CACHE[str(app_dir)] = (stamp, out)
     return out
 
 
@@ -7193,6 +7405,347 @@ def _retarget_key_values(reg, key, subkey: str, stale_roots: "Sequence[str]",
     return changed
 
 
+# --- запись в «Установленные программы» ---------------------------------------
+#
+# Портатив не устанавливается, поэтому в Панели управления (Параметры ->
+# Приложения) его быть не должно. Но установщик, который разворачивается внутрь
+# App, пишет свою запись в Uninstall — и она остаётся на компьютере навсегда.
+# После переноса папки на другой диск такая запись ещё и указывает в никуда или
+# в прежнее место, а пользователь видит «Cursor установлен», хотя это портатив.
+#
+# Удаляется только доказанная запись: какое-то из её значений с путём
+# (InstallLocation, DisplayIcon, UninstallString, Inno Setup: App Path…)
+# ведёт внутрь ЭТОЙ папки — текущей или одного из прежних мест — либо содержит
+# наш маркер @@PORTABLE_ROOT@@. Чужая установка той же программы (например,
+# %LOCALAPPDATA%\\Programs\\cursor) не совпадает ни с одним корнем и остаётся
+# нетронутой.
+
+#: Значения записи, в которых установщики хранят путь установки.
+UNINSTALL_PATH_VALUES = (
+    "InstallLocation", "InstallDir", "InstallDirectory", "InstallFolder",
+    "InstallPath", "DisplayIcon", "UninstallString", "QuietUninstallString",
+    "InstallSource", "Inno Setup: App Path", "AppPath", "Path", "ModifyPath",
+)
+
+#: Ветка, формирующая список «Установленные программы».
+UNINSTALL_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+
+#: Сколько записей просматривается за один запуск (защита от гигантских
+#: каталогов вроде Microsoft Visual Studio).
+UNINSTALL_MAX_ENTRIES = 400
+
+#: Путь Windows (``D:\\...``) или POSIX (``/opt/...``): второй вариант нужен
+#: тестам и на случай значения, записанного чужой программой.
+_WINDOWS_PATH_RE = re.compile(
+    r"[A-Za-z]:[\\/][^\"<>|?*\r\n;]*|/[^\"<>|?*\r\n;]*")
+
+
+def _record_roots(root: Path, cfg: "Optional[Dict[str, Any]]" = None
+                  ) -> "list[str]":
+    """Корни, которые считаются «этим портативом»: текущий и прежние места."""
+    roots: "list[str]" = [str(root)]
+    try:
+        roots.extend(remembered_roots(root, cfg))
+    except Exception:  # noqa: BLE001 - штамп мог быть нечитаем
+        pass
+    current = os.path.normcase(os.path.normpath(str(root)))
+    unique: "list[str]" = [str(root)]
+    seen = {current}
+    for item in roots:
+        text = str(item or "").strip().strip('"').rstrip("\\/")
+        if not text:
+            continue
+        key = os.path.normcase(os.path.normpath(text))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(text)
+    return unique
+
+
+def _expanded_record_value(value: str) -> str:
+    """Раскрывает ``%VAR%`` окружением ЭТОГО ПК (не портативным профилем)."""
+    text = str(value or "")
+    if not text:
+        return text
+    try:
+        text = os.path.expandvars(text)
+    except Exception:  # noqa: BLE001
+        pass
+    return text.replace(ROOT_TOKEN, str(os.environ.get("PORTABLE_ROOT", "")))
+
+
+def path_points_into_portable(value: str, roots: "Sequence[str]") -> bool:
+    """Есть ли в значении путь внутрь одного из корней портатива.
+
+    Значение записи — не всегда чистый путь: ``"D:\\Apps\\Cursor\\App\\Cursor.exe",0``,
+    ``"D:\\...\\unins000.exe" /SILENT``, ``%LOCALAPPDATA%\\Programs\\cursor``.
+    Поэтому из строки достаются все похожие на путь Windows фрагменты, а
+    кавычки и номер значка отбрасываются.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if ROOT_TOKEN.casefold() in text.casefold():
+        return True
+    candidates = _WINDOWS_PATH_RE.findall(_expanded_record_value(text))
+    if not candidates:
+        return False
+    def _fold(text: str) -> str:
+        """Путь в сравнимом виде: те же разделители, без хвостового слэша."""
+        clean = str(text or "").strip().strip('"').replace("/", "\\")
+        clean = os.path.normpath(clean).rstrip("\\")
+        # Пути Windows регистронезависимы, а сравнение выполняется и в тестах
+        # на Linux, где normcase ничего не меняет.
+        return clean.casefold()
+
+    normalized_roots = [folded for folded in (_fold(item) for item in roots)
+                        if folded and len(folded) >= 2]
+    for candidate in candidates:
+        clean = re.sub(r",\s*-?\d+\s*$", "", candidate.strip().strip('"'))
+        folded = _fold(clean)
+        if len(folded) < 3:
+            continue
+        for root in normalized_roots:
+            if folded == root or folded.startswith(root + "\\"):
+                return True
+    return False
+
+
+def _normalised_record_name(value: str) -> str:
+    """Имя приложения без разделителей и регистра: «Cursor 0.44» -> «cursor044»."""
+    return re.sub(r"[^0-9a-z]+", "", str(value or "").casefold())
+
+
+def _record_belongs_to_app(values: Dict[str, Any], key_name: str,
+                           app_name: str) -> bool:
+    """Запись называет это приложение (DisplayName или имя ключа).
+
+    Проверка нужна вместе с путём: портатив можно положить в широкую папку
+    (``D:\Apps`` и даже в корень диска), и тогда «путь внутри портатива»
+    совпал бы у чужих программ. Имя сужает правило до своей записи.
+    """
+    expected = _normalised_record_name(app_name)
+    if not expected:
+        return False
+    for candidate in (values.get("DisplayName", ""), key_name):
+        found = _normalised_record_name(candidate)
+        if not found:
+            continue
+        if found == expected or expected in found or found in expected:
+            return True
+    return False
+
+
+def _record_looks_like_this_portable(values: Dict[str, Any],
+                                     roots: "Sequence[str]",
+                                     app_name: str = "",
+                                     key_name: str = "") -> bool:
+    """Запись Uninstall принадлежит этому портативу.
+
+    Два условия сразу: имя совпадает с приложением и какое-то значение с путём
+    ведёт внутрь папки портатива. Одного пути мало (папка может быть широкой),
+    одного имени тоже (у пользователя бывает настоящая установка той же
+    программы).
+    """
+    if not _record_belongs_to_app(values, key_name, app_name):
+        return False
+    path_values = {item.casefold() for item in UNINSTALL_PATH_VALUES}
+    for name, value in values.items():
+        if str(name).casefold() not in path_values:
+            continue
+        if isinstance(value, str) and path_points_into_portable(value, roots):
+            return True
+    return False
+
+
+def _uninstall_registry_views() -> "list[tuple[Any, int, int, str]]":
+    """(hive, чтение, запись, подпись) для HKCU и обоих видов HKLM.
+
+    Чтение и запись — разные флаги: перечислять записи можно и без прав
+    администратора, а ``RegDeleteKey`` требует у родительского ключа
+    ``KEY_WRITE``. Иначе отказ в доступе к машинной ветке выглядел бы как
+    «записей нет», и след установки тихо оставался бы на месте.
+    """
+    reg = _winreg()
+    if reg is None:
+        return []
+    read = getattr(reg, "KEY_READ", 0)
+    write = getattr(reg, "KEY_WRITE", 0)
+    views: "list[tuple[Any, int, int, str]]" = [
+        (reg.HKEY_CURRENT_USER, read, write, "HKCU"),
+        (reg.HKEY_LOCAL_MACHINE,
+         read | getattr(reg, "KEY_WOW64_64KEY", 0),
+         write | getattr(reg, "KEY_WOW64_64KEY", 0), "HKLM"),
+    ]
+    if getattr(reg, "KEY_WOW64_32KEY", 0):
+        views.append((reg.HKEY_LOCAL_MACHINE,
+                      read | reg.KEY_WOW64_32KEY,
+                      write | reg.KEY_WOW64_32KEY, "HKLM32"))
+    return views
+
+
+def _read_uninstall_entry(reg, hive, access: int, name: str
+                          ) -> "Optional[Dict[str, Any]]":
+    """Значения одной записи Uninstall (только строковые)."""
+    path = UNINSTALL_KEY_PATH + "\\" + name
+    try:
+        with reg.OpenKey(hive, path, 0, access) as key:
+            values: Dict[str, Any] = {}
+            index = 0
+            while True:
+                try:
+                    value_name, value, _kind = reg.EnumValue(key, index)
+                except OSError:
+                    break
+                index += 1
+                if isinstance(value, str):
+                    values[value_name] = value
+            return values
+    except OSError:
+        return None
+
+
+def portable_install_records(root: Path,
+                             cfg: "Optional[Dict[str, Any]]" = None
+                             ) -> "list[Dict[str, Any]]":
+    """Записи «Установленные программы», которые создал этот портатив."""
+    reg = _winreg()
+    if reg is None:
+        return []
+    roots = _record_roots(root, cfg)
+    app_name = str((cfg or {}).get("app_name") or "")
+    found: "list[Dict[str, Any]]" = []
+    for hive, read_access, _write_access, label in _uninstall_registry_views():
+        try:
+            with reg.OpenKey(hive, UNINSTALL_KEY_PATH, 0, read_access) as parent:
+                names = []
+                index = 0
+                while len(names) < UNINSTALL_MAX_ENTRIES:
+                    try:
+                        names.append(reg.EnumKey(parent, index))
+                    except OSError:
+                        break
+                    index += 1
+        except OSError:
+            continue
+        for name in names:
+            values = _read_uninstall_entry(reg, hive, read_access, name)
+            if not values:
+                continue
+            if not _record_looks_like_this_portable(values, roots,
+                                                    app_name, name):
+                continue
+            found.append({
+                "hive": label,
+                "hive_handle": hive,
+                "write_access": _write_access,
+                "name": name,
+                "display": str(values.get("DisplayName") or name),
+            })
+    return found
+
+
+def remove_portable_install_records(root: Path,
+                                    cfg: "Optional[Dict[str, Any]]" = None
+                                    ) -> "tuple[list[str], bool]":
+    """Удаляет записи этого портатива из «Установленные программы».
+
+    Возвращает ``(строки для журнала, нужны ли права администратора)``.
+    Права нужны, только если запись лежит в машинной ветке (установка «для
+    всех пользователей»), а лончер запущен без повышения.
+    """
+    reg = _winreg()
+    if reg is None:
+        return [], False
+    lines: "list[str]" = []
+    needs_admin = False
+    for record in portable_install_records(root, cfg):
+        hive = record["hive_handle"]
+        access = int(record["write_access"])
+        name = str(record["name"])
+        display = str(record["display"])
+        try:
+            with reg.OpenKey(hive, UNINSTALL_KEY_PATH, 0, access) as parent:
+                reg.DeleteKey(parent, name)
+        except OSError as exc:
+            if record["hive"] == "HKCU":
+                lines.append(f"не удалось удалить запись «{display}» ({exc})")
+            else:
+                needs_admin = True
+                lines.append(
+                    f"запись «{display}» лежит в машинной ветке {record['hive']}: "
+                    "нужны права администратора")
+            continue
+        lines.append(f"удалена запись «{display}» из списка установленных "
+                     f"приложений ({record['hive']})")
+    return lines, needs_admin
+
+
+def _machine_registry_pending(root: Path, cfg: "Dict[str, Any]") -> bool:
+    """Ожидается ли отдельный UAC для импорта машинного реестра.
+
+    Если да, права администратора попросит он — второй запрос за один запуск
+    только раздражает, а отказ от первого запоминается на час и отменил бы
+    вторую (нужную) операцию.
+    """
+    registry = (cfg or {}).get("registry") or {}
+    name = str(registry.get("machine_file") or "")
+    if not registry.get("enabled") or not name:
+        return False
+    try:
+        return _as_relative_path(root, name).is_file()
+    except Exception:  # noqa: BLE001 - путь не разобрался, значит ничего не ждём
+        return False
+
+
+def clean_installed_programs(root: Path,
+                             cfg: "Optional[Dict[str, Any]]" = None,
+                             allow_elevation: bool = False) -> "list[str]":
+    """Убирает след установки портатива из списка приложений Windows.
+
+    Вызывается перед запуском программы и ещё раз после выхода: родной
+    апдейтер программы может поставить запись заново, пока она работает.
+    Удаление идёт только по доказанному пути внутрь портатива — см. выше.
+    """
+    if not IS_WINDOWS:
+        return []
+    settings = (cfg or {}).get("host_cleanup") or {}
+    if isinstance(settings, dict) and settings.get("hide_installed_entry") is False:
+        return []
+    lines, needs_admin = remove_portable_install_records(root, cfg)
+    if (needs_admin and allow_elevation and not _is_elevated()
+            and getattr(sys, "frozen", False)
+            and not elevation_refused_recently(root)):
+        code = _run_elevated(["--clean-installed-entry"])
+        if code is None:
+            mark_elevation_refused(root, "no result from the UAC prompt")
+            lines.append("машинную запись удалить не удалось: UAC не подтверждён")
+        elif code == 0:
+            clear_elevation_refusal(root)
+            lines.append("машинная запись удалена с правами администратора")
+        else:
+            mark_elevation_refused(root, f"elevated cleanup returned {code}")
+            lines.append("машинную запись удалить не удалось (повышенный "
+                         f"запуск вернул код {code})")
+    return lines
+
+
+def clean_installed_programs_command(root: "Optional[Path]" = None) -> int:
+    """``--clean-installed-entry``: служебный режим для повышенной копии."""
+    root = root or find_portable_root()
+    try:
+        cfg = read_launcher_config(root)
+    except Exception:  # noqa: BLE001 - конфиг мог быть старым
+        cfg = {}
+    lines, needs_admin = remove_portable_install_records(root, cfg)
+    for line in lines:
+        _run_log(root, "installed programs: " + line)
+    if needs_admin:
+        return 1
+    return 0
+
+
 # --- маркер в реестре и в настройках программы --------------------------------
 #
 # Маркер ``@@PORTABLE_ROOT@@`` — наш: он живёт в ``portable*.reg`` и подменяется
@@ -8634,6 +9187,9 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     #: Время начала сеанса (0.0, пока программа не запущена): по нему
     #: определяется, что установщик положил в прежнее место портатива.
     session_start = 0.0
+    timings = _StageTimer(
+        root / str(cfg.get("data_dir_name") or "PortableData"))
+    timings.tick("profile self-check")
     # Самопроверка профиля: прерванный прошлый сеанс мог оставить Known Folder
     # «Документы» направленным внутрь уже удалённой папки портатива. Это ломает
     # сохранения и меню «Пуск», а стоит проверка один запрос к реестру.
@@ -8644,6 +9200,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     except Exception as exc:  # noqa: BLE001 - проверка не срывает запуск
         _run_log(root, f"profile self-check failed ({exc})")
 
+    timings.tick("paths")
     # Перенос между дисками: если папка переехала с прошлого запуска, пути
     # старого корня в настройках программы заменяются новыми ДО того, как она
     # их прочитает. Наши файлы и реестр этого не требуют — там либо
@@ -8654,6 +9211,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     except Exception as exc:  # noqa: BLE001 - починка не срывает запуск
         _run_log(root, f"paths: repair failed ({exc})")
 
+    timings.tick("install records")
     # Записи об установке на этом ПК (`InstallLocation`, `App Paths`,
     # `UninstallString` и т. п.) могли остаться от прежнего места портатива:
     # именно оттуда установщик берёт «прошлую установку» и ставит новую
@@ -8667,6 +9225,21 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     except Exception as exc:  # noqa: BLE001 - реестр не срывает запуск
         _run_log(root, f"registry: healing failed ({exc})")
 
+    timings.tick("installed list")
+    # Портатив не устанавливается: записи в «Установленные программы» тут не
+    # место. Обычно её пишет установщик, который распаковывается в App, и после
+    # переноса папки на другой диск она ещё и указывает в никуда. Удаляется
+    # только запись, у которой какое-то значение с путём ведёт внутрь этой
+    # папки (текущей или прежнего места) — чужая установка не страдает.
+    try:
+        for line in clean_installed_programs(
+                root, cfg,
+                allow_elevation=not _machine_registry_pending(root, cfg)):
+            _run_log(root, "installed programs: " + line)
+    except Exception as exc:  # noqa: BLE001 - след установки не срывает запуск
+        _run_log(root, f"installed programs: cleanup failed ({exc})")
+
+    timings.tick("marker sweep")
     # Маркер мог остаться и в настройках самой программы (включая App на любой
     # глубине): тогда установщик обновления читает каталог
     # ``@@PORTABLE_ROOT@@\App`` и падает с «Error opening file for writing».
@@ -8679,6 +9252,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     except Exception as exc:  # noqa: BLE001 - проход не срывает запуск
         _run_log(root, f"paths: marker sweep failed ({exc})")
 
+    timings.tick("update adoption")
     # Обновление, поставленное в прежнее место портатива (в том числе
     # предыдущим сеансом, который закрыли аварийно), забирается в App — до
     # того, как программа прочитает свои файлы.
@@ -8697,6 +9271,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
         _run_log(root, f"update: adoption from the previous location failed "
                        f"({exc})")
 
+    timings.tick("shortcuts")
     # «Пустые» ярлыки этой программы на рабочем столе. Установщик мог
     # записать в ярлык путь временного каталога, которого уже нет, или путь
     # прежнего места папки — такой ярлык не работает ни при каких условиях и
@@ -8712,6 +9287,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     except Exception as exc:  # noqa: BLE001 - уборка не срывает запуск
         _run_log(root, f"shortcut: cleanup failed ({exc})")
 
+    timings.tick("registry sanitize")
     # Портатив, собранный прежней версией, мог принести в portable.reg ветки
     # оболочки (меню «Пуск»). Чистим файл на месте — и EXE-, и BAT-лончер
     # тогда импортируют только настройки приложения.
@@ -8720,6 +9296,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     except Exception as exc:  # noqa: BLE001 - чистка не срывает запуск
         _run_log(root, f"registry sanitize failed: {exc}")
 
+    timings.tick("stale session")
     # Остатки прошлого запуска убираются ДО старта: иначе они так и будут
     # держать папку, пока пользователь не перезагрузит компьютер. Уборка —
     # вспомогательный шаг: её сбой не должен мешать запуску программы.
@@ -8737,6 +9314,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     shared_saves = SharedSaveSession(root, cfg)
     drive_root_data = DriveRootDataSession(root, cfg)
 
+    timings.tick("target selection")
     raw_arguments = _arguments_with_executable_alias(
         cfg, list(argv if argv is not None else sys.argv[1:])
     )
@@ -8817,6 +9395,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             _run_log(root, "elevation was refused, unavailable or timed out; "
                            "continuing without the HKLM import")
 
+    timings.tick("environment")
     env = _prepare_environment(root, cfg)
     target = _as_relative_path(root, target_rel)
     if not target.is_file():
@@ -8835,6 +9414,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # «отсутствует MSVCR110.dll». Запуск системного установщика при старте
     # запрещён; лончер сообщает о недостающем пакете и оставляет решение
     # пользователю.
+    timings.tick("runtime check")
     missing_runtime = missing_runtime_components(root, cfg, target, env)
     if missing_runtime:
         missing_runtime = install_missing_runtime(root, cfg, missing_runtime)
@@ -8845,12 +9425,14 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # без повышения, UAC — только когда чего-то реально не хватает. Ошибки
     # не должны срывать запуск: программа сама объяснит отсутствие адаптера,
     # а журнал лончера скажет, пытался ли портатив это починить.
+    timings.tick("netstack")
     try:
         for line in ensure_netstack(root, cfg):
             _run_log(root, "netstack: " + line)
     except Exception as exc:  # noqa: BLE001 - netstack must not block start
         _run_log(root, f"netstack: ensure failed ({exc})")
 
+    timings.tick("saves")
     # Сейвы, сделанные мимо лончера (прямой запуск App\Game.exe), забираются
     # в портатив ПЕРЕД стартом: иначе программа их просто не увидит.
     # Синхронизация — вспомогательный шаг: её ошибка не должна оставить
@@ -8866,6 +9448,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     except Exception as exc:  # noqa: BLE001
         _run_log(root, f"drive-root data: pre-launch sync failed ({exc})")
 
+    timings.tick("session start")
     # Время начала сеанса: по нему определяется, что установщик (в том числе
     # запущенный самой программой) положил в прежнее место портатива.
     session_start = write_session_start(root)
@@ -8889,6 +9472,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             _run_log(root, "vscode: " + line.split(": ", 1)[-1])
     except Exception as exc:  # noqa: BLE001 - профиль не срывает запуск
         _run_log(root, f"vscode: profile setup failed ({exc})")
+    timings.tick("profile setup")
     try:
         shell_folders.load()
     except Exception as exc:  # noqa: BLE001 - Known Folder не срывает запуск
@@ -8897,6 +9481,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
         registry.load()
     except Exception as exc:  # noqa: BLE001 - реестр не срывает запуск
         _run_log(root, f"registry import failed ({exc})")
+    timings.finish(root)
     try:
         try:
             command = with_electron_flags(
@@ -9048,6 +9633,14 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                     "больше не нужна.")
         except Exception as exc:  # noqa: BLE001 - уже закрываемся
             _run_log(root, f"update: adoption at exit failed ({exc})")
+        # Родной апдейтер программы мог за время работы поставить запись
+        # «Установленные программы» заново — снимаем и её. Права не просим:
+        # закрытие не должно зависеть от UAC.
+        try:
+            for line in clean_installed_programs(root, cfg):
+                _run_log(root, "installed programs (after exit): " + line)
+        except Exception as exc:  # noqa: BLE001 - уже закрываемся
+            _run_log(root, f"installed programs: post-exit cleanup failed ({exc})")
         _report_folder_state(root, shutdown)
 
 
@@ -9337,6 +9930,30 @@ def diagnose(root: Optional[Path] = None) -> int:
         add("Папки App НЕТ — портатив неполный.")
     add("")
 
+    add("Список «Установленные программы»")
+    add("-" * 60)
+    cleanup_settings = cfg.get("host_cleanup") if isinstance(cfg, dict) else None
+    hidden = not (isinstance(cleanup_settings, dict)
+                  and cleanup_settings.get("hide_installed_entry") is False)
+    add(f"запись портатива скрывается: {'да' if hidden else 'нет (host_cleanup)'}")
+    try:
+        records = portable_install_records(root, cfg)
+    except Exception as exc:  # noqa: BLE001 - отчёт не должен падать
+        records = []
+        add(f"проверить не удалось: {exc}")
+    if records:
+        for record in records:
+            add(f"  НАЙДЕНА: «{record['display']}» ({record['hive']}) — "
+                "указывает внутрь портатива и будет удалена")
+    else:
+        add("записей этого портатива нет")
+    add("")
+
+    add("Предстартовые шаги (прошлый запуск)")
+    add("-" * 60)
+    lines.extend(_last_launch_timing(data))
+    add("")
+
     add("Настройки переноса")
     add("-" * 60)
     add(f"data_dir_name:   {cfg.get('data_dir_name', 'PortableData')}")
@@ -9419,6 +10036,10 @@ def main() -> int:
         if any(str(arg).casefold() in ("--repair-paths", "/repair-paths")
                for arg in sys.argv[1:]):
             return repair_paths_command(root)
+        if any(str(arg).casefold() in ("--clean-installed-entry",
+                                       "/clean-installed-entry")
+               for arg in sys.argv[1:]):
+            return clean_installed_programs_command(root)
         if any(str(arg).casefold() in ("--import-reg", "/import-reg")
                for arg in sys.argv[1:]):
             value = ""
