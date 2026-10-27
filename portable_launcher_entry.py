@@ -776,6 +776,41 @@ def _run_log(root: Optional[Path], message: str) -> None:
 LAUNCH_TIMING_NAME = "launch-timing.json"
 
 
+def _process_start_age_seconds() -> float:
+    """Сколько секунд назад Windows создала наш процесс.
+
+    ``LaunchPortable.exe`` собран как PyInstaller-onefile: перед первой
+    строкой Python он распаковывает себя во временную папку, и эти секунды
+    собственными замерами не видны. ``GetProcessTimes`` знает настоящее время
+    создания процесса, поэтому в отчёте появляется строка «exe boot», и
+    становится видно, тормозит ли лончер или сама программа.
+    """
+    if not IS_WINDOWS:
+        return 0.0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                        ("dwHighDateTime", wintypes.DWORD)]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        times = (FILETIME(), FILETIME(), FILETIME(), FILETIME())
+        if not kernel32.GetProcessTimes(
+                kernel32.GetCurrentProcess(),
+                *[ctypes.byref(item) for item in times]):
+            return 0.0
+        created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+    except Exception:  # noqa: BLE001 - замер не срывает запуск
+        return 0.0
+    if not created:
+        return 0.0
+    # FILETIME считает 100-нс интервалы от 1601-01-01.
+    created_epoch = created / 10_000_000 - 11644473600
+    return max(0.0, min(time.time() - created_epoch, 300.0))
+
+
 class _StageTimer:
     """Секундомер предстартовых шагов: ``tick()`` закрывает предыдущий шаг.
 
@@ -788,6 +823,11 @@ class _StageTimer:
         self.steps: "list[tuple[str, float]]" = []
         self._name = ""
         self._started = 0.0
+
+    def add_startup(self, seconds: float) -> None:
+        """Первая строка отчёта: время от создания процесса до этой строки."""
+        if seconds >= 0.02:
+            self.steps.append(("exe boot", seconds))
 
     def tick(self, name: str) -> None:
         now = time.perf_counter()
@@ -812,7 +852,8 @@ class _StageTimer:
         slowest = sorted(self.steps, key=lambda item: item[1], reverse=True)[:4]
         summary = ", ".join(f"{name} {seconds:.2f}s"
                             for name, seconds in slowest if seconds >= 0.05)
-        line = f"pre-launch: {total:.2f}s before the program starts"
+        line = (f"pre-launch (from LaunchPortable.exe start): {total:.2f}s "
+                "before the program starts")
         if summary:
             line += " (slowest: " + summary + ")"
         _run_log(root, line)
@@ -827,6 +868,71 @@ class _StageTimer:
         except OSError:
             pass
         return total
+
+
+class _BackgroundWork:
+    """Уборка на стороне Windows, которая не должна задерживать программу.
+
+    Список «Установленные программы» и чужие ярлыки программе для старта не
+    нужны: она спокойно открывается параллельно с этими шагами. Раньше они
+    выполнялись до запуска, и любой медленный шаг (антивирус проверяет десятки
+    ярлыков, Windows показывает запрос UAC) отодвигал появление окна. Теперь
+    работа идёт в отдельных потоках, а перед восстановлением реестра лончер её
+    дожидается.
+    """
+
+    def __init__(self, root: Path, name: str) -> None:
+        self.root = root
+        self.name = name
+        self._threads: "list[Any]" = []
+        self._finished: "list[float]" = []
+        self._waited = 0.0
+        self._reported = False
+
+    def submit(self, work, name: str = "") -> None:
+        """Запускает ``work()`` в фоне; возвращаемый список — строки журнала."""
+        import threading
+
+        label = name or self.name
+
+        def _run() -> None:
+            started = time.perf_counter()
+            try:
+                for line in work():
+                    if line:
+                        _run_log(self.root, f"{label}: {line}")
+            except Exception as exc:  # noqa: BLE001 - уборка не срывает запуск
+                _run_log(self.root, f"{label}: failed ({exc})")
+            finally:
+                self._finished.append(time.perf_counter() - started)
+
+        thread = threading.Thread(target=_run, name="portable-" + label,
+                                  daemon=True)
+        thread.start()
+        self._threads.append(thread)
+
+    def wait(self, timeout: float = 30.0) -> None:
+        """Дожидается фоновой работы; второй вызов не ждёт то же время снова."""
+        if not self._threads:
+            return
+        deadline = time.monotonic() + max(0.1, float(timeout) - self._waited)
+        started = time.monotonic()
+        for thread in self._threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        self._waited += time.monotonic() - started
+        alive = [thread for thread in self._threads if thread.is_alive()]
+        if self._reported:
+            return
+        self._reported = True
+        if alive:
+            _run_log(self.root, f"{self.name}: still busy after "
+                               f"{self._waited:.0f}s, the rest is done when the "
+                               "program exits")
+            return
+        total = sum(self._finished)
+        if total >= 0.2:
+            _run_log(self.root, f"{self.name}: {total:.2f}s of host cleanup, "
+                               "done in parallel with the program start")
 
 
 def _last_launch_timing(data: Path) -> "list[str]":
@@ -3066,9 +3172,67 @@ APP_REG_SKIP_DIRS = frozenset({
 #: дважды за запуск, и второй раз обходить дерево незачем.
 _APP_REG_CACHE: Dict[str, tuple] = {}
 
+#: Список найденных ``.reg`` запоминается и на диске: у Cursor в App десятки
+#: тысяч файлов, и полный обход дерева на каждом запуске — это секунды до
+#: появления окна. Ключ кэша — время изменения самой папки App, поэтому после
+#: обновления программы (установщик меняет содержимое App) обход повторится.
+APP_REG_CACHE_NAME = "app-reg-files.json"
+
+
+def _app_reg_cache_file(root: Path,
+                        cfg: "Optional[Dict[str, Any]]" = None) -> Path:
+    return _data_dir(root, cfg or {}) / APP_REG_CACHE_NAME
+
+
+def _read_app_reg_cache(root: Path,
+                        cfg: "Optional[Dict[str, Any]]",
+                        stamp: int) -> "Optional[list[str]]":
+    """Список ``.reg`` из прошлого запуска, если App с тех пор не менялась."""
+    try:
+        data = json.loads(_app_reg_cache_file(root, cfg).read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or int(data.get("app_mtime") or -1) != stamp:
+        return None
+    files = data.get("files")
+    if not isinstance(files, list):
+        return None
+    return [str(item) for item in files]
+
+
+def _write_app_reg_cache(root: Path,
+                         cfg: "Optional[Dict[str, Any]]",
+                         stamp: int, files: "list[str]") -> None:
+    target = _app_reg_cache_file(root, cfg)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({
+            "app_mtime": stamp,
+            "files": files,
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _load_app_reg_file(
+        app_dir: Path, rel: str
+) -> "Optional[tuple[Path, Dict[str, Dict[str, str]], Optional[str]]]":
+    """Читает и разбирает один ``.reg`` из App (``None`` — не подходит)."""
+    fpath = app_dir / rel.replace("/", os.sep)
+    try:
+        text = _decode_reg(fpath.read_bytes())
+    except OSError:
+        return None
+    sections = _parse_reg_sections(text)
+    if not any(_extract_software_tail(sec) for sec in sections):
+        return None
+    lang = _detect_app_reg_file_lang(sections, rel)
+    return (fpath, sections, lang)
+
 
 def _discover_app_reg_files(
-    root: Path,
+    root: Path, cfg: "Optional[Dict[str, Any]]" = None,
 ) -> list[tuple[Path, Dict[str, Dict[str, str]], Optional[str]]]:
     app_dir = root / "App"
     if not app_dir.is_dir():
@@ -3080,8 +3244,20 @@ def _discover_app_reg_files(
     cached = _APP_REG_CACHE.get(str(app_dir))
     if cached is not None and cached[0] == stamp:
         return list(cached[1])
-    out: list[tuple[Path, Dict[str, Dict[str, str]], Optional[str]]] = []
+
+    known = _read_app_reg_cache(root, cfg, stamp)
+    if known is not None:
+        out: "list[tuple[Path, Dict[str, Dict[str, str]], Optional[str]]]" = []
+        for rel in known:
+            item = _load_app_reg_file(app_dir, rel)
+            if item is not None:
+                out.append(item)
+        _APP_REG_CACHE[str(app_dir)] = (stamp, out)
+        return out
+
+    out = []
     skip = APP_REG_SKIP_DIRS
+    found_rel: "list[str]" = []
     for cur_root, dirs, files in os.walk(app_dir):
         dirs[:] = sorted(d for d in dirs if d.casefold() not in skip)
         for fname in sorted(files):
@@ -3090,18 +3266,218 @@ def _discover_app_reg_files(
             if fname.lower() in ("portable.reg", "portable_machine.reg", "cleanup_host.reg"):
                 continue
             fpath = Path(cur_root) / fname
-            try:
-                text = _decode_reg(fpath.read_bytes())
-            except OSError:
-                continue
-            sections = _parse_reg_sections(text)
-            if not any(_extract_software_tail(sec) for sec in sections):
-                continue
             rel = str(fpath.relative_to(app_dir))
-            lang = _detect_app_reg_file_lang(sections, rel)
-            out.append((fpath, sections, lang))
+            item = _load_app_reg_file(app_dir, rel)
+            if item is None:
+                continue
+            found_rel.append(rel)
+            out.append(item)
     _APP_REG_CACHE[str(app_dir)] = (stamp, out)
+    _write_app_reg_cache(root, cfg, stamp, found_rel)
     return out
+
+
+# --- быстрый экспорт реестра --------------------------------------------------
+#
+# `reg.exe export` — отдельный процесс на каждый ключ: 40-150 мс каждый. У
+# программы вроде Cursor ключей десятки, и лончер запускал их все перед стартом
+# (и ещё раз столько же при закрытии) — окно программы ждало секунды, хотя
+# прямой запуск exe открывался сразу. Поэтому снимок ключей делается напрямую
+# через winreg: значения читаются тем же вызовом, каким их пишет regedit, и
+# складываются в один .reg-файл — импорт при восстановлении тоже один.
+
+#: Типы значений winreg, которые умеет записывать .reg-файл.
+REG_TYPE_SZ = 1
+REG_TYPE_EXPAND_SZ = 2
+REG_TYPE_BINARY = 3
+REG_TYPE_DWORD = 4
+REG_TYPE_LINK = 6
+REG_TYPE_MULTI_SZ = 7
+REG_TYPE_QWORD = 11
+
+#: Потолок числа ключей в одном снимке: защита от гигантских поддеревьев
+#: (`Software\\Classes` целиком). Дальше — обычный `reg export`.
+REG_SNAPSHOT_MAX_KEYS = 20000
+
+#: Имя файла снимка реестра в PortableData\\RegistryHostBackup.
+REGISTRY_SNAPSHOT_NAME = "all-keys.reg"
+
+#: Экспорт ключей, созданных установщиком: нужен для сведения настроек.
+REGISTRY_CREATED_NAME = "created-keys.reg"
+
+#: Потолок глубины обхода: ключи приложения не бывают глубже.
+REG_SNAPSHOT_MAX_DEPTH = 32
+
+
+def _escape_reg_string(text: str) -> str:
+    """Строка для .reg: обратный слэш и кавычка экранируются."""
+    return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _reg_hex_value(prefix: str, kind: "Optional[int]", payload: bytes) -> str:
+    """Значение в виде ``hex:``/``hex(2):`` с переносами, как у regedit."""
+    label = "hex" if kind is None else f"hex({kind})"
+    digits = ",".join(f"{byte:02x}" for byte in payload)
+    chunks = [digits[i:i + 72] for i in range(0, len(digits), 72)] or [""]
+    body = "\\\r\n  ".join(chunks)
+    return f"{prefix}={label}:{body}"
+
+
+def _reg_utf16_payload(text: str) -> bytes:
+    """Строка ``REG_SZ`` в том виде, в каком её пишет regedit в ``hex(2)``."""
+    return str(text).encode("utf-16-le") + b"\x00\x00"
+
+
+def _reg_value_line(name: str, kind: int, value: Any) -> "Optional[str]":
+    """Строка значения для .reg или ``None``, если тип не поддержан."""
+    prefix = "@" if not name else '"' + _escape_reg_string(name) + '"'
+    if kind == REG_TYPE_SZ and isinstance(value, str):
+        return f'{prefix}="{_escape_reg_string(value)}"'
+    if kind == REG_TYPE_EXPAND_SZ and isinstance(value, str):
+        return _reg_hex_value(prefix, kind, _reg_utf16_payload(value))
+    if kind == REG_TYPE_MULTI_SZ and isinstance(value, (list, tuple)):
+        payload = b"".join(_reg_utf16_payload(str(item)) for item in value)
+        return _reg_hex_value(prefix, kind, payload + b"\x00\x00")
+    if kind == REG_TYPE_DWORD and isinstance(value, int):
+        return f"{prefix}=dword:{int(value) & 0xFFFFFFFF:08x}"
+    if kind == REG_TYPE_QWORD and isinstance(value, int):
+        raw = int(value).to_bytes(8, "little", signed=int(value) < 0)
+        return _reg_hex_value(prefix, 0x0b, raw)
+    if isinstance(value, (bytes, bytearray)):
+        # REG_BINARY у regedit пишется как ``hex:``, остальные типы — ``hex(N)``.
+        label = None if kind == REG_TYPE_BINARY else kind
+        return _reg_hex_value(prefix, label, bytes(value))
+    if isinstance(value, str):
+        return f'{prefix}="{_escape_reg_string(value)}"'
+    return None
+
+
+def _export_key_lines(reg, hive_full: str, path: str, budget: "list[int]",
+                      depth: int = 0) -> "list[str]":
+    """Секции .reg для ключа и всех его подключей (``reg export`` целиком)."""
+    if budget[0] <= 0 or depth > REG_SNAPSHOT_MAX_DEPTH:
+        return []
+    hive = getattr(reg, hive_full, None)
+    if hive is None:
+        return []
+    try:
+        handle = reg.OpenKey(hive, path, 0, reg.KEY_READ)
+    except OSError:
+        return []
+    budget[0] -= 1
+    values: "list[str]" = []
+    children: "list[str]" = []
+    with handle:
+        index = 0
+        while True:
+            try:
+                name, value, kind = reg.EnumValue(handle, index)
+            except OSError:
+                break
+            index += 1
+            try:
+                typed = int(kind)
+            except (TypeError, ValueError):
+                continue
+            line = _reg_value_line(str(name), typed, value)
+            if line:
+                values.append(line)
+        index = 0
+        while True:
+            try:
+                children.append(reg.EnumKey(handle, index))
+            except OSError:
+                break
+            index += 1
+    lines: "list[str]" = []
+    # Секция пишется даже без значений: пустой ключ тоже часть состояния, и
+    # при восстановлении он должен появиться (regedit пишет так же).
+    lines.append(f"[{hive_full}\\{path}]")
+    lines.extend(values)
+    lines.append("")
+    for child in children:
+        lines.extend(_export_key_lines(reg, hive_full, path + "\\" + child,
+                                       budget, depth + 1))
+    return lines
+
+
+def export_registry_text(keys: "Sequence[str]",
+                         root: "Optional[Path]" = None) -> str:
+    """Снимок ключей в виде одного .reg-документа (пусто — снимать нечего)."""
+    reg = _winreg()
+    if reg is None:
+        return ""
+    budget = [REG_SNAPSHOT_MAX_KEYS]
+    body: "list[str]" = []
+    for key in keys:
+        hive_short, _sep, path = str(key).partition("\\")
+        hive_full = _HIVE_BY_NAME.get(hive_short.upper(), "")
+        if not hive_full or not path:
+            continue
+        body.extend(_export_key_lines(reg, hive_full, path, budget))
+        if budget[0] <= 0:
+            _run_log(root, "registry: snapshot budget reached, the rest is "
+                           "exported by reg.exe")
+            return ""
+    if not body:
+        return ""
+    header = ["Windows Registry Editor Version 5.00", ""]
+    return "\r\n".join(header + body)
+
+
+def write_reg_file(path: Path, text: str) -> bool:
+    """Записывает .reg в UTF-16 с BOM и CRLF (так его понимает reg import)."""
+    if not text:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_bytes(text.encode("utf-16"))
+        os.replace(temporary, path)
+        return True
+    except OSError:
+        return False
+
+
+def delete_key_tree(key: str) -> bool:
+    """Удаляет ключ реестра вместе с подключами без запуска reg.exe."""
+    reg = _winreg()
+    if reg is None:
+        return False
+    hive_short, _sep, path = str(key).partition("\\")
+    hive_full = _HIVE_BY_NAME.get(hive_short.upper(), "")
+    hive = getattr(reg, hive_full, None) if hive_full else None
+    if hive is None or not path:
+        return False
+
+    def _remove(sub: str) -> None:
+        names: "list[str]" = []
+        try:
+            with reg.OpenKey(hive, sub, 0, reg.KEY_READ) as handle:
+                index = 0
+                while True:
+                    try:
+                        names.append(reg.EnumKey(handle, index))
+                    except OSError:
+                        break
+                    index += 1
+        except OSError:
+            names = []
+        for child in names:
+            _remove(sub + "\\" + child)
+        try:
+            reg.DeleteKey(hive, sub)
+        except OSError:
+            pass
+
+    _remove(path)
+    # Проверяем результат: если ключ остался (нет прав, занят), вызывающий
+    # код успеет убрать его через reg.exe.
+    try:
+        reg.CloseKey(reg.OpenKey(hive, path, 0, reg.KEY_READ))
+    except OSError:
+        return True
+    return False
 
 
 class RegistrySession:
@@ -3291,7 +3667,7 @@ class RegistrySession:
             if tail:
                 candidate_tails.setdefault(tail.casefold(), tail)
 
-        app_regs = _discover_app_reg_files(self.root)
+        app_regs = _discover_app_reg_files(self.root, self.full_cfg)
         for _fpath, secs, _lang in app_regs:
             for hdr in secs:
                 tail = _extract_software_tail(hdr)
@@ -3386,6 +3762,68 @@ class RegistrySession:
                 _run_log(self.root, f"registry sync: {note}")
         return notes
 
+    def _split_keys(self) -> "tuple[list[str], list[str]]":
+        """Ключи на две группы: исходные на этом ПК и созданные установщиком.
+
+        Вторые не входят в базовый снимок: их не должно быть на машине после
+        выхода из портатива, поэтому их не восстанавливают, а удаляют.
+        """
+        plain: "list[str]" = []
+        created: "list[str]" = []
+        for key in self.keys:
+            text = str(key)
+            (created if text.casefold() in self.created else plain).append(text)
+        return plain, created
+
+    def _snapshot_host(self) -> "tuple[list[Path], list[Path]]":
+        """Снимок реестра машины одним .reg вместо процесса на каждый ключ.
+
+        Прямой обход через winreg дешевле ``reg export``: у программы вроде
+        Cursor ключей десятки, и каждый запуск ``reg.exe`` стоил 40-150 мс —
+        окно открывалось заметно позже прямого запуска её exe.
+
+        Возвращает ``(базовые файлы, экспорты созданных ключей)``. Вторые нужны
+        не для восстановления, а как «состояние ключа на хосте» для сведения
+        настроек (см. ``sync_external_changes``), поэтому пишутся отдельно.
+        """
+        plain, created = self._split_keys()
+        baseline: "list[Path]" = []
+        target = self.backup / REGISTRY_SNAPSHOT_NAME
+        if target.is_file():
+            # Снимок остался от прошлого запуска, который не дошёл до
+            # восстановления: это по-прежнему исходное состояние машины.
+            baseline.append(target)
+        else:
+            legacy = sorted(self.backup.glob("k[0-9][0-9].reg"))
+            if legacy:
+                # Базовый снимок прежней версии (файл на ключ) — используем его.
+                baseline.extend(legacy)
+            else:
+                text = export_registry_text(plain, self.root)
+                if text and write_reg_file(target, text):
+                    baseline.append(target)
+                else:
+                    # Запасной путь прежней версии: файл на каждый ключ. Номера
+                    # файлов считаются по полному списку ``keys`` — так их
+                    # потом найдёт восстановление.
+                    created_cf = {str(key).casefold() for key in created}
+                    for index, key in enumerate(self.keys):
+                        text_key = str(key)
+                        if text_key.casefold() in created_cf:
+                            continue
+                        legacy_file = self.backup / f"k{index:02d}.reg"
+                        if _reg(("export", text_key, str(legacy_file),
+                                 "/y")) == 0 and legacy_file.is_file():
+                            baseline.append(legacy_file)
+
+        created_exports: "list[Path]" = []
+        if created:
+            text = export_registry_text(created, self.root)
+            created_file = self.backup / REGISTRY_CREATED_NAME
+            if text and write_reg_file(created_file, text):
+                created_exports.append(created_file)
+        return baseline, created_exports
+
     def load(self) -> None:
         if not self.active:
             return
@@ -3395,14 +3833,7 @@ class RegistrySession:
 
         self.sync_external_changes()
 
-        created_exports: list[Path] = []
-        for index, key in enumerate(self.keys):
-            backup_file = self.backup / f"k{index:02d}.reg"
-            if not backup_file.exists():
-                _reg(("export", str(key), str(backup_file), "/y"))
-            if str(key).casefold() in self.created and backup_file.is_file():
-                created_exports.append(backup_file)
-
+        _baseline, created_exports = self._snapshot_host()
         if created_exports:
             self.sync_external_changes(extra_files=created_exports)
 
@@ -3451,29 +3882,64 @@ class RegistrySession:
         if not restore:
             return
 
-        for index, key in enumerate(self.keys):
-            session_file = self.session / f"k{index:02d}.reg"
-            try:
-                session_file.unlink()
-            except FileNotFoundError:
-                pass
-            if _reg(("export", str(key), str(session_file), "/y")) == 0 and session_file.exists():
+        # Что программа изменила в этом сеансе — один снимок, а не файл на
+        # каждый ключ (см. _snapshot_host). Корень портатива заменяется
+        # маркером, чтобы настройки переехали вместе с папкой.
+        session_text = export_registry_text(self.keys, self.root)
+        if session_text:
+            session_file = self.session / "session.reg"
+            for stale in self.session.glob("k[0-9][0-9].reg"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+            if write_reg_file(session_file, session_text):
                 _pack_reg(session_file, self.root)
 
-            backup_file = self.backup / f"k{index:02d}.reg"
-            if str(key).casefold() in self.created:
-                _reg(("delete", str(key), "/f"))
-                if backup_file.exists():
-                    try:
-                        backup_file.unlink()
-                    except OSError:
-                        pass
-            elif backup_file.exists():
-                _reg(("import", str(backup_file)))
+        # Ключи, созданные установщиком: их нет в базовом снимке, поэтому
+        # импорт их не уберёт — удаляем явно. Список берётся из ``created_keys``
+        # и из помеченных ключей, а не только из ``keys``: созданный ключ может
+        # быть подключом сохранённого и отдельно в списке ключей не значиться.
+        removed: "set[str]" = set()
+        for key in list(self.keys) + list(self.cfg.get("created_keys", [])):
+            text = str(key)
+            if text.casefold() in removed or text.casefold() not in self.created:
+                continue
+            removed.add(text.casefold())
+            # winreg быстрее, reg.exe — запасной путь, если ключ занят или
+            # доступ закрыт.
+            if not delete_key_tree(text):
+                _reg(("delete", text, "/f"))
+
+        snapshot = self.backup / REGISTRY_SNAPSHOT_NAME
+        if snapshot.is_file():
+            code = _reg(("import", str(snapshot)))
+            _run_log(self.root, "registry restore: "
+                               f"{'ok' if code == 0 else f'FAILED (rc={code})'}")
+            try:
+                snapshot.unlink()
+            except OSError:
+                pass
+        else:
+            # Снимка одним файлом нет — значит, он не получился, и лежат
+            # пофайловые снимки прежнего пути. Файл созданного ключа не
+            # импортируется никогда: такой ключ должен исчезнуть с машины.
+            for index, key in enumerate(self.keys):
+                backup_file = self.backup / f"k{index:02d}.reg"
+                if not backup_file.is_file():
+                    continue
+                if str(key).casefold() not in self.created:
+                    _reg(("import", str(backup_file)))
                 try:
                     backup_file.unlink()
                 except OSError:
                     pass
+
+        for leftover in (self.backup / REGISTRY_CREATED_NAME,):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
 
         try:
             for item in self.runtime.glob("*.reg"):
@@ -9670,6 +10136,9 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     session_start = 0.0
     timings = _StageTimer(
         root / str(cfg.get("data_dir_name") or "PortableData"))
+    # Первая строка отчёта — распаковка onefile-сборки до первой строки
+    # Python: без неё «медленный запуск» некуда отнести (см. _process_start_age_seconds).
+    timings.add_startup(_process_start_age_seconds())
     timings.tick("profile self-check")
     # Самопроверка профиля: прерванный прошлый сеанс мог оставить Known Folder
     # «Документы» направленным внутрь уже удалённой папки портатива. Это ломает
@@ -9712,11 +10181,15 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # переноса папки на другой диск она ещё и указывает в никуда. Удаляется
     # только запись, у которой какое-то значение с путём ведёт внутрь этой
     # папки (текущей или прежнего места) — чужая установка не страдает.
+    #
+    # Работа идёт в фоне: программе она для старта не нужна, а возможный
+    # запрос UAC раньше вставал поперёк запуска.
+    background = _BackgroundWork(root, "installed programs")
     try:
-        for line in clean_installed_programs(
-                root, cfg,
-                allow_elevation=not _machine_registry_pending(root, cfg)):
-            _run_log(root, "installed programs: " + line)
+        allow_elevation = not _machine_registry_pending(root, cfg)
+        background.submit(
+            lambda: clean_installed_programs(root, cfg,
+                                             allow_elevation=allow_elevation))
     except Exception as exc:  # noqa: BLE001 - след установки не срывает запуск
         _run_log(root, f"installed programs: cleanup failed ({exc})")
 
@@ -9758,15 +10231,18 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # прежнего места папки — такой ярлык не работает ни при каких условиях и
     # только путает. Чужие и рабочие ярлыки не трогаются: см.
     # remove_stale_shortcuts().
-    try:
+    #
+    # Обход рабочего стола и меню «Пуск» тоже идёт в фоне (см. выше):
+    # ярлыки на старт программы не влияют.
+    def _sweep_shortcuts() -> "list[str]":
         stale_guard = ShortcutGuard(
             root, extra_roots=remembered_roots(root, cfg),
             folders=_shortcut_folders_for(root, cfg),
             app_names=_app_shortcut_names(root, cfg))
-        for path in stale_guard.sweep():
-            _run_log(root, "shortcut: removed a stale shortcut: " + path)
-    except Exception as exc:  # noqa: BLE001 - уборка не срывает запуск
-        _run_log(root, f"shortcut: cleanup failed ({exc})")
+        return ["removed a stale shortcut: " + path
+                for path in stale_guard.sweep()]
+
+    background.submit(_sweep_shortcuts, name="shortcuts")
 
     timings.tick("registry sanitize")
     # Портатив, собранный прежней версией, мог принести в portable.reg ветки
@@ -10054,11 +10530,19 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                                "folder: " + ", ".join(sorted(set(stopped))))
             return code
         finally:
+            # Фоновая уборка — до возврата реестра: она трогает те же ключи.
+            # Ждём не дольше десяти секунд: программа уже закрыта, а остаток
+            # работы заведомо повторится ниже, на выходе.
+            background.wait(timeout=10.0)
             try:
                 registry.save_and_restore()
             except Exception as exc:  # noqa: BLE001 - уже закрываемся
                 _run_log(root, f"registry restore failed ({exc})")
     finally:
+        try:
+            background.wait(timeout=10.0)
+        except Exception as exc:  # noqa: BLE001 - уже закрываемся
+            _run_log(root, f"background cleanup: {exc}")
         try:
             shell_folders.restore()
         except Exception as exc:  # noqa: BLE001 - уже закрываемся

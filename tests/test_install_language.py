@@ -736,15 +736,25 @@ class LauncherExternalRegSwitchTests(unittest.TestCase):
                 return {}
 
             reg_calls = []
+            removed_keys = []
 
             def fake_reg(args):
                 reg_calls.append(tuple(args))
                 return 0
 
+            def fake_delete(key):
+                # Удаление идёт через winreg (см. delete_key_tree), reg.exe —
+                # только запасной путь.
+                removed_keys.append(key)
+                return True
+
             with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
                     mock.patch.object(
                         exe_launcher, "_read_host_key_reg_values",
                         side_effect=fake_host_read,
+                    ), \
+                    mock.patch.object(
+                        exe_launcher, "delete_key_tree", side_effect=fake_delete
                     ), \
                     mock.patch.object(
                         exe_launcher, "_reg", side_effect=fake_reg
@@ -772,7 +782,8 @@ class LauncherExternalRegSwitchTests(unittest.TestCase):
 
             # После выхода созданный ключ удаляется с хоста, а не восстанавливается
             deletes = [c for c in reg_calls if c[0] == "delete"]
-            self.assertEqual(len(deletes), 2)
+            self.assertEqual(len(removed_keys) + len(deletes), 2)
+            self.assertEqual(len(removed_keys), 2)
 
     def test_hklm_key_missing_detects_partial_lang_sw_key_without_installdir(self):
         import portable_launcher_entry as exe_launcher

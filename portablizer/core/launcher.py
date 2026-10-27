@@ -1290,14 +1290,20 @@ rem continues in this console path, which prints every step and stays open.
 set "PORTABLE_EXE_ALIVE="
 set /a PORTABLE_EXE_TICKS=0
 :portable_exe_watch_loop
-"%SystemRoot%\System32\ping.exe" -n 2 127.0.0.1 >nul 2>&1
+rem Check FIRST and sleep only between attempts: start already created the
+rem process, so a ping-long wait before the first look only kept this console
+rem window on the screen while the program was starting behind it.
 "%SystemRoot%\System32\tasklist.exe" /fi "IMAGENAME eq {exe_launcher}" 2>nul | "%SystemRoot%\System32\find.exe" /i "{exe_launcher}" >nul
 if not errorlevel 1 (
   set "PORTABLE_EXE_ALIVE=1"
   goto :eof
 )
 set /a PORTABLE_EXE_TICKS+=1 >nul
-if %PORTABLE_EXE_TICKS% LSS 3 goto :portable_exe_watch_loop
+if %PORTABLE_EXE_TICKS% GEQ 3 goto :portable_exe_watch_failed
+"%SystemRoot%\System32\ping.exe" -n 2 127.0.0.1 >nul 2>&1
+goto :portable_exe_watch_loop
+
+:portable_exe_watch_failed
 echo.
 echo [WARNING] App\{exe_launcher} exited immediately.
 echo The program is started by this console launcher instead, so that the
