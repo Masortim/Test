@@ -803,5 +803,332 @@ class LaunchTimingTests(unittest.TestCase):
             self.assertIn("paths", "\n".join(lines))
 
 
+class _SnapshotKey:
+    """Ключ поддельного winreg для снимка реестра."""
+
+    def __init__(self, values, children) -> None:
+        self.values = values
+        self.children = children
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+
+class _SnapshotReg:
+    """Мини-реестр в памяти: только то, что нужно export_registry_text."""
+
+    HKEY_CURRENT_USER = "HKCU"
+    HKEY_LOCAL_MACHINE = "HKLM"
+    KEY_READ = 0x20019
+
+    def __init__(self, tree) -> None:
+        self.tree = tree
+        self.opened = 0
+
+    def _node(self, hive, path: str):
+        node = self.tree.get(hive) or {}
+        for part in path.split("\\"):
+            node = (node.get("__children__") or {}).get(part) or {}
+            if not node:
+                return None
+        return node
+
+    def OpenKey(self, hive, path, reserved, access):
+        self.opened += 1
+        node = self._node(hive, path)
+        if node is None:
+            raise FileNotFoundError(path)
+        return _SnapshotKey(node.get("__values__") or {}, node.get("__children__") or {})
+
+    def EnumValue(self, key, index: int):
+        items = list(key.values.items())
+        if index >= len(items):
+            raise OSError("no more data")
+        name, (value, kind) = items[index]
+        return name, value, kind
+
+    def EnumKey(self, key, index: int):
+        names = list(key.children)
+        if index >= len(names):
+            raise OSError("no more data")
+        return names[index]
+
+
+def snapshot_tree():
+    return {
+        "HKCU": {
+            "__values__": {},
+            "__children__": {
+                "Software": {
+                    "__values__": {},
+                    "__children__": {
+                        "Cursor": {
+                            "__values__": {
+                                "Path": (r"D:\Apps\Cursor", entry.REG_TYPE_SZ),
+                                "Update": (1, entry.REG_TYPE_DWORD),
+                                "Boost": (b"\x01\x02", entry.REG_TYPE_BINARY),
+                                "Exe": (r"D:\Apps\Cursor\Cursor.exe",
+                                        entry.REG_TYPE_EXPAND_SZ),
+                            },
+                            "__children__": {},
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+
+class RegistrySnapshotTests(unittest.TestCase):
+    """Реестр снимается одним проходом winreg, а не процессом на каждый ключ."""
+
+    def test_snapshot_is_one_importable_document(self):
+        fake = _SnapshotReg(snapshot_tree())
+        with mock.patch.object(entry, "_winreg", return_value=fake):
+            text = entry.export_registry_text([r"HKCU\Software\Cursor"])
+        self.assertIn("Windows Registry Editor Version 5.00", text)
+        self.assertIn(r"[HKEY_CURRENT_USER\Software\Cursor]", text)
+        self.assertIn('"Path"="D:\\\\Apps\\\\Cursor"', text)
+        self.assertIn('"Update"=dword:00000001', text)
+        self.assertIn('"Boost"=hex:01,02', text)
+        self.assertIn('"Exe"=hex(2):', text)
+        # Строки в hex(2) — UTF-16: иначе reg import усечёт значение.
+        self.assertIn("44,00,3a,00,", text.lower())
+
+    def test_snapshot_text_parses_back_into_the_same_keys(self):
+        fake = _SnapshotReg(snapshot_tree())
+        with mock.patch.object(entry, "_winreg", return_value=fake):
+            text = entry.export_registry_text([r"HKCU\Software\Cursor"])
+        sections = entry._parse_reg_sections(text)
+        self.assertIn(r"HKEY_CURRENT_USER\Software\Cursor", sections)
+        self.assertEqual(sections[r"HKEY_CURRENT_USER\Software\Cursor"]["Update"],
+                         "dword:00000001")
+
+    def test_empty_key_is_kept_in_the_snapshot(self):
+        tree = {"HKCU": {"__values__": {}, "__children__": {
+            "Software": {"__values__": {}, "__children__": {
+                "Cursor": {"__values__": {}, "__children__": {
+                    "Empty": {"__values__": {}, "__children__": {}}}}}}}}}
+        fake = _SnapshotReg(tree)
+        with mock.patch.object(entry, "_winreg", return_value=fake):
+            text = entry.export_registry_text([r"HKCU\Software\Cursor"])
+        self.assertIn(r"[HKEY_CURRENT_USER\Software\Cursor\Empty]", text)
+
+    def test_missing_key_is_skipped_quietly(self):
+        fake = _SnapshotReg(snapshot_tree())
+        with mock.patch.object(entry, "_winreg", return_value=fake):
+            self.assertEqual(entry.export_registry_text([r"HKCU\Software\Absent"]), "")
+
+    def test_file_is_utf16_with_crlf_and_no_leftovers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "backup" / "all-keys.reg"
+            self.assertTrue(entry.write_reg_file(target, "a\r\nb"))
+            raw = target.read_bytes()
+            self.assertTrue(raw.startswith(b"\xff\xfe"))
+            self.assertIn("a\r\nb".encode("utf-16-le"), raw)
+            self.assertEqual(list(target.parent.glob("*.tmp")), [])
+            self.assertFalse(entry.write_reg_file(target, ""))
+
+    def test_session_snapshot_replaces_one_process_per_key(self):
+        """Бэкап машины — один файл и ни одного вызова reg.exe."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg = {"registry": {"enabled": True, "keys": [
+                r"HKCU\Software\Cursor", r"HKCU\Software\Cursor2"],
+                "created_keys": []}}
+            session = entry.RegistrySession(root, cfg)
+            session.active = True
+            calls = []
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "export_registry_text",
+                                      return_value="Windows Registry Editor Version 5.00\r\n"), \
+                    mock.patch.object(entry, "_reg",
+                                      side_effect=lambda args: calls.append(args) or 0):
+                baseline, created = session._snapshot_host()
+            self.assertEqual([p.name for p in baseline],
+                             [entry.REGISTRY_SNAPSHOT_NAME])
+            self.assertTrue(baseline[0].is_file())
+            self.assertEqual(created, [])
+            self.assertEqual([c for c in calls if c[0] == "export"], [])
+
+    def test_previous_snapshot_is_reused_instead_of_overwritten(self):
+        """Снимок от упавшего сеанса — это исходное состояние машины."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg = {"registry": {"enabled": True, "keys": [r"HKCU\Software\Cursor"]}}
+            session = entry.RegistrySession(root, cfg)
+            session.active = True
+            session.backup.mkdir(parents=True, exist_ok=True)
+            marker = session.backup / entry.REGISTRY_SNAPSHOT_NAME
+            marker.write_bytes(b"old")
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "export_registry_text") as exporter:
+                baseline, _created = session._snapshot_host()
+            exporter.assert_not_called()
+            self.assertEqual(baseline, [marker])
+            self.assertEqual(marker.read_bytes(), b"old")
+
+    def test_created_key_is_not_part_of_the_baseline(self):
+        """Созданный установщиком ключ не восстанавливается, а удаляется."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg = {"registry": {
+                "enabled": True,
+                "keys": [r"HKCU\Software\Cursor", r"HKCU\Software\Cursor\Install"],
+                "created_keys": [r"HKCU\Software\Cursor\Install",
+                                 r"HKCU\Software\Microsoft\Windows\CurrentVersion"
+                                 r"\Uninstall\cursor"],
+            }}
+            session = entry.RegistrySession(root, cfg)
+            self.assertEqual(session._split_keys(), (
+                [r"HKCU\Software\Cursor"], [r"HKCU\Software\Cursor\Install"]))
+
+            session.active = True
+            session.started = True
+            deleted = []
+            with mock.patch.object(entry, "export_registry_text",
+                                   return_value="Windows Registry Editor Version 5.00\r\n"), \
+                    mock.patch.object(entry, "_pack_reg"), \
+                    mock.patch.object(entry, "_reg", return_value=0), \
+                    mock.patch.object(entry, "delete_key_tree",
+                                      side_effect=lambda key: deleted.append(key) or True):
+                session.save_and_restore()
+            # Подключ исходного ключа и ключ Uninstall (его нет в списке keys).
+            self.assertEqual(deleted, [r"HKCU\Software\Cursor\Install",
+                                       r"HKCU\Software\Microsoft\Windows"
+                                       r"\CurrentVersion\Uninstall\cursor"])
+
+
+class BackgroundCleanupTests(unittest.TestCase):
+    """Уборка на стороне Windows не должна задерживать появление окна."""
+
+    def test_work_runs_and_is_logged_after_the_program_starts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "PortableData").mkdir(parents=True, exist_ok=True)
+            work = entry._BackgroundWork(root, "installed programs")
+            work.submit(lambda: ["removed a record", ""])
+            work.wait(timeout=10)
+            log = (root / "PortableData" / "launcher-run.log").read_text(
+                encoding="utf-8")
+            self.assertIn("installed programs: removed a record", log)
+
+    def test_failure_in_background_is_logged_but_not_raised(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "PortableData").mkdir(parents=True, exist_ok=True)
+
+            def boom():
+                raise RuntimeError("registry is busy")
+
+            work = entry._BackgroundWork(root, "shortcuts")
+            work.submit(boom)
+            work.wait(timeout=10)
+            log = (root / "PortableData" / "launcher-run.log").read_text(
+                encoding="utf-8")
+            self.assertIn("registry is busy", log)
+
+
+    def test_every_submitted_step_is_waited_for(self):
+        """Оба шага (записи установки и ярлыки) доходят до конца."""
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "PortableData").mkdir(parents=True, exist_ok=True)
+            done = []
+            work = entry._BackgroundWork(root, "installed programs")
+
+            def first():
+                _time.sleep(0.05)
+                done.append("first")
+                return []
+
+            def second():
+                _time.sleep(0.05)
+                done.append("second")
+                return []
+
+            work.submit(first)
+            work.submit(second, name="shortcuts")
+            work.wait(timeout=10)
+            self.assertEqual(sorted(done), ["first", "second"])
+
+
+class AppRegistryCacheTests(unittest.TestCase):
+    """Поиск .reg в App кэшируется: у Cursor там десятки тысяч файлов."""
+
+    def test_second_launch_reuses_the_cached_list(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp))
+            reg_file = root / "App" / "extra" / "settings.reg"
+            reg_file.parent.mkdir(parents=True, exist_ok=True)
+            reg_file.write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Cursor]\r\n\"a\"=\"b\"\r\n",
+                encoding="utf-16", newline="\r\n")
+            entry._APP_REG_CACHE.clear()
+            found = entry._discover_app_reg_files(root, {})
+            self.assertEqual([path.name for path, _s, _l in found],
+                             ["settings.reg"])
+            cache_file = root / "PortableData" / entry.APP_REG_CACHE_NAME
+            self.assertTrue(cache_file.is_file())
+
+            # Второй запуск: файл кэша читается, дерево App не обходится.
+            entry._APP_REG_CACHE.clear()
+            with mock.patch.object(entry.os, "walk",
+                                   side_effect=AssertionError("App was walked")):
+                second = entry._discover_app_reg_files(root, {})
+            self.assertEqual([path.name for path, _s, _l in second],
+                             ["settings.reg"])
+
+    def test_new_reg_file_invalidates_the_cache(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp))
+            entry._APP_REG_CACHE.clear()
+            self.assertEqual(entry._discover_app_reg_files(root, {}), [])
+            added = root / "App" / "later.reg"
+            added.write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Cursor]\r\n\"b\"=\"c\"\r\n",
+                encoding="utf-16", newline="\r\n")
+            # Windows хранит время каталога с точностью ~10 мс; в тесте
+            # поднимаем mtime явно, чтобы изменение было видно.
+            stamp = os.stat(root / "App").st_mtime_ns
+            os.utime(root / "App", ns=(stamp + 10_000_000, stamp + 10_000_000))
+            entry._APP_REG_CACHE.clear()
+            self.assertEqual([path.name for path, _s, _l in
+                              entry._discover_app_reg_files(root, {})],
+                             ["later.reg"])
+
+
+class BootTimingTests(unittest.TestCase):
+    """Отчёт показывает и распаковку exe: иначе «медленно» некуда отнести."""
+
+    def test_boot_stage_comes_first_and_counts_towards_the_total(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "PortableData"
+            timer = entry._StageTimer(data)
+            timer.add_startup(1.5)
+            timer.tick("paths")
+            timer.finish(root)
+            payload = json.loads((data / entry.LAUNCH_TIMING_NAME)
+                                 .read_text(encoding="utf-8"))
+            self.assertEqual(payload["steps"][0][0], "exe boot")
+            self.assertGreaterEqual(payload["total_seconds"], 1.5)
+            lines = entry._last_launch_timing(data)
+            self.assertIn("exe boot", "\n".join(lines))
+
+    def test_tiny_startup_overhead_is_not_reported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            timer = entry._StageTimer(Path(temp))
+            timer.add_startup(0.001)
+            self.assertEqual(timer.steps, [])
+
+
 if __name__ == "__main__":
     unittest.main()
