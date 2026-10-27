@@ -868,6 +868,7 @@ rem      --keep-registry   keep imported settings in the registry after exit
 rem      --reset           forget the saved session settings and start clean
 rem      --bat-fallback    force this console BAT instead of LaunchPortable.exe
 rem      --diagnose        write a diagnostics report and show where it is
+rem      --no-ui           no dialog boxes (automated runs)
 rem      --help            show this help
 rem ===========================================================================
 
@@ -1182,6 +1183,7 @@ echo     --keep-registry   keep imported settings in the registry after exit
 echo     --reset           forget the saved session settings and start clean
 echo     --bat-fallback    force this console BAT instead of LaunchPortable.exe
 echo     --diagnose        write a diagnostics report and show where it is
+echo     --no-ui           no dialog boxes (automated runs)
 echo     --help            show this help
 echo.
 echo All settings stay inside the {data_dir_name} folder next to this file.

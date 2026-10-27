@@ -37,6 +37,11 @@ from portablizer.core import launcher as launcher_mod
 from portablizer.core import maintenance
 from portablizer.core.logutil import Logger
 
+# Диалоги лончера выключены на весь модуль. Regression CI: окно с «ОК»
+# некому закрыть, MessageBoxW ждёт вечно, и модуль упирался в 240-секундный
+# потолок вместо того, чтобы просто пройти.
+os.environ[exe_launcher.NO_UI_ENV] = "1"
+
 CURSOR_PRODUCT = {
     "nameShort": "Cursor",
     "nameLong": "Cursor",
@@ -336,6 +341,20 @@ class CursorLauncherRuntimeTests(unittest.TestCase):
 
             self.assertEqual(exe_launcher._as_relative_path(root, elsewhere),
                              Path(elsewhere))
+
+    def test_dialogs_can_be_switched_off_for_automated_runs(self):
+        """--no-ui / переменная окружения: без них MessageBox ждёт клика."""
+        previous = os.environ.pop(exe_launcher.NO_UI_ENV, None)
+        try:
+            self.assertFalse(exe_launcher._ui_disabled())
+            os.environ[exe_launcher.NO_UI_ENV] = "1"
+            self.assertTrue(exe_launcher._ui_disabled())
+        finally:
+            os.environ.pop(exe_launcher.NO_UI_ENV, None)
+            if previous is not None:
+                os.environ[exe_launcher.NO_UI_ENV] = previous
+            else:
+                os.environ[exe_launcher.NO_UI_ENV] = "1"
 
     def test_diagnose_collects_the_launch_pipeline(self):
         with tempfile.TemporaryDirectory() as temp:

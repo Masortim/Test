@@ -1532,6 +1532,7 @@ Launch.bat --no-registry        :: вообще не трогать реестр
 Launch.bat --keep-registry      :: оставить настройки в реестре после выхода
 Launch.bat --reset              :: забыть сохранённые настройки
 Launch.bat --diagnose           :: отчёт PortableData\diagnostics.txt
+Launch.bat --no-ui              :: без окон-диалогов (автоматические прогоны)
 Launch.bat --help               :: справка
 Launch.bat -- --arg1 --arg2     :: передать аргументы самой программе
 ```

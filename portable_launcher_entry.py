@@ -29,6 +29,23 @@ NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 ERROR_ICON = 0x00000010
 WARNING_ICON = 0x00000030
 
+#: Переменная окружения и ключ, которые выключают диалоги лончера.
+#:
+#: Окно с кнопкой «ОК» в неинтерактивном сеансе (CI, планировщик заданий,
+#: удалённый рабочий стол без пользователя) некому закрыть: MessageBoxW ждёт
+#: вечно, и запуск программы не начинается вовсе. Поэтому у всех диалогов
+#: есть выключатель — им пользуются тесты и автоматические прогоны.
+NO_UI_ENV = "PORTABLE_LAUNCHER_NO_UI"
+
+
+def _ui_disabled() -> bool:
+    """True, если диалоги показывать нельзя (``--no-ui`` или переменная)."""
+    if any(str(arg).casefold() in ("--no-ui", "/no-ui")
+           for arg in sys.argv[1:]):
+        return True
+    value = str(os.environ.get(NO_UI_ENV, "")).strip().casefold()
+    return value in {"1", "true", "yes", "on", "да"}
+
 
 def _runtime_directory() -> Path:
     """Return the directory containing this script/the frozen launcher."""
@@ -59,6 +76,12 @@ def find_portable_root(start: Optional[Path] = None) -> Path:
 
 def _show_error(message: str) -> None:
     """Show an error even though the launcher is built without a console."""
+    if _ui_disabled():
+        try:
+            print(message, file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+        return
     if IS_WINDOWS:
         try:
             import ctypes
@@ -77,6 +100,12 @@ def _show_error(message: str) -> None:
 
 def _show_warning(message: str) -> None:
     """Show a non-fatal warning; the program is still started afterwards."""
+    if _ui_disabled():
+        try:
+            print(message, file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+        return
     if IS_WINDOWS:
         try:
             import ctypes
@@ -7414,7 +7443,7 @@ class _BusyNotice:
 def _ask_yes_no(message: str, title: str = "Portable Launcher") -> bool:
     """Вопрос «Да/Нет». Без рабочего стола ответ всегда «нет»: молча менять
     файлы программы лончер не вправе."""
-    if not IS_WINDOWS:
+    if not IS_WINDOWS or _ui_disabled():
         return False
     try:
         import ctypes
@@ -7429,6 +7458,12 @@ def _ask_yes_no(message: str, title: str = "Portable Launcher") -> bool:
 
 
 def _show_info(message: str, title: str = "Portable Launcher") -> None:
+    if _ui_disabled():
+        try:
+            print(message, file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+        return
     if IS_WINDOWS:
         try:
             import ctypes
@@ -9340,6 +9375,13 @@ def diagnose(root: Optional[Path] = None) -> int:
         _show_error(f"Не удалось записать отчёт диагностики: {exc}")
         return 1
     _run_log(root, f"diagnostics written to {report}")
+    try:
+        print(f"Diagnostics report: {report}")
+    except Exception:  # noqa: BLE001
+        pass
+    if _ui_disabled():
+        # Автоматический прогон: файл уже на диске, открывать его некому.
+        return 0
     try:
         if IS_WINDOWS:
             os.startfile(str(report))  # type: ignore[attr-defined]
