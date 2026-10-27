@@ -8270,6 +8270,15 @@ class Portablizer:
             extra_env.setdefault("ELECTRON_NO_SANDBOX", "1")
             extra_env.setdefault("ELECTRON_DISABLE_SANDBOX", "1")
             target_args = list(launcher_mod.ELECTRON_CHROMIUM_FLAGS)
+        # Cursor / VS Code / VSCodium: Electron с распакованным app-каталогом.
+        # Его профиль задаётся не только APPDATA, а ещё и VSCODE_* переменными;
+        # без них helper-процессы и перезапуск «для обновления» уходят в
+        # настоящий профиль Windows, а на другом диске — в старый путь.
+        vscode = launcher_mod.vscode_product(main_abs)
+        if vscode:
+            for key, value in launcher_mod.vscode_portable_env(
+                    vscode, "PortableData").items():
+                extra_env.setdefault(key, value)
         if webview2_host:
             extra_env.setdefault(
                 "WEBVIEW2_USER_DATA_FOLDER",
@@ -8381,6 +8390,19 @@ class Portablizer:
         # Общий config читают и корневые скрипты, и готовый EXE в App/.
         self._write_text(os.path.join(portable_dir, "launcher_config.json"),
                          launcher_mod.render_config_json(cfg), newline="\n")
+        # Cursor/VS Code: профиль и расширения живут в PortableData, а
+        # disable-chromium-sandbox в argv.json не даёт Chromium-песочнице
+        # отказаться от запуска внутри папки портатива. Файлы пишутся один раз
+        # при сборке, но лончер проверяет и восстанавливает их на каждом
+        # запуске (см. portable_launcher_entry._apply_vscode_profile).
+        if vscode:
+            self.log.ok(
+                f"Обнаружено приложение VS Code-семейства ({vscode['name']}): "
+                "профиль и расширения будут храниться в PortableData "
+                "(VSCODE_APPDATA / VSCODE_EXTENSIONS)")
+            for note in launcher_mod.prepare_vscode_profile(
+                    portable_dir, main_exe_rel, "PortableData"):
+                self.log.ok(note)
         if launcher_mod.identity_settings(cfg) is not None:
             self.log.info(
                 "Программа входит в аккаунт ключом профиля (Ollama): ключ "

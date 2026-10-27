@@ -345,6 +345,26 @@ def refresh(folder: str, log: Optional[Logger] = None,
             log.warn(message)
             report.messages.append(message)
 
+    # Cursor/VS Code: у портатива, собранного прежней версией, профиль не
+    # привязан к папке (VSCODE_* переменных нет), а Chromium-песочница не
+    # отключена. Обслуживание дописывает и то, и другое — пересобирать
+    # приложение ради этого не нужно.
+    # target_exe_rel уже включает "App" (это путь от корня портатива).
+    app_main = os.path.join(folder, cfg.target_exe_rel.replace("/", os.sep)
+                            .replace("\\", os.sep))
+    vscode = launcher_mod.vscode_product(app_main)
+    if vscode:
+        for key, value in launcher_mod.vscode_portable_env(
+                vscode, cfg.data_dir_name).items():
+            cfg.extra_env.setdefault(key, value)
+        try:
+            for note in launcher_mod.prepare_vscode_profile(
+                    folder, cfg.target_exe_rel, cfg.data_dir_name):
+                log.ok(note)
+                report.messages.append(note)
+        except OSError as exc:
+            log.warn(f"Профиль {vscode['name']} подготовить не удалось: {exc}")
+
     files = {
         "Launch.bat": (launcher_mod.render_bat(cfg), "ascii"),
         "LaunchHidden.vbs": (launcher_mod.render_vbs(), "ascii"),
