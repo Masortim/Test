@@ -315,5 +315,264 @@ class RegistryWorkTests(unittest.TestCase):
             self.assertEqual(parse.call_count, calls_after_first)
 
 
+
+class PrelaunchBudgetTests(unittest.TestCase):
+    """Потолок времени на предстартовые шаги (1.31.0).
+
+    Жалоба осталась прежней: окно программы появляется поздно, хотя сам
+    лончер больше не распаковывается. Значит время уходит на шаги до старта
+    (импорт сотен ключей реестра, обход файлов на медленном диске), и у них
+    должен быть потолок: не успели — доделываем в фоне, параллельно с
+    запущенной программой.
+    """
+
+    def test_default_budget_is_a_couple_of_seconds(self):
+        self.assertGreater(entry.PRELAUNCH_BUDGET_SECONDS, 0.5)
+        self.assertLessEqual(entry.PRELAUNCH_BUDGET_SECONDS, 5.0)
+        self.assertEqual(entry.prelaunch_budget({}),
+                         entry.PRELAUNCH_BUDGET_SECONDS)
+
+    def test_the_budget_can_be_configured_and_disabled(self):
+        self.assertEqual(entry.prelaunch_budget(
+            {"prelaunch_budget_seconds": 1.5}), 1.5)
+        self.assertEqual(entry.prelaunch_budget(
+            {"prelaunch_budget_seconds": 0}), 0.0)
+        # Мусор в конфиге не должен ни отключать потолок, ни ронять запуск.
+        self.assertEqual(entry.prelaunch_budget(
+            {"prelaunch_budget_seconds": "много"}),
+            entry.PRELAUNCH_BUDGET_SECONDS)
+        self.assertEqual(entry.prelaunch_budget(
+            {"prelaunch_budget_seconds": -3}), 0.0)
+
+    def test_a_zero_budget_means_no_ceiling(self):
+        timer = entry._StageTimer(Path(tempfile.gettempdir()))
+        self.assertFalse(timer.exceeded(0.0))
+
+    def test_time_is_counted_from_the_process_start(self):
+        timer = entry._StageTimer(Path(tempfile.gettempdir()))
+        timer.add_startup(1.25)
+        self.assertGreaterEqual(timer.spent, 1.25)
+        self.assertTrue(timer.exceeded(1.0))
+        self.assertFalse(timer.exceeded(30.0))
+        # «exe boot» — первой строкой отчёта, как и раньше.
+        self.assertEqual(timer.steps[0][0], "exe boot")
+
+    def test_the_report_lists_the_deferred_steps(self):
+        """По отчёту видно, что не успело до старта и ушло в фон."""
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp)
+            timer = entry._StageTimer(data)
+            timer.tick("profile self-check")
+            timer.note_deferred("path repair")
+            timer.note_deferred("path repair")  # повтор не задваивает список
+            timer.finish(data)
+            payload = json.loads(
+                (data / entry.LAUNCH_TIMING_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(payload["deferred"], ["path repair"])
+            lines = entry._last_launch_timing(data)
+            self.assertTrue(any("в фоне уже после старта" in line
+                                and "path repair" in line for line in lines),
+                            lines)
+
+    def test_the_build_writes_the_budget_into_the_config(self):
+        """Сборка кладёт потолок в launcher_config.json — его видно и можно
+        поднять или обнулить для конкретного портатива."""
+        from portablizer.core import launcher as launcher_mod
+
+        cfg = launcher_mod.LauncherConfig(app_name="Cursor",
+                                          target_exe_rel="App/Cursor.exe")
+        data = json.loads(launcher_mod.render_config_json(cfg))
+        self.assertEqual(data["prelaunch_budget_seconds"],
+                         entry.PRELAUNCH_BUDGET_SECONDS)
+        # И обратно: разбор конфига возвращает то же значение.
+        restored = launcher_mod.config_from_dict(
+            dict(data, prelaunch_budget_seconds=0))
+        self.assertEqual(restored.prelaunch_budget_seconds, 0.0)
+
+    def test_a_deferred_step_is_logged_by_its_own_lines(self):
+        """Отложенный шаг пишет журнал так же, как выполняемый на месте."""
+        logged = []
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            work = entry._BackgroundWork(root, "pre-launch work")
+            with mock.patch.object(entry, "_run_log",
+                                   side_effect=lambda _root, line:
+                                   logged.append(line)):
+                work.submit(lambda: ["registry: previous location fixed"],
+                            name="install records", prefix=False)
+                work.wait(timeout=5.0)
+        self.assertIn("registry: previous location fixed", logged)
+        self.assertFalse([line for line in logged
+                          if line.startswith("install records:")])
+
+
+class RegistrySplitTests(unittest.TestCase):
+    """Снимок машины — до старта; импорт настроек — можно и после (1.31.0)."""
+
+    def _session(self, root: Path):
+        cfg = {"registry": {"enabled": True, "keys": [], "file": "portable.reg",
+                            "machine_file": "portable_machine.reg"}}
+        (root / "portable.reg").write_text(
+            "Windows Registry Editor Version 5.00\r\n\r\n"
+            "[HKEY_CURRENT_USER\\Software\\Cursor]\r\n\"a\"=\"b\"\r\n",
+            encoding="utf-16", newline="\r\n")
+        session = entry.RegistrySession(root, cfg)
+        session.active = True
+        return session
+
+    def test_prepare_only_snapshots_and_apply_imports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp))
+            session = self._session(root)
+            with mock.patch.object(session, "_snapshot_host",
+                                   return_value=([], [])) as snapshot, \
+                    mock.patch.object(entry, "import_registry_text",
+                                      return_value=True) as import_text:
+                session.prepare()
+                self.assertEqual(snapshot.call_count, 1)
+                self.assertEqual(import_text.call_count, 0)
+                self.assertFalse(session.started)
+                session.apply()
+                self.assertEqual(import_text.call_count, 1)
+                self.assertTrue(session.started)
+                # Повторный apply ничего не импортирует заново.
+                session.apply()
+                self.assertEqual(import_text.call_count, 1)
+                self.assertEqual(snapshot.call_count, 1)
+
+    def test_apply_alone_snapshots_first(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp))
+            session = self._session(root)
+            with mock.patch.object(session, "_snapshot_host",
+                                   return_value=([], [])) as snapshot, \
+                    mock.patch.object(entry, "import_registry_text",
+                                      return_value=True):
+                session.apply()
+            self.assertEqual(snapshot.call_count, 1)
+            self.assertTrue(session.prepared)
+
+
+class InstallRecordNameTests(unittest.TestCase):
+    """Запись ``{GUID}}_is1`` из конфига сборки должна находиться и удаляться."""
+
+    DOUBLED = "{DADADADA-ADAD-ADAD-ADAD-ADADADADADAD}}_is1"
+    FIXED = "{DADADADA-ADAD-ADAD-ADAD-ADADADADADAD}_is1"
+
+    def test_the_fixed_name_is_tried_too(self):
+        variants = entry.uninstall_name_variants(self.DOUBLED)
+        self.assertIn(self.FIXED, variants)
+
+    def test_a_plain_name_is_not_duplicated(self):
+        self.assertEqual(entry.uninstall_name_variants("Cursor"), ["Cursor"])
+
+    def test_the_record_is_found_under_the_real_name(self):
+        reg = _fake_reg({self.FIXED: {"DisplayName": "Cursor"}})
+        found = entry._read_uninstall_entry_variant(
+            reg, "HKCU", 0, self.DOUBLED)
+        self.assertIsNotNone(found)
+        name, values = found
+        self.assertEqual(name, self.FIXED)
+        self.assertEqual(values.get("DisplayName"), "Cursor")
+
+    def _report(self, entries, record_path):
+        cfg = {"app_name": "Cursor",
+               "host_cleanup": {"records": [
+                   {"hive": "HKCU", "path": record_path, "display": "Cursor"}]}}
+        reg = _fake_reg(entries)
+        with mock.patch.object(entry, "_winreg", return_value=reg), \
+                mock.patch.object(entry, "IS_WINDOWS", True), \
+                mock.patch.object(entry, "_uninstall_registry_views",
+                                  return_value=[]):
+            return entry.describe_install_records(Path(tempfile.gettempdir()),
+                                                  cfg)
+
+    def test_diagnose_says_the_record_is_still_there(self):
+        """Запись из сборки с лишней скобкой находится и называется в отчёте."""
+        path = ("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+                + self.DOUBLED)
+        lines = self._report({self.FIXED: {"DisplayName": "Cursor"}}, path)
+        self.assertEqual(len([line for line in lines
+                              if "корни этого портатива" in line]), 1)
+        text = "\n".join(lines)
+        self.assertIn(self.FIXED, text)
+        self.assertIn("будет удалена", text)
+        # Запись считается найденной: «записей нет» больше не пишем.
+        self.assertNotIn("в списке установленных программ нет", text)
+
+    def test_diagnose_says_the_record_is_already_gone(self):
+        path = ("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+                + self.DOUBLED)
+        text = "\n".join(self._report({}, path))
+        self.assertIn("ключа на этом ПК нет", text)
+
+    def test_a_missing_record_is_reported_as_missing(self):
+        reg = _fake_reg({})
+        self.assertIsNone(entry._read_uninstall_entry_variant(
+            reg, "HKCU", 0, self.DOUBLED))
+
+
+class RootDedupTests(unittest.TestCase):
+    """Один и тот же корень не должен печататься дважды (``--diagnose``)."""
+
+    def test_the_same_root_written_differently_is_shown_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp) / "Cursor_Portable")
+            for variant in (str(root).replace(os.sep, "/"),
+                            str(root) + os.sep,
+                            str(root).upper()):
+                (root / "PortableData" / "portable-root.json").write_text(
+                    json.dumps({"root": variant, "previous": variant}),
+                    encoding="utf-8")
+                self.assertEqual(entry._record_roots(root, {}), [str(root)],
+                                 f"корень задвоился при написании {variant}")
+
+    def test_the_long_path_prefix_is_the_same_root(self):
+        self.assertEqual(entry._root_key(r"\\?\D:\Apps\Cursor_Portable"),
+                         entry._root_key(r"d:/apps/cursor_portable/"))
+
+    def test_a_real_previous_location_is_kept(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp) / "Cursor_Portable")
+            (root / "PortableData" / "portable-root.json").write_text(
+                json.dumps({"root": str(root),
+                            "previous": r"D:\Old\Cursor_Portable"}),
+                encoding="utf-8")
+            roots = entry._record_roots(root, {})
+            self.assertEqual(len(roots), 2)
+            self.assertIn(r"D:\Old\Cursor_Portable", roots)
+
+
+class _FakeKey:
+    """Ключ реестра для winreg-мока: только перечисление строковых значений."""
+
+    def __init__(self, values):
+        self.items = list(values.items())
+
+
+def _fake_reg(entries):
+    """Мини-подделка winreg: только то, что нужно чтению записи Uninstall."""
+    reg = mock.MagicMock()
+
+    def open_key(_hive, path, _reserved=0, _access=0):
+        name = str(path).rsplit("\\", 1)[-1]
+        if name not in entries:
+            raise OSError(2, "key not found")
+        context = mock.MagicMock()
+        context.__enter__ = lambda _self: _FakeKey(entries[name])
+        context.__exit__ = lambda _self, *_args: False
+        return context
+
+    def enum(key, index):
+        if index < len(key.items):
+            value_name, value = key.items[index]
+            return value_name, value, 1
+        raise OSError(259, "no more data")
+
+    reg.OpenKey.side_effect = open_key
+    reg.EnumValue.side_effect = enum
+    return reg
+
+
 if __name__ == "__main__":
     unittest.main()
