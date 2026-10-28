@@ -32,6 +32,19 @@ CURSOR_REG = (
 )
 
 
+def _app_reads(read) -> list:
+    """Вызовы ``read_bytes`` для файлов ВНУТРИ папки App (не AppData и т. п.)."""
+    found = []
+    for call in read.call_args_list:
+        target = call.args[0] if call.args else None
+        if target is None:
+            continue
+        parts = str(target).replace("\\", "/").split("/")
+        if "App" in parts:
+            found.append(str(target))
+    return found
+
+
 def _no_app_reads(self: Path, *args, **kwargs):
     """``read_bytes`` для теста: файлы App читать не нужно, остальные — можно."""
     if "App" in str(self).replace(os.sep, "/").split("/"):
@@ -121,8 +134,7 @@ class DriveRootScanTests(unittest.TestCase):
             self.assertEqual([line for line in report if "neutralized" in line],
                              [])
             self.assertLess(spent, 1.0)
-            self.assertFalse([call for call in read.call_args_list
-                              if "App" in str(call)])
+            self.assertEqual(_app_reads(read), [])
 
     def test_a_hardcoded_drive_path_is_still_neutralized(self):
         """Multitran-подобный случай: `C:\\Multitran` в реестре -> правка exe."""
@@ -172,8 +184,7 @@ class DriveRootScanTests(unittest.TestCase):
             with mock.patch.object(Path, "read_bytes", autospec=True,
                                    side_effect=_no_app_reads) as read:
                 session.before()
-            self.assertFalse([call for call in read.call_args_list
-                              if "App" in str(call)])
+            self.assertEqual(_app_reads(read), [])
 
     def test_a_changed_file_is_checked_again(self):
         with tempfile.TemporaryDirectory() as temp:
