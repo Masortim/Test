@@ -2611,6 +2611,67 @@ def _pe_unsigned_checksum_offset(data: bytes) -> Optional[int]:
     return optional + 64
 
 
+def _read_json_dict(path: Path) -> "Dict[str, Any]":
+    """JSON-объект из файла или пустой словарь (нет файла, мусор, список)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_json_dict(path: Path, payload: "Dict[str, Any]") -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+    except OSError:
+        pass
+
+
+#: Слова, которые не могут быть папкой программы: они встречаются в путях
+#: реестра (`Software\\Classes\\Cursor.py\\shell\\open`) и раньше попадали в
+#: список «папок» как есть. Каждый такой «токен» означал отдельный проход
+#: регулярным выражением по всем exe/dll папки App — на Cursor это давало
+#: минуты ожидания до старта программы (исправлено в 1.32.0).
+_DRIVE_ROOT_NOT_FOLDERS = frozenset({
+    "classes", "class", "shell", "open", "command", "defaulticon", "icon",
+    "currentversion", "uninstall", "software", "wow6432node", "microsoft",
+    "windows", "policies", "explorer", "applications", "capabilities",
+    "registeredapplications", "clsid", "appid", "typelib", "shellex",
+    "contextmenuhandlers", "properties", "profile", "profiles", "fileexts",
+    "mscoree", "installer", "run", "paths", "environment", "mime",
+    "database", "updater", "update", "server", "print", "network",
+    "internet explorer", "wownode", "clients", "cursors", "schemes",
+})
+
+#: GUID-подобное имя (`{DADADADA-...}_is1`) папкой программы не бывает.
+_GUID_LIKE_RE = re.compile(r"^\{?[0-9a-f]{8}-[0-9a-f]{4}-", re.IGNORECASE)
+
+#: Путь `<диск>:\<папка>` в тексте реестра (.reg: обратные слеши удвоены).
+_DRIVE_ROOT_LITERAL_RE = re.compile(
+    r"[A-Za-z]:(?:\\\\|\\)([A-Za-z0-9][A-Za-z0-9 _\.\-]{1,40})"
+    r"(?=(?:\\\\|\\)|[\"'\r\n]|$)",
+    re.IGNORECASE,
+)
+
+
+def _drive_root_token_ok(token: str) -> bool:
+    """Может ли это слово быть папкой, которую программа пишет в корень диска."""
+    text = str(token or "").strip().strip("\\/\"'")
+    if len(text) < 3:
+        return False
+    low = text.casefold()
+    if low in _DRIVE_ROOT_SYSTEM_DIRS or low in _DRIVE_ROOT_NOT_FOLDERS:
+        return False
+    # «Cursor.py», «Cursor.plist» — расширения файлов (классы), не папки.
+    if "." in text:
+        return False
+    if _GUID_LIKE_RE.match(text):
+        return False
+    return True
+
+
 class DriveRootDataSession:
     """Keep working folders like ``C:\\multitran`` inside the portable root.
 
@@ -2630,9 +2691,33 @@ class DriveRootDataSession:
        PC, drive, or partition keeps history and user profiles intact.
     """
 
+    #: Отметка «эти файлы App уже проверены при этом наборе слов».
+    PATCH_STAMP_NAME = "drive-root-patch.json"
+    #: Больше этого файл не читается: такие программы пишут в корень диска
+    #: мелкие файлы, а не гигабайтные образы.
+    MAX_FILE_BYTES = 64 * 1024 * 1024
+
     def __init__(self, root: Path, cfg: Dict[str, Any]) -> None:
         self.root = root
         self.cfg = cfg
+        self.data_dir = root / str(cfg.get("data_dir_name") or "PortableData")
+        self.patch_stamp = self.data_dir / self.PATCH_STAMP_NAME
+        self.tokens: "List[str]" = []
+        #: Слова, для которых в ``portable*.reg`` есть путь `<диск>:\<слово>`.
+        self.drive_literals: "set[str]" = set()
+
+    def describe(self) -> "List[str]":
+        """Строки для ``--diagnose``: что ищется и что уже проверено."""
+        tokens = self.tokens or self._candidate_folders()
+        files = _read_json_dict(self.patch_stamp).get("files")
+        checked = len(files) if isinstance(files, dict) else 0
+        lines = ["папки в корне диска: "
+                 + (", ".join(tokens) if tokens else "нет (переносить нечего)")]
+        if tokens:
+            lines.append(f"проверено файлов App: {checked}"
+                         + (" (повторно не читаются: размер и время изменения "
+                            "те же)" if checked else ""))
+        return lines
 
     def _candidate_folders(self) -> List[str]:
         candidates: List[str] = []
@@ -2643,7 +2728,7 @@ class DriveRootDataSession:
             if not token or len(token) < 3:
                 return
             low = token.casefold()
-            if low in seen or low in _DRIVE_ROOT_SYSTEM_DIRS:
+            if low in seen or not _drive_root_token_ok(token):
                 return
             if any(ch in token for ch in (":", "*", "?", "<", ">", "|", "\\", "/")):
                 return
@@ -2660,14 +2745,18 @@ class DriveRootDataSession:
         for key in reg_cfg.get("keys", []) or []:
             parts = [p for p in str(key).replace("/", "\\").split("\\") if p]
             for idx, part in enumerate(parts):
-                if part.casefold() == "software" and idx + 1 < len(parts):
-                    seg = parts[idx + 1]
-                    if seg.casefold() == "wow6432node" and idx + 2 < len(parts):
-                        seg = parts[idx + 2]
+                if part.casefold() != "software" or idx + 1 >= len(parts):
+                    continue
+                # Папку программы называют первый (или второй, если первый —
+                # издатель) ключ после Software: `Software\\Multitran\\...` ->
+                # «Multitran». Остальные сегменты (`Classes`, `shell`, `open`,
+                # `CurrentVersion`, `Uninstall`, GUID записи) папками не
+                # бывают, а каждый лишний токен — это ещё один проход по всем
+                # exe/dll папки App до старта программы.
+                segments = [sub for sub in parts[idx + 1:]
+                            if sub.casefold() != "wow6432node"]
+                for seg in segments[:2]:
                     _add(seg)
-                    for sub in parts[idx + 1:]:
-                        if sub.casefold() != "wow6432node":
-                            _add(sub)
 
         for reg_name in (
             reg_cfg.get("file", "portable.reg"),
@@ -2688,9 +2777,42 @@ class DriveRootDataSession:
                 re.IGNORECASE,
             ):
                 _add(m.group(1))
+            # Жёстко прописанный путь `<диск>:\<папка>` — единственное
+            # доказательство, что программе вообще нужна папка в корне диска
+            # (так делает, например, Multitran: `C:\Multitran`). Без такого
+            # следа править exe/dll нечего, а чтение гигабайтов папки App на
+            # внешнем диске — это минуты ожидания окна.
+            for m in _DRIVE_ROOT_LITERAL_RE.finditer(text):
+                self.drive_literals.add(m.group(1).casefold())
         return candidates
 
+    def _justified_tokens(self, folders: Sequence[str]) -> "List[str]":
+        """Слова, для которых в захваченном реестре есть путь ``<диск>:\<слово>``."""
+        return [token for token in folders
+                if token.casefold() in self.drive_literals]
+
+    def _patch_stamp_key(self, folders: Sequence[str]) -> str:
+        """Отпечаток набора слов: меняется — отметки о файлах недействительны."""
+        return hashlib.sha1(
+            "\n".join(sorted(str(f).casefold() for f in folders)).encode(
+                "utf-8")).hexdigest()
+
     def _neutralize_app_binaries_and_configs(self, folders: Sequence[str]) -> int:
+        """Заменяет ``<диск>:\\<папка>`` на ``..\\<папка>`` в файлах App.
+
+        Раньше этот проход выполнялся при КАЖДОМ запуске и читал каждый
+        exe/dll/ini папки App целиком — по одному проходу регулярного
+        выражения на каждое найденное «слово». У Cursor (179 файлов в App,
+        часть по 25 МБ, внешний диск, антивирус) это занимало 460-550 секунд
+        и целиком съедало запуск. Теперь:
+          * файл, который не менялся, повторно не читается (размер и время
+            изменения хранятся в ``PortableData/drive-root-patch.json``);
+          * перед регулярным выражением идёт дешёвый поиск подстроки: если
+            слова в файле нет вовсе, регулярка не запускается;
+          * слов стало в разы меньше — в них больше не попадают `shell`,
+            `open`, `Classes`, `Cursor.py` и GUID записи (см.
+            :func:`_drive_root_token_ok`).
+        """
         app_dir = self.root / "App"
         if not app_dir.is_dir() or not folders:
             return 0
@@ -2699,7 +2821,26 @@ class DriveRootDataSession:
             "portable_launcher.exe",
         }
         pe_exts = {".exe", ".dll"}
-        text_exts = {".ini", ".cfg", ".conf", ".xml", ".json", ".txt", ".cmd", ".bat"}
+        text_exts = {".ini", ".cfg", ".conf", ".xml", ".json", ".txt", ".cmd",
+                     ".bat"}
+        # Байтовые формы слов: как есть и UTF-16LE (в ресурсах PE строки
+        # лежат в UTF-16). По ним же идёт дешёвая проверка «есть ли слово».
+        token_bytes: "Dict[str, tuple[bytes, bytes]]" = {}
+        for token in folders:
+            try:
+                ascii_token = token.encode("ascii")
+            except UnicodeEncodeError:
+                continue
+            token_bytes[token] = (
+                ascii_token.lower(),
+                b"".join(bytes([b, 0]) for b in ascii_token).lower())
+        stamp_key = self._patch_stamp_key(folders)
+        stamp = _read_json_dict(self.patch_stamp)
+        done: "Dict[str, Any]" = {}
+        if stamp.get("token_key") == stamp_key \
+                and isinstance(stamp.get("files"), dict):
+            done = stamp["files"]
+        seen: "Dict[str, Any]" = {}
         patched = 0
         for dirpath, _dirnames, filenames in os.walk(app_dir):
             for fname in filenames:
@@ -2710,29 +2851,46 @@ class DriveRootDataSession:
                 if ext not in pe_exts and ext not in text_exts:
                     continue
                 try:
-                    if fpath.stat().st_size > 64 * 1024 * 1024:
-                        continue
+                    stat = fpath.stat()
+                except OSError:
+                    continue
+                marker = [int(stat.st_size), int(stat.st_mtime_ns)]
+                rel = str(fpath.relative_to(self.root)).replace(os.sep, "/")
+                if done.get(rel) == marker:
+                    # Файл уже проверен и с тех пор не менялся.
+                    seen[rel] = marker
+                    continue
+                if stat.st_size > self.MAX_FILE_BYTES:
+                    seen[rel] = marker
+                    continue
+                try:
                     raw = fpath.read_bytes()
                 except OSError:
                     continue
+                lowered = raw.lower()
                 new_raw = raw
                 if ext in pe_exts:
                     csum_off = _pe_unsigned_checksum_offset(raw)
                     if csum_off is None:
+                        seen[rel] = marker
                         continue
-                    for token in folders:
-                        try:
-                            tok_b = token.encode("ascii")
-                        except UnicodeEncodeError:
-                            continue
+                    for token, (ascii_form, utf16_form) in token_bytes.items():
+                        if ascii_form not in lowered \
+                                and utf16_form not in lowered:
+                            continue  # слова в файле нет — регулярку не зовём
+                        tok_b = token.encode("ascii")
+                        tok_u = b"".join(bytes([b, 0]) for b in tok_b)
                         pat_a = re.compile(
-                            b"(?<![A-Za-z0-9_])([A-Za-z]):(\\\\" + re.escape(tok_b) + b")(?=[\\\\\"'\\x00\\r\\n\\s])",
+                            b"(?<![A-Za-z0-9_])([A-Za-z]):(\\\\"
+                            + re.escape(tok_b) + b")(?=[\\\\\"'\x00\r\n\s])",
                             re.IGNORECASE,
                         )
                         new_raw = pat_a.sub(rb"..\2", new_raw)
-                        tok_u = b"".join(bytes([b, 0]) for b in tok_b)
                         pat_u = re.compile(
-                            b"([A-Za-z])\x00:\x00(\\\\\x00" + re.escape(tok_u) + b")(?=(?:\\\\\x00|\"\x00|'\x00|\x00\x00|\r\x00|\n\x00| \x00))",
+                            b"([A-Za-z])\x00:\x00(\\\\\x00"
+                            + re.escape(tok_u)
+                            + b")(?=(?:\\\\\x00|\"\x00|'\x00|\x00\x00|\r\x00"
+                              b"|\n\x00| \x00))",
                             re.IGNORECASE,
                         )
                         new_raw = pat_u.sub(b".\x00.\x00\\2", new_raw)
@@ -2741,13 +2899,15 @@ class DriveRootDataSession:
                         struct.pack_into("<I", buf, csum_off, 0)
                         new_raw = bytes(buf)
                 else:
-                    for token in folders:
-                        try:
-                            tok_b = token.encode("ascii")
-                        except UnicodeEncodeError:
+                    for token, (ascii_form, utf16_form) in token_bytes.items():
+                        if ascii_form not in lowered \
+                                and utf16_form not in lowered:
                             continue
+                        tok_b = token.encode("ascii")
                         pat = re.compile(
-                            b"(?<![A-Za-z0-9_])[A-Za-z]:([\\\\/]" + re.escape(tok_b) + b")(?=[\\\\/\"'\\r\\n\\s]|$)",
+                            b"(?<![A-Za-z0-9_])[A-Za-z]:([\\\\/]"
+                            + re.escape(tok_b)
+                            + b")(?=[\\\\/\"'\r\n\s]|$)",
                             re.IGNORECASE,
                         )
                         new_raw = pat.sub(rb"..\1", new_raw)
@@ -2757,6 +2917,19 @@ class DriveRootDataSession:
                         patched += 1
                     except OSError:
                         pass
+                    try:
+                        stat = fpath.stat()
+                        marker = [int(stat.st_size), int(stat.st_mtime_ns)]
+                    except OSError:
+                        pass
+                seen[rel] = marker
+        # Отметки снимаются только тем файлам, что реально просмотрены сейчас:
+        # удалённые из App записи не должны копиться в файле годами. Если
+        # ничего не изменилось — файл не перезаписываем: на медленном диске
+        # лишняя запись тоже стоит времени.
+        if stamp.get("token_key") != stamp_key or stamp.get("files") != seen:
+            _write_json_dict(self.patch_stamp,
+                             {"token_key": stamp_key, "files": seen})
         return patched
 
     @staticmethod
@@ -2924,12 +3097,20 @@ class DriveRootDataSession:
 
     def before(self) -> List[str]:
         folders = self._candidate_folders()
+        self.tokens = list(folders)
         if not folders:
             return []
         report: List[str] = []
-        patched = self._neutralize_app_binaries_and_configs(folders)
-        if patched:
-            report.append(f"neutralized hardcoded drive paths in {patched} file(s)")
+        # Проход по файлам App — только когда это доказанно нужно: в
+        # захваченном реестре есть путь `<диск>:\<папка>`. Иначе программа
+        # в корень диска не пишет, а чтение всех exe/dll на внешнем диске
+        # стоит минуты (у Cursor — 461 с до старта).
+        targets = self._justified_tokens(folders)
+        if targets:
+            patched = self._neutralize_app_binaries_and_configs(targets)
+            if patched:
+                report.append("neutralized hardcoded drive paths in "
+                              f"{patched} file(s)")
         report.extend(self._collect_drive_roots(folders))
         return report
 
@@ -4245,7 +4426,19 @@ class RegistrySession:
             return
         self.prepare()
         started = time.perf_counter()
+        machine_name = str(self.cfg.get("machine_file", "") or "")
         for index, source in enumerate(self.sources):
+            if machine_name and source.name == machine_name \
+                    and not _is_elevated() \
+                    and _machine_file_needs_admin(source):
+                # HKLM без прав администратора не импортируется ни напрямую,
+                # ни через reg.exe (rc=1 каждый запуск). Пробовать — только
+                # время терять: об этом уже сказано в журнале выше, а сам
+                # файл импортирует повышенная копия лончера.
+                _run_log(self.root, "registry import " + source.name
+                         + ": skipped (needs administrator rights; the "
+                           "elevated launcher imports it)")
+                continue
             imported = _unpacked_reg(source, self.runtime, self.root, index)
             if imported is None:
                 _run_log(self.root, "registry import " + source.name
@@ -6649,16 +6842,42 @@ def _is_elevated() -> bool:
         return False
 
 
-#: Сколько ждать повышенную копию лончера, мс. Раньше ожидание было
-#: бесконечным (``WaitForSingleObject(..., INFINITE)``): если окно UAC никто не
-#: закрывал или повышенная копия зависала на своём диалоге, лончер висел
-#: навсегда — ровно это и выглядело как «завис запрос UAC».
-ELEVATED_WAIT_MS = 300_000
+#: Сколько ждать ответа на запрос UAC, мс. Раньше ожидание было бесконечным
+#: (``WaitForSingleObject(..., INFINITE)``): если окно UAC никто не закрывал или
+#: повышенная копия зависала на своём диалоге, лончер висел навсегда — ровно
+#: это и выглядело как «завис запрос UAC».
+#:
+#: Теперь 300 секунд ожидания — тоже слишком много: окно программы всё это
+#: время не появляется, а пользователь давно нажал «Нет» (или окно ушло за
+#: другие). 45 секунд хватает, чтобы прочитать и подтвердить запрос.
+ELEVATED_WAIT_MS = 45_000
+
+#: Сколько ещё ждать повышенную копию, которая запускает САМУ программу
+#: (сеанс целиком), если запрос прав уже подтвердили, с. Верхняя граница —
+#: защита от вечного ожидания; обычный сеанс игры в неё укладывается.
+ELEVATED_FOLLOW_MS = 4 * 3600.0
+
+#: Ключ повышенного запуска «только импортировать захваченный HKLM и выйти».
+#: Импорт — единственное, ради чего нужен администратор в большинстве
+#: случаев; сама программа при этом запускается обычным, не повышенным
+#: процессом. Без этого лончер ждал повышенную копию ВСЕГО сеанса, то есть
+#: программы, которая ещё даже не стартовала.
+ELEVATION_IMPORT_ONLY = "--import-machine-only"
 
 
 def _run_elevated(arguments: Sequence[str],
-                  timeout_ms: int = ELEVATED_WAIT_MS) -> Optional[int]:
+                  timeout_ms: int = ELEVATED_WAIT_MS,
+                  extra: Sequence[str] = (),
+                  follow: bool = False,
+                  log=None) -> Optional[int]:
     """Relaunch this frozen EXE through UAC, wait for its exit code — но не вечно.
+
+    ``timeout_ms`` — сколько ждать ответа на запрос прав. Если за это время
+    повышенная копия не завершилась и ``follow`` включён, значит запрос
+    подтвердили (отказ возвращается сразу, кодом 1223) — тогда ждём её работу
+    дальше, кусками по минуте, но не дольше :data:`ELEVATED_FOLLOW_MS`.
+    ``follow`` нужен там, где повышенная копия запускает саму программу: без
+    него по тайм-ауту запустилась бы вторая копия программы.
 
     ``None`` означает «результата нет»: пользователь отказался от UAC, окно
     повышения не появилось или повышенная копия не уложилась в ``timeout_ms``.
@@ -6692,7 +6911,7 @@ def _run_elevated(arguments: Sequence[str],
         info.lpVerb = "runas"
         info.lpFile = str(sys.executable)
         info.lpParameters = subprocess.list2cmdline(
-            [*map(str, arguments), "--elevated"])
+            [*map(str, arguments), "--elevated", *map(str, extra)])
         info.lpDirectory = str(_runtime_directory())
         info.nShow = 1
         shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
@@ -6701,6 +6920,18 @@ def _run_elevated(arguments: Sequence[str],
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         WAIT_TIMEOUT = 0x00000102
         waited = kernel32.WaitForSingleObject(info.hProcess, int(timeout_ms))
+        followed = 0.0
+        while waited == WAIT_TIMEOUT and follow and followed < ELEVATED_FOLLOW_MS:
+            # Запрос прав уже не висит: отказ вернул бы код 1223 сразу. Значит
+            # его подтвердили, и повышенная копия работает — ждём её, иначе
+            # запустили бы вторую копию программы.
+            slice_ms = 60_000
+            waited = kernel32.WaitForSingleObject(info.hProcess, slice_ms)
+            followed += slice_ms / 1000.0
+            if waited == WAIT_TIMEOUT and log is not None and \
+                    int(followed) % 300 == 0:
+                log(f"elevated copy is still running ({int(followed)}s): "
+                    "waiting, the program runs in it")
         if waited == WAIT_TIMEOUT:
             # Повышенная копия не ответила за отведённое время. Процесс НЕ
             # убиваем: он может добросовестно работать (например, ставить
@@ -10661,6 +10892,46 @@ def offer_recovery(root: Path, cfg: Dict[str, Any],
     return "\n".join(notes) or None
 
 
+def import_machine_registry_command(root: Path, cfg: "Optional[Dict[str, Any]]"
+                                    = None) -> int:
+    """``LaunchPortable.exe --import-machine-only`` (запускается через UAC).
+
+    Повышенная копия лончера нужна ради одной операции — импорта
+    захваченного ``portable_machine.reg`` в HKLM. Раньше лончер поднимал
+    «повышенный сеанс целиком» и ждал его окончания: пока пользователь не
+    закроет программу. Теперь администратор нужен на секунды, а сама
+    программа запускается обычным процессом.
+
+    Код возврата: 0 — импортировано (или импортировать было нечего),
+    1 — импорт не удался.
+    """
+    try:
+        cfg = cfg if cfg is not None else read_launcher_config(root)
+    except (OSError, ValueError):
+        cfg = {}
+    registry = cfg.get("registry")
+    registry = registry if isinstance(registry, dict) else {}
+    name = str(registry.get("machine_file", "portable_machine.reg"))
+    path = root / name
+    if not name or not path.is_file():
+        _run_log(root, "machine registry: nothing to import")
+        return 0
+    try:
+        text = _decode_reg(_unpacked_reg(path, root / "PortableData" / "Runtime",
+                                         root, 0)
+                           .read_bytes())
+    except OSError:
+        text = ""
+    if text and import_registry_text(text):
+        _run_log(root, "machine registry: imported (elevated)")
+        return 0
+    code = _reg(("import", str(path)))
+    _run_log(root, "machine registry: "
+             f"{'imported' if code == 0 else f'FAILED (reg.exe rc={code})'}"
+             " (elevated)")
+    return 0 if code == 0 else 1
+
+
 def update_command(root: Path, argv: Sequence[str]) -> int:
     """``LaunchPortable.exe --update [файл|ссылка] [--yes]``.
 
@@ -10992,6 +11263,10 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # VirtualStore covers un-manifested programs only, so when the keys really
     # are missing on this computer the machine file has to be imported for
     # real - and that needs administrator rights, once, for this run.
+    # Программа сама требует администратора (старый лончер/конфигуратор
+    # игры) — это отдельный случай: тогда повышенным должен работать весь
+    # сеанс. Импорт же захваченного HKLM нужен и без этого.
+    target_needs_admin = bool(needs_machine)
     if not needs_machine and machine_available and bool(registry_cfg.get("enabled")) \
             and _machine_file_needs_admin(machine_path) \
             and _hklm_key_missing(registry_cfg.get("keys", []), machine_path, root=root):
@@ -11008,8 +11283,31 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             _run_log(root, "the UAC prompt was declined recently; not asking "
                            "again this hour, starting with the VirtualStore "
                            "fallback instead")
+        elif not target_needs_admin:
+            # Администратор нужен только для импорта машины. Повышенная
+            # копия делает ровно это и сразу выходит, а программа запускается
+            # обычным процессом — иначе лончер ждал бы конец ВСЕГО сеанса
+            # (у Cursor это минуты) прежде чем показать окно.
+            elevated_code = _run_elevated(
+                [], timeout_ms=min(ELEVATED_WAIT_MS, 45_000),
+                extra=[ELEVATION_IMPORT_ONLY])
+            if elevated_code == 0:
+                clear_elevation_refusal(root)
+                _run_log(root, "machine registry: imported through the UAC "
+                               "hop; the program itself starts normally")
+            elif elevated_code == 1223:
+                mark_elevation_refused(root, "declined at the UAC prompt")
+                _run_log(root, "elevation declined at the UAC prompt; "
+                               "the captured HKLM entries stay unimported "
+                               "and the request will not repeat for an hour")
+            else:
+                mark_elevation_refused(root, "no result from the UAC prompt")
+                _run_log(root, "elevation was refused, unavailable or timed "
+                               "out; continuing without the HKLM import")
         else:
-            elevated_code = _run_elevated(raw_arguments)
+            elevated_code = _run_elevated(
+                raw_arguments, follow=True,
+                log=lambda line: _run_log(root, line))
             if elevated_code is not None:
                 # The elevated copy already reported its own result (including
                 # the friendly error 14001 box when the runtime is missing), so
@@ -11626,6 +11924,15 @@ def diagnose(root: Optional[Path] = None) -> int:
     add("  Ручная уборка: Launch.bat --remove-installed-entry \"Cursor\"")
     add("")
 
+    add("Папки в корне диска (перенос данных программы)")
+    add("-" * 60)
+    try:
+        for line in DriveRootDataSession(root, cfg).describe():
+            add(line)
+    except Exception as exc:  # noqa: BLE001 - отчёт не должен падать
+        add(f"проверить не удалось: {exc}")
+    add("")
+
     add("Предстартовые шаги (прошлый запуск)")
     add("-" * 60)
     budget = prelaunch_budget(cfg)
@@ -11705,6 +12012,9 @@ def main() -> int:
         return repair_start_menu_command(root)
     try:
         root = find_portable_root()
+        if any(str(arg).casefold() == ELEVATION_IMPORT_ONLY
+               for arg in sys.argv[1:]):
+            return import_machine_registry_command(root)
         if any(str(arg).casefold() in ("--stop", "/stop")
                for arg in sys.argv[1:]):
             return stop(root)
