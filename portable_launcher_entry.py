@@ -7006,6 +7006,455 @@ def clear_elevation_refusal(root: Path) -> None:
         pass
 
 
+# --- сторож служебных портов ---------------------------------------------------
+#
+# Жалоба, ради которой появился раздел: портированный OpenCode Desktop при
+# запуске Launch.bat падал с «Desktop IPC handler failed», а причина в журнале
+# была такой: «Managed service port 28894 on 127.0.0.1 is already in use by
+# another process. Configure another port with `opencode service set port
+# <port>`». Программа сама поднимает фоновый сервис (opencode-cli.exe serve
+# --service) на ЗАФИКСИРОВАННОМ порту, и когда порт занят - остатком прошлого
+# запуска, второй копией портатива, установленной на этом ПК программой или
+# зарезервированным Windows диапазоном (WSL/Hyper-V) - приложение умирает ещё
+# до своего окна, а пользователь видит только малопонятную ошибку.
+#
+# Правило лончера то же, что и у уборки остатков: свой остаток - добиваем,
+# чужое - не трогаем, но переносим программу на свободный порт через её же
+# конфиг (для OpenCode это %USERPROFILE%\.config\opencode\service.json, внутри
+# портатива - PortableData\User\.config\opencode\service.json, именно так
+# рекомендует сам OpenCode). Внутри перенаправленного окружения программы файл
+# читается по обычному %USERPROFILE%, поэтому правка незаметна для самой
+# программы и переживает перенос папки.
+#
+# Настраивается блоком ``service_ports`` в launcher_config.json (для OpenCode
+# и подобных программ сборщик записывает его сам; см. SERVICE_PORT_PROFILES):
+#
+#   "service_ports": {
+#     "enabled": true,
+#     "defaults": [28894],                       - порты по умолчанию;
+#     "config_files": [                          - где программа хранит порт;
+#       {"base": "data", "path": "User/.config/opencode/service.json",
+#        "key": "port"}                          - base: "data" = PortableData
+#     ]
+#   }
+
+#: Сколько секунд ждать самостоятельного освобождения порта (сервис прошлого
+#: запуска мог ещё закрываться), прежде чем принимать решение.
+SERVICE_PORT_WAIT_SECONDS = 2.5
+
+#: Сколько секунд после завершения владельца ждать, пока порт освободится
+#: (Windows разбирает сокеты асинхронно).
+SERVICE_PORT_RECHECK_SECONDS = 3.0
+
+#: Сколько секунд ждать после вежливого WM_CLOSE, прежде чем завершать
+#: владельца порта принудительно.
+SERVICE_PORT_CLOSE_GRACE = 2.0
+
+#: Сколько кандидатов перебирать при подборе свободного порта.
+SERVICE_PORT_SCAN_LIMIT = 128
+
+#: Известные программы с фоновым сервисом на фиксированном порту. Это ТЕ ЖЕ
+#: данные, что в ``portablizer.core.launcher.SERVICE_PORT_PROFILES``: сборщик
+#: записывает блок ``service_ports`` в launcher_config.json явно, а встроенная
+#: копия нужна лончеру для портативов, собранных до появления блока. Тест
+#: следит за тем, чтобы копии не разошлись.
+SERVICE_PORT_PROFILES = (
+    ("opencode", {
+        #: Управляемый сервис OpenCode на Windows: 28894 в актуальных версиях
+        #: (до 2.0.33 - 45278). Запасной +1 используют только локальные сборки,
+        #: поэтому в проверке он не участвует: лишний порт дал бы ложное
+        #: «перенаправление» из-за чужого процесса на соседнем порту.
+        "defaults": [28894],
+        "config_files": [
+            #: Адрес переопределения порта из документации OpenCode:
+            #: {"port": <свободный>} в %USERPROFILE%\.config\opencode\service.json.
+            {"base": "data",
+             "path": "User/.config/opencode/service.json",
+             "key": "port"},
+        ],
+    }),
+)
+
+
+def service_port_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Блок ``service_ports`` для этого портатива: профиль + явные настройки.
+
+    Профиль опознаётся по имени программы и путям exe (как у ``update``).
+    Явный блок в launcher_config.json перекрывает профиль по ключам, а
+    ``{"enabled": false}`` полностью выключает проверку.
+    """
+    names = [cfg.get("app_name", ""), cfg.get("target_exe_rel", ""),
+             cfg.get("launcher_target_rel", "")]
+    targets = cfg.get("targets")
+    if isinstance(targets, list):
+        names.extend(str(item.get("rel_path", ""))
+                     for item in targets if isinstance(item, dict))
+    haystack = " ".join(str(n) for n in names).casefold()
+    profile: Dict[str, Any] = {}
+    for marker, item in SERVICE_PORT_PROFILES:
+        if marker in haystack:
+            profile = dict(item)
+            break
+    explicit = cfg.get("service_ports")
+    explicit = dict(explicit) if isinstance(explicit, dict) else {}
+    if explicit.get("enabled") is False:
+        return {}
+    profile.update(explicit)
+    return profile
+
+
+def _service_port_base(root: Path, cfg: Dict[str, Any], entry: Dict[str, Any]
+                       ) -> Path:
+    """Каталог, относительно которого задан ``path`` записи конфига порта."""
+    if str(entry.get("base", "")) == "data":
+        data_name = str(cfg.get("data_dir_name") or "PortableData")
+        return root / data_name
+    return root
+
+
+def _service_config_path(root: Path, cfg: Dict[str, Any],
+                         entry: Dict[str, Any]) -> Path:
+    return _service_port_base(root, cfg, entry) / str(entry.get("path", ""))
+
+
+def _json_key(data: Any, key: str) -> Any:
+    """Значение по составному ключу ``a.b.c`` или ``None``."""
+    current = data
+    for part in str(key or "").split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _read_config_port(root: Path, cfg: Dict[str, Any],
+                      entry: Dict[str, Any]) -> int:
+    """Порт, который программа уже записала в свой конфиг (0 - если нет)."""
+    try:
+        raw = _service_config_path(root, cfg, entry).read_text(
+            encoding="utf-8-sig")
+        value = _json_key(json.loads(raw), str(entry.get("key", "port")))
+        return int(value) if value is not None else 0
+    except (OSError, ValueError, TypeError):
+        # Файла нет, он чужого формата или порт там не число - это не ошибка:
+        # программа просто ещё не переопределяла порт.
+        return 0
+
+
+def _write_config_port(root: Path, cfg: Dict[str, Any], entry: Dict[str, Any],
+                       port: int) -> str:
+    """Пишет свободный порт в конфиг программы, сохраняя остальные ключи."""
+    path = _service_config_path(root, cfg, entry)
+    key = str(entry.get("key", "port"))
+    data: Any = {}
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(parsed, dict):
+            data = parsed
+    except (OSError, ValueError):
+        data = {}
+    target = data
+    parts = key.split(".")
+    for part in parts[:-1]:
+        nested = target.get(part)
+        if not isinstance(nested, dict):
+            nested = {}
+            target[part] = nested
+        target = nested
+    target[parts[-1]] = int(port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8")
+    return str(path)
+
+
+def _tcp_bindable(port: int) -> bool:
+    """True, если программу на этом порту ничего не ждёт.
+
+    Проверяются оба привязки: 127.0.0.1 (адрес управляемого сервиса OpenCode)
+    и 0.0.0.0 - слушатель «на всех интерфейсах» не даёт привязать конкретный
+    адрес так же, как слушатель того же адреса.
+    """
+    if not 0 < int(port) < 65536:
+        return False
+    import socket
+
+    for host in ("127.0.0.1", "0.0.0.0"):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind((host, int(port)))
+            finally:
+                sock.close()
+        except OSError:
+            return False
+    return True
+
+
+def _query_image_path(pid: int) -> str:
+    """Путь к exe процесса или пустая строка (нет прав, процесс уже ушёл)."""
+    if not IS_WINDOWS or int(pid) <= 0:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if kernel32.QueryFullProcessImageNameW(
+                    handle, 0, buffer, ctypes.byref(size)):
+                return buffer.value
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return ""
+    return ""
+
+
+def _tcp_listener_owner(port: int) -> "tuple[int, str]":
+    """Кто слушает порт: (pid, путь exe). ``(0, "")`` - никто или не видно.
+
+    Разбирается таблица TCP соединений с владельцами (GetExtendedTcpTable) -
+    те же данные, что показывает ``netstat -bno``, но без запуска процесса.
+    """
+    if not IS_WINDOWS:
+        return (0, "")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        AF_INET = 2
+        TCP_TABLE_OWNER_PID_LISTENER = 3
+        ERROR_INSUFFICIENT_BUFFER = 122
+        MIB_TCP_STATE_LISTEN = 2
+
+        class MIB_TCPROW_OWNER_PID(ctypes.Structure):
+            _fields_ = [
+                ("dwState", wintypes.DWORD),
+                ("dwLocalAddr", wintypes.DWORD),
+                ("dwLocalPort", wintypes.DWORD),
+                ("dwRemoteAddr", wintypes.DWORD),
+                ("dwRemotePort", wintypes.DWORD),
+                ("dwOwningPid", wintypes.DWORD),
+            ]
+
+        class MIB_TCPTABLE_OWNER_PID(ctypes.Structure):
+            _fields_ = [("dwNumEntries", wintypes.DWORD),
+                        ("table", MIB_TCPROW_OWNER_PID * 1)]
+
+        iphlpapi = ctypes.windll.iphlpapi  # type: ignore[attr-defined]
+        size = wintypes.DWORD(0)
+        if iphlpapi.GetExtendedTcpTable(
+                None, ctypes.byref(size), False, AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER, 0) != ERROR_INSUFFICIENT_BUFFER:
+            return (0, "")
+        buffer = ctypes.create_string_buffer(int(size.value))
+        if iphlpapi.GetExtendedTcpTable(
+                buffer, ctypes.byref(size), False, AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER, 0) != 0:
+            return (0, "")
+        table = ctypes.cast(buffer,
+                            ctypes.POINTER(MIB_TCPTABLE_OWNER_PID)).contents
+        wanted = int(port) & 0xFFFF
+        row_size = ctypes.sizeof(MIB_TCPROW_OWNER_PID)
+        rows = ctypes.cast(
+            ctypes.addressof(table) + MIB_TCPTABLE_OWNER_PID.table.offset,
+            ctypes.POINTER(MIB_TCPROW_OWNER_PID))
+        for index in range(int(table.dwNumEntries)):
+            row = rows[index]
+            if int(row.dwState) != MIB_TCP_STATE_LISTEN:
+                continue
+            # Порт в таблице хранится в сетевом порядке байт в младшем слове.
+            raw = int(row.dwLocalPort)
+            local = ((raw & 0xFF) << 8) | ((raw >> 8) & 0xFF)
+            if local != wanted:
+                continue
+            pid = int(row.dwOwningPid)
+            return (pid, _query_image_path(pid))
+    except Exception:
+        return (0, "")
+    return (0, "")
+
+
+def _path_inside(base: Path, image: str) -> bool:
+    """Лежит ли exe процесса внутри папки (без учёта регистра, как в Windows)."""
+    if not image:
+        return False
+    try:
+        prefix = str(base).replace("/", "\\").rstrip("\\").casefold() + "\\"
+        normalized = str(image).replace("/", "\\").casefold()
+    except Exception:
+        return False
+    return normalized.startswith(prefix) and normalized != prefix
+
+
+def _process_from_portable(root: Path, cfg: Dict[str, Any],
+                           image: str) -> bool:
+    """True, если exe принадлежит этому портативу (в том числе прежнему месту).
+
+    Прежние места нужны: пользователь мог перенести папку, а сервис прошлого
+    запуска - остаться работать из старого расположения.
+    """
+    if not image:
+        return False
+    candidates: "list[Path]" = [Path(root)]
+    try:
+        candidates.extend(Path(item) for item in remembered_roots(root, cfg))
+    except Exception:  # noqa: BLE001 - штамп мог быть нечитаем
+        pass
+    return any(_path_inside(base, image) for base in candidates)
+
+
+def _stop_port_owner(pid: int) -> bool:
+    """Закрывает остаток прошлого запуска: сначала вежливо, потом принудительно."""
+    import time
+
+    try:
+        _post_close_to_windows([int(pid)])
+    except Exception:  # noqa: BLE001 - вежливость не обязательна
+        pass
+    deadline = time.monotonic() + SERVICE_PORT_CLOSE_GRACE
+    while time.monotonic() < deadline:
+        if not _query_image_path(pid):
+            return True
+        time.sleep(0.2)
+    try:
+        killed = _terminate_pids([int(pid)])
+    except Exception:  # noqa: BLE001 - добивание не срывает запуск
+        return False
+    return int(pid) in {int(item) for item in (killed or ())}
+
+
+def _pick_free_service_port(port: int, avoid: "Iterable[int]" = ()) -> int:
+    """Первый свободный порт рядом с занятым (0 - найти не удалось)."""
+    taken = {int(item) for item in avoid if item}
+    for step in range(1, SERVICE_PORT_SCAN_LIMIT + 1):
+        candidate = int(port) + step
+        if candidate > 65535:
+            break
+        if candidate in taken:
+            continue
+        if _tcp_bindable(candidate):
+            return candidate
+    return 0
+
+
+def _redirect_service_port(root: Path, cfg: Dict[str, Any],
+                           settings: Dict[str, Any], port: int,
+                           holder: str) -> "list[str]":
+    """Переносит программу на свободный порт через её собственный конфиг."""
+    entries = [entry for entry in (settings.get("config_files") or ())
+               if isinstance(entry, dict) and entry.get("path")]
+    if not entries:
+        return [f"порт {port} занят ({holder}); блок config_files пуст - "
+                "укажите свободный порт в конфиге программы вручную"]
+    fresh = _pick_free_service_port(
+        port, _service_port_list(root, cfg, settings))
+    if not fresh:
+        return [f"порт {port} занят ({holder}), свободный порт рядом не найден; "
+                "освободите порт или укажите порт вручную"]
+    written: "list[str]" = []
+    try:
+        for entry in entries:
+            try:
+                written.append(_write_config_port(root, cfg, entry, fresh))
+            except Exception as exc:  # noqa: BLE001 - пишем, что успели
+                written.append(f"{entry.get('path')}: запись не удалась ({exc})")
+    except Exception as exc:  # noqa: BLE001 - перенос не срывает запуск
+        return [f"порт {port} занят ({holder}); перенаправить не удалось ({exc})"]
+    return [f"порт {port} занят ({holder}) - это не процесс портатива, чужой "
+            f"процесс не тронут; порт перенаправлен на {fresh}: "
+            + "; ".join(written)]
+
+
+def _service_port_list(root: Path, cfg: Dict[str, Any],
+                       settings: Dict[str, Any]) -> "list[int]":
+    """Порты для проверки: значения по умолчанию + записанные программой."""
+    ports: "list[int]" = []
+    for value in (settings.get("defaults") or ()):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 < number < 65536 and number not in ports:
+            ports.append(number)
+    for entry in (settings.get("config_files") or ()):
+        if not isinstance(entry, dict) or not entry.get("path"):
+            continue
+        found = _read_config_port(root, cfg, entry)
+        if 0 < found < 65536 and found not in ports:
+            ports.append(found)
+    return ports
+
+
+def guard_service_ports(root: Path, cfg: Dict[str, Any]) -> "list[str]":
+    """Освобождает служебные порты программы ПЕРЕД её запуском.
+
+    Свои остатки (процесс из папки портатива, держащий порт с прошлого раза)
+    завершаются; чужой процесс не трогается, а программа переносится на
+    свободный порт через её же конфиг - ровно то, что OpenCode предлагает
+    сделать вручную. Каждая ошибка - только строка в журнале: проверка не
+    должна мешать запуску программы.
+    """
+    import time
+
+    settings = service_port_settings(cfg)
+    if not settings:
+        return []
+    try:
+        running = _portable_process_list(root)
+    except Exception:  # noqa: BLE001 - проверка не срывает запуск
+        running = []
+    if running:
+        # Из портатива уже что-то работает - это второй экземпляр программы,
+        # и его сервис на порту закономерно жив. Добивать его нельзя.
+        return ["port check skipped: the program is already running"]
+    lines: "list[str]" = []
+    for port in _service_port_list(root, cfg, settings):
+        try:
+            free = _tcp_bindable(port)
+            if not free:
+                # Сервис прошлого запуска мог ещё закрываться: короткая пауза,
+                # прежде чем завершать процессы или переносить порт.
+                deadline = time.monotonic() + SERVICE_PORT_WAIT_SECONDS
+                while not free and time.monotonic() < deadline:
+                    time.sleep(0.25)
+                    free = _tcp_bindable(port)
+            if free:
+                continue
+            pid, image = _tcp_listener_owner(port)
+            holder = Path(image).name if image else (
+                f"pid {pid}" if pid else "неизвестный процесс или "
+                "зарезервированный Windows диапазон")
+            if pid and image and _process_from_portable(root, cfg, image):
+                if _stop_port_owner(pid):
+                    deadline = time.monotonic() + SERVICE_PORT_RECHECK_SECONDS
+                    while (time.monotonic() < deadline
+                           and not _tcp_bindable(port)):
+                        time.sleep(0.25)
+                if _tcp_bindable(port):
+                    lines.append(
+                        f"порт {port} держал остаток прошлого запуска "
+                        f"({holder}, pid {pid}); остаток закрыт, порт свободен")
+                    continue
+                lines.append(
+                    f"порт {port} держал остаток прошлого запуска "
+                    f"({holder}, pid {pid}); остаток закрыт, но порт не "
+                    "освободился")
+            lines.extend(_redirect_service_port(
+                root, cfg, settings, port, holder))
+        except Exception as exc:  # noqa: BLE001 - один порт не срывает другие
+            lines.append(f"порт {port}: проверка не удалась ({exc})")
+    return lines
+
+
 def temp_leftovers(root: Path, cfg: "Optional[Dict[str, Any]]" = None) -> int:
     """Сколько записей осталось во временных папках портатива."""
     data_name = str((cfg or {}).get("data_dir_name", "PortableData"))
@@ -11382,6 +11831,20 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             _run_log(root, "drive-root data: " + line)
     except Exception as exc:  # noqa: BLE001
         _run_log(root, f"drive-root data: pre-launch sync failed ({exc})")
+
+    timings.tick("service ports")
+    # Служебный порт программы (OpenCode и подобные): приложение само поднимает
+    # фоновый сервис на ЗАФИКСИРОВАННОМ порту, и при занятом порте падает ещё
+    # до своего окна («Desktop IPC handler failed», «Managed service port N is
+    # already in use»). До старта: свой остаток прошлого запуска завершается,
+    # чужой процесс не трогается, а программа переносится на свободный порт
+    # через её же конфиг. Шаг обязателен (после старта уже поздно), но стоит
+    # миллисекунды, а его ошибка не должна срывать запуск.
+    try:
+        for line in guard_service_ports(root, cfg):
+            _run_log(root, "service port: " + line)
+    except Exception as exc:  # noqa: BLE001 - проверка не срывает запуск
+        _run_log(root, f"service port: check failed ({exc})")
 
     timings.tick("session start")
     # Время начала сеанса: по нему определяется, что установщик (в том числе
