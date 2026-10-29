@@ -182,6 +182,13 @@ class LauncherConfig:
     # следы родного апдейтера, ключи тихой установки (см. UPDATE_PROFILES).
     # Пустой словарь - значит «взять профиль программы, если он есть».
     update: Dict[str, object] = field(default_factory=dict)
+    # --- служебные порты программы -------------------------------------------
+    # Блок ``service_ports`` из launcher_config.json: порты, которые фоновые
+    # сервисы программы привязывают жёстко (см. SERVICE_PORT_PROFILES).
+    # Лончер перед стартом освобождает занятый порт (свой остаток прошлого
+    # запуска) или переносит программу на свободный порт через её же конфиг.
+    # Пустой словарь - значит «взять профиль программы, если он есть».
+    service_ports: Dict[str, object] = field(default_factory=dict)
     # Сетевые компоненты (драйвер TAP-Windows и службы), перенесённые в
     # папку NetStack/ портатива: {"manifest", "setup", "teardown",
     # "driver_services", "service_names", "stop_on_exit"}. Пусто — компонентов
@@ -1945,6 +1952,8 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
                       if isinstance(data.get("shared_saves"), dict) else {}),
         update=(dict(data["update"])
                 if isinstance(data.get("update"), dict) else {}),
+        service_ports=(dict(data["service_ports"])
+                       if isinstance(data.get("service_ports"), dict) else {}),
         netstack=(dict(data["netstack"])
                   if isinstance(data.get("netstack"), dict) else {}),
         targets=targets,
@@ -2214,6 +2223,68 @@ def update_settings(cfg: "LauncherConfig") -> Optional[Dict[str, object]]:
             break
     block.update(cfg.update or {})
     return block or None
+
+
+#: Известные программы с фоновым сервисом на фиксированном порту. Это ТЕ ЖЕ
+#: данные, что в ``portable_launcher_entry.SERVICE_PORT_PROFILES``: сборщик
+#: записывает их в ``launcher_config.json`` явно, а встроенная копия нужна
+#: лончеру для портативов, собранных до появления блока ``service_ports``.
+#: Тест следит за тем, чтобы копии не разошлись.
+#:
+#: Зачем это: OpenCode Desktop поднимает управляемый сервис на ЗАФИКСИРОВАННОМ
+#: порту (28894) и при занятом порте падает ещё до окна с «Desktop IPC handler
+#: failed: Managed service port ... is already in use». Лончер перед стартом
+#: добивает свой остаток прошлого запуска, чужой процесс не трогает, а
+#: программе переносит порт через её же конфиг
+#: (%USERPROFILE%\.config\opencode\service.json - рекомендация самого OpenCode).
+SERVICE_PORT_PROFILES = (
+    ("opencode", {
+        #: Управляемый сервис OpenCode на Windows: 28894 в актуальных версиях
+        #: (до 2.0.33 - 45278). Соседний +1 используют только локальные сборки,
+        #: поэтому он не проверяется: чужой процесс на соседнем порту дал бы
+        #: ложное «перенаправление».
+        "defaults": [28894],
+        #: Адрес переопределения порта из документации OpenCode:
+        #: {"port": <свободный>} в %USERPROFILE%\.config\opencode\service.json.
+        #: ``base: "data"`` - путь относительно папки данных портатива
+        #: (PortableData), куда лончер направляет %USERPROFILE%.
+        "config_files": [
+            {"base": "data",
+             "path": "User/.config/opencode/service.json",
+             "key": "port"},
+        ],
+    }),
+)
+
+
+def service_port_settings(cfg: "LauncherConfig") -> Dict[str, object]:
+    """Блок ``service_ports`` для launcher_config.json или пустой словарь.
+
+    Профиль программы (см. SERVICE_PORT_PROFILES) опознаётся по имени и путям
+    exe; явные настройки (``cfg.service_ports``) перекрывают его по ключам.
+    Блок не пишется вовсе, если программе некуда писать переопределение порта
+    и нечего проверять.
+    """
+    names = [cfg.app_name, cfg.target_exe_rel, cfg.launcher_target_rel]
+    names.extend(f"{t.name} {t.rel_path}" for t in cfg.targets)
+    haystack = " ".join(str(n) for n in names).casefold()
+    profile: Dict[str, object] = {}
+    for marker, item in SERVICE_PORT_PROFILES:
+        if marker in haystack:
+            profile = dict(item)
+            break
+    # ``config_files`` - список словарей: копируем глубже, чтобы явный блок
+    # не разделял записи профиля с константой.
+    files = profile.get("config_files")
+    if isinstance(files, list):
+        profile["config_files"] = [
+            dict(inner) if isinstance(inner, dict) else inner for inner in files]
+    explicit = cfg.service_ports or {}
+    if isinstance(explicit, dict) and explicit.get("enabled") is False:
+        return {}
+    if isinstance(explicit, dict):
+        profile.update(explicit)
+    return profile
 
 
 # --- Вспомогательные лаунчеры и меню ------------------------------------------
@@ -2760,4 +2831,10 @@ def render_config_json(cfg: LauncherConfig) -> str:
     update = update_settings(cfg)
     if update is not None:
         payload["update"] = update
+    # Служебные порты: лончер перед стартом проверяет, что фоновый сервис
+    # программы сможет привязать свой фиксированный порт, иначе программа
+    # падает ещё до окна («Managed service port ... is already in use»).
+    ports = service_port_settings(cfg)
+    if ports:
+        payload["service_ports"] = ports
     return json.dumps(payload, ensure_ascii=False, indent=2)
