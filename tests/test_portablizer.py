@@ -37,7 +37,7 @@ from portablizer.core.logutil import Logger
 from portablizer.core.portablizer import (
     PortableOptions, PortableResult, Portablizer, _burn_layout_payloads,
     _exit_code_hint, _format_exit_code, read_installshield_result,
-    retarget_response_file,
+    retarget_response_file, _stage_single_file,
 )
 from portablizer.core.silentargs import (
     SilentPlan, build_attempts, build_burn_layout_plan, build_custom_cli_plan,
@@ -59,6 +59,24 @@ def _jump_targets(bat: str):
 class PortablizerOutputTests(unittest.TestCase):
     def setUp(self):
         self.engine = Portablizer(Logger())
+
+    def test_single_file_staging_contains_only_selected_installer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source_dir = Path(temp, "media")
+            source_dir.mkdir()
+            installer = source_dir / "setup.exe"
+            installer.write_bytes(b"selected installer")
+            (source_dir / "setup-1.bin").write_bytes(b"neighbor part")
+            (source_dir / "payloads").mkdir()
+
+            staging, copied = _stage_single_file(str(installer))
+            try:
+                self.assertEqual(Path(copied).name, "setup.exe")
+                self.assertEqual(Path(copied).read_bytes(), b"selected installer")
+                self.assertEqual([p.name for p in Path(staging).iterdir()],
+                                 ["setup.exe"])
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
 
     def test_prepare_output_removes_stale_launcher_but_keeps_user_data(self):
         with tempfile.TemporaryDirectory() as temp:
