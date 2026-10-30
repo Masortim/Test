@@ -8,6 +8,7 @@ portable app is started.
 """
 from __future__ import annotations
 
+import atexit
 import base64
 import hashlib
 import json
@@ -5622,22 +5623,28 @@ def apply_webview2_bridge(env: Dict[str, str], target: Path,
 
 # --- вход через браузер по умолчанию ------------------------------------------
 #
-# Программа, которой нужен вход в аккаунт (Figma, OpenCode, Obsidian, любая
-# Electron/CEF-сборка), открывает страницу входа через оболочку Windows:
+# Программа, которой нужен вход в аккаунт (Figma, Cursor, OpenCode, Obsidian,
+# любая Electron/CEF-сборка), открывает страницу входа через оболочку Windows:
 # ShellExecute("https://…"). Оболочка запускает браузер по умолчанию с ТЕМ
 # окружением, которое получил вызывающий процесс, — а лончер перенаправил
-# APPDATA/LOCALAPPDATA/USERPROFILE внутрь PortableData. Браузер видит пустой
-# профиль, создаёт второй (портативный) и выглядит как «дубликат браузера по
-# умолчанию»: без закладок, без сохранённых входов, с новыми ключами в
-# реестре и мегабайтами кэша на флешке.
+# APPDATA/LOCALAPPDATA/USERPROFILE внутрь PortableData. Браузер не находит
+# своего профиля, создаёт второй (портативный) и выглядит как «дубликат
+# браузера по умолчанию»: без закладок и сохранённых входов. Хуже того, не
+# найдя рядом свой обновлятор, он решает, что не установлен, и запускает
+# установку заново — уже внутрь портатива.
 #
-# Мост ловит такой запуск — новый процесс известного браузера, который
-# стартовал из самой программы (или чей профиль появился внутри PortableData)
-# и несёт в командной строке http(s)-адрес, — снимает его до того, как профиль
-# успел создаться, и открывает тот же адрес через оболочку САМОГО лончера.
-# У лончера окружение настоящее, поэтому адрес попадает в уже открытый
-# браузер пользователя: вход проходит в привычном профиле, второй копии
-# браузера не появляется ни на диске, ни в реестре.
+# Поэтому мост не ловит запуск постфактум, а не даёт профилю раздвоиться:
+# каталоги браузера в перенаправленном профиле на время сеанса становятся
+# junction'ами на настоящие каталоги пользователя. Браузер открывает СВОЙ
+# профиль (а значит, и уже открытое окно) — вход проходит там, где человек уже
+# авторизован, второй копии не появляется ни на диске, ни в реестре.
+# Junction'ы снимаются при выходе, чтобы папку портатива можно было копировать.
+#
+# Если файловая система junction'ов не умеет (FAT/exFAT на флешке, сетевая
+# папка), остаётся второй рубеж: наблюдение за процессами. Новый процесс
+# известного браузера, который стартовал из самой программы и несёт в
+# командной строке http(s)-адрес, снимается, а адрес открывает оболочка самого
+# лончера — с настоящим профилем.
 
 #: Браузеры, чей запуск перехватывается. Имена сравниваются без пути.
 _BROWSER_IMAGES = frozenset({
@@ -5646,27 +5653,43 @@ _BROWSER_IMAGES = frozenset({
     "waterfox.exe", "librewolf.exe", "thorium.exe", "arc.exe", "zen.exe",
 })
 
-#: Где браузер держит профиль ВНУТРИ перенаправленного профиля портатива.
-#: Ключ — имя exe, значение — относительные пути от PortableData. Именно эти
-#: каталоги появляются как «дубликат браузера», и именно их убирает мост.
+#: Где каждый браузер держит свой профиль: (переменная, путь от неё).
+#: APPDATA — сам профиль и настройки, LOCALAPPDATA — кэш и «User Data».
 _BROWSER_PROFILE_DIRS: Dict[str, tuple] = {
-    "chrome.exe": ("AppData/Local/Google/Chrome",),
-    "msedge.exe": ("AppData/Local/Microsoft/Edge",),
-    "brave.exe": ("AppData/Local/BraveSoftware",),
-    "vivaldi.exe": ("AppData/Local/Vivaldi",),
-    "opera.exe": ("AppData/Roaming/Opera Software",
-                  "AppData/Local/Opera Software"),
-    "launcher.exe": ("AppData/Roaming/Opera Software",
-                     "AppData/Local/Opera Software"),
-    "yandex.exe": ("AppData/Local/Yandex", "AppData/Roaming/Yandex"),
-    "chromium.exe": ("AppData/Local/Chromium",),
-    "firefox.exe": ("AppData/Roaming/Mozilla", "AppData/Local/Mozilla"),
-    "waterfox.exe": ("AppData/Roaming/Mozilla", "AppData/Local/Mozilla"),
-    "librewolf.exe": ("AppData/Roaming/Mozilla", "AppData/Local/Mozilla"),
-    "thorium.exe": ("AppData/Local/Thorium",),
-    "arc.exe": ("AppData/Local/Packages",),
-    "zen.exe": ("AppData/Roaming/zen", "AppData/Local/zen"),
+    "chrome.exe": (("LOCALAPPDATA", "Google/Chrome"),),
+    "msedge.exe": (("LOCALAPPDATA", "Microsoft/Edge"),),
+    "brave.exe": (("LOCALAPPDATA", "BraveSoftware"),),
+    "vivaldi.exe": (("LOCALAPPDATA", "Vivaldi"),),
+    "chromium.exe": (("LOCALAPPDATA", "Chromium"),),
+    "thorium.exe": (("LOCALAPPDATA", "Thorium"),),
+    "opera.exe": (("APPDATA", "Opera Software"),
+                  ("LOCALAPPDATA", "Opera Software")),
+    "launcher.exe": (("APPDATA", "Opera Software"),
+                     ("LOCALAPPDATA", "Opera Software")),
+    "yandex.exe": (("APPDATA", "Yandex"), ("LOCALAPPDATA", "Yandex")),
+    "firefox.exe": (("APPDATA", "Mozilla"), ("LOCALAPPDATA", "Mozilla")),
+    "waterfox.exe": (("APPDATA", "Mozilla"), ("LOCALAPPDATA", "Mozilla")),
+    "librewolf.exe": (("APPDATA", "Mozilla"), ("LOCALAPPDATA", "Mozilla")),
+    "zen.exe": (("APPDATA", "zen"), ("LOCALAPPDATA", "zen")),
+    # Arc хранит профиль внутри UWP-каталога ``Packages``; соединять весь
+    # этот каталог нельзя (там данные всех магазинных приложений), поэтому
+    # для него работает только наблюдение за процессами.
 }
+
+#: Обновляторы рядом с браузером. Без них браузер в перенаправленном профиле
+#: решает, что он «не установлен», и запускает установку заново — внутрь
+#: портатива. ``Microsoft\EdgeUpdate`` уже соединяет мост WebView2.
+_BROWSER_UPDATE_DIRS: tuple = (
+    ("LOCALAPPDATA", "Google/Update"),
+    ("LOCALAPPDATA", "Google/GoogleUpdater"),
+)
+
+#: Кто запускает браузер, когда оболочка работает не сама, а через службу
+#: (AppInfo/DCOM): в этом случае цепочка родителей до программы не доходит.
+_SHELL_BROKERS = frozenset({
+    "explorer.exe", "svchost.exe", "dllhost.exe", "runtimebroker.exe",
+    "searchprotocolhost.exe", "searchhost.exe", "wmiprvse.exe",
+})
 
 #: Адрес в командной строке браузера. Кавычки и разделители аргументов в
 #: токен не попадают, поэтому «--single-argument "https://…"» разбирается без
@@ -5689,13 +5712,78 @@ def _browser_login_url(command_line: str) -> str:
     return match.group(0).rstrip(".,;)")
 
 
+def _browser_profile_pairs() -> "tuple[tuple[str, str], ...]":
+    """Все каталоги браузеров: профиль и обновлятор, без повторов."""
+    pairs: "list[tuple[str, str]]" = []
+    for roots in _BROWSER_PROFILE_DIRS.values():
+        pairs.extend(roots)
+    pairs.extend(_BROWSER_UPDATE_DIRS)
+    return tuple(dict.fromkeys(pairs))
+
+
+def _is_junction(path: Path) -> bool:
+    """True, если путь — junction или символическая ссылка, а не каталог.
+
+    Проверка нужна, чтобы не удалить настоящий профиль и не принять ссылку
+    за «дубликат браузера»: содержимое junction'а — это данные пользователя.
+    """
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        pass
+    try:
+        os.readlink(str(path))
+        return True
+    except (OSError, AttributeError, ValueError):
+        pass
+    try:
+        import stat
+
+        attributes = getattr(os.lstat(str(path)), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    except (OSError, ValueError):
+        return False
+
+
+def _remove_junction(path: Path) -> bool:
+    """Снять junction/ссылку, не заглядывая внутрь цели."""
+    for action in (os.unlink, os.rmdir):
+        try:
+            action(str(path))
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _remove_tree(path: Path) -> bool:
+    """Удалить каталог, не заходя внутрь вложенных ссылок.
+
+    ``shutil.rmtree`` считает junction каталогом и обошёл бы его — то есть
+    удалил бы содержимое НАСТОЯЩЕГО профиля за ссылкой. Поэтому ссылки
+    снимаются заранее, а не «вместе с папкой».
+    """
+    try:
+        for current, dirs, _files in os.walk(str(path), topdown=True,
+                                             followlinks=False):
+            for name in list(dirs):
+                child = Path(current) / name
+                if _is_junction(child):
+                    _remove_junction(child)
+                    dirs.remove(name)
+    except OSError:
+        pass
+    shutil.rmtree(path, ignore_errors=True)
+    return not path.exists()
+
+
 def _process_table(full_paths: bool = False) -> "list[tuple[int, int, str]]":
     """Все процессы системы: ``(pid, parent_pid, имя или путь к exe)``.
 
     ``full_paths=False`` — снимок без открытия каждого процесса: он делается
     несколько раз в секунду и обязан быть дешёвым. Для опознания браузера
-    достаточно имени файла; полный путь нужен только там, где печатается
-    журнал.
+    достаточно имени файла; полный путь нужен только в журнале.
     """
     if not IS_WINDOWS:
         return []
@@ -5825,21 +5913,32 @@ def open_in_host_browser(url: str) -> bool:
 
 
 class BrowserLoginBridge:
-    """Вход в аккаунт — в браузере по умолчанию, без второй копии профиля.
+    """Вход в аккаунт — в настоящем браузере, без второй копии профиля.
 
-    Работает как наблюдатель: пока программа жива, раз в ``poll_seconds``
-    смотрит на процессы. Реагирует только на НОВЫЙ процесс известного
-    браузера, который либо стартовал из самой программы (по цепочке
-    родителей), либо уже создал свой профиль внутри ``PortableData``, и у
-    которого в командной строке есть http(s)-адрес. Такой процесс снимается,
-    а адрес открывается оболочкой лончера — с обычным профилем.
+    Два рубежа:
+
+    * **Профиль не раздваивается.** Каталоги браузеров внутри
+      перенаправленного профиля становятся junction'ами на каталоги
+      пользователя — браузер открывает свой обычный профиль (и уже открытое
+      окно), поэтому вход происходит там, где человек уже авторизован, а
+      второй копии не появляется ни на диске, ни в реестре. Junction'ы
+      снимаются при выходе: папку портатива можно копировать.
+    * **Наблюдение.** Если junction создать нельзя (FAT/exFAT, сетевая папка),
+      новый процесс известного браузера, стартовавший из программы и несущий
+      http(s)-адрес, снимается, а адрес открывает оболочка лончера — с
+      настоящим профилем.
+
+    Дубликаты, оставшиеся от прежних запусков (или от сборки), удаляются при
+    старте: это данные именно той копии браузера, которой быть не должно.
     """
 
     def __init__(self, root: Path, cfg: Dict[str, Any], target: Path,
+                 env: "Optional[Dict[str, str]]" = None,
                  log: Optional[Any] = None) -> None:
         self.root = root
         self.cfg = cfg
         self.target = target
+        self.env = dict(env or {})
         settings = cfg.get("browser_login")
         self.settings: Dict[str, Any] = (
             dict(settings) if isinstance(settings, dict) else {})
@@ -5847,6 +5946,7 @@ class BrowserLoginBridge:
         self.target_pid = 0
         self._baseline: "set[int]" = set()
         self._profiles_before: "set[str]" = set()
+        self._bridged: "set[tuple[str, str]]" = set()
         self._handled: "set[str]" = set()
         self._last_poll = 0.0
         self._reported = False
@@ -5870,24 +5970,62 @@ class BrowserLoginBridge:
         # это и есть программа, а не чужой «вход».
         return not _is_known_browser(str(self.target))
 
+    @property
+    def connect_host_profile(self) -> bool:
+        return self.settings.get("connect_host_profile") is not False
+
+    @property
+    def clean_duplicates(self) -> bool:
+        return self.settings.get("clean_duplicates") is not False
+
     # -- жизненный цикл ----------------------------------------------------
     def prepare(self) -> None:
-        """Запомнить, что уже было открыто ДО старта программы."""
+        """Подготовить профиль и запомнить, что было открыто до старта."""
         if not self.enabled:
             return
         try:
             self._baseline = {pid for pid, _ppid, _image in _process_table()}
         except Exception:  # noqa: BLE001 - снимок необязателен
             self._baseline = set()
+        # Сначала убираем дубликат, оставшийся от прежних запусков или от
+        # сборки: иначе junction на его место уже не встанет.
+        removed = self.drop_duplicate_profiles()
+        for path in removed[:4]:
+            self.log("browser login: removed a duplicate browser profile "
+                     "inside the portable folder (" + path + "); a login "
+                     "must use the installed browser with the real profile")
+        if self.connect_host_profile:
+            bridged = self.connect_host_profiles()
+            if bridged:
+                self.log("browser login: browser profiles are connected to "
+                         "the real user profile (" + str(len(bridged))
+                         + " folder(s)); a login opens the installed browser")
         self._profiles_before = self._existing_profiles()
         if not self._reported:
             self._reported = True
-            self.log("browser login: watching the processes started by the "
-                     "program (a login page must open in the real default "
-                     "browser, not in a copy with a portable profile)")
+            if not self._bridged:
+                self.log("browser login: the file system cannot link the "
+                         "browser profile; watching the processes started by "
+                         "the program instead")
 
     def attach(self, pid: int) -> None:
         self.target_pid = int(pid or 0)
+
+    def teardown(self) -> None:
+        """Снять junction'ы: в папке портатива не должно остаться ссылок."""
+        for var, rel in _browser_profile_pairs():
+            root = self._portable_root(var)
+            if root is None:
+                continue
+            path = root / rel
+            try:
+                if not _is_junction(path):
+                    continue
+                if _remove_junction(path):
+                    self.log("browser login: unlinked " + str(path))
+            except OSError:
+                continue
+        self._bridged.clear()
 
     def poll(self) -> None:
         """Один проход наблюдения; вызывается из цикла ожидания программы."""
@@ -5927,6 +6065,7 @@ class BrowserLoginBridge:
             return []
         reader = command_line_of or _process_command_line
         parents = {int(pid): int(ppid) for pid, ppid, _image in table}
+        images = {int(pid): str(image) for pid, _ppid, image in table}
         candidates = [
             (int(pid), str(image)) for pid, _ppid, image in table
             if int(pid) not in self._baseline and int(pid) != self.target_pid
@@ -5938,8 +6077,12 @@ class BrowserLoginBridge:
         new_profiles = self._new_profiles()
         planned: "list[tuple[int, str, str]]" = []
         for pid, image in candidates:
+            if self._bridged_image(image):
+                # Профиль уже настоящий: браузер открывает вход там, где надо.
+                continue
             if not (self._descends_from_target(parents.get(pid, 0), parents)
-                    or self._profile_appeared(image, new_profiles)):
+                    or self._profile_appeared(image, new_profiles)
+                    or self._brokered_launch(pid, parents, images)):
                 continue
             try:
                 command_line = reader(pid)
@@ -5950,7 +6093,6 @@ class BrowserLoginBridge:
                 continue
             self._handled.add(url)
             planned.append((pid, url, image))
-            self._remember_profile_dirs(image)
         return planned
 
     def _descends_from_target(self, parent: int,
@@ -5970,20 +6112,58 @@ class BrowserLoginBridge:
             current = int(parents.get(current, 0))
         return False
 
-    # -- служебное ---------------------------------------------------------
+    def _brokered_launch(self, pid: int, parents: Dict[int, int],
+                         images: Dict[int, str]) -> bool:
+        """Браузер запущен службой оболочки, а не самим процессом программы.
+
+        ``ShellExecute`` может уйти в AppInfo/DCOM: тогда родитель браузера —
+        ``svchost.exe``/``explorer.exe``, и цепочка до программы не доходит.
+        Вызывается только для браузеров, чей профиль соединить не удалось
+        (для соединённых ``plan`` выходит раньше): иначе окно пользователя
+        можно было бы закрыть без всякой причины.
+        """
+        parent_image = images.get(int(parents.get(int(pid), 0)), "")
+        return _image_name(parent_image).casefold() in _SHELL_BROKERS
+
+    # -- соединение профилей -----------------------------------------------
+    def _data_dir(self) -> Path:
+        return self.root / str(self.cfg.get("data_dir_name", "PortableData"))
+
+    def _portable_root(self, var: str) -> "Optional[Path]":
+        """Куда перенаправлена переменная у дочернего процесса."""
+        raw = str(self.env.get(var) or "")
+        if raw:
+            return Path(raw)
+        data = self._data_dir() / "AppData"
+        return data / ("Roaming" if var.upper() == "APPDATA" else "Local")
+
+    def _host_root(self, var: str) -> "Optional[Path]":
+        """Настоящий каталог пользователя: у лончера окружение не тронуто."""
+        raw = str(os.environ.get(var) or "")
+        return Path(raw) if raw else None
+
     def _profile_roots(self, image: str) -> "list[Path]":
-        rels = _BROWSER_PROFILE_DIRS.get(_image_name(image).casefold(), ())
-        data = self.root / str(self.cfg.get("data_dir_name", "PortableData"))
-        return [data / rel for rel in rels]
+        pairs = _BROWSER_PROFILE_DIRS.get(_image_name(image).casefold(), ())
+        roots: "list[Path]" = []
+        for var, rel in pairs:
+            root = self._portable_root(var)
+            if root is not None:
+                roots.append(root / rel)
+        return roots
+
+    def _bridged_image(self, image: str) -> bool:
+        pairs = _BROWSER_PROFILE_DIRS.get(_image_name(image).casefold(), ())
+        return any(pair in self._bridged for pair in pairs)
 
     def _existing_profiles(self) -> "set[str]":
         found: "set[str]" = set()
-        data = self.root / str(self.cfg.get("data_dir_name", "PortableData"))
-        for rel in {rel for rels in _BROWSER_PROFILE_DIRS.values()
-                    for rel in rels}:
-            path = data / rel
+        for var, rel in _browser_profile_pairs():
+            root = self._portable_root(var)
+            if root is None:
+                continue
+            path = root / rel
             try:
-                if path.exists():
+                if path.exists() or _is_junction(path):
                     found.add(str(path).casefold())
             except OSError:
                 continue
@@ -5996,9 +6176,56 @@ class BrowserLoginBridge:
         return any(str(path).casefold() in new_profiles
                    for path in self._profile_roots(image))
 
-    def _remember_profile_dirs(self, image: str) -> None:
-        for path in self._profile_roots(image):
-            self._profiles_before.add(str(path).casefold())
+    def drop_duplicate_profiles(self) -> "list[str]":
+        """Удалить профили браузеров, попавшие ВНУТРЬ портатива.
+
+        Такой каталог — не данные программы, а копия браузера, созданная
+        из-за перенаправленного профиля. Junction'ы не трогаем: за ними
+        лежит настоящий профиль пользователя.
+        """
+        removed: "list[str]" = []
+        if not self.enabled or not self.clean_duplicates:
+            return removed
+        for var, rel in _browser_profile_pairs():
+            root = self._portable_root(var)
+            if root is None:
+                continue
+            path = root / rel
+            try:
+                if not path.exists() or _is_junction(path):
+                    continue
+                if _remove_tree(path):
+                    removed.append(str(path))
+            except OSError:
+                continue
+        return removed
+
+    def connect_host_profiles(self) -> "list[str]":
+        """Соединить каталоги браузеров с настоящими каталогами пользователя."""
+        linked: "list[str]" = []
+        for var, rel in _browser_profile_pairs():
+            host_root = self._host_root(var)
+            portable_root = self._portable_root(var)
+            if host_root is None or portable_root is None:
+                continue
+            source = host_root / rel
+            destination = portable_root / rel
+            try:
+                if not source.is_dir():
+                    continue
+                if _is_junction(destination):
+                    self._bridged.add((var, rel))
+                    continue
+                if destination.exists():
+                    # Настоящий каталог оставить нельзя: это и есть дубликат,
+                    # который не удалось убрать (занят процессом).
+                    continue
+                if _junction_directory(destination, source):
+                    self._bridged.add((var, rel))
+                    linked.append(str(destination))
+            except OSError:
+                continue
+        return linked
 
     @staticmethod
     def _stop(pid: int) -> None:
@@ -6010,11 +6237,7 @@ class BrowserLoginBridge:
             pass
 
     def cleanup_duplicate_profile(self, image: str) -> "list[str]":
-        """Удалить профиль браузера, созданный внутри портатива.
-
-        Вызывается только для того браузера, чей запуск перехвачен: каталог
-        появился после старта программы, значит его создала именно эта копия.
-        """
+        """Удалить профиль, созданный перехваченной копией браузера."""
         removed: "list[str]" = []
         if not self.enabled:
             return removed
@@ -6023,10 +6246,10 @@ class BrowserLoginBridge:
             if key in self._profiles_before:
                 continue
             try:
-                if not path.exists():
+                if not path.exists() or _is_junction(path):
                     continue
-                shutil.rmtree(path, ignore_errors=True)
-                removed.append(str(path))
+                if _remove_tree(path):
+                    removed.append(str(path))
             except OSError:
                 continue
         return removed
@@ -12333,9 +12556,12 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             # Вход в аккаунт должен проходить в настоящем браузере. Слежка
             # готовится ДО старта программы: снимок уже открытых процессов -
             # это и есть граница «чужие окна не трогаем».
-            browser_login = BrowserLoginBridge(root, cfg, target)
+            browser_login = BrowserLoginBridge(root, cfg, target, env=env)
             try:
                 browser_login.prepare()
+                # Ссылки на настоящий профиль не должны переживать лончер
+                # ни при каком выходе, включая ранний return по ошибке.
+                atexit.register(browser_login.teardown)
             except Exception as exc:  # noqa: BLE001 - слежка не срывает запуск
                 _run_log(root, f"browser login: preparation failed ({exc})")
             started_at = time.monotonic()
@@ -12386,6 +12612,13 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                 root, settings=shutdown, tick=_session_tick)
             # Родной апдейтер мог стартовать в последний момент: дожимаем.
             watch.finish()
+            # Ссылки на настоящий профиль снимаются всегда — даже если
+            # программа упала: папку портатива нельзя оставлять с junction'ами
+            # внутри, иначе её копирование утащит чужой профиль целиком.
+            try:
+                browser_login.teardown()
+            except Exception as exc:  # noqa: BLE001 - снятие не срывает выход
+                _run_log(root, f"browser login: unlink failed ({exc})")
             if waited:
                 _run_log(root, f"waited {waited}s for programs started from "
                                f"the portable folder to finish")

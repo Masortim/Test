@@ -2297,12 +2297,49 @@ def service_port_settings(cfg: "LauncherConfig") -> Dict[str, object]:
     return profile
 
 
-#: Параметры слежки за браузером по умолчанию: как часто лончер смотрит на
-#: процессы и включён ли перехват вообще.
+#: Параметры входа в аккаунт по умолчанию.
 BROWSER_LOGIN_DEFAULTS: Dict[str, object] = {
+    # Профиль браузера внутри портатива соединяется с настоящим профилем
+    # пользователя: вход идёт в уже открытом браузере, второй копии нет.
     "enabled": True,
+    "connect_host_profile": True,
+    # Дубликаты профиля, оставшиеся от прежних запусков (и от сборки),
+    # удаляются при старте: это данные той самой лишней копии браузера.
+    "clean_duplicates": True,
+    # Шаг наблюдения за процессами — второй рубеж для файловых систем без
+    # junction'ов (FAT/exFAT, сетевые папки).
     "poll_seconds": 0.3,
 }
+
+#: Каталоги браузеров внутри профиля пользователя: (переменная, путь).
+#: Список продублирован в ``portable_launcher_entry.py``: лончер обязан быть
+#: автономным (только стандартная библиотека, без пакета Portablizer), а
+#: совпадение двух списков проверяется тестом.
+BROWSER_PROFILE_DIRS: Tuple[Tuple[str, str], ...] = (
+    ("LOCALAPPDATA", "Google/Chrome"),
+    ("LOCALAPPDATA", "Microsoft/Edge"),
+    ("LOCALAPPDATA", "BraveSoftware"),
+    ("LOCALAPPDATA", "Vivaldi"),
+    ("LOCALAPPDATA", "Chromium"),
+    ("LOCALAPPDATA", "Thorium"),
+    ("APPDATA", "Opera Software"),
+    ("LOCALAPPDATA", "Opera Software"),
+    ("APPDATA", "Yandex"),
+    ("LOCALAPPDATA", "Yandex"),
+    ("APPDATA", "Mozilla"),
+    ("LOCALAPPDATA", "Mozilla"),
+    ("APPDATA", "zen"),
+    ("LOCALAPPDATA", "zen"),
+    # Обновляторы: без них браузер в перенаправленном профиле решает, что не
+    # установлен, и ставит себя заново — внутрь портатива.
+    ("LOCALAPPDATA", "Google/Update"),
+    ("LOCALAPPDATA", "Google/GoogleUpdater"),
+)
+
+
+def browser_profile_pairs() -> Tuple[Tuple[str, str], ...]:
+    """Каталоги браузеров в порядке «профиль, затем обновлятор»."""
+    return BROWSER_PROFILE_DIRS
 
 
 def browser_login_settings(cfg: "LauncherConfig") -> Dict[str, object]:
