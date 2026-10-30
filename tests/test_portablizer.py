@@ -260,6 +260,116 @@ class PortablizerOutputTests(unittest.TestCase):
             self.assertFalse(recovered)
             self.assertEqual(list(app.iterdir()), [])
 
+    def test_recovery_never_promotes_installer_directory_or_its_ancestor(self):
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp, "Downloads")
+            downloads.mkdir()
+            installer = downloads / "delta-windows-x86_64-setup.exe"
+            installer.write_bytes(b"installer")
+            for name in ("delta.exe", "other.exe", "old.zip", "new.mp4", "photo.jpg"):
+                (downloads / name).write_bytes(b"unrelated")
+            (downloads / "other-folder").mkdir()
+            (downloads / "other-folder" / "another.exe").write_bytes(b"unrelated")
+            app = Path(temp, "portable", "App")
+            data = app.parent / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir()
+            with mock.patch.object(self.engine, "_install_search_roots", return_value=[]):
+                for location in (str(downloads), str(downloads / "delta.exe"), temp):
+                    recovered = self.engine._recover_installed_app(
+                        str(app), str(data), "delta", str(installer), {},
+                        registry_locations=[location], shortcut_locations=[location])
+                    self.assertFalse(recovered)
+                    self.assertEqual(list(app.iterdir()), [])
+            with self.assertRaises(OSError):
+                self.engine._copy_recovered_tree(str(downloads), str(app), str(data), str(installer))
+
+    def test_recovery_prefers_separate_installation_over_downloads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp, "Downloads")
+            installed = Path(temp, "Installed", "delta")
+            downloads.mkdir()
+            installed.mkdir(parents=True)
+            installer = downloads / "delta-windows-x86_64-setup.exe"
+            installer.write_bytes(b"installer")
+            for name in ("old.zip", "movie.mp4", "picture.png", "other.exe"):
+                (downloads / name).write_bytes(b"unrelated")
+            (installed / "delta.exe").write_bytes(b"MZ application")
+            (installed / "data.dll").write_bytes(b"dependency")
+            app = Path(temp, "portable", "App")
+            data = app.parent / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir()
+            with mock.patch.object(self.engine, "_install_search_roots", return_value=[]), \
+                    mock.patch.object(self.engine, "_remove_recovered_source"):
+                self.assertTrue(self.engine._recover_installed_app(
+                    str(app), str(data), "delta", str(installer), {},
+                    registry_locations=[str(downloads), str(installed)]))
+            self.engine._supplement_recovered_from_registry(
+                str(app), "delta", str(installer), [str(downloads)])
+            self.assertEqual({x.name for x in app.iterdir()}, {"delta.exe", "data.dll"})
+            self.assertTrue((downloads / "other.exe").exists())
+
+    def test_search_does_not_treat_new_download_as_installed_app(self):
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp, "Downloads")
+            downloads.mkdir()
+            installer = downloads / "delta-windows-x86_64-setup.exe"
+            installer.write_bytes(b"installer")
+            (downloads / "delta.exe").write_bytes(b"unrelated")
+            app = Path(temp, "portable", "App")
+            data = app.parent / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir()
+            with mock.patch.object(self.engine, "_install_search_roots",
+                                   return_value=[(str(downloads), 100, False)]):
+                self.assertFalse(self.engine._recover_installed_app(
+                    str(app), str(data), "delta", str(installer), {}))
+            self.assertEqual(list(app.iterdir()), [])
+
+    def test_registry_supplement_copies_only_specific_referenced_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp, "Downloads")
+            downloads.mkdir()
+            installer = downloads / "delta-windows-x86_64-setup.exe"
+            installer.write_bytes(b"installer")
+            (downloads / "data.bin").write_bytes(b"needed")
+            (downloads / "other.exe").write_bytes(b"unrelated")
+            (downloads / "photo.jpg").write_bytes(b"unrelated")
+            assets = downloads / "assets"
+            assets.mkdir()
+            (assets / "required.dat").write_bytes(b"needed")
+            app = Path(temp, "portable", "App")
+            app.mkdir(parents=True)
+            (app / "delta.exe").write_bytes(b"installed")
+            (app / "assets").mkdir()
+            (app / "assets" / "required.dat").write_bytes(b"already installed")
+            self.engine._supplement_recovered_from_registry(
+                str(app), "delta", str(installer),
+                [str(downloads), str(installer), str(downloads / "data.bin"), str(assets)])
+            self.assertEqual((app / "data.bin").read_bytes(), b"needed")
+            self.assertEqual((app / "assets" / "required.dat").read_bytes(), b"already installed")
+            self.assertFalse((app / "other.exe").exists())
+            self.assertFalse((app / "photo.jpg").exists())
+            self.assertFalse((app / installer.name).exists())
+
+    def test_registry_supplement_ignores_directory_only_reference(self):
+        with tempfile.TemporaryDirectory() as temp:
+            downloads = Path(temp, "Downloads")
+            downloads.mkdir()
+            installer = downloads / "delta.msi"
+            installer.write_bytes(b"installer")
+            (downloads / "delta.exe").write_bytes(b"unrelated")
+            (downloads / "archive.zip").write_bytes(b"unrelated")
+            app = Path(temp, "portable", "App")
+            app.mkdir(parents=True)
+            (app / "delta.exe").write_bytes(b"installed")
+            self.engine._supplement_recovered_from_registry(
+                str(app), "delta", str(installer), [str(downloads)])
+            self.assertEqual((app / "delta.exe").read_bytes(), b"installed")
+            self.assertEqual({x.name for x in app.iterdir()}, {"delta.exe"})
+            self.assertNotIn(str(downloads), self.engine._recovered_sources)
+
     def test_empty_install_does_not_create_broken_launcher(self):
         with tempfile.TemporaryDirectory() as temp, mock.patch(
             "portablizer.core.portablizer.IS_WINDOWS", False
@@ -1874,7 +1984,7 @@ class RegistryLocationTests(unittest.TestCase):
         self.assertIn(r"Multitran_Portable\\App\\eng.erd", text)
         self.assertIn(r"Multitran_Portable\\App\\network.exe", text)
 
-    def test_unpacked_distribution_with_generic_setup_recovers_on_first_attempt(self):
+    def test_generic_setup_does_not_copy_unverified_distribution_folder(self):
         class FakeMultitran(Portablizer):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
@@ -1901,11 +2011,10 @@ class RegistryLocationTests(unittest.TestCase):
                 bundle_runtimes=False,
             )
             res = engine.run(opts)
-            self.assertTrue(res.success, "; ".join(res.messages))
-            self.assertEqual(len(engine.calls), 1)
+            self.assertFalse(res.success)
             app_dir = Path(res.portable_dir, "App")
-            self.assertTrue((app_dir / "network.exe").is_file())
-            self.assertTrue((app_dir / "eng.erd").is_file())
+            self.assertFalse((app_dir / "network.exe").exists())
+            self.assertFalse((app_dir / "eng.erd").exists())
             self.assertFalse((app_dir / "setup.exe").exists())
             self.assertFalse((app_dir / "Multitran_Portable").exists())
             # Исходная папка пользователя не должна быть удалена!

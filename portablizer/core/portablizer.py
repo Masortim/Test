@@ -2304,6 +2304,15 @@ class Portablizer:
                     )
                     if recovered:
                         self.log.ok("Файлы программы перенесены в папку App.")
+                        if registry_locations:
+                            self._supplement_recovered_from_registry(
+                                app_dir, name, opts.installer_path, registry_locations)
+                    else:
+                        self.log.warn(
+                            "Папка установщика не копируется целиком: в ней "
+                            "могут быть посторонние файлы. Для распакованного "
+                            "дистрибутива используйте исходный архив или "
+                            "установите программу в отдельный каталог.")
             elif registry_locations:
                 self._supplement_recovered_from_registry(
                     app_dir=app_dir,
@@ -6738,6 +6747,16 @@ class Portablizer:
                for item in self._recovered_sources):
             self._recovered_sources.append(abs_src)
 
+    @staticmethod
+    def _contains_path(parent: str, path: str) -> bool:
+        """Проверяет вложенность, учитывая ссылки и границы компонентов пути."""
+        try:
+            parent = os.path.normcase(os.path.realpath(parent))
+            path = os.path.normcase(os.path.realpath(path))
+            return os.path.commonpath((parent, path)) == parent
+        except (ValueError, OSError):
+            return False
+
     def _copy_recovered_tree(self, source: str, app_dir: str, data_dir: str,
                              installer_path: str,
                              overwrite: bool = True) -> None:
@@ -6756,25 +6775,28 @@ class Portablizer:
             if installer_path else ""
         )
         source_abs = os.path.abspath(source)
-        is_installer_dir = (
-            bool(installer_dir_norm)
-            and os.path.normcase(source_abs) == installer_dir_norm
-        )
-        skip_Root_files = {
-            "setup.exe", "install.exe", "installer.exe", "autorun.exe",
-            "portablizer.log", "installer-output.log", "unpacker-output.log",
-        }
+        # Сам каталог загрузок (или его предок) не является результатом
+        # установки. Это ограничение действует даже для путей из реестра/ярлыка.
+        if (installer_path and os.path.isdir(source_abs)
+                and self._contains_path(source_abs, installer_dir_norm)):
+            raise OSError("Нельзя копировать каталог установщика целиком")
 
         def _ignore_in_tree(cur_dir: str, names: List[str]) -> Set[str]:
             ignored: Set[str] = set()
             for n in names:
                 child_abs = os.path.abspath(os.path.join(cur_dir, n))
                 child_norm = os.path.normcase(child_abs)
-                if (child_norm in excluded_dir_norms
+                if (os.path.islink(child_abs)
+                        or child_norm in excluded_dir_norms
                         or n.casefold().endswith("_portable")
                         or (installer_abs_norm and child_norm == installer_abs_norm)):
                     ignored.add(n)
             return ignored
+
+        def _copy_file(src: str, dst: str) -> str:
+            if not overwrite and os.path.exists(dst):
+                return dst
+            return shutil.copy2(src, dst)
 
         if os.path.isdir(source_abs):
             for item in os.scandir(source_abs):
@@ -6785,13 +6807,11 @@ class Portablizer:
                     continue
                 if installer_abs_norm and item_norm == installer_abs_norm:
                     continue
-                if is_installer_dir and item.name.casefold() in skip_Root_files:
-                    continue
                 destination = os.path.join(app_dir, item.name)
                 if item.is_dir(follow_symlinks=False):
                     shutil.copytree(
                         item.path, destination, dirs_exist_ok=True,
-                        ignore=_ignore_in_tree)
+                        ignore=_ignore_in_tree, copy_function=_copy_file)
                 elif item.is_file(follow_symlinks=False):
                     if overwrite or not os.path.exists(destination):
                         shutil.copy2(item.path, destination)
@@ -6807,44 +6827,56 @@ class Portablizer:
         installer_path: str,
         registry_locations: Iterable[str] = (),
     ) -> None:
-        """Дополняет ``_recovered_sources`` и ``App`` путями из снимка реестра.
+        """Переносит только конкретные пути из реестра, не всю папку загрузок.
 
-        Например, если ``setup.exe`` из распакованной папки ``Multitran 03.11.2023``
-        скопировал оболочку в ``C:\\Multitran`` (которую ``recover()`` уже забрал
-        в ``App`` на шаге 4), а словарные базы в реестре оставил привязанными
-        к исходной папке ``E:\\...\\Multitran 03.11.2023``, докопируем базы в
-        ``App`` и добавим исходную папку в ``_recovered_sources`` для перепривязки
-        путей в ``portable.reg``.
+        Указанный файл или отдельный подкаталог сохраняет относительный путь.
+        Сама папка установщика не подтверждает принадлежность её содержимого.
         """
         if not installer_path:
             return
         keys = self._name_keys(app_name, installer_path)
         installer_dir = os.path.dirname(os.path.abspath(installer_path))
-        installer_dir_norm = os.path.normcase(installer_dir)
         portable_dir = os.path.dirname(os.path.abspath(app_dir))
-        portable_norm = os.path.normcase(portable_dir)
-        data_dir = os.path.join(portable_dir, "PortableData")
+        installer_real = os.path.normcase(os.path.realpath(installer_path))
 
         for location in registry_locations:
             loc_abs = os.path.abspath(location)
-            src = os.path.dirname(loc_abs) if os.path.isfile(loc_abs) else loc_abs
-            if not os.path.isdir(src):
+            if not os.path.exists(loc_abs) or os.path.islink(loc_abs):
                 continue
-            src_norm = os.path.normcase(src)
-            if (src_norm == portable_norm
-                    or src_norm.startswith(portable_norm + os.sep)):
+            if self._contains_path(portable_dir, loc_abs):
                 continue
-            if (src_norm == installer_dir_norm
-                    or src_norm.startswith(installer_dir_norm + os.sep)):
-                self._remember_recovered_source(installer_dir)
+            if self._contains_path(installer_dir, loc_abs):
+                # Ссылки на сам каталог загрузок или сам установщик не дают
+                # информации о том, какие соседние файлы принадлежат программе.
+                if (os.path.normcase(os.path.realpath(loc_abs)) in
+                        (os.path.normcase(os.path.realpath(installer_dir)),
+                         installer_real)):
+                    continue
+                relative = os.path.relpath(loc_abs, installer_dir)
+                if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+                    continue
+                target = os.path.join(app_dir, relative)
                 try:
-                    self._copy_recovered_tree(
-                        installer_dir, app_dir, data_dir, installer_path,
-                        overwrite=False)
-                except OSError:
-                    pass
-            elif self._name_score(os.path.basename(src), keys) >= 125:
-                self._remember_recovered_source(src)
+                    if os.path.isfile(loc_abs):
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        if not os.path.exists(target):
+                            shutil.copy2(loc_abs, target)
+                    elif os.path.isdir(loc_abs):
+                        os.makedirs(target, exist_ok=True)
+                        self._copy_recovered_tree(
+                            loc_abs, target, os.path.join(portable_dir, "PortableData"),
+                            installer_path, overwrite=False)
+                    else:
+                        continue
+                    self._remember_recovered_source(installer_dir)
+                except OSError as exc:
+                    self.log.warn(f"Не удалось скопировать указанный в реестре путь: {exc}")
+            else:
+                src = os.path.dirname(loc_abs) if os.path.isfile(loc_abs) else loc_abs
+                if (os.path.isdir(src)
+                        and not self._contains_path(src, installer_dir)
+                        and self._name_score(os.path.basename(src), keys) >= 125):
+                    self._remember_recovered_source(src)
 
     def _recover_installed_app(
         self,
@@ -6859,7 +6891,7 @@ class Portablizer:
         """Копирует результат установщика, если тот проигнорировал папку App.
 
         Рассматриваются только новые каталоги, цели созданных ярлыков, записи
-        реестра или уже распакованная папка дистрибутива рядом с ``setup.exe``.
+        реестра; каталог самого установщика целиком не копируется.
         Это не даёт случайно скопировать произвольную уже установленную
         программу из Program Files.
         """
@@ -6897,6 +6929,9 @@ class Portablizer:
                     or source_norm in excluded_dir_norms):
                 return
             if not os.path.exists(source):
+                return
+            if (installer_dir and os.path.isdir(source)
+                    and self._contains_path(source, installer_dir)):
                 return
             if os.path.isfile(source):
                 exes = [source] if source.lower().endswith(".exe") else []
@@ -6943,6 +6978,13 @@ class Portablizer:
             old_entries = before.get(root_key, set())
             for path, entry_name, is_dir, is_file in self._location_entries(root):
                 entry_path = os.path.abspath(path)
+                # Даже новый файл в общей папке может быть чужой загрузкой.
+                # Здесь нужны отдельные доказательства (ярлык/реестр), а не
+                # совпадение имени или времени появления.
+                if (installer_dir
+                        and self._contains_path(installer_dir, entry_path)
+                        and not self._contains_path(portable_dir, entry_path)):
+                    continue
                 is_new = os.path.normcase(entry_path) not in old_entries
                 # Для уже существующего каталога совпадение должно быть
                 # точным. Короткое имя приложения вроде "Type" раньше
@@ -6964,26 +7006,8 @@ class Portablizer:
                     bonus += 35
                 add_source(entry_path, priority + bonus, reason)
 
-        # Распакованный дистрибутив с безликим setup.exe/install.exe внутри
-        # папки приложения (например, «Multitran 03.11.2023\setup.exe»): такой
-        # setup.exe нередко лишь прописывает текущую папку и словари в реестр
-        # и создаёт ярлык.
-        installer_base_low = (
-            os.path.basename(installer_abs).casefold() if installer_abs else ""
-        )
-        unpacked_installer_dir_match = (
-            bool(installer_dir)
-            and installer_base_low in (
-                "setup.exe", "install.exe", "installer.exe", "autorun.exe")
-            and os.path.isdir(installer_dir)
-            and installer_dir_norm not in protected_roots
-            and not self._is_drive_root(installer_dir)
-            and self._name_score(os.path.basename(installer_dir), keys) >= 125
-        )
-        if unpacked_installer_dir_match:
-            add_source(
-                installer_dir, 140,
-                "распакованная папка дистрибутива рядом с setup.exe")
+        # Папка рядом с setup.exe может быть общей папкой загрузок. Ни имя
+        # setup.exe, ни название папки не доказывают принадлежность её файлов.
 
         ranked = sorted(candidates.values(), key=lambda item: item[0], reverse=True)
         for score, _exe, reason, source in ranked:
@@ -7009,19 +7033,6 @@ class Portablizer:
                     else os.path.dirname(os.path.abspath(source))
                 )
                 self._remember_recovered_source(source_dir)
-                # Если setup.exe скопировал только exe-оболочку в каталог по
-                # умолчанию (например, C:\Multitran), а базы/словари лежат в
-                # распакованной папке дистрибутива рядом с setup.exe,
-                # докопируем недостающие файлы из неё и перепривяжем её путь.
-                if (unpacked_installer_dir_match
-                        and os.path.normcase(source_dir) != installer_dir_norm):
-                    try:
-                        self._copy_recovered_tree(
-                            installer_dir, app_dir, data_dir, installer_path,
-                            overwrite=False)
-                        self._remember_recovered_source(installer_dir)
-                    except OSError:
-                        pass
                 # Удаляем оригинал из Program Files/корня диска — иначе на C:
                 # остаётся брошенный каталог установки. Исходную папку
                 # пользователя рядом с setup.exe _remove_recovered_source не
