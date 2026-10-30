@@ -1924,8 +1924,16 @@ class BurnFallbackTests(unittest.TestCase):
             rc, used = engine._run_attempts(attempts, opts, str(app),
                                             str(data), str(portable), "Type")
 
-            # Обе команды установки и /layout: MSI не было, msiexec не вызывался.
-            self.assertEqual(len(engine.calls), 3)
+            # Обе команды установки, /layout и затем сам exe-пакет бандла:
+            # MSI не было, msiexec не вызывался. Пакет запускается своими
+            # ключами тишины (1.39.0) — раньше такой бандл гарантированно
+            # заканчивался пустым App, потому что «MSI нет — распаковывать
+            # нечего».
+            self.assertGreater(len(engine.calls), 3)
+            nested = [plan for plan in engine.calls[3:]]
+            self.assertTrue(nested, "exe-пакет бандла не запускался")
+            for plan in nested:
+                self.assertEqual(os.path.basename(plan.program), "tool.exe")
             self.assertIsNone(used)
             self.assertEqual(rc, 5)
             self.assertFalse((app / "Type.exe").exists())
