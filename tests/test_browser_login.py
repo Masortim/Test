@@ -376,6 +376,58 @@ class HostProfileBridgeTests(unittest.TestCase):
                     root / "PortableData/AppData/Local/Google/Chrome"))
 
 
+class DefaultBrowserTests(unittest.TestCase):
+    """Соединяется профиль браузера по умолчанию, а не всех подряд."""
+
+    def test_known_progids_are_recognised(self):
+        cases = {
+            "ChromeHTML": "chrome.exe",
+            "MSEdgeHTM": "msedge.exe",
+            "FirefoxURL-308046B0AF4A39CB": "firefox.exe",
+            "BraveHTML": "brave.exe",
+            "VivaldiHTML": "vivaldi.exe",
+            "YandexBrowserHTML": "yandex.exe",
+        }
+        for progid, image in cases.items():
+            self.assertIn(image, entry._browser_images_for_progid(progid), progid)
+
+    def test_unknown_progid_links_everything(self):
+        # Пустой набор — «определить не удалось»: тогда соединяются все
+        # найденные браузеры, лишь бы вход не создал дубликат.
+        self.assertEqual(entry._browser_images_for_progid("SomeBrowserHTML"),
+                         set())
+        self.assertEqual(entry._browser_images_for_progid(""), set())
+
+    def test_only_the_default_browser_is_linked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            host = root / "host"
+            (host / "Google/Chrome").mkdir(parents=True)
+            (host / "Mozilla").mkdir(parents=True)
+            env = {
+                "LOCALAPPDATA": str(root / "PortableData/AppData/Local"),
+                "APPDATA": str(root / "PortableData/AppData/Roaming"),
+            }
+            for value in env.values():
+                Path(value).mkdir(parents=True, exist_ok=True)
+            target = make_portable(root)
+            bridge = entry.BrowserLoginBridge(
+                root, {"browser_login": {}}, target, env=env,
+                log=lambda message: None)
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_process_table", return_value=[]), \
+                    mock.patch.object(entry, "_default_browser_images",
+                                      return_value={"chrome.exe"}), \
+                    mock.patch.dict(os.environ, {"LOCALAPPDATA": str(host),
+                                                 "APPDATA": str(host)}):
+                bridge.prepare()
+            self.assertTrue(bridge._bridged_image("chrome.exe"))
+            # Firefox на этом ПК установлен, но он не по умолчанию: его
+            # каталог не трогаем.
+            self.assertFalse(
+                (root / "PortableData/AppData/Roaming/Mozilla").exists())
+
+
 class SafeDeleteTests(unittest.TestCase):
     """Удаление копии профиля не должно утащить настоящий профиль."""
 

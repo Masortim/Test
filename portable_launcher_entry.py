@@ -5656,7 +5656,12 @@ _BROWSER_IMAGES = frozenset({
 #: Где каждый браузер держит свой профиль: (переменная, путь от неё).
 #: APPDATA — сам профиль и настройки, LOCALAPPDATA — кэш и «User Data».
 _BROWSER_PROFILE_DIRS: Dict[str, tuple] = {
-    "chrome.exe": (("LOCALAPPDATA", "Google/Chrome"),),
+    # Обновляторы перечислены рядом с профилем: браузер, не нашедший свой
+    # обновлятор, решает, что не установлен, и ставит себя заново — внутрь
+    # портатива.
+    "chrome.exe": (("LOCALAPPDATA", "Google/Chrome"),
+                   ("LOCALAPPDATA", "Google/Update"),
+                   ("LOCALAPPDATA", "Google/GoogleUpdater")),
     "msedge.exe": (("LOCALAPPDATA", "Microsoft/Edge"),),
     "brave.exe": (("LOCALAPPDATA", "BraveSoftware"),),
     "vivaldi.exe": (("LOCALAPPDATA", "Vivaldi"),),
@@ -5675,14 +5680,6 @@ _BROWSER_PROFILE_DIRS: Dict[str, tuple] = {
     # этот каталог нельзя (там данные всех магазинных приложений), поэтому
     # для него работает только наблюдение за процессами.
 }
-
-#: Обновляторы рядом с браузером. Без них браузер в перенаправленном профиле
-#: решает, что он «не установлен», и запускает установку заново — внутрь
-#: портатива. ``Microsoft\EdgeUpdate`` уже соединяет мост WebView2.
-_BROWSER_UPDATE_DIRS: tuple = (
-    ("LOCALAPPDATA", "Google/Update"),
-    ("LOCALAPPDATA", "Google/GoogleUpdater"),
-)
 
 #: Кто запускает браузер, когда оболочка работает не сама, а через службу
 #: (AppInfo/DCOM): в этом случае цепочка родителей до программы не доходит.
@@ -5717,8 +5714,54 @@ def _browser_profile_pairs() -> "tuple[tuple[str, str], ...]":
     pairs: "list[tuple[str, str]]" = []
     for roots in _BROWSER_PROFILE_DIRS.values():
         pairs.extend(roots)
-    pairs.extend(_BROWSER_UPDATE_DIRS)
     return tuple(dict.fromkeys(pairs))
+
+
+#: ProgId браузера по умолчанию (``https`` в реестре) -> его исполняемые файлы.
+#: Соединять профили ВСЕХ установленных браузеров незачем: страницу входа
+#: открывает браузер по умолчанию, а каждый лишний junction — это время на
+#: старте программы.
+_DEFAULT_BROWSER_PROGIDS: tuple = (
+    ("chromehtml", ("chrome.exe",)),
+    ("msedgehtm", ("msedge.exe",)),           # MSEdgeHTM
+    ("microsoftedge", ("msedge.exe",)),
+    ("appxq0fevz", ("msedge.exe",)),          # Edge из Store (AppX ProgId)
+    ("firefoxurl", ("firefox.exe",)),
+    ("bravehtml", ("brave.exe",)),
+    ("vivaldi", ("vivaldi.exe",)),
+    ("operastable", ("opera.exe", "launcher.exe")),
+    ("yandexbrowser", ("yandex.exe",)),
+    ("chromium", ("chromium.exe",)),
+)
+
+
+def _default_browser_images() -> "set[str]":
+    """Имена exe браузера по умолчанию; пусто, если определить не удалось.
+
+    Пустой набор — не ошибка: тогда соединяются профили всех найденных
+    браузеров (см. :meth:`BrowserLoginBridge.connect_host_profiles`).
+    """
+    if not IS_WINDOWS:
+        return set()
+    try:
+        import winreg
+
+        path = ("Software\\Microsoft\\Windows\\Shell\\Associations\\"
+                "UrlAssociations\\https\\UserChoice")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+            progid = str(winreg.QueryValueEx(key, "ProgId")[0])
+    except Exception:  # noqa: BLE001 - реестр недоступен: соединяем всё
+        return set()
+    return _browser_images_for_progid(progid)
+
+
+def _browser_images_for_progid(progid: str) -> "set[str]":
+    """ProgId обработчика ``https`` -> исполняемые файлы этого браузера."""
+    name = str(progid or "").casefold()
+    for marker, images in _DEFAULT_BROWSER_PROGIDS:
+        if marker in name:
+            return set(images)
+    return set()
 
 
 def _is_junction(path: Path) -> bool:
@@ -6203,28 +6246,32 @@ class BrowserLoginBridge:
     def connect_host_profiles(self) -> "list[str]":
         """Соединить каталоги браузеров с настоящими каталогами пользователя."""
         linked: "list[str]" = []
-        for var, rel in _browser_profile_pairs():
-            host_root = self._host_root(var)
-            portable_root = self._portable_root(var)
-            if host_root is None or portable_root is None:
+        preferred = _default_browser_images()
+        for image, pairs in _BROWSER_PROFILE_DIRS.items():
+            if preferred and image not in preferred:
                 continue
-            source = host_root / rel
-            destination = portable_root / rel
-            try:
-                if not source.is_dir():
+            for var, rel in pairs:
+                host_root = self._host_root(var)
+                portable_root = self._portable_root(var)
+                if host_root is None or portable_root is None:
                     continue
-                if _is_junction(destination):
-                    self._bridged.add((var, rel))
+                source = host_root / rel
+                destination = portable_root / rel
+                try:
+                    if not source.is_dir():
+                        continue
+                    if _is_junction(destination):
+                        self._bridged.add((var, rel))
+                        continue
+                    if destination.exists():
+                        # Настоящий каталог оставить нельзя: это и есть
+                        # дубликат, который не удалось убрать (занят).
+                        continue
+                    if _junction_directory(destination, source):
+                        self._bridged.add((var, rel))
+                        linked.append(str(destination))
+                except OSError:
                     continue
-                if destination.exists():
-                    # Настоящий каталог оставить нельзя: это и есть дубликат,
-                    # который не удалось убрать (занят процессом).
-                    continue
-                if _junction_directory(destination, source):
-                    self._bridged.add((var, rel))
-                    linked.append(str(destination))
-            except OSError:
-                continue
         return linked
 
     @staticmethod

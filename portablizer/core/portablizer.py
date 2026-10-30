@@ -3525,11 +3525,6 @@ class Portablizer:
         # subprocess с list не даст «сырой» аргумент, поэтому для NSIS собираем
         # командную строку строкой.
         env = self._build_isolated_env(opts, data_dir)
-        if opts.redirect_userdirs:
-            # Пока установщик работает, браузер по умолчанию должен видеть
-            # настоящий профиль: иначе страница входа, открытая «Запустить
-            # программу», создаст в портативе вторую копию браузера.
-            self._link_browser_profiles(data_dir)
         cmdline = subprocess.list2cmdline(cmd)
         if plan.raw_tail:
             cmdline += " " + plan.raw_tail
@@ -6490,10 +6485,10 @@ class Portablizer:
     # оказывается внутри PortableData и уезжает вместе с портативом: именно
     # так появлялся «второй такой же браузер».
     #
-    # Поэтому на время установки каталоги браузера в перенаправленном профиле
-    # указывают (junction) на настоящие каталоги пользователя, а сразу после
-    # установки ссылки снимаются: папку портатива нельзя отдавать со ссылками
-    # внутри. Всё, что не удалось предотвратить, удаляется.
+    # На запущенном портативе это решает лончер (junction'ы на настоящий
+    # профиль). Сборка обязана решить обратное: в папке портатива не должно
+    # остаться ни копии браузера, ни ссылки на чужой профиль — иначе они уедут
+    # вместе с портативом на другой компьютер.
 
     @staticmethod
     def _browser_profile_paths(data_dir: str) -> List[Tuple[str, str]]:
@@ -6511,31 +6506,6 @@ class Portablizer:
             if os.path.isdir(host):
                 pairs.append((portable, host))
         return pairs
-
-    def _link_browser_profiles(self, data_dir: str) -> int:
-        """Соединить каталоги браузера с настоящими (только Windows)."""
-        if not IS_WINDOWS:
-            return 0
-        linked = 0
-        for portable, host in self._browser_profile_paths(data_dir):
-            try:
-                if os.path.islink(portable) or os.path.exists(portable):
-                    continue
-                os.makedirs(os.path.dirname(portable), exist_ok=True)
-                completed = subprocess.run(  # noqa: S603 - cmd есть всегда
-                    ["cmd", "/c", "mklink", "/J", portable, host],
-                    capture_output=True, timeout=20, check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                if completed.returncode == 0:
-                    linked += 1
-            except (OSError, subprocess.SubprocessError):
-                continue
-        if linked:
-            self.log.debug(
-                f"Профиль браузера временно соединён с настоящим "
-                f"({linked} каталог(ов)): вход в аккаунт не создаст вторую "
-                f"копию браузера.")
-        return linked
 
     def _unlink_browser_profiles(self, data_dir: str) -> None:
         """Снять ссылки на профиль браузера: они не должны уехать с портативом."""
