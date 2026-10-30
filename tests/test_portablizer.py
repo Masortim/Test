@@ -2252,6 +2252,17 @@ class BurnFallbackTests(unittest.TestCase):
             def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
                 self.calls.append(plan)
                 if any(a.startswith("InstallFolder=") for a in plan.args):
+                    # Даже когда сам /install уже положил приложение в App,
+                    # его установочные layout/cache должны быть удалены общим
+                    # успешным путём, а не только веткой recovery из MSI.
+                    portable = Path(data_dir).parent
+                    layout = portable / "_bundle_layout"
+                    cache = (Path(data_dir) / "User" / "AppData" / "Local" /
+                             "Package Cache" / "{type-package}")
+                    layout.mkdir(parents=True, exist_ok=True)
+                    cache.mkdir(parents=True, exist_ok=True)
+                    (layout / "TypeSetup.exe").write_bytes(b"MZ setup")
+                    (cache / "Type.msi").write_bytes(b"cached installer")
                     return 4294967295
                 Path(app_dir, "Type.exe").write_bytes(b"MZ application")
                 return 0
@@ -2277,6 +2288,8 @@ class BurnFallbackTests(unittest.TestCase):
             # Собранный портатив сразу переносим: корень запомнен, отчёт о
             # путях лежит в корне, а в конфиге лончера нет абсолютного пути.
             portable = Path(temp, "Type_Portable")
+            self.assertFalse((portable / "_bundle_layout").exists())
+            self.assertFalse(any(portable.rglob("Package Cache")))
             self.assertTrue((portable / "portability-report.txt").is_file())
             self.assertTrue(Path(portable, "PortableData",
                                  "portable-root.json").is_file())

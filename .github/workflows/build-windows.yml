@@ -158,6 +158,59 @@ jobs:
             throw "Delta installer hash mismatch: expected $expectedHash, got $actualHash"
           }
 
+          # Состояние из жалобы: bundle уже Present, а MSI остался в
+          # PortableData после прошлой попытки. На абсолютно чистом runner
+          # первый /install может поставить Delta прямо в App и обойти нужную
+          # регрессионную ветку, поэтому сначала создаём это состояние тем же
+          # официальным установщиком.
+          $portable = Join-Path $out "Delta_Portable"
+          $seedData = Join-Path $portable "PortableData"
+          $seedApp = Join-Path $portable "App"
+          $seedLog = Join-Path $root "seed-install.log"
+          $seedEnv = @{
+            APPDATA = Join-Path $seedData "AppData/Roaming"
+            LOCALAPPDATA = Join-Path $seedData "AppData/Local"
+            USERPROFILE = Join-Path $seedData "User"
+            PROGRAMDATA = Join-Path $seedData "ProgramData"
+            TEMP = Join-Path $seedData "Temp"
+            TMP = Join-Path $seedData "Temp"
+          }
+          New-Item -ItemType Directory -Force -Path $seedApp,
+            (Join-Path $seedData "User/AppData/Local"),
+            (Join-Path $seedData "User/AppData/Roaming") | Out-Null
+          $oldEnv = @{}
+          foreach ($entry in $seedEnv.GetEnumerator()) {
+            $oldEnv[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key)
+            New-Item -ItemType Directory -Force -Path $entry.Value | Out-Null
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value)
+          }
+          try {
+            $seedArguments = '/quiet /norestart /install "InstallFolder=' +
+              $seedApp + '" /log "' + $seedLog + '"'
+            $seedProcess = Start-Process -FilePath $installer `
+              -ArgumentList $seedArguments -PassThru
+            if (-not $seedProcess.WaitForExit(180000)) {
+              $seedProcess.Kill()
+              throw "Delta seed install did not exit within 180 s"
+            }
+          }
+          finally {
+            foreach ($key in $oldEnv.Keys) {
+              [Environment]::SetEnvironmentVariable($key, $oldEnv[$key])
+            }
+          }
+          if ($seedProcess.ExitCode -notin @(0, 3010)) {
+            if (Test-Path $seedLog) { Get-Content $seedLog -Tail 100 }
+            throw "Delta seed install failed with exit $($seedProcess.ExitCode)"
+          }
+          $seededMsi = @(Get-ChildItem $seedData -Recurse -File -Filter "*.msi" |
+            Where-Object { $_.FullName -match 'Package Cache' })
+          if ($seededMsi.Count -eq 0) {
+            if (Test-Path $seedLog) { Get-Content $seedLog -Tail 100 }
+            throw "Delta seed install did not create a cached MSI"
+          }
+          Write-Host "Seeded Present bundle cache: $($seededMsi.FullName -join ', ')"
+
           $crashLog = Join-Path $root "portablizer-crash.log"
           $env:PORTABLIZER_CRASH_LOG = $crashLog
           $arguments = 'build "' + $installer + '" --out "' + $out + '" ' +
@@ -170,7 +223,6 @@ jobs:
             throw "Delta portable build did not exit within 600 s"
           }
 
-          $portable = Join-Path $out "Delta_Portable"
           if ($process.ExitCode -ne 0 -or (Test-Path $crashLog)) {
             foreach ($name in @(
                 "portablizer-crash.log", "out/portablizer-cli.log",
@@ -207,6 +259,12 @@ jobs:
           if (-not (Test-Path (Join-Path $portable $config.target_exe_rel))) {
             throw "Delta launcher target does not exist: $($config.target_exe_rel)"
           }
+          $buildLog = Join-Path $portable "portablizer.log"
+          $buildLogText = Get-Content $buildLog -Raw
+          if ($buildLogText -notmatch 'MSI из Package Cache распакован в App') {
+            Get-Content $buildLog -Tail 160 | ForEach-Object { Write-Host $_ }
+            throw "Delta did not exercise the cached-MSI recovery path"
+          }
           $cacheDirs = @(Get-ChildItem $portable -Recurse -Directory `
             -Filter "Package Cache" -ErrorAction SilentlyContinue)
           $layoutPath = Join-Path $portable "_bundle_layout"
@@ -218,7 +276,6 @@ jobs:
               Get-ChildItem $layoutPath -Recurse -Force |
                 Select-Object FullName, Attributes | Format-Table -AutoSize
             }
-            $buildLog = Join-Path $portable "portablizer.log"
             if (Test-Path $buildLog) {
               Write-Host "--- Delta portablizer.log (tail) ---"
               Get-Content $buildLog -Tail 140 | ForEach-Object { Write-Host $_ }

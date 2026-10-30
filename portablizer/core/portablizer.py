@@ -2502,6 +2502,10 @@ class Portablizer:
                 result.attempt_outcomes = list(self._attempt_history)
                 raise RuntimeError(
                     self._failure_message(det, install_rc, result))
+            if det.installer_type == InstallerType.WIX_BURN:
+                # Настоящий App уже найден: bootstrapper, layout и Package Cache
+                # больше не нужны независимо от того, какой сценарий сработал.
+                self._cleanup_burn_artifacts(portable_dir, data_dir)
             result.targets = targets
             result.main_exe_rel = os.path.relpath(main_exe, portable_dir)
             self.log.ok(f"Главный exe: {result.main_exe_rel}")
@@ -4221,15 +4225,6 @@ class Portablizer:
                     and self._install_burn_cached_packages(
                         data_dir, opts, app_dir, name,
                         before=burn_cache_before, console_log=console_log)):
-                layout_dir = os.path.join(portable_dir, "_bundle_layout")
-                if os.path.exists(layout_dir):
-                    try:
-                        self._remove_path(layout_dir)
-                    except OSError as exc:
-                        self.log.warn(
-                            f"Не удалось удалить временный Burn layout "
-                            f"{layout_dir}: {exc}"
-                        )
                 self.log.ok(
                     f"MSI из Package Cache распакован в App. Сработал сценарий: "
                     f"{plan.label}"
@@ -4658,6 +4653,35 @@ class Portablizer:
         )
         return False
 
+    def _cleanup_burn_artifacts(self, portable_dir: str,
+                                data_dir: str) -> None:
+        """Убирает установочные layout/cache после получения настоящего App.
+
+        Это общий финальный шаг, а не только ветка восстановления MSI: на
+        чистом ПК Delta может установиться прямо первым quiet /install, и в
+        этом случае его Package Cache с _bundle_layout тоже не нужны готовому
+        портативу.
+        """
+        paths = [os.path.join(portable_dir, "_bundle_layout")]
+        paths.extend(_burn_cache_roots(data_dir))
+        removed: List[str] = []
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                self._remove_path(path)
+            except OSError as exc:
+                self.log.warn(
+                    f"Не удалось удалить установочные файлы Burn {path}: {exc}"
+                )
+            else:
+                removed.append(os.path.basename(path))
+        if removed:
+            self.log.info(
+                "Установочные файлы Burn удалены из готового портатива: "
+                + ", ".join(removed)
+            )
+
     def _install_burn_cached_packages(
             self, data_dir: str, opts: PortableOptions, app_dir: str,
             name: str, before: Dict[str, Tuple[int, int]],
@@ -4721,17 +4745,8 @@ class Portablizer:
                     "программы, а не bootstrapper. Установочный кэш удаляю "
                     "из PortableData."
                 )
-                for root in _burn_cache_roots(data_dir):
-                    if not os.path.exists(root):
-                        continue
-                    try:
-                        self._remove_path(root)
-                    except OSError as exc:
-                        # Программа уже полностью распакована в App; невозможность
-                        # удалить временный кэш не должна отменять готовый App.
-                        self.log.warn(
-                            f"Не удалось удалить Package Cache {root}: {exc}"
-                        )
+                self._cleanup_burn_artifacts(
+                    os.path.dirname(os.path.abspath(app_dir)), data_dir)
                 return True
         if fresh or reusable:
             self.log.warn(
