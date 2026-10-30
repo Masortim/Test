@@ -189,6 +189,14 @@ class LauncherConfig:
     # запуска) или переносит программу на свободный порт через её же конфиг.
     # Пустой словарь - значит «взять профиль программы, если он есть».
     service_ports: Dict[str, object] = field(default_factory=dict)
+    # --- вход в аккаунт через браузер по умолчанию ---------------------------
+    # Блок ``browser_login`` из launcher_config.json: лончер следит за тем,
+    # чтобы страница входа открывалась в УЖЕ установленном браузере с обычным
+    # профилем, а не в копии, которую программа запускает внутри
+    # перенаправленного профиля портатива. {"enabled": true, "poll_seconds"}.
+    # Пустой словарь - значит «включено по умолчанию» (так ведут себя и
+    # портативы, собранные прежней версией, — им достаточно нового лончера).
+    browser_login: Dict[str, object] = field(default_factory=dict)
     # Сетевые компоненты (драйвер TAP-Windows и службы), перенесённые в
     # папку NetStack/ портатива: {"manifest", "setup", "teardown",
     # "driver_services", "service_names", "stop_on_exit"}. Пусто — компонентов
@@ -1954,6 +1962,8 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
                 if isinstance(data.get("update"), dict) else {}),
         service_ports=(dict(data["service_ports"])
                        if isinstance(data.get("service_ports"), dict) else {}),
+        browser_login=(dict(data["browser_login"])
+                       if isinstance(data.get("browser_login"), dict) else {}),
         netstack=(dict(data["netstack"])
                   if isinstance(data.get("netstack"), dict) else {}),
         targets=targets,
@@ -2285,6 +2295,36 @@ def service_port_settings(cfg: "LauncherConfig") -> Dict[str, object]:
     if isinstance(explicit, dict):
         profile.update(explicit)
     return profile
+
+
+#: Параметры слежки за браузером по умолчанию: как часто лончер смотрит на
+#: процессы и включён ли перехват вообще.
+BROWSER_LOGIN_DEFAULTS: Dict[str, object] = {
+    "enabled": True,
+    "poll_seconds": 0.3,
+}
+
+
+def browser_login_settings(cfg: "LauncherConfig") -> Dict[str, object]:
+    """Блок ``browser_login`` для launcher_config.json.
+
+    Программа, которой нужен вход в аккаунт, открывает страницу через
+    оболочку Windows — и та запускает браузер с окружением программы, то есть
+    с профилем внутри ``PortableData``. Получается вторая копия браузера по
+    умолчанию: без закладок и сохранённых входов, с лишними ключами в
+    реестре. Лончер перехватывает такой запуск и открывает тот же адрес сам —
+    своей оболочкой, с настоящим профилем пользователя.
+
+    Явные значения из ``cfg.browser_login`` перекрывают умолчания, поэтому
+    блок можно выключить для конкретного портатива.
+    """
+    settings = dict(BROWSER_LOGIN_DEFAULTS)
+    explicit = cfg.browser_login or {}
+    if isinstance(explicit, dict):
+        settings.update(explicit)
+    if settings.get("enabled") is not False:
+        settings["enabled"] = True
+    return settings
 
 
 # --- Вспомогательные лаунчеры и меню ------------------------------------------
@@ -2837,4 +2877,9 @@ def render_config_json(cfg: LauncherConfig) -> str:
     ports = service_port_settings(cfg)
     if ports:
         payload["service_ports"] = ports
+    # Вход в аккаунт: лончер обязан открыть страницу входа в настоящем
+    # браузере пользователя, а не в копии внутри PortableData. Блок пишется
+    # всегда, чтобы решение было видно в конфиге и его можно было выключить
+    # для отдельного портатива.
+    payload["browser_login"] = browser_login_settings(cfg)
     return json.dumps(payload, ensure_ascii=False, indent=2)
