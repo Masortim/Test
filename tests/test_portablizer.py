@@ -1698,6 +1698,28 @@ class BurnPlanTests(unittest.TestCase):
         log_index = plan.args.index("/log")
         self.assertEqual(plan.args[log_index + 1], r"E:\Type_Portable\install.log")
 
+    def test_burn_assisted_fallback_is_opt_in_and_runs_after_layout(self):
+        detection = DetectionResult(InstallerType.WIX_BURN, 0.97)
+        normal = build_attempts(
+            detection, r"C:\Downloads\DeltaSetup.exe",
+            r"D:\Portable\Delta\App",
+            log_dir=r"D:\Portable\Delta",
+            layout_dir=r"D:\Portable\Delta\_bundle_layout")
+        assisted = build_attempts(
+            detection, r"C:\Downloads\DeltaSetup.exe",
+            r"D:\Portable\Delta\App",
+            log_dir=r"D:\Portable\Delta",
+            layout_dir=r"D:\Portable\Delta\_bundle_layout",
+            allow_assisted=True)
+
+        self.assertEqual(len(normal), 3)
+        self.assertEqual(len(assisted), 4)
+        self.assertTrue(assisted[-1].interactive)
+        self.assertNotIn("/quiet", assisted[-1].args)
+        self.assertIn("InstallFolder=D:\\Portable\\Delta\\App",
+                      assisted[-1].args)
+        self.assertIn("штатное окно мастера", assisted[-1].label)
+
     def test_burn_plan_can_drop_install_folder_override(self):
         plan = build_silent_plan(
             InstallerType.WIX_BURN,
@@ -1820,6 +1842,55 @@ class BurnFallbackTests(unittest.TestCase):
             self.assertTrue((app / "Type.exe").exists())
             # Временная распаковка бандла удалена.
             self.assertFalse((portable / "_bundle_layout").exists())
+
+    def test_burn_does_not_relaunch_identical_embedded_bundle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "delta-windows-x86_64-setup.exe")
+            installer.write_bytes(b"same Burn bundle binary")
+            portable = Path(temp, "Delta_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            layout = portable / "_bundle_layout"
+            app.mkdir(parents=True)
+            data.mkdir()
+            layout.mkdir()
+            (layout / "DeltaSetup.exe").write_bytes(installer.read_bytes())
+            engine = Portablizer(Logger())
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Delta")
+
+            ok = engine._install_layout_packages(
+                str(layout), opts, str(app), str(data), "Delta")
+
+            self.assertFalse(ok)
+            self.assertTrue(engine._burn_cycle_detected)
+            self.assertEqual(list(app.iterdir()), [])
+            self.assertIn("Повторно запускать тот же бандл",
+                          engine.log.text)
+
+    def test_burn_does_not_repeat_nested_bundle_name_with_new_hash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "DeltaSetup.exe")
+            installer.write_bytes(b"parent Burn bundle")
+            payload = Path(temp, "layout", "DeltaSetup.exe")
+            payload.parent.mkdir()
+            payload.write_bytes(b"different nested Burn bundle")
+            engine = Portablizer(Logger())
+            engine._detection = DetectionResult(InstallerType.WIX_BURN, 0.97)
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Delta")
+            burn = DetectionResult(InstallerType.WIX_BURN, 0.97)
+
+            with mock.patch(
+                    "portablizer.core.portablizer.detect_installer",
+                    return_value=burn) as detect:
+                ok = engine._run_burn_embedded_installers(
+                    [str(payload)], opts, str(temp), str(temp), temp, "Delta")
+
+            self.assertFalse(ok)
+            self.assertTrue(engine._burn_cycle_detected)
+            detect.assert_called_once_with(str(payload))
+            self.assertIn("тем же именем", engine.log.text)
 
     def test_burn_fallback_runs_matching_embedded_product_setup(self):
         with tempfile.TemporaryDirectory() as temp:
