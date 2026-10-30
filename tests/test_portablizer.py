@@ -1872,16 +1872,14 @@ class BurnFallbackTests(unittest.TestCase):
             rc, used = engine._run_attempts(attempts, opts, str(app),
                                             str(data), str(portable), "Type")
 
-            # С InstallFolder, без него, затем /layout, затем msiexec /a.
-            self.assertEqual(len(engine.calls), 4)
-            self.assertTrue(any(a.startswith("InstallFolder=")
-                                for a in engine.calls[0].args))
-            self.assertFalse(any(a.startswith("InstallFolder=")
-                                 for a in engine.calls[1].args))
-            self.assertIn("/layout", engine.calls[2].args)
-            self.assertEqual(engine.calls[3].program, "msiexec.exe")
-            self.assertIn("/a", engine.calls[3].args)
-            self.assertNotIn("/i", engine.calls[3].args)
+            # /layout идёт ПЕРВЫМ (не пишет в реестр «уже установлено»),
+            # затем msiexec /a. Запуск установки бандла даже не понадобился.
+            self.assertEqual(len(engine.calls), 2)
+            self.assertIn("/layout", engine.calls[0].args)
+            self.assertNotIn("/install", engine.calls[0].args)
+            self.assertEqual(engine.calls[1].program, "msiexec.exe")
+            self.assertIn("/a", engine.calls[1].args)
+            self.assertNotIn("/i", engine.calls[1].args)
             self.assertEqual(rc, 0)
             self.assertIn("/layout", used.args)
             self.assertTrue((app / "Type.exe").exists())
@@ -1924,16 +1922,16 @@ class BurnFallbackTests(unittest.TestCase):
             rc, used = engine._run_attempts(attempts, opts, str(app),
                                             str(data), str(portable), "Type")
 
-            # Обе команды установки, /layout и затем сам exe-пакет бандла:
-            # MSI не было, msiexec не вызывался. Пакет запускается своими
-            # ключами тишины (1.39.0) — раньше такой бандл гарантированно
-            # заканчивался пустым App, потому что «MSI нет — распаковывать
-            # нечего».
-            self.assertGreater(len(engine.calls), 3)
-            nested = [plan for plan in engine.calls[3:]]
+            # /layout, затем exe-пакет из бандла своими ключами тишины,
+            # затем (уже безрезультатно) обе команды установки бандла.
+            # MSI не было — msiexec не вызывался.
+            self.assertGreaterEqual(len(engine.calls), 6)
+            self.assertIn("/layout", engine.calls[0].args)
+            nested = [plan for plan in engine.calls[1:]
+                      if os.path.basename(plan.program) == "tool.exe"]
             self.assertTrue(nested, "exe-пакет бандла не запускался")
-            for plan in nested:
-                self.assertEqual(os.path.basename(plan.program), "tool.exe")
+            self.assertFalse(
+                any(plan.program == "msiexec.exe" for plan in engine.calls))
             self.assertIsNone(used)
             self.assertEqual(rc, 5)
             self.assertFalse((app / "Type.exe").exists())

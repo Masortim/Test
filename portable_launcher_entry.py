@@ -4986,6 +4986,41 @@ _TARGET_JUNK = ("unins", "uninstall", "update", "updater", "setup", "install",
                 "crashpad", "crashhandler", "crashreport", "elevate", "helper",
                 "report", "vc_redist", "dxsetup")
 
+#: Имена самого лончера. Он лежит в ``App\`` и после неудачной сборки
+#: оказывается там единственным «настоящим» exe. Жалоба: клик по ``Launch.bat``
+#: бесконечно запускал ``App\LaunchPortable.exe`` — конфиг указывал на
+#: пропавшую программу, поиск замены находил сам лончер, записывал его в
+#: ``launcher_config.json``, и лончер запускал себя заново.
+_LAUNCHER_IMAGE_NAMES = frozenset({
+    "launchportable.exe", "portablelauncher.exe", "relauncher.exe",
+})
+
+
+def _launcher_own_images() -> "set[str]":
+    """Имена файлов, которые являются самим лончером (включая текущий exe)."""
+    names = set(_LAUNCHER_IMAGE_NAMES)
+    if getattr(sys, "frozen", False):
+        exe = Path(str(sys.executable or "")).name.casefold()
+        if exe:
+            names.add(exe)
+    return names
+
+
+def _is_own_image(path: Path) -> bool:
+    """Это сам лончер? Запускать его вместо программы нельзя."""
+    try:
+        name = Path(str(path)).name.casefold()
+    except (TypeError, ValueError):
+        return False
+    if name in _launcher_own_images():
+        return True
+    if not getattr(sys, "frozen", False):
+        return False
+    try:
+        return Path(str(path)).resolve() == Path(sys.executable).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return False
+
 
 def _find_replacement_target(root: Path, wanted: str) -> "Optional[Path]":
     """Ищет настоящий exe, если записанная в конфиге цель исчезла.
@@ -5027,6 +5062,10 @@ def _find_replacement_target(root: Path, wanted: str) -> "Optional[Path]":
                 break
             path = Path(current) / name
             folded = name.casefold()
+            if folded in _launcher_own_images() or _is_own_image(path):
+                # Лончер — не программа: замена им самим даёт бесконечный
+                # цикл «запустил себя — запустил себя».
+                continue
             if _looks_like_installer_name(folded):
                 # Установщик в App — не программа: запускать его по клику
                 # нельзя, даже если имя совпало с записанной целью.
@@ -5078,8 +5117,13 @@ def _repair_missing_target(root: Path, cfg: Dict[str, Any], target_rel: str,
     запускателя): тогда имя файла не повод искать замену.
     """
     target = _as_relative_path(root, target_rel)
+    own_image = _is_own_image(target)
     installer_like = (not allow_installer
-                      and _looks_like_installer_name(target_rel))
+                      and (_looks_like_installer_name(target_rel)
+                           or own_image))
+    if own_image:
+        _run_log(root, f"target: {target_rel} is the launcher itself, not "
+                       "the program; looking for the real program in App")
     try:
         if target.is_file() and not installer_like:
             return target_rel
@@ -12642,6 +12686,19 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                 "Похоже, папка App неполная (или программу обновил её "
                 "собственный апдейтер). Запустите Launch.bat --diagnose: "
                 "отчёт покажет, что лежит в App.")
+    if _is_own_image(target):
+        # Бесконечный цикл «лончер запускает лончер»: конфиг остался от
+        # неполной сборки. Честное сообщение лучше карусели окон.
+        _run_log(root, "target: refusing to start the launcher as the program")
+        raise FileNotFoundError(
+            "В папке App нет самой программы, а launcher_config.json "
+            "указывает на сам лончер:\n"
+            f"{target}\n\n"
+            "Так выглядит неполная сборка: установщик не дал файлов "
+            "программы. Пересоберите портатив новым Portablizer или укажите "
+            "настоящий exe в launcher_config.json. Что лежит в App — "
+            "покажет Launch.bat --diagnose."
+        )
     if not needs_machine and _looks_like_installer_name(target.name):
         # Мастер установки по клику не запускаем: он поставил бы программу
         # заново (ровно на это и жаловались — «запускается установщик»).
