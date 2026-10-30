@@ -1198,6 +1198,7 @@ class Portablizer:
         #: Имя упавшего процесса: по нему ищутся записи в журнале событий.
         self._installer_name = ""
         self._source_staging_dir = ""
+        self._burn_embedded_depth = 0
         #: Чем закончилась распаковка без запуска (для подсказок).
         self._unpacker_result = ""
         #: Каким распаковщиком воспользовались (пусто — ни одним).
@@ -1998,6 +1999,7 @@ class Portablizer:
             self._recovered_sources = []
             self._installer_name = opts.installer_path
             self._source_staging_dir = ""
+            self._burn_embedded_depth = 0
             # Жалоба: в C:\Users\<user> накапливались Portablizer-*-Temp / _MEI*
             # от аварийных завершений предыдущих запусков. Убираем их сразу,
             # до любой новой работы с TEMP — иначе их будет всё больше.
@@ -4095,7 +4097,8 @@ class Portablizer:
                     and os.path.normcase(plan.output_dir) != os.path.normcase(app_dir)):
                 if self._install_layout_packages(plan.output_dir, opts, app_dir,
                                                  data_dir, name,
-                                                 console_log=console_log):
+                                                 console_log=console_log,
+                                                 recover=recover):
                     self.log.ok(f"Сработал сценарий: {plan.label}")
                     return rc, plan
                 continue
@@ -4337,11 +4340,97 @@ class Portablizer:
         queue.insert(index, plan)
         return True
 
+    @classmethod
+    def _burn_embedded_installer_match(cls, path: str, app_name: str,
+                                       installer_path: str) -> bool:
+        """True для очевидного установщика самого продукта внутри Burn.
+
+        Burn может содержать не MSI, а отдельный bootstrapper приложения
+        (например, ``DeltaSetup.exe``). Не запускаем произвольные EXE из
+        layout: имя после снятия суффикса Setup/Installer должно точно
+        совпасть с именем продукта.
+        """
+        stem = os.path.splitext(os.path.basename(path))[0]
+        product_stem = re.sub(
+            r"(?i)(?:[._ -]*)(?:setup|installer|install|bootstrapper|"
+            r"bootstrap|bundle)$", "", stem).strip(" ._-")
+        if not product_stem or product_stem == stem:
+            return False
+        keys = cls._name_keys(app_name, installer_path)
+        return cls._name_score(product_stem, keys) >= 200
+
+    def _run_burn_embedded_installers(
+        self, payloads: Sequence[str], opts: PortableOptions,
+        app_dir: str, data_dir: str, portable_dir: str, name: str,
+        console_log: Optional[str] = None,
+        recover: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """Запускает распознанный продуктовый setup.exe из Burn /layout.
+
+        У некоторых bundle'ов вложенный package — самостоятельный EXE, а не
+        MSI. Это всё ещё часть выбранного bundle, но не файл программы. По
+        одному запуску уровня на каждый bundle (максимум два вложения), с
+        обычной лестницей детектора/тихих ключей и только для имени, совпавшего
+        с продуктом.
+        """
+        if self._burn_embedded_depth >= 2:
+            return False
+        for payload in payloads:
+            if (not payload.casefold().endswith(".exe")
+                    or not os.path.isfile(payload)):
+                continue
+            if not self._burn_embedded_installer_match(
+                    payload, name, opts.installer_path):
+                continue
+            self._check_cancel()
+            child_detection = detect_installer(payload)
+            self.log.info(
+                "В WiX Burn найден установщик самого приложения: "
+                f"{os.path.basename(payload)} ({child_detection.human}). "
+                "Запускаю его собственную лестницу установки вместо того, "
+                "чтобы переносить setup.exe как готовую программу.")
+            child_layout = os.path.join(
+                portable_dir,
+                f"_bundle_layout_nested_{self._burn_embedded_depth + 1}")
+            child_opts = replace(opts, installer_path=payload, single_file=False)
+            child_attempts = build_attempts(
+                child_detection, payload, app_dir, log_dir=portable_dir,
+                extra_args=opts.extra_install_args,
+                layout_dir=child_layout,
+                allow_assisted=opts.allow_assisted_install,
+                language=opts.install_language,
+                adobe_layout_dir=os.path.join(
+                    portable_dir, "_adobe_payloads_nested"),
+            )
+            old_detection = self._detection
+            old_adobe = self._adobe_detected
+            self._detection = child_detection
+            self._adobe_detected = bool(
+                child_detection.is_adobe_hd or child_detection.adobe_named)
+            self._burn_embedded_depth += 1
+            try:
+                _rc, used = self._run_attempts(
+                    child_attempts, child_opts, app_dir, data_dir,
+                    portable_dir, name, recover=recover)
+            finally:
+                self._burn_embedded_depth -= 1
+                self._detection = old_detection
+                self._adobe_detected = old_adobe
+                shutil.rmtree(child_layout, ignore_errors=True)
+            if self._find_main_exe(app_dir, name):
+                used_label = used.label if used else "результат найден"
+                self.log.ok(
+                    "Вложенный установщик WiX Burn установил файлы "
+                    f"программы в App ({used_label}).")
+                return True
+        return False
+
     def _install_layout_packages(self, layout_dir: str, opts: PortableOptions,
                                  app_dir: str, data_dir: str,
                                  name: str,
-                                 console_log: Optional[str] = None) -> bool:
-        """Распаковывает MSI из подготовленного ``/layout`` прямо в ``App``."""
+                                 console_log: Optional[str] = None,
+                                 recover: Optional[Callable[[], bool]] = None) -> bool:
+        """Распаковывает MSI и продуктовые EXE из WiX ``/layout`` в ``App``."""
         msis, other_payloads = _burn_layout_payloads(layout_dir)
         if other_payloads:
             self.log.info(
@@ -4351,9 +4440,17 @@ class Portablizer:
                     os.path.basename(p) for p in other_payloads)[:5])
             )
         if not msis:
+            if self._run_burn_embedded_installers(
+                    other_payloads, opts, app_dir, data_dir,
+                    os.path.dirname(layout_dir), name,
+                    console_log=console_log, recover=recover):
+                self.log.ok("Вложенный пакет WiX Burn собран в App.")
+                shutil.rmtree(layout_dir, ignore_errors=True)
+                return True
             self.log.warn(
-                "В распакованном бандле нет ни одного MSI-пакета — "
-                "распаковывать нечего."
+                "В распакованном бандле нет MSI-пакета и не найден "
+                "подходящий вложенный установщик приложения — переносить "
+                "файлы бандла как готовую программу нельзя."
             )
             return False
 
@@ -4372,9 +4469,17 @@ class Portablizer:
             self.log.info("Временная распаковка бандла удалена.")
             return True
 
+        if self._run_burn_embedded_installers(
+                other_payloads, opts, app_dir, data_dir,
+                os.path.dirname(layout_dir), name,
+                console_log=console_log, recover=recover):
+            shutil.rmtree(layout_dir, ignore_errors=True)
+            return True
+
         self.log.warn(
-            "MSI-пакеты не дали исполняемых файлов. Распакованное "
-            f"содержимое оставлено для диагностики: {layout_dir}"
+            "MSI- и EXE-пакеты бандла не дали запускаемых файлов "
+            "программы. Распакованное содержимое оставлено для диагностики: "
+            f"{layout_dir}"
         )
         return False
 
@@ -6959,6 +7064,12 @@ class Portablizer:
         def add_source(source: str, score: int, reason: str) -> None:
             source = os.path.abspath(source)
             source_norm = os.path.normcase(source)
+            # Burn хранит там bootstrapper/maintenance EXE и кэш пакетов,
+            # а не установленную программу. InstallLocation этой папки —
+            # частая причина «успешного» портатива из одного Setup.exe.
+            parts = os.path.normpath(source).replace("\\", "/").split("/")
+            if any(part.casefold() == "package cache" for part in parts):
+                return
             # Никогда не копируем Program Files/AppData/корень диска целиком
             # или саму папку собираемого портатива.
             if (source_norm in protected_roots
@@ -7694,6 +7805,19 @@ class Portablizer:
                 score += 80
         return min(100, score)
 
+    @staticmethod
+    def _is_setup_or_maintenance_exe(path: str) -> bool:
+        """Исключает bootstrapper/maintenance EXE из кандидатов главного app."""
+        stem = os.path.splitext(os.path.basename(path))[0].casefold()
+        match = re.search(
+            r"(?:setup|installer|install|bootstrapper|bootstrap|uninstaller|"
+            r"uninstall|repair|modify)$", stem)
+        # Суффиксы с разделителем (Language_Setup.exe) часто обозначают
+        # реальные configurator'ы; отсекаем склеенные имена вроде
+        # DeltaSetup.exe, характерные для maintenance/bootstrapper.
+        return bool(match and (match.start() == 0
+                               or stem[match.start() - 1].isalnum()))
+
     def _discover_app_executables(
         self, app_dir: str, app_name: str, portable_prefix: str = "App",
     ) -> Tuple[Optional[str], List[launcher_mod.TargetInfo]]:
@@ -7728,7 +7852,8 @@ class Portablizer:
         for p in candidates:
             base = os.path.basename(p).lower()
             stem = os.path.splitext(os.path.basename(p))[0]
-            if base.startswith("unins") or base == "uninstall.exe":
+            if (base.startswith("unins") or base == "uninstall.exe"
+                    or self._is_setup_or_maintenance_exe(p)):
                 continue
             if any(b in base for b in bad_prefixes):
                 continue
