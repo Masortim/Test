@@ -1874,9 +1874,13 @@ class BurnFallbackTests(unittest.TestCase):
             data.mkdir()
             engine = Portablizer(Logger())
 
-            recovered = engine._recover_installed_app(
-                str(app), str(data), "Delta", str(installer), {},
-                registry_locations=[str(cache)])
+            # Не сканируем реальные Program Files/корни дисков в Windows CI:
+            # здесь проверяется только отбрасывание cache-пути из реестра.
+            with mock.patch.object(engine, "_install_search_roots",
+                                   return_value=[]):
+                recovered = engine._recover_installed_app(
+                    str(app), str(data), "Delta", str(installer), {},
+                    registry_locations=[str(cache)])
 
             self.assertFalse(recovered)
             self.assertEqual(list(app.iterdir()), [])
