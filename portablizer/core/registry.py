@@ -141,15 +141,6 @@ _PROTECTED_PREFIXES: Tuple[str, ...] = (
     r"software\microsoft\edge",
     r"software\microsoft\edgewebview",
     r"software\microsoft\edgeupdate",
-    # Регистрация браузера по умолчанию. Портатив не устанавливает браузер:
-    # перенос этих веток создавал на чужом ПК дубликат — вторую запись в
-    # «Программах по умолчанию», второй пункт «Браузер» и перехват ссылок.
-    # Страницы входа открываются в уже установленном браузере, поэтому
-    # хранить здесь нечего.
-    r"software\clients\startmenuinternet",
-    r"software\registeredapplications",
-    r"software\microsoft\windows\shell\associations\urlassociations",
-    r"software\microsoft\windows\currentversion\applicationassociations",
 )
 
 # Отдельные записи «Программы и компоненты» могут иметь случайный GUID вместо
@@ -314,18 +305,6 @@ _PROTOCOL_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*$", re.IGNORECASE)
 #: протокола (``HKCU\Software\Classes\<scheme>``).
 _PROTOCOL_MARKER_VALUE = "url protocol"
 
-#: Схемы, которые принадлежат не программе, а браузеру и оболочке Windows.
-#: Регистрация ``http``/``https`` — это заявка «я браузер по умолчанию»; если
-#: перенести её в портатив, лончер на чужом ПК переназначит открытие ссылок
-#: своей копии, то есть создаст второй браузер в реестре. Ровно этого и не
-#: должно происходить: страница входа открывается в УЖЕ установленном
-#: браузере пользователя (см. BrowserLoginBridge в лончере).
-_WEB_SCHEMES = frozenset({
-    "http", "https", "ftp", "ftps", "file", "mailto", "tel", "callto", "sms",
-    "news", "nntp", "feed", "webcal", "irc", "ircs", "magnet", "mms",
-    "microsoft-edge", "ms-edge", "msedge", "ms-settings", "search-ms",
-})
-
 #: Подключ с командой открытия протокола.
 _PROTOCOL_COMMAND_SUBKEY = r"\shell\open\command"
 
@@ -358,11 +337,7 @@ def is_protocol_key(key_path: str,
     ``shell\open\command`` (такие регистрации встречаются у Electron-
     приложений, например Figma).
     """
-    tail = _protocol_tail(key_path)
-    if not tail:
-        return False
-    if tail.casefold() in _WEB_SCHEMES:
-        # Схема браузера/оболочки: это не протокол приложения.
+    if not _protocol_tail(key_path):
         return False
     if values is not None and _PROTOCOL_MARKER_VALUE in {
             str(name).casefold() for name in values}:

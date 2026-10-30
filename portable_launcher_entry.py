@@ -8,7 +8,6 @@ portable app is started.
 """
 from __future__ import annotations
 
-import atexit
 import base64
 import hashlib
 import json
@@ -1146,35 +1145,6 @@ _SHELL_PROTECTED_SUBKEYS = (
     r"software\microsoft\windows\currentversion\explorer\sessioninfo",
     r"software\microsoft\windows\currentversion\shell",
     r"software\microsoft\windows\currentversion\cloudstore",
-    # Браузер по умолчанию. Портатив не устанавливает браузер, поэтому эти
-    # ветки в portable.reg — чужая регистрация: «второй браузер» в списке
-    # программ по умолчанию, перехваченные ссылки http/https, свой обработчик
-    # в StartMenuInternet. Сборки до 1.35 переносили их вместе с протоколами
-    # программы, и импорт создавал дубликат; файл вычищается на месте, поэтому
-    # лечение работает и для уже собранных портативов.
-    r"software\clients\startmenuinternet",
-    r"software\registeredapplications",
-    r"software\microsoft\windows\shell\associations\urlassociations",
-    r"software\microsoft\windows\currentversion\applicationassociations",
-    r"software\classes\http",
-    r"software\classes\https",
-    r"software\classes\ftp",
-    r"software\classes\ftps",
-    r"software\classes\file",
-    r"software\classes\mailto",
-    r"software\classes\tel",
-    r"software\classes\callto",
-    r"software\classes\sms",
-    r"software\classes\news",
-    r"software\classes\nntp",
-    r"software\classes\feed",
-    r"software\classes\webcal",
-    r"software\classes\irc",
-    r"software\classes\ircs",
-    r"software\classes\magnet",
-    r"software\classes\microsoft-edge",
-    r"software\classes\ms-settings",
-    r"software\classes\search-ms",
 )
 
 
@@ -4864,23 +4834,6 @@ def _select_target(cfg: Dict[str, Any], arguments: Sequence[str]
     return target_rel, forwarded, selected_role != "main"
 
 
-#: Слова, по которым файл — установщик, а не программа.
-_INSTALLER_WORDS = ("setup", "install", "instal", "unins", "repack", "bundle",
-                    "unpack", "extract")
-
-
-def _looks_like_installer_name(value: str) -> bool:
-    """True, если имя файла принадлежит установщику, а не программе.
-
-    Готовая сборка не должна запускать мастер установки по клику: если
-    конфиг почему-то указывает на ``*Setup.exe``, лончер ищет настоящую
-    программу в ``App`` и правит конфиг, а не открывает установщик.
-    """
-    name = _image_name(str(value)).casefold()
-    stem = name.rsplit(".", 1)[0] if "." in name else name
-    return bool(stem) and any(word in stem for word in _INSTALLER_WORDS)
-
-
 #: Служебные exe, которые не могут быть «главной программой».
 _TARGET_JUNK = ("unins", "uninstall", "update", "updater", "setup", "install",
                 "crashpad", "crashhandler", "crashreport", "elevate", "helper",
@@ -4927,10 +4880,6 @@ def _find_replacement_target(root: Path, wanted: str) -> "Optional[Path]":
                 break
             path = Path(current) / name
             folded = name.casefold()
-            if _looks_like_installer_name(folded):
-                # Установщик в App — не программа: запускать его по клику
-                # нельзя, даже если имя совпало с записанной целью.
-                continue
             if folded == wanted_name:
                 same_name.append(path)
                 continue
@@ -4970,24 +4919,14 @@ def _remember_target(root: Path, new_rel: str) -> bool:
         return False
 
 
-def _repair_missing_target(root: Path, cfg: Dict[str, Any], target_rel: str,
-                           allow_installer: bool = False) -> str:
-    """Returns a usable target path, repairing the config when it is stale.
-
-    ``allow_installer`` — цель выбрана явно (``--target`` от вспомогательного
-    запускателя): тогда имя файла не повод искать замену.
-    """
+def _repair_missing_target(root: Path, cfg: Dict[str, Any], target_rel: str) -> str:
+    """Returns a usable target path, repairing the config when it is stale."""
     target = _as_relative_path(root, target_rel)
-    installer_like = (not allow_installer
-                      and _looks_like_installer_name(target_rel))
     try:
-        if target.is_file() and not installer_like:
+        if target.is_file():
             return target_rel
     except OSError:
         pass
-    if installer_like:
-        _run_log(root, f"target: {target_rel} is an installer, not the "
-                       "program; looking for the real program in App")
     replacement = _find_replacement_target(root, target_rel)
     if replacement is None:
         return target_rel
@@ -5652,727 +5591,6 @@ def apply_webview2_bridge(env: Dict[str, str], target: Path,
     return patched
 
 
-# --- вход через браузер по умолчанию ------------------------------------------
-#
-# Программа, которой нужен вход в аккаунт (Figma, Cursor, OpenCode, Obsidian,
-# любая Electron/CEF-сборка), открывает страницу входа через оболочку Windows:
-# ShellExecute("https://…"). Оболочка запускает браузер по умолчанию с ТЕМ
-# окружением, которое получил вызывающий процесс, — а лончер перенаправил
-# APPDATA/LOCALAPPDATA/USERPROFILE внутрь PortableData. Браузер не находит
-# своего профиля, создаёт второй (портативный) и выглядит как «дубликат
-# браузера по умолчанию»: без закладок и сохранённых входов. Хуже того, не
-# найдя рядом свой обновлятор, он решает, что не установлен, и запускает
-# установку заново — уже внутрь портатива.
-#
-# Поэтому мост не ловит запуск постфактум, а не даёт профилю раздвоиться:
-# каталоги браузера в перенаправленном профиле на время сеанса становятся
-# junction'ами на настоящие каталоги пользователя. Браузер открывает СВОЙ
-# профиль (а значит, и уже открытое окно) — вход проходит там, где человек уже
-# авторизован, второй копии не появляется ни на диске, ни в реестре.
-# Junction'ы снимаются при выходе, чтобы папку портатива можно было копировать.
-#
-# Если файловая система junction'ов не умеет (FAT/exFAT на флешке, сетевая
-# папка), остаётся второй рубеж: наблюдение за процессами. Новый процесс
-# известного браузера, который стартовал из самой программы и несёт в
-# командной строке http(s)-адрес, снимается, а адрес открывает оболочка самого
-# лончера — с настоящим профилем.
-
-#: Браузеры, чей запуск перехватывается. Имена сравниваются без пути.
-_BROWSER_IMAGES = frozenset({
-    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "vivaldi.exe",
-    "opera.exe", "launcher.exe", "yandex.exe", "chromium.exe", "iexplore.exe",
-    "waterfox.exe", "librewolf.exe", "thorium.exe", "arc.exe", "zen.exe",
-})
-
-#: Где каждый браузер держит свой профиль: (переменная, путь от неё).
-#: APPDATA — сам профиль и настройки, LOCALAPPDATA — кэш и «User Data».
-_BROWSER_PROFILE_DIRS: Dict[str, tuple] = {
-    # Обновляторы перечислены рядом с профилем: браузер, не нашедший свой
-    # обновлятор, решает, что не установлен, и ставит себя заново — внутрь
-    # портатива.
-    "chrome.exe": (("LOCALAPPDATA", "Google/Chrome"),
-                   ("LOCALAPPDATA", "Google/Update"),
-                   ("LOCALAPPDATA", "Google/GoogleUpdater")),
-    "msedge.exe": (("LOCALAPPDATA", "Microsoft/Edge"),),
-    "brave.exe": (("LOCALAPPDATA", "BraveSoftware"),),
-    "vivaldi.exe": (("LOCALAPPDATA", "Vivaldi"),),
-    "chromium.exe": (("LOCALAPPDATA", "Chromium"),),
-    "thorium.exe": (("LOCALAPPDATA", "Thorium"),),
-    "opera.exe": (("APPDATA", "Opera Software"),
-                  ("LOCALAPPDATA", "Opera Software")),
-    "launcher.exe": (("APPDATA", "Opera Software"),
-                     ("LOCALAPPDATA", "Opera Software")),
-    "yandex.exe": (("APPDATA", "Yandex"), ("LOCALAPPDATA", "Yandex")),
-    "firefox.exe": (("APPDATA", "Mozilla"), ("LOCALAPPDATA", "Mozilla")),
-    "waterfox.exe": (("APPDATA", "Mozilla"), ("LOCALAPPDATA", "Mozilla")),
-    "librewolf.exe": (("APPDATA", "Mozilla"), ("LOCALAPPDATA", "Mozilla")),
-    "zen.exe": (("APPDATA", "zen"), ("LOCALAPPDATA", "zen")),
-    # Arc хранит профиль внутри UWP-каталога ``Packages``; соединять весь
-    # этот каталог нельзя (там данные всех магазинных приложений), поэтому
-    # для него работает только наблюдение за процессами.
-}
-
-#: Кто запускает браузер, когда оболочка работает не сама, а через службу
-#: (AppInfo/DCOM): в этом случае цепочка родителей до программы не доходит.
-_SHELL_BROKERS = frozenset({
-    "explorer.exe", "svchost.exe", "dllhost.exe", "runtimebroker.exe",
-    "searchprotocolhost.exe", "searchhost.exe", "wmiprvse.exe",
-})
-
-#: Адрес в командной строке браузера. Кавычки и разделители аргументов в
-#: токен не попадают, поэтому «--single-argument "https://…"» разбирается без
-#: отдельного разбора командной строки.
-_LOGIN_URL_RE = re.compile(r"(?i)\bhttps?://[^\s\"'<>|]+")
-
-
-def _is_known_browser(image: str) -> bool:
-    """True для исполняемого файла известного браузера."""
-    return _image_name(image).casefold() in _BROWSER_IMAGES
-
-
-def _browser_login_url(command_line: str) -> str:
-    """Первый http(s)-адрес из командной строки браузера (или "")."""
-    if not command_line:
-        return ""
-    match = _LOGIN_URL_RE.search(str(command_line))
-    if not match:
-        return ""
-    return match.group(0).rstrip(".,;)")
-
-
-def _browser_profile_pairs() -> "tuple[tuple[str, str], ...]":
-    """Все каталоги браузеров: профиль и обновлятор, без повторов."""
-    pairs: "list[tuple[str, str]]" = []
-    for roots in _BROWSER_PROFILE_DIRS.values():
-        pairs.extend(roots)
-    return tuple(dict.fromkeys(pairs))
-
-
-#: ProgId браузера по умолчанию (``https`` в реестре) -> его исполняемые файлы.
-#: Соединять профили ВСЕХ установленных браузеров незачем: страницу входа
-#: открывает браузер по умолчанию, а каждый лишний junction — это время на
-#: старте программы.
-_DEFAULT_BROWSER_PROGIDS: tuple = (
-    ("chromehtml", ("chrome.exe",)),
-    ("msedgehtm", ("msedge.exe",)),           # MSEdgeHTM
-    ("microsoftedge", ("msedge.exe",)),
-    ("appxq0fevz", ("msedge.exe",)),          # Edge из Store (AppX ProgId)
-    ("firefoxurl", ("firefox.exe",)),
-    ("bravehtml", ("brave.exe",)),
-    ("vivaldi", ("vivaldi.exe",)),
-    ("operastable", ("opera.exe", "launcher.exe")),
-    ("yandexbrowser", ("yandex.exe",)),
-    ("chromium", ("chromium.exe",)),
-)
-
-
-def _default_browser_images() -> "set[str]":
-    """Имена exe браузера по умолчанию; пусто, если определить не удалось.
-
-    Пустой набор — не ошибка: тогда соединяются профили всех найденных
-    браузеров (см. :meth:`BrowserLoginBridge.connect_host_profiles`).
-    """
-    if not IS_WINDOWS:
-        return set()
-    try:
-        import winreg
-
-        path = ("Software\\Microsoft\\Windows\\Shell\\Associations\\"
-                "UrlAssociations\\https\\UserChoice")
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
-            progid = str(winreg.QueryValueEx(key, "ProgId")[0])
-    except Exception:  # noqa: BLE001 - реестр недоступен: соединяем всё
-        return set()
-    return _browser_images_for_progid(progid)
-
-
-def _browser_images_for_progid(progid: str) -> "set[str]":
-    """ProgId обработчика ``https`` -> исполняемые файлы этого браузера."""
-    name = str(progid or "").casefold()
-    for marker, images in _DEFAULT_BROWSER_PROGIDS:
-        if marker in name:
-            return set(images)
-    return set()
-
-
-def _is_junction(path: Path) -> bool:
-    """True, если путь — junction или символическая ссылка, а не каталог.
-
-    Проверка нужна, чтобы не удалить настоящий профиль и не принять ссылку
-    за «дубликат браузера»: содержимое junction'а — это данные пользователя.
-    """
-    try:
-        if path.is_symlink():
-            return True
-    except OSError:
-        pass
-    try:
-        os.readlink(str(path))
-        return True
-    except (OSError, AttributeError, ValueError):
-        pass
-    try:
-        import stat
-
-        attributes = getattr(os.lstat(str(path)), "st_file_attributes", 0)
-        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
-    except (OSError, ValueError):
-        return False
-
-
-def _remove_junction(path: Path) -> bool:
-    """Снять junction/ссылку, не заглядывая внутрь цели."""
-    for action in (os.unlink, os.rmdir):
-        try:
-            action(str(path))
-            return True
-        except OSError:
-            continue
-    return False
-
-
-def _remove_tree(path: Path) -> bool:
-    """Удалить каталог, не заходя внутрь вложенных ссылок.
-
-    ``shutil.rmtree`` считает junction каталогом и обошёл бы его — то есть
-    удалил бы содержимое НАСТОЯЩЕГО профиля за ссылкой. Поэтому ссылки
-    снимаются заранее, а не «вместе с папкой».
-    """
-    try:
-        for current, dirs, _files in os.walk(str(path), topdown=True,
-                                             followlinks=False):
-            for name in list(dirs):
-                child = Path(current) / name
-                if _is_junction(child):
-                    _remove_junction(child)
-                    dirs.remove(name)
-    except OSError:
-        pass
-    shutil.rmtree(path, ignore_errors=True)
-    return not path.exists()
-
-
-#: Расширения файлов, по которым каталог — установленная программа.
-_PROGRAM_SUFFIXES = (".exe", ".dll")
-
-
-def _dir_holds_program(path: Path, max_depth: int = 3) -> bool:
-    """True, если в каталоге лежит сама программа (exe/dll), а не профиль.
-
-    У браузера, установленного для одного пользователя, профиль и программа
-    делят один каталог: ``Local\\Google\\Chrome`` содержит и ``User Data``, и
-    ``Application\\chrome.exe``, а рядом стоит ``Google\\Update`` со своим
-    ``GoogleUpdate.exe``. Такой каталог — установленная программа, а не
-    дубликат профиля: удалять его (особенно обновлятор) нельзя, иначе
-    браузер решает, что не установлен, и запускает УСТАНОВЩИК при каждом
-    старте. Профиль же никогда не содержит exe/dll.
-    """
-    root = str(path).replace("\\", os.sep)
-    base_depth = root.rstrip(os.sep).count(os.sep)
-    try:
-        for current, dirs, files in os.walk(root, followlinks=False):
-            depth = current.rstrip(os.sep).count(os.sep) - base_depth
-            if depth >= max_depth:
-                dirs[:] = []
-            for name in files:
-                if name.casefold().endswith(_PROGRAM_SUFFIXES):
-                    return True
-    except OSError:
-        return False
-    return False
-
-
-def _process_table(full_paths: bool = False) -> "list[tuple[int, int, str]]":
-    """Все процессы системы: ``(pid, parent_pid, имя или путь к exe)``.
-
-    ``full_paths=False`` — снимок без открытия каждого процесса: он делается
-    несколько раз в секунду и обязан быть дешёвым. Для опознания браузера
-    достаточно имени файла; полный путь нужен только в журнале.
-    """
-    if not IS_WINDOWS:
-        return []
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        TH32CS_SNAPPROCESS = 0x00000002
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-
-        class PROCESSENTRY32W(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", wintypes.WCHAR * 260),
-            ]
-
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-        if snap in (0, -1, None):
-            return []
-        own = os.getpid()
-        found: list[tuple[int, int, str]] = []
-        try:
-            entry = PROCESSENTRY32W()
-            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-            more = kernel32.Process32FirstW(snap, ctypes.byref(entry))
-            while more:
-                pid = int(entry.th32ProcessID)
-                if pid not in (0, 4, own):
-                    parent = int(entry.th32ParentProcessID)
-                    image = entry.szExeFile
-                    handle = (kernel32.OpenProcess(
-                        PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-                        if full_paths else 0)
-                    if handle:
-                        try:
-                            size = wintypes.DWORD(32768)
-                            buffer = ctypes.create_unicode_buffer(size.value)
-                            if kernel32.QueryFullProcessImageNameW(
-                                    handle, 0, buffer, ctypes.byref(size)):
-                                image = buffer.value
-                        finally:
-                            kernel32.CloseHandle(handle)
-                    found.append((pid, parent, image))
-                more = kernel32.Process32NextW(snap, ctypes.byref(entry))
-        finally:
-            kernel32.CloseHandle(snap)
-        return found
-    except Exception:  # noqa: BLE001 - перехват не должен срывать запуск
-        return []
-
-
-def _process_command_line(pid: int) -> str:
-    """Командная строка процесса (Windows 8.1+); "" если недоступна.
-
-    Используется документированный класс ``ProcessCommandLineInformation``
-    (60) у ``NtQueryInformationProcess``: ядро само возвращает строку, поэтому
-    не нужно читать чужой PEB и разбирать структуры под разные разрядности.
-    """
-    if not IS_WINDOWS or not pid:
-        return ""
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        ProcessCommandLineInformation = 60
-        STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
-
-        class UNICODE_STRING(ctypes.Structure):
-            _fields_ = [("Length", wintypes.USHORT),
-                        ("MaximumLength", wintypes.USHORT),
-                        ("Buffer", wintypes.LPWSTR)]
-
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        ntdll = ctypes.windll.ntdll  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-        if not handle:
-            return ""
-        try:
-            needed = wintypes.ULONG(0)
-            status = ntdll.NtQueryInformationProcess(
-                handle, ProcessCommandLineInformation, None, 0,
-                ctypes.byref(needed))
-            if status != STATUS_INFO_LENGTH_MISMATCH or needed.value <= 0:
-                return ""
-            size = int(needed.value) + ctypes.sizeof(UNICODE_STRING)
-            buffer = ctypes.create_string_buffer(size)
-            status = ntdll.NtQueryInformationProcess(
-                handle, ProcessCommandLineInformation, buffer, size,
-                ctypes.byref(needed))
-            if status < 0:
-                return ""
-            text = UNICODE_STRING.from_buffer(buffer)
-            if not text.Buffer or not text.Length:
-                return ""
-            return ctypes.wstring_at(text.Buffer, text.Length // 2)
-        finally:
-            kernel32.CloseHandle(handle)
-    except Exception:  # noqa: BLE001 - без командной строки просто не реагируем
-        return ""
-
-
-def open_in_host_browser(url: str) -> bool:
-    """Открыть адрес в браузере по умолчанию с окружением ЭТОГО ПК.
-
-    ``os.startfile`` — это ShellExecute с окружением текущего процесса. У
-    лончера оно настоящее (перенаправление получает только запускаемая
-    программа), поэтому адрес уходит в уже открытый браузер пользователя.
-    """
-    if not IS_WINDOWS or not url:
-        return False
-    try:
-        os.startfile(url)  # type: ignore[attr-defined]  # noqa: S606
-        return True
-    except OSError:
-        return False
-
-
-class BrowserLoginBridge:
-    """Вход в аккаунт — в настоящем браузере, без второй копии профиля.
-
-    Два рубежа:
-
-    * **Профиль не раздваивается.** Каталоги браузеров внутри
-      перенаправленного профиля становятся junction'ами на каталоги
-      пользователя — браузер открывает свой обычный профиль (и уже открытое
-      окно), поэтому вход происходит там, где человек уже авторизован, а
-      второй копии не появляется ни на диске, ни в реестре. Junction'ы
-      снимаются при выходе: папку портатива можно копировать.
-    * **Наблюдение.** Если junction создать нельзя (FAT/exFAT, сетевая папка),
-      новый процесс известного браузера, стартовавший из программы и несущий
-      http(s)-адрес, снимается, а адрес открывает оболочка лончера — с
-      настоящим профилем.
-
-    Дубликаты, оставшиеся от прежних запусков (или от сборки), удаляются при
-    старте: это данные именно той копии браузера, которой быть не должно.
-    """
-
-    def __init__(self, root: Path, cfg: Dict[str, Any], target: Path,
-                 env: "Optional[Dict[str, str]]" = None,
-                 log: Optional[Any] = None) -> None:
-        self.root = root
-        self.cfg = cfg
-        self.target = target
-        self.env = dict(env or {})
-        settings = cfg.get("browser_login")
-        self.settings: Dict[str, Any] = (
-            dict(settings) if isinstance(settings, dict) else {})
-        self.log = log or (lambda message: _run_log(root, message))
-        self.target_pid = 0
-        self._baseline: "set[int]" = set()
-        self._profiles_before: "set[str]" = set()
-        self._bridged: "set[tuple[str, str]]" = set()
-        self._handled: "set[str]" = set()
-        self._last_poll = 0.0
-        self._reported = False
-
-    # -- настройки ---------------------------------------------------------
-    @property
-    def poll_seconds(self) -> float:
-        try:
-            value = float(self.settings.get("poll_seconds", 0.3))
-        except (TypeError, ValueError):
-            value = 0.3
-        return min(2.0, max(0.1, value))
-
-    @property
-    def enabled(self) -> bool:
-        if self.settings.get("enabled") is False:
-            return False
-        if not IS_WINDOWS:
-            return False
-        # Портатив самого браузера не перехватываем: его окна и вкладки —
-        # это и есть программа, а не чужой «вход».
-        return not _is_known_browser(str(self.target))
-
-    @property
-    def connect_host_profile(self) -> bool:
-        return self.settings.get("connect_host_profile") is not False
-
-    @property
-    def clean_duplicates(self) -> bool:
-        return self.settings.get("clean_duplicates") is not False
-
-    # -- жизненный цикл ----------------------------------------------------
-    def prepare(self) -> None:
-        """Подготовить профиль и запомнить, что было открыто до старта."""
-        if not self.enabled:
-            return
-        try:
-            self._baseline = {pid for pid, _ppid, _image in _process_table()}
-        except Exception:  # noqa: BLE001 - снимок необязателен
-            self._baseline = set()
-        # Сначала убираем дубликат, оставшийся от прежних запусков или от
-        # сборки: иначе junction на его место уже не встанет.
-        removed = self.drop_duplicate_profiles()
-        for path in removed[:4]:
-            self.log("browser login: removed a duplicate browser profile "
-                     "inside the portable folder (" + path + "); a login "
-                     "must use the installed browser with the real profile")
-        if self.connect_host_profile:
-            bridged = self.connect_host_profiles()
-            if bridged:
-                self.log("browser login: browser profiles are connected to "
-                         "the real user profile (" + str(len(bridged))
-                         + " folder(s)); a login opens the installed browser")
-        self._profiles_before = self._existing_profiles()
-        if not self._reported:
-            self._reported = True
-            if not self._bridged:
-                self.log("browser login: the file system cannot link the "
-                         "browser profile; watching the processes started by "
-                         "the program instead")
-
-    def attach(self, pid: int) -> None:
-        self.target_pid = int(pid or 0)
-
-    def teardown(self) -> None:
-        """Снять junction'ы: в папке портатива не должно остаться ссылок."""
-        for var, rel in _browser_profile_pairs():
-            root = self._portable_root(var)
-            if root is None:
-                continue
-            path = root / rel
-            try:
-                if not _is_junction(path):
-                    continue
-                if _remove_junction(path):
-                    self.log("browser login: unlinked " + str(path))
-            except OSError:
-                continue
-        self._bridged.clear()
-
-    def poll(self) -> None:
-        """Один проход наблюдения; вызывается из цикла ожидания программы."""
-        if not self.enabled or not self.target_pid:
-            return
-        now = time.monotonic()
-        if now - self._last_poll < self.poll_seconds:
-            return
-        self._last_poll = now
-        try:
-            table = _process_table()
-        except Exception:  # noqa: BLE001
-            return
-        if not table:
-            return
-        for pid, url, image in self.plan(table):
-            self._stop(pid)
-            self.cleanup_duplicate_profile(image)
-            if open_in_host_browser(url):
-                self.log("browser login: opened " + url
-                         + " in the default browser (the portable copy was "
-                           "stopped, so the real profile is used)")
-            else:
-                self.log("browser login: could not reopen " + url
-                         + " in the default browser")
-
-    # -- логика (отделена от WinAPI: её проверяют тесты) -------------------
-    def plan(self, table: "Sequence[tuple[int, int, str]]",
-             command_line_of: "Optional[Any]" = None
-             ) -> "list[tuple[int, str, str]]":
-        """Кого снять, какой адрес открыть заново и чей это браузер.
-
-        ``table`` — снимок процессов ``(pid, parent_pid, image)``;
-        ``command_line_of`` подменяется в тестах.
-        """
-        if not self.enabled:
-            return []
-        reader = command_line_of or _process_command_line
-        parents = {int(pid): int(ppid) for pid, ppid, _image in table}
-        images = {int(pid): str(image) for pid, _ppid, image in table}
-        candidates = [
-            (int(pid), str(image)) for pid, _ppid, image in table
-            if int(pid) not in self._baseline and int(pid) != self.target_pid
-            and _is_known_browser(image)]
-        if not candidates:
-            return []
-        # Каталоги на диске проверяются только когда появился хоть один
-        # кандидат: на флешке это самый дорогой шаг наблюдения.
-        new_profiles = self._new_profiles()
-        planned: "list[tuple[int, str, str]]" = []
-        for pid, image in candidates:
-            if self._bridged_image(image):
-                # Профиль уже настоящий: браузер открывает вход там, где надо.
-                continue
-            if not (self._descends_from_target(parents.get(pid, 0), parents)
-                    or self._profile_appeared(image, new_profiles)
-                    or self._brokered_launch(pid, parents, images)):
-                continue
-            try:
-                command_line = reader(pid)
-            except Exception:  # noqa: BLE001
-                command_line = ""
-            url = _browser_login_url(command_line)
-            if not url or url in self._handled:
-                continue
-            self._handled.add(url)
-            planned.append((pid, url, image))
-        return planned
-
-    def _descends_from_target(self, parent: int,
-                              parents: Dict[int, int],
-                              depth: int = 8) -> bool:
-        """True, если цепочка родителей приводит к запущенной программе."""
-        if not self.target_pid:
-            return False
-        current = int(parent or 0)
-        seen: "set[int]" = set()
-        for _ in range(depth):
-            if not current or current in seen:
-                return False
-            if current == self.target_pid:
-                return True
-            seen.add(current)
-            current = int(parents.get(current, 0))
-        return False
-
-    def _brokered_launch(self, pid: int, parents: Dict[int, int],
-                         images: Dict[int, str]) -> bool:
-        """Браузер запущен службой оболочки, а не самим процессом программы.
-
-        ``ShellExecute`` может уйти в AppInfo/DCOM: тогда родитель браузера —
-        ``svchost.exe``/``explorer.exe``, и цепочка до программы не доходит.
-        Вызывается только для браузеров, чей профиль соединить не удалось
-        (для соединённых ``plan`` выходит раньше): иначе окно пользователя
-        можно было бы закрыть без всякой причины.
-        """
-        parent_image = images.get(int(parents.get(int(pid), 0)), "")
-        return _image_name(parent_image).casefold() in _SHELL_BROKERS
-
-    # -- соединение профилей -----------------------------------------------
-    def _data_dir(self) -> Path:
-        return self.root / str(self.cfg.get("data_dir_name", "PortableData"))
-
-    def _portable_root(self, var: str) -> "Optional[Path]":
-        """Куда перенаправлена переменная у дочернего процесса."""
-        raw = str(self.env.get(var) or "")
-        if raw:
-            return Path(raw)
-        data = self._data_dir() / "AppData"
-        return data / ("Roaming" if var.upper() == "APPDATA" else "Local")
-
-    def _host_root(self, var: str) -> "Optional[Path]":
-        """Настоящий каталог пользователя: у лончера окружение не тронуто."""
-        raw = str(os.environ.get(var) or "")
-        return Path(raw) if raw else None
-
-    def _profile_roots(self, image: str) -> "list[Path]":
-        pairs = _BROWSER_PROFILE_DIRS.get(_image_name(image).casefold(), ())
-        roots: "list[Path]" = []
-        for var, rel in pairs:
-            root = self._portable_root(var)
-            if root is not None:
-                roots.append(root / rel)
-        return roots
-
-    def _bridged_image(self, image: str) -> bool:
-        pairs = _BROWSER_PROFILE_DIRS.get(_image_name(image).casefold(), ())
-        return any(pair in self._bridged for pair in pairs)
-
-    def _existing_profiles(self) -> "set[str]":
-        found: "set[str]" = set()
-        for var, rel in _browser_profile_pairs():
-            root = self._portable_root(var)
-            if root is None:
-                continue
-            path = root / rel
-            try:
-                if path.exists() or _is_junction(path):
-                    found.add(str(path).casefold())
-            except OSError:
-                continue
-        return found
-
-    def _new_profiles(self) -> "set[str]":
-        return self._existing_profiles() - self._profiles_before
-
-    def _profile_appeared(self, image: str, new_profiles: "set[str]") -> bool:
-        return any(str(path).casefold() in new_profiles
-                   for path in self._profile_roots(image))
-
-    def drop_duplicate_profiles(self) -> "list[str]":
-        """Удалить профили браузеров, попавшие ВНУТРЬ портатива.
-
-        Такой каталог — не данные программы, а копия браузера, созданная
-        из-за перенаправленного профиля. Junction'ы не трогаем: за ними
-        лежит настоящий профиль пользователя.
-        """
-        removed: "list[str]" = []
-        if not self.enabled or not self.clean_duplicates:
-            return removed
-        for var, rel in _browser_profile_pairs():
-            root = self._portable_root(var)
-            if root is None:
-                continue
-            path = root / rel
-            try:
-                if not path.exists() or _is_junction(path):
-                    continue
-                if _dir_holds_program(path):
-                    self.log("browser login: kept " + str(path)
-                             + " - it holds the program itself (exe/dll), "
-                               "not a duplicate profile")
-                    continue
-                if _remove_tree(path):
-                    removed.append(str(path))
-            except OSError:
-                continue
-        return removed
-
-    def connect_host_profiles(self) -> "list[str]":
-        """Соединить каталоги браузеров с настоящими каталогами пользователя."""
-        linked: "list[str]" = []
-        preferred = _default_browser_images()
-        for image, pairs in _BROWSER_PROFILE_DIRS.items():
-            if preferred and image not in preferred:
-                continue
-            for var, rel in pairs:
-                host_root = self._host_root(var)
-                portable_root = self._portable_root(var)
-                if host_root is None or portable_root is None:
-                    continue
-                source = host_root / rel
-                destination = portable_root / rel
-                try:
-                    if not source.is_dir():
-                        continue
-                    if _is_junction(destination):
-                        self._bridged.add((var, rel))
-                        continue
-                    if destination.exists():
-                        # Настоящий каталог оставить нельзя: это и есть
-                        # дубликат, который не удалось убрать (занят).
-                        continue
-                    if _junction_directory(destination, source):
-                        self._bridged.add((var, rel))
-                        linked.append(str(destination))
-                except OSError:
-                    continue
-        return linked
-
-    @staticmethod
-    def _stop(pid: int) -> None:
-        # Дочерние процессы не трогаем: у Chromium это GPU/renderer, они уйдут
-        # вместе с главным процессом, а чужие окна задевать нельзя.
-        try:
-            _terminate_pids([int(pid)])
-        except Exception:  # noqa: BLE001 - остановка необязательна
-            pass
-
-    def cleanup_duplicate_profile(self, image: str) -> "list[str]":
-        """Удалить профиль, созданный перехваченной копией браузера."""
-        removed: "list[str]" = []
-        if not self.enabled:
-            return removed
-        for path in self._profile_roots(image):
-            key = str(path).casefold()
-            if key in self._profiles_before:
-                continue
-            try:
-                if not path.exists() or _is_junction(path):
-                    continue
-                if _dir_holds_program(path):
-                    self.log("browser login: kept " + str(path)
-                             + " - it holds the program itself (exe/dll), "
-                               "not a duplicate profile")
-                    continue
-                if _remove_tree(path):
-                    removed.append(str(path))
-            except OSError:
-                continue
-        return removed
-
-
 def _is_interactive_image(image: str) -> bool:
     """True for a tray/Electron app that must not be idle-killed."""
     name = Path(image).name.casefold()
@@ -6554,7 +5772,61 @@ def _modules_of(pid: int) -> "list[str]":
 
 def _all_processes() -> "list[tuple[int, str]]":
     """Все процессы системы: ``(pid, путь к exe)``."""
-    return [(pid, image) for pid, _parent, image in _process_table(True)]
+    if not IS_WINDOWS:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap in (0, -1, None):
+            return []
+        own = os.getpid()
+        found: list[tuple[int, str]] = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            more = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while more:
+                pid = int(entry.th32ProcessID)
+                if pid not in (0, 4, own):
+                    handle = kernel32.OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                    image = entry.szExeFile
+                    if handle:
+                        try:
+                            size = wintypes.DWORD(32768)
+                            buffer = ctypes.create_unicode_buffer(size.value)
+                            if kernel32.QueryFullProcessImageNameW(
+                                    handle, 0, buffer, ctypes.byref(size)):
+                                image = buffer.value
+                        finally:
+                            kernel32.CloseHandle(handle)
+                    found.append((pid, image))
+                more = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+        return found
+    except Exception:
+        return []
 
 
 def module_holders(root: Path, budget: float = 4.0
@@ -8770,33 +8042,19 @@ class UpdateWatch:
         return None
 
 
-def _wait_target(process: "subprocess.Popen", watch: "Optional[UpdateWatch]",
-                 hooks: "Sequence[Any]" = ()) -> int:
-    """``process.wait()`` с фоновой слежкой во время работы программы.
-
-    ``watch`` ловит родной апдейтер, ``hooks`` — всё остальное, что должно
-    происходить, пока программа жива (мост входа через браузер).  Раньше шаг
-    ожидания был 0.5 с; он уменьшен вдвое, чтобы перехватить запуск браузера
-    до того, как чужая копия успеет создать профиль.
-    """
-    active = [hook for hook in hooks if callable(hook)]
-    if (watch is None or not watch.active) and not active:
+def _wait_target(process: "subprocess.Popen", watch: "Optional[UpdateWatch]"
+                 ) -> int:
+    """``process.wait()``, но с проверкой родного апдейтера каждые полсекунды."""
+    if watch is None or not watch.active:
         return process.wait()
-    root = watch.root if watch is not None else None
     while True:
         try:
-            return process.wait(timeout=0.25)
+            return process.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
-            if watch is not None and watch.active:
-                try:
-                    watch.poll()
-                except Exception as exc:  # noqa: BLE001 - слежка не срывает запуск
-                    _run_log(root, f"update watch failed: {exc}")
-            for hook in active:
-                try:
-                    hook()
-                except Exception as exc:  # noqa: BLE001
-                    _run_log(root, f"launch hook failed: {exc}")
+            try:
+                watch.poll()
+            except Exception as exc:  # noqa: BLE001 - слежка не срывает запуск
+                _run_log(watch.root, f"update watch failed: {exc}")
 
 
 # --- установщик: определение движка и команды тихой установки ------------------
@@ -12422,8 +11680,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # Cursor уносит exe в промежуточную папку), переименование, конфиг от
     # сборки на прежнем диске. Ищем программу в App и правим конфиг, вместо
     # того чтобы показать «файл не найден» и не запустить ничего.
-    target_rel = _repair_missing_target(root, cfg, target_rel,
-                                        allow_installer=needs_machine)
+    target_rel = _repair_missing_target(root, cfg, target_rel)
     already_elevated = any(
         str(arg).casefold() == "--elevated" for arg in raw_arguments)
     registry_cfg = cfg.get("registry", {})
@@ -12535,18 +11792,6 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                 "Похоже, папка App неполная (или программу обновил её "
                 "собственный апдейтер). Запустите Launch.bat --diagnose: "
                 "отчёт покажет, что лежит в App.")
-    if not needs_machine and _looks_like_installer_name(target.name):
-        # Мастер установки по клику не запускаем: он поставил бы программу
-        # заново (ровно на это и жаловались — «запускается установщик»).
-        _run_log(root, f"target: {target.name} is an installer; refusing to "
-                       "start it as the program")
-        raise FileNotFoundError(
-            f"В папке программы нет готовой программы — только установщик:"
-            f"\n{target}\n\n"
-            "Установщик по клику не запускается: он поставил бы программу "
-            "заново. Пересоберите портатив (Portablizer) или укажите в "
-            "launcher_config.json настоящий exe программы. Отчёт о том, что "
-            "лежит в App: Launch.bat --diagnose.")
 
     # Предстартовая проверка распространяемых компонентов: лучше назвать
     # пакет, чем оставить пользователя наедине с окном Windows
@@ -12684,26 +11929,10 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             _run_log(root, "start: " + subprocess.list2cmdline(command)
                      + f" (cwd={target.parent}, elevated={_is_elevated()}, "
                      + f"job={'yes' if job.handle else 'no'})")
-            # Вход в аккаунт должен проходить в настоящем браузере. Слежка
-            # готовится ДО старта программы: снимок уже открытых процессов -
-            # это и есть граница «чужие окна не трогаем».
-            browser_login = BrowserLoginBridge(root, cfg, target, env=env)
-            try:
-                browser_login.prepare()
-                # Ссылки на настоящий профиль не должны переживать лончер
-                # ни при каком выходе, включая ранний return по ошибке.
-                atexit.register(browser_login.teardown)
-            except Exception as exc:  # noqa: BLE001 - слежка не срывает запуск
-                _run_log(root, f"browser login: preparation failed ({exc})")
             started_at = time.monotonic()
             try:
-                process = _spawn_target(command, str(target.parent), env, job)
-                try:
-                    browser_login.attach(process.pid)
-                except Exception:  # noqa: BLE001
-                    pass
-                code = _wait_target(process, watch,
-                                    hooks=(browser_login.poll,))
+                code = _wait_target(_spawn_target(
+                    command, str(target.parent), env, job), watch)
             except OSError as exc:
                 if getattr(exc, "winerror", None) != 14001:
                     raise
@@ -12734,22 +11963,11 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             # The official launcher usually starts the game and exits at once.
             # Restoring the registry right now would pull the install keys out
             # from under the game that is just starting, so wait for it.
-            def _session_tick() -> None:
-                if watch.active:
-                    watch.poll()
-                browser_login.poll()
-
             waited = _wait_for_portable_processes(
-                root, settings=shutdown, tick=_session_tick)
+                root, settings=shutdown,
+                tick=watch.poll if watch.active else None)
             # Родной апдейтер мог стартовать в последний момент: дожимаем.
             watch.finish()
-            # Ссылки на настоящий профиль снимаются всегда — даже если
-            # программа упала: папку портатива нельзя оставлять с junction'ами
-            # внутри, иначе её копирование утащит чужой профиль целиком.
-            try:
-                browser_login.teardown()
-            except Exception as exc:  # noqa: BLE001 - снятие не срывает выход
-                _run_log(root, f"browser login: unlink failed ({exc})")
             if waited:
                 _run_log(root, f"waited {waited}s for programs started from "
                                f"the portable folder to finish")

@@ -189,14 +189,6 @@ class LauncherConfig:
     # запуска) или переносит программу на свободный порт через её же конфиг.
     # Пустой словарь - значит «взять профиль программы, если он есть».
     service_ports: Dict[str, object] = field(default_factory=dict)
-    # --- вход в аккаунт через браузер по умолчанию ---------------------------
-    # Блок ``browser_login`` из launcher_config.json: лончер следит за тем,
-    # чтобы страница входа открывалась в УЖЕ установленном браузере с обычным
-    # профилем, а не в копии, которую программа запускает внутри
-    # перенаправленного профиля портатива. {"enabled": true, "poll_seconds"}.
-    # Пустой словарь - значит «включено по умолчанию» (так ведут себя и
-    # портативы, собранные прежней версией, — им достаточно нового лончера).
-    browser_login: Dict[str, object] = field(default_factory=dict)
     # Сетевые компоненты (драйвер TAP-Windows и службы), перенесённые в
     # папку NetStack/ портатива: {"manifest", "setup", "teardown",
     # "driver_services", "service_names", "stop_on_exit"}. Пусто — компонентов
@@ -1962,8 +1954,6 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
                 if isinstance(data.get("update"), dict) else {}),
         service_ports=(dict(data["service_ports"])
                        if isinstance(data.get("service_ports"), dict) else {}),
-        browser_login=(dict(data["browser_login"])
-                       if isinstance(data.get("browser_login"), dict) else {}),
         netstack=(dict(data["netstack"])
                   if isinstance(data.get("netstack"), dict) else {}),
         targets=targets,
@@ -2295,112 +2285,6 @@ def service_port_settings(cfg: "LauncherConfig") -> Dict[str, object]:
     if isinstance(explicit, dict):
         profile.update(explicit)
     return profile
-
-
-#: Параметры входа в аккаунт по умолчанию.
-BROWSER_LOGIN_DEFAULTS: Dict[str, object] = {
-    # Профиль браузера внутри портатива соединяется с настоящим профилем
-    # пользователя: вход идёт в уже открытом браузере, второй копии нет.
-    "enabled": True,
-    "connect_host_profile": True,
-    # Дубликаты профиля, оставшиеся от прежних запусков (и от сборки),
-    # удаляются при старте: это данные той самой лишней копии браузера.
-    "clean_duplicates": True,
-    # Шаг наблюдения за процессами — второй рубеж для файловых систем без
-    # junction'ов (FAT/exFAT, сетевые папки).
-    "poll_seconds": 0.3,
-}
-
-#: Каталоги браузеров внутри профиля пользователя: (переменная, путь).
-#: Список продублирован в ``portable_launcher_entry.py``: лончер обязан быть
-#: автономным (только стандартная библиотека, без пакета Portablizer), а
-#: совпадение двух списков проверяется тестом.
-BROWSER_PROFILE_DIRS: Tuple[Tuple[str, str], ...] = (
-    ("LOCALAPPDATA", "Google/Chrome"),
-    ("LOCALAPPDATA", "Microsoft/Edge"),
-    ("LOCALAPPDATA", "BraveSoftware"),
-    ("LOCALAPPDATA", "Vivaldi"),
-    ("LOCALAPPDATA", "Chromium"),
-    ("LOCALAPPDATA", "Thorium"),
-    ("APPDATA", "Opera Software"),
-    ("LOCALAPPDATA", "Opera Software"),
-    ("APPDATA", "Yandex"),
-    ("LOCALAPPDATA", "Yandex"),
-    ("APPDATA", "Mozilla"),
-    ("LOCALAPPDATA", "Mozilla"),
-    ("APPDATA", "zen"),
-    ("LOCALAPPDATA", "zen"),
-    # Обновляторы: без них браузер в перенаправленном профиле решает, что не
-    # установлен, и ставит себя заново — внутрь портатива.
-    ("LOCALAPPDATA", "Google/Update"),
-    ("LOCALAPPDATA", "Google/GoogleUpdater"),
-)
-
-
-#: Расширения файлов, по которым видно, что каталог — УСТАНОВЛЕННАЯ
-#: ПРОГРАММА, а не профиль.
-_PROGRAM_SUFFIXES: Tuple[str, ...] = (".exe", ".dll")
-
-
-def browser_profile_pairs() -> Tuple[Tuple[str, str], ...]:
-    """Каталоги браузеров в порядке «профиль, затем обновлятор»."""
-    return BROWSER_PROFILE_DIRS
-
-
-def browser_dir_holds_program(path, max_depth: int = 3) -> bool:
-    """True, если в каталоге лежит сама программа, а не только профиль.
-
-    У браузера, установленного «для одного пользователя», профиль и программа
-    делят один каталог: ``%LOCALAPPDATA%\\Google\\Chrome`` содержит и
-    ``User Data`` (профиль), и ``Application\\chrome.exe`` (программа), а рядом
-    стоит ``Google\\Update`` с ``GoogleUpdate.exe``. Профиль же никогда не
-    содержит exe/dll.
-
-    Считать такой каталог «дубликатом профиля» и удалять его нельзя: это
-    установленная программа. Особенно плохо удалять обновлятор — браузер без
-    него решает, что не установлен, и запускает УСТАНОВЩИК заново (а если это
-    данные самой портативной программы, установщик запускается при каждом
-    клике по ярлыку). Поэтому проверка общая: и сборщик, и лончер трогают
-    только каталоги без исполняемых файлов.
-    """
-    if not path:
-        return False
-    root = str(path).replace("\\", os.sep)
-    base_depth = root.rstrip(os.sep).count(os.sep)
-    try:
-        for current, dirs, files in os.walk(root, followlinks=False):
-            depth = current.rstrip(os.sep).count(os.sep) - base_depth
-            if depth >= max_depth:
-                dirs[:] = []
-            for name in files:
-                if name.casefold().endswith(_PROGRAM_SUFFIXES):
-                    dirs[:] = []
-                    return True
-    except OSError:
-        return False
-    return False
-
-
-def browser_login_settings(cfg: "LauncherConfig") -> Dict[str, object]:
-    """Блок ``browser_login`` для launcher_config.json.
-
-    Программа, которой нужен вход в аккаунт, открывает страницу через
-    оболочку Windows — и та запускает браузер с окружением программы, то есть
-    с профилем внутри ``PortableData``. Получается вторая копия браузера по
-    умолчанию: без закладок и сохранённых входов, с лишними ключами в
-    реестре. Лончер перехватывает такой запуск и открывает тот же адрес сам —
-    своей оболочкой, с настоящим профилем пользователя.
-
-    Явные значения из ``cfg.browser_login`` перекрывают умолчания, поэтому
-    блок можно выключить для конкретного портатива.
-    """
-    settings = dict(BROWSER_LOGIN_DEFAULTS)
-    explicit = cfg.browser_login or {}
-    if isinstance(explicit, dict):
-        settings.update(explicit)
-    if settings.get("enabled") is not False:
-        settings["enabled"] = True
-    return settings
 
 
 # --- Вспомогательные лаунчеры и меню ------------------------------------------
@@ -2953,9 +2837,4 @@ def render_config_json(cfg: LauncherConfig) -> str:
     ports = service_port_settings(cfg)
     if ports:
         payload["service_ports"] = ports
-    # Вход в аккаунт: лончер обязан открыть страницу входа в настоящем
-    # браузере пользователя, а не в копии внутри PortableData. Блок пишется
-    # всегда, чтобы решение было видно в конфиге и его можно было выключить
-    # для отдельного портатива.
-    payload["browser_login"] = browser_login_settings(cfg)
     return json.dumps(payload, ensure_ascii=False, indent=2)
