@@ -4221,8 +4221,15 @@ class Portablizer:
                     and self._install_burn_cached_packages(
                         data_dir, opts, app_dir, name,
                         before=burn_cache_before, console_log=console_log)):
-                shutil.rmtree(os.path.join(portable_dir, "_bundle_layout"),
-                              ignore_errors=True)
+                layout_dir = os.path.join(portable_dir, "_bundle_layout")
+                if os.path.exists(layout_dir):
+                    try:
+                        self._remove_path(layout_dir)
+                    except OSError as exc:
+                        self.log.warn(
+                            f"Не удалось удалить временный Burn layout "
+                            f"{layout_dir}: {exc}"
+                        )
                 self.log.ok(
                     f"MSI из Package Cache распакован в App. Сработал сценарий: "
                     f"{plan.label}"

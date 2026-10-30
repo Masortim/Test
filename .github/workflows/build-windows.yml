@@ -153,7 +153,7 @@ jobs:
             -OutFile $installer
           $actualHash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Host "Delta 0.23.0 installer SHA256: $actualHash"
-          $expectedHash = ""
+          $expectedHash = "c8d46fb62e1b6ae569ac7f2d6bd0c84c1b895703640f9493feced46e54e4bc48"
           if ($expectedHash -and $actualHash -ne $expectedHash) {
             throw "Delta installer hash mismatch: expected $expectedHash, got $actualHash"
           }
@@ -209,8 +209,20 @@ jobs:
           }
           $cacheDirs = @(Get-ChildItem $portable -Recurse -Directory `
             -Filter "Package Cache" -ErrorAction SilentlyContinue)
-          if ($cacheDirs.Count -ne 0 -or
-              (Test-Path (Join-Path $portable "_bundle_layout"))) {
+          $layoutPath = Join-Path $portable "_bundle_layout"
+          $layoutLeft = Test-Path $layoutPath
+          if ($cacheDirs.Count -ne 0 -or $layoutLeft) {
+            Write-Host "Remaining Package Cache: $($cacheDirs.FullName -join ', ')"
+            Write-Host "Burn layout remains: $layoutLeft ($layoutPath)"
+            if ($layoutLeft) {
+              Get-ChildItem $layoutPath -Recurse -Force |
+                Select-Object FullName, Attributes | Format-Table -AutoSize
+            }
+            $buildLog = Join-Path $portable "portablizer.log"
+            if (Test-Path $buildLog) {
+              Write-Host "--- Delta portablizer.log (tail) ---"
+              Get-Content $buildLog -Tail 140 | ForEach-Object { Write-Host $_ }
+            }
             throw "Delta installer cache/layout leaked into the finished portable"
           }
           Write-Host ("Real Delta portable: {0}; {1} App files, {2:N1} MiB" -f
