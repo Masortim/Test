@@ -513,6 +513,56 @@ def _burn_layout_payloads(layout_dir: str) -> "Tuple[List[str], List[str]]":
     return msis, others
 
 
+def _burn_cache_roots(data_dir: str) -> List[str]:
+    """Перенаправленные каталоги Burn Package Cache для текущего портатива.
+
+    Burn выбирает per-machine или per-user cache. Кроме того, часть сборок
+    обращается к Known Folder через USERPROFILE, а не через LOCALAPPDATA,
+    поэтому нужны оба перенаправленных дерева. Кэш настоящего профиля хоста
+    сюда намеренно не входит.
+    """
+    roots = [
+        os.path.join(data_dir, "ProgramData", "Package Cache"),
+        os.path.join(data_dir, "AppData", "Local", "Package Cache"),
+        os.path.join(data_dir, "User", "AppData", "Local", "Package Cache"),
+    ]
+    unique: List[str] = []
+    seen: Set[str] = set()
+    for root in roots:
+        normalized = os.path.normcase(os.path.abspath(root))
+        if normalized not in seen:
+            seen.add(normalized)
+            unique.append(os.path.abspath(root))
+    return unique
+
+
+def _burn_cached_msis(data_dir: str) -> List[str]:
+    """MSI из перенаправленного Package Cache, не смешивая их с программой."""
+    msis: List[str] = []
+    for root in _burn_cache_roots(data_dir):
+        if not os.path.isdir(root):
+            continue
+        for current, _dirs, files in os.walk(root, followlinks=False):
+            for filename in files:
+                if filename.casefold().endswith(".msi"):
+                    msis.append(os.path.join(current, filename))
+    return sorted(msis, key=lambda path: os.path.normcase(path))
+
+
+def _burn_cache_snapshot(data_dir: str) -> Dict[str, Tuple[int, int]]:
+    """Снимок MSI до попыток Burn: отличает новый payload от старого кэша."""
+    snapshot: Dict[str, Tuple[int, int]] = {}
+    for path in _burn_cached_msis(data_dir):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        snapshot[os.path.normcase(os.path.abspath(path))] = (
+            stat.st_size, stat.st_mtime_ns,
+        )
+    return snapshot
+
+
 #: Временные каталоги, которые предыдущие версии оставляли в профиле
 #: пользователя (C:\Users\<user>). Они появляются, когда Portablizer
 #: аварийно завершается до уборки внешнего TEMP или когда PyInstaller
@@ -2903,12 +2953,14 @@ class Portablizer:
                     "WiX Burn завершил команды с кодом 0, но не установил "
                     "файлы программы. Вложенный setup.exe повторил уже "
                     "обработанный Burn payload (совпало имя или SHA-256), "
-                    "поэтому рекурсивный запуск остановлен. Повторный Install "
-                    "в штатном окне здесь не помогает: после Apply Burn "
-                    "требует новый Detect и возвращает 0x8007139f. Нужен "
-                    "полный офлайн-дистрибутив с реальным payload программы; "
-                    "из одного maintenance/bootstrapper рабочий портатив "
-                    "создать нельзя."
+                    "поэтому рекурсивный запуск остановлен. Это не доказывает "
+                    "отсутствие программы: quiet /install может положить "
+                    "настоящий MSI только в перенаправленный Package Cache. "
+                    "Portablizer распаковывает такие MSI через msiexec /a, "
+                    "не копируя кэш как приложение. Если файлов всё равно "
+                    "нет, проверьте install-retry.log и наличие MSI в "
+                    "PortableData; без реального MSI/payload нужен полный "
+                    "офлайн-дистрибутив."
                 )
             else:
                 hints.append(
@@ -2916,9 +2968,11 @@ class Portablizer:
                     "всегда выполняется /layout — он не регистрирует бандл "
                     "как уже установленный. Проверьте install-layout.log: "
                     "если payload отсутствует или не скачан, нужен полный "
-                    "офлайн-дистрибутив. Повторно нажимать Install в штатном "
-                    "окне не следует: после Apply это вызывает 0x8007139f, "
-                    "а не новую установку."
+                    "офлайн-дистрибутив. Если /install создал только "
+                    "Package Cache, проверьте install-retry.log: найденный "
+                    "там MSI распаковывается через msiexec /a, а не "
+                    "переносится в App как готовая программа. Повторно "
+                    "нажимать Install в штатном окне не следует."
                 )
         else:
             hints.append(
@@ -4059,6 +4113,15 @@ class Portablizer:
             space_mod.payload_signature(app_dir),
             space_mod.payload_signature(data_dir),
         )
+        # Delta и похожие bundle'ы иногда отдают в /layout только собственную
+        # копию, а настоящий MSI появляется лишь после quiet /install в
+        # перенаправленном Package Cache. Снимок позволяет отличить свежий
+        # payload текущего запуска от кэша прошлой неудачной сборки.
+        is_burn = (
+            getattr(self._detection, "installer_type", None)
+            == InstallerType.WIX_BURN
+        )
+        burn_cache_before = _burn_cache_snapshot(data_dir) if is_burn else {}
         payload_seen = False
         index = 0
         while index < len(queue):
@@ -4145,6 +4208,26 @@ class Portablizer:
                     self.log.ok(f"Сработал сценарий: {plan.label}")
                     return rc, plan
                 continue
+
+            # Некоторые Burn-бандлы (Delta 0.23.0) раскладывают в /layout
+            # только собственный setup.exe. Повторять его бессмысленно, но
+            # quiet /install кэширует настоящий Delta.msi в redirected
+            # Package Cache даже когда App остаётся пустой. Это не «готовая
+            # программа из кэша»: MSI извлекается отдельной административной
+            # установкой, а bootstrapper и Package Cache в App не копируются.
+            if (is_burn and not plan.extracts_only and not plan.payload_kind
+                    and rc in (0, 3010)
+                    and not self._find_main_exe(app_dir, name)
+                    and self._install_burn_cached_packages(
+                        data_dir, opts, app_dir, name,
+                        before=burn_cache_before, console_log=console_log)):
+                shutil.rmtree(os.path.join(portable_dir, "_bundle_layout"),
+                              ignore_errors=True)
+                self.log.ok(
+                    f"MSI из Package Cache распакован в App. Сработал сценарий: "
+                    f"{plan.label}"
+                )
+                return rc, plan
 
             # Падение — отдельный случай, и разбирать его нужно ДО проверки
             # «а файлы-то появились»: установщик, упавший в отрисовке
@@ -4566,6 +4649,88 @@ class Portablizer:
             "программы. Распакованное содержимое оставлено для диагностики: "
             f"{layout_dir}"
         )
+        return False
+
+    def _install_burn_cached_packages(
+            self, data_dir: str, opts: PortableOptions, app_dir: str,
+            name: str, before: Dict[str, Tuple[int, int]],
+            console_log: Optional[str] = None) -> bool:
+        """Извлекает MSI, который Burn положил в redirected Package Cache.
+
+        Кэш сам по себе не является установленным приложением и никогда не
+        копируется в App. Свежие MSI текущего запуска можно использовать без
+        дополнительных предположений. MSI, оставшийся от прошлой неудачной
+        сборки, допускается только при точном совпадении имени с продуктом:
+        иначе смена установщика могла бы молча вернуть старую/чужую программу.
+        """
+        cached = _burn_cached_msis(data_dir)
+        if not cached:
+            return False
+        keys = self._name_keys(name, opts.installer_path)
+        fresh: List[str] = []
+        reusable: List[str] = []
+        for path in cached:
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            normalized = os.path.normcase(os.path.abspath(path))
+            signature = (stat.st_size, stat.st_mtime_ns)
+            if before.get(normalized) != signature:
+                fresh.append(path)
+            elif self._name_score(path, keys) >= 200:
+                reusable.append(path)
+
+        def by_size(paths: Sequence[str]) -> List[str]:
+            def size(path: str) -> int:
+                try:
+                    return os.path.getsize(path)
+                except OSError:
+                    return 0
+            return sorted(paths, key=size, reverse=True)
+
+        # Сначала пакеты, которые доказуемо записал текущий Burn. Сохранённый
+        # кэш нужен для повторной сборки 1.41.0: bundle уже Present, поэтому
+        # повторный /install может вообще не перезаписать Delta.msi.
+        for paths, origin in ((by_size(fresh), "свежий"),
+                              (by_size(reusable), "сохранённый")):
+            for msi in paths:
+                self._check_cancel()
+                self.log.info(
+                    f"В Package Cache найден {origin} MSI-пакет Burn: "
+                    f"{os.path.basename(msi)}. Распаковываю его в App через "
+                    "msiexec /a; сам кэш как программу не использую."
+                )
+                msi_plan = build_silent_plan(
+                    InstallerType.MSI, msi, app_dir, is_msi=True)
+                self._run_install(
+                    msi_plan, opts, app_dir, data_dir,
+                    progress_from=58, progress_to=60, console_log=console_log,
+                )
+                if not self._find_main_exe(app_dir, name):
+                    continue
+                self.log.ok(
+                    "Из MSI в Package Cache получены настоящие файлы "
+                    "программы, а не bootstrapper. Установочный кэш удаляю "
+                    "из PortableData."
+                )
+                for root in _burn_cache_roots(data_dir):
+                    if not os.path.exists(root):
+                        continue
+                    try:
+                        self._remove_path(root)
+                    except OSError as exc:
+                        # Программа уже полностью распакована в App; невозможность
+                        # удалить временный кэш не должна отменять готовый App.
+                        self.log.warn(
+                            f"Не удалось удалить Package Cache {root}: {exc}"
+                        )
+                return True
+        if fresh or reusable:
+            self.log.warn(
+                "MSI из Package Cache не дал запускаемого файла программы. "
+                "Кэш оставлен для диагностики и не скопирован в App."
+            )
         return False
 
     # -- распаковка вложенного архива ----------------------------------------

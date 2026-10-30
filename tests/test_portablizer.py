@@ -1944,11 +1944,11 @@ class BurnFallbackTests(unittest.TestCase):
                           engine.log.text)
 
     def test_nested_burn_uses_layout_without_registering_an_install(self):
-        """Точная цепочка Delta: outer Burn → DeltaSetup.exe → Delta.msi.
+        """Вложенный Burn тоже начинается с собственного /layout.
 
-        Вложенный Burn тоже начинается с /layout. Поэтому успешная сборка не
-        выполняет ни одного /install и не создаёт состояние Present, после
-        которого WixStdBA показывал 0x8007139f при каждом повторном Install.
+        Когда layout действительно содержит новый Delta.msi, успешной цепочке
+        не нужен /install и не создаётся состояние Present. Случай, где layout
+        возвращает лишь копию того же bundle, проверяется отдельным тестом.
         """
         with tempfile.TemporaryDirectory() as temp:
             installer = Path(temp, "delta-windows-x86_64-setup.exe")
@@ -2000,6 +2000,169 @@ class BurnFallbackTests(unittest.TestCase):
                                  for plan in engine.calls))
             self.assertFalse(any(plan.interactive for plan in engine.calls))
             self.assertFalse(layout.exists())
+
+    def test_delta_self_layout_recovers_msi_from_redirected_package_cache(self):
+        """Реальный журнал 1.41.0: /layout вернул тот же bundle, MSI — в cache.
+
+        Первый quiet /install с InstallFolder ничего не даёт, второй без него
+        кэширует Delta.msi. Его нужно распаковать через msiexec /a, а не
+        копировать Package Cache или запускать одинаковый setup.exe рекурсивно.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "delta-windows-x86_64-setup.exe")
+            installer.write_bytes(b"same Delta Burn bundle")
+            portable = Path(temp, "Delta_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir()
+            cache = (data / "User" / "AppData" / "Local" /
+                     "Package Cache" / "{delta-package-guid}")
+            detection = DetectionResult(InstallerType.WIX_BURN, 0.97)
+
+            class FakeBurn(Portablizer):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.calls = []
+
+                def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                    self.calls.append(plan)
+                    if "/layout" in plan.args:
+                        out = Path(plan.output_dir)
+                        out.mkdir(parents=True, exist_ok=True)
+                        (out / "DeltaSetup.exe").write_bytes(
+                            installer.read_bytes())
+                    elif plan.program == "msiexec.exe":
+                        Path(app_dir, "Delta.exe").write_bytes(b"MZ application")
+                    elif ("/install" in plan.args
+                          and not any(arg.startswith("InstallFolder=")
+                                      for arg in plan.args)):
+                        cache.mkdir(parents=True, exist_ok=True)
+                        (cache / "Delta.msi").write_bytes(b"real MSI payload")
+                    return 0
+
+            engine = FakeBurn(Logger())
+            engine._detection = detection
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Delta")
+            attempts = build_attempts(
+                detection, str(installer), str(app), log_dir=str(portable),
+                layout_dir=str(portable / "_bundle_layout"))
+
+            rc, used = engine._run_attempts(
+                attempts, opts, str(app), str(data), str(portable), "Delta")
+
+            self.assertEqual(rc, 0)
+            self.assertIsNotNone(used)
+            self.assertIn("/install", used.args)
+            self.assertTrue((app / "Delta.exe").is_file())
+            self.assertEqual(len(engine.calls), 4)
+            self.assertIn("/layout", engine.calls[0].args)
+            self.assertIn("/install", engine.calls[1].args)
+            self.assertIn("/install", engine.calls[2].args)
+            self.assertEqual(engine.calls[3].program, "msiexec.exe")
+            self.assertIn("/a", engine.calls[3].args)
+            self.assertIn("Delta.msi", engine.calls[3].display())
+            self.assertFalse((app / "DeltaSetup.exe").exists())
+            self.assertFalse((app / "Delta.msi").exists())
+            self.assertFalse(cache.exists())
+            self.assertFalse((portable / "_bundle_layout").exists())
+            self.assertIn("сам кэш как программу не использую",
+                          engine.log.text)
+
+    def test_burn_reuses_matching_cached_msi_from_previous_failed_build(self):
+        """Повторная сборка не зависит от перезаписи уже Present-пакета."""
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "DeltaSetup.exe")
+            installer.write_bytes(b"same Delta Burn bundle")
+            portable = Path(temp, "Delta_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            app.mkdir(parents=True)
+            cache = (data / "ProgramData" / "Package Cache" /
+                     "{delta-package-guid}")
+            cache.mkdir(parents=True)
+            (cache / "Delta.msi").write_bytes(b"cached MSI from 1.41.0")
+            detection = DetectionResult(InstallerType.WIX_BURN, 0.97)
+
+            class FakeBurn(Portablizer):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.calls = []
+
+                def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                    self.calls.append(plan)
+                    if "/layout" in plan.args:
+                        out = Path(plan.output_dir)
+                        out.mkdir(parents=True, exist_ok=True)
+                        (out / "DeltaSetup.exe").write_bytes(
+                            installer.read_bytes())
+                    elif plan.program == "msiexec.exe":
+                        Path(app_dir, "Delta.exe").write_bytes(b"MZ application")
+                    # /install завершается нулём, но Present-пакет не пишет MSI
+                    # повторно: кэш остаётся байт-в-байт прежним.
+                    return 0
+
+            engine = FakeBurn(Logger())
+            engine._detection = detection
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Delta")
+            attempts = build_attempts(
+                detection, str(installer), str(app), log_dir=str(portable),
+                layout_dir=str(portable / "_bundle_layout"))
+
+            rc, used = engine._run_attempts(
+                attempts, opts, str(app), str(data), str(portable), "Delta")
+
+            self.assertEqual(rc, 0)
+            self.assertIsNotNone(used)
+            self.assertTrue((app / "Delta.exe").is_file())
+            # /layout, один /install, затем msiexec /a сохранённого Delta.msi.
+            self.assertEqual(len(engine.calls), 3)
+            self.assertEqual(engine.calls[-1].program, "msiexec.exe")
+            self.assertIn("сохранённый MSI-пакет", engine.log.text)
+            self.assertFalse(cache.exists())
+
+    def test_burn_does_not_use_unrelated_stale_cached_msi(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "DeltaSetup.exe")
+            installer.write_bytes(b"Delta Burn bundle")
+            portable = Path(temp, "Delta_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            app.mkdir(parents=True)
+            cache = data / "ProgramData" / "Package Cache" / "{other-guid}"
+            cache.mkdir(parents=True)
+            other_msi = cache / "OtherProduct.msi"
+            other_msi.write_bytes(b"unrelated old MSI")
+            detection = DetectionResult(InstallerType.WIX_BURN, 0.97)
+
+            class FakeBurn(Portablizer):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.calls = []
+
+                def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                    self.calls.append(plan)
+                    return 0
+
+            engine = FakeBurn(Logger())
+            engine._detection = detection
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Delta")
+            attempts = build_attempts(
+                detection, str(installer), str(app), log_dir=str(portable),
+                layout_dir=str(portable / "_bundle_layout"))
+
+            _rc, used = engine._run_attempts(
+                attempts, opts, str(app), str(data), str(portable), "Delta")
+
+            self.assertIsNone(used)
+            self.assertEqual(len(engine.calls), 3)
+            self.assertFalse(any(call.program == "msiexec.exe"
+                                 for call in engine.calls))
+            self.assertTrue(other_msi.is_file())
+            self.assertEqual(list(app.iterdir()), [])
 
     def test_burn_package_cache_is_not_recovered_as_application(self):
         with tempfile.TemporaryDirectory() as temp:
