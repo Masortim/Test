@@ -2337,9 +2337,48 @@ BROWSER_PROFILE_DIRS: Tuple[Tuple[str, str], ...] = (
 )
 
 
+#: Расширения файлов, по которым видно, что каталог — УСТАНОВЛЕННАЯ
+#: ПРОГРАММА, а не профиль.
+_PROGRAM_SUFFIXES: Tuple[str, ...] = (".exe", ".dll")
+
+
 def browser_profile_pairs() -> Tuple[Tuple[str, str], ...]:
     """Каталоги браузеров в порядке «профиль, затем обновлятор»."""
     return BROWSER_PROFILE_DIRS
+
+
+def browser_dir_holds_program(path, max_depth: int = 3) -> bool:
+    """True, если в каталоге лежит сама программа, а не только профиль.
+
+    У браузера, установленного «для одного пользователя», профиль и программа
+    делят один каталог: ``%LOCALAPPDATA%\\Google\\Chrome`` содержит и
+    ``User Data`` (профиль), и ``Application\\chrome.exe`` (программа), а рядом
+    стоит ``Google\\Update`` с ``GoogleUpdate.exe``. Профиль же никогда не
+    содержит exe/dll.
+
+    Считать такой каталог «дубликатом профиля» и удалять его нельзя: это
+    установленная программа. Особенно плохо удалять обновлятор — браузер без
+    него решает, что не установлен, и запускает УСТАНОВЩИК заново (а если это
+    данные самой портативной программы, установщик запускается при каждом
+    клике по ярлыку). Поэтому проверка общая: и сборщик, и лончер трогают
+    только каталоги без исполняемых файлов.
+    """
+    if not path:
+        return False
+    root = str(path).replace("\\", os.sep)
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    try:
+        for current, dirs, files in os.walk(root, followlinks=False):
+            depth = current.rstrip(os.sep).count(os.sep) - base_depth
+            if depth >= max_depth:
+                dirs[:] = []
+            for name in files:
+                if name.casefold().endswith(_PROGRAM_SUFFIXES):
+                    dirs[:] = []
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def browser_login_settings(cfg: "LauncherConfig") -> Dict[str, object]:

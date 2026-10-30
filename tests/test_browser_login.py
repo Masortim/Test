@@ -279,6 +279,41 @@ class DuplicateProfileTests(unittest.TestCase):
                 bridge.prepare()
                 self.assertFalse(profile.exists())
 
+    def test_a_browser_installation_is_not_deleted_as_a_duplicate(self):
+        # Chrome, установленный «для одного пользователя», держит в этом
+        # каталоге и профиль (User Data), и саму программу (Application).
+        # Удалить её — значит заставить браузер при каждом старте решать,
+        # что он не установлен, и запускать УСТАНОВЩИК вместо себя.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = make_portable(root)
+            chrome = root / "PortableData/AppData/Local/Google/Chrome"
+            (chrome / "Application").mkdir(parents=True)
+            (chrome / "Application/chrome.exe").write_bytes(b"MZ")
+            (chrome / "User Data/Default").mkdir(parents=True)
+            bridge = make_bridge(root, target)
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_process_table", return_value=[]), \
+                    isolated_host():
+                self.assertEqual(bridge.drop_duplicate_profiles(), [])
+            self.assertTrue((chrome / "Application/chrome.exe").is_file())
+            self.assertTrue((chrome / "User Data/Default").is_dir())
+
+    def test_the_updater_next_to_the_program_is_kept(self):
+        # Без своего обновлятора браузер запускает установку заново.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = make_portable(root)
+            update = root / "PortableData/AppData/Local/Google/Update"
+            update.mkdir(parents=True)
+            (update / "GoogleUpdate.exe").write_bytes(b"MZ")
+            bridge = make_bridge(root, target)
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_process_table", return_value=[]), \
+                    isolated_host():
+                self.assertEqual(bridge.drop_duplicate_profiles(), [])
+            self.assertTrue((update / "GoogleUpdate.exe").is_file())
+
     def test_cleanup_can_be_switched_off(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -639,6 +674,37 @@ class BuilderBrowserGuardTests(unittest.TestCase):
             self.assertFalse((data / "AppData/Local/Google/Chrome").exists())
             # Настройки самой программы остаются на месте.
             self.assertTrue((app_data / "settings.ini").is_file())
+
+    def test_a_browser_build_keeps_its_own_folders(self):
+        # Портатив самого браузера: эти каталоги — данные программы.
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp, "PortableData")
+            chrome = data / "AppData/Local/Google/Chrome"
+            (chrome / "User Data/Default").mkdir(parents=True)
+            update = data / "AppData/Local/Google/Update"
+            update.mkdir(parents=True)
+            (update / "GoogleUpdate.exe").write_bytes(b"MZ")
+
+            engine = self._engine()
+            self.assertEqual(
+                engine._drop_browser_duplicates(str(data), "ChromeSetup.exe"), [])
+            self.assertTrue((chrome / "User Data/Default").is_dir())
+            self.assertTrue((update / "GoogleUpdate.exe").is_file())
+
+    def test_a_program_inside_the_portable_is_not_a_duplicate_profile(self):
+        # Chromium-based программа держит свои файлы в таком каталоге.
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp, "PortableData")
+            app = data / "AppData/Local/Chromium/App"
+            app.mkdir(parents=True)
+            (app / "App.exe").write_bytes(b"MZ")
+            (app / "settings.ini").write_bytes(b"1")
+
+            removed = self._engine()._drop_browser_duplicates(
+                str(data), "AppSetup.exe")
+
+            self.assertEqual(removed, [])
+            self.assertTrue((app / "App.exe").is_file())
 
     def test_real_profile_behind_a_link_is_never_deleted(self):
         with tempfile.TemporaryDirectory() as temp:
