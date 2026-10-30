@@ -4126,6 +4126,10 @@ class Portablizer:
             == InstallerType.WIX_BURN
         )
         burn_cache_before = _burn_cache_snapshot(data_dir) if is_burn else {}
+        # Один и тот же неизменённый MSI не распаковываем повторно после
+        # каждого следующего Burn-плана: код ошибки/модальное окно от этого
+        # не изменится, а пользователь снова будет ждать тот же таймаут.
+        burn_cache_attempted: Set[Tuple[str, int, int]] = set()
         payload_seen = False
         index = 0
         while index < len(queue):
@@ -4224,7 +4228,8 @@ class Portablizer:
                     and not self._find_main_exe(app_dir, name)
                     and self._install_burn_cached_packages(
                         data_dir, opts, app_dir, name,
-                        before=burn_cache_before, console_log=console_log)):
+                        before=burn_cache_before, console_log=console_log,
+                        attempted=burn_cache_attempted)):
                 self.log.ok(
                     f"MSI из Package Cache распакован в App. Сработал сценарий: "
                     f"{plan.label}"
@@ -4685,7 +4690,8 @@ class Portablizer:
     def _install_burn_cached_packages(
             self, data_dir: str, opts: PortableOptions, app_dir: str,
             name: str, before: Dict[str, Tuple[int, int]],
-            console_log: Optional[str] = None) -> bool:
+            console_log: Optional[str] = None,
+            attempted: Optional[Set[Tuple[str, int, int]]] = None) -> bool:
         """Извлекает MSI, который Burn положил в redirected Package Cache.
 
         Кэш сам по себе не является установленным приложением и никогда не
@@ -4697,9 +4703,12 @@ class Portablizer:
         cached = _burn_cached_msis(data_dir)
         if not cached:
             return False
+        if attempted is None:
+            attempted = set()
         keys = self._name_keys(name, opts.installer_path)
         fresh: List[str] = []
         reusable: List[str] = []
+        identities: Dict[str, Tuple[str, int, int]] = {}
         for path in cached:
             try:
                 stat = os.stat(path)
@@ -4707,6 +4716,7 @@ class Portablizer:
                 continue
             normalized = os.path.normcase(os.path.abspath(path))
             signature = (stat.st_size, stat.st_mtime_ns)
+            identities[path] = (normalized, stat.st_size, stat.st_mtime_ns)
             if before.get(normalized) != signature:
                 fresh.append(path)
             elif self._name_score(path, keys) >= 200:
@@ -4723,17 +4733,28 @@ class Portablizer:
         # Сначала пакеты, которые доказуемо записал текущий Burn. Сохранённый
         # кэш нужен для повторной сборки 1.41.0: bundle уже Present, поэтому
         # повторный /install может вообще не перезаписать Delta.msi.
+        made_attempt = False
         for paths, origin in ((by_size(fresh), "свежий"),
                               (by_size(reusable), "сохранённый")):
             for msi in paths:
                 self._check_cancel()
+                identity = identities[msi]
+                if identity in attempted:
+                    continue
+                attempted.add(identity)
+                made_attempt = True
+                msi_log = os.path.join(
+                    os.path.dirname(os.path.abspath(app_dir)),
+                    f"burn-cache-msi-{len(attempted)}.log",
+                )
                 self.log.info(
                     f"В Package Cache найден {origin} MSI-пакет Burn: "
                     f"{os.path.basename(msi)}. Распаковываю его в App через "
                     "msiexec /a; сам кэш как программу не использую."
                 )
                 msi_plan = build_silent_plan(
-                    InstallerType.MSI, msi, app_dir, is_msi=True)
+                    InstallerType.MSI, msi, app_dir, is_msi=True,
+                    log_file=msi_log)
                 self._run_install(
                     msi_plan, opts, app_dir, data_dir,
                     progress_from=58, progress_to=60, console_log=console_log,
@@ -4748,7 +4769,7 @@ class Portablizer:
                 self._cleanup_burn_artifacts(
                     os.path.dirname(os.path.abspath(app_dir)), data_dir)
                 return True
-        if fresh or reusable:
+        if made_attempt:
             self.log.warn(
                 "MSI из Package Cache не дал запускаемого файла программы. "
                 "Кэш оставлен для диагностики и не скопирован в App."

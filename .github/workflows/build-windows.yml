@@ -230,6 +230,7 @@ jobs:
                 "out/Delta_Portable/install-layout.log",
                 "out/Delta_Portable/install.log",
                 "out/Delta_Portable/install-retry.log",
+                "out/Delta_Portable/burn-cache-msi-1.log",
                 "out/Delta_Portable/installer-output.log")) {
               $path = Join-Path $root $name
               if (Test-Path $path) {

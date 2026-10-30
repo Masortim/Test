@@ -2123,6 +2123,60 @@ class BurnFallbackTests(unittest.TestCase):
             self.assertIn("сохранённый MSI-пакет", engine.log.text)
             self.assertFalse(cache.exists())
 
+    def test_burn_does_not_retry_unchanged_cached_msi_after_failure(self):
+        """Неизменный MSI после ошибки не запускается заново на каждом плане."""
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "DeltaSetup.exe")
+            installer.write_bytes(b"same Delta Burn bundle")
+            portable = Path(temp, "Delta_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir()
+            cache = (data / "ProgramData" / "Package Cache" /
+                     "{delta-package-guid}")
+            cache.mkdir(parents=True)
+            cached_msi = cache / "Delta.msi"
+            cached_msi.write_bytes(b"cached MSI from a previous build")
+            detection = DetectionResult(InstallerType.WIX_BURN, 0.97)
+
+            class FakeBurn(Portablizer):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.calls = []
+
+                def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                    self.calls.append(plan)
+                    if "/layout" in plan.args:
+                        out = Path(plan.output_dir)
+                        out.mkdir(parents=True, exist_ok=True)
+                        (out / "DeltaSetup.exe").write_bytes(
+                            installer.read_bytes())
+                    # Present-пакет ничего не ставит; msiexec тоже не даёт
+                    # payload. Повтор того же MSI уже ничего изменить не может.
+                    return 0
+
+            engine = FakeBurn(Logger())
+            engine._detection = detection
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Delta")
+            attempts = build_attempts(
+                detection, str(installer), str(app), log_dir=str(portable),
+                layout_dir=str(portable / "_bundle_layout"))
+
+            _rc, used = engine._run_attempts(
+                attempts, opts, str(app), str(data), str(portable), "Delta")
+
+            self.assertIsNone(used)
+            msi_calls = [call for call in engine.calls
+                         if call.program == "msiexec.exe"]
+            self.assertEqual(len(msi_calls), 1)
+            self.assertEqual(len(engine.calls), 4)
+            self.assertTrue(msi_calls[0].progress_logs[0].endswith(
+                "burn-cache-msi-1.log"))
+            self.assertTrue(cached_msi.is_file())
+            self.assertFalse(any(app.iterdir()))
+
     def test_burn_does_not_use_unrelated_stale_cached_msi(self):
         with tempfile.TemporaryDirectory() as temp:
             installer = Path(temp, "DeltaSetup.exe")
