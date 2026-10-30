@@ -232,8 +232,7 @@ def build_silent_plan(
         notes.append(
             "WiX Burn: /quiet /install + /log. Папку бандл принимает только "
             "при публичной переменной InstallFolder; при неудаче Portablizer "
-            "повторит запуск без неё. Распаковка /layout уже была первой "
-            "попыткой: она не пишет в реестр «уже установлено»."
+            "повторит запуск без неё и распакует бандл через /layout."
         )
         label = ("WiX Burn: /quiet /install + InstallFolder"
                  if override_install_folder else "WiX Burn: /quiet /install")
@@ -1056,19 +1055,6 @@ def build_attempts(
             visible.label = "Собственные ключи без --hidden"
             attempts.append(visible)
     elif itype == InstallerType.WIX_BURN:
-        # Распаковка /layout идёт ПЕРВОЙ — и это принципиально.
-        #
-        # 1. Она ничего не меняет в системе: Burn не пишет запись «установлено»
-        #    в Uninstall и не кэширует payload. Портативный сборщик обязан
-        #    начинать с самого безопасного пути.
-        # 2. Запуск установки делает бандл «уже установленным» (state: Present).
-        #    Следующий запуск уходит в режим обслуживания, где Plan требует
-        #    нового Detect: `Error 0x8007139f` в цикле и пустой App — ровно то,
-        #    что видел пользователь Delta.
-        if layout_dir:
-            attempts.append(build_burn_layout_plan(
-                installer_path, layout_dir,
-                log_file=log_path("install-layout.log"), extra_args=extra))
         attempts.append(build_silent_plan(
             InstallerType.WIX_BURN, installer_path, target_dir,
             log_file=log_path("install.log"), extra_args=extra))
@@ -1102,6 +1088,12 @@ def build_attempts(
                                      "--accept-license-agreement")):
         attempts.append(build_custom_cli_plan(
             installer_path, target_dir, detection=detection, extra_args=extra))
+
+    # Распаковка бандла: не требует прав администратора и не меняет систему.
+    if itype == InstallerType.WIX_BURN and layout_dir:
+        attempts.append(build_burn_layout_plan(
+            installer_path, layout_dir, log_file=log_path("install-layout.log"),
+            extra_args=extra))
 
     # Тип, опознанный ненадёжно (например, по одиночной слабой подстроке
     # «nsis»), не должен заканчиваться единственной типо-специфичной

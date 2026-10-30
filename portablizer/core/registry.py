@@ -141,15 +141,6 @@ _PROTECTED_PREFIXES: Tuple[str, ...] = (
     r"software\microsoft\edge",
     r"software\microsoft\edgewebview",
     r"software\microsoft\edgeupdate",
-    # Регистрация браузера по умолчанию. Портатив не устанавливает браузер:
-    # перенос этих веток создавал на чужом ПК дубликат — вторую запись в
-    # «Программах по умолчанию», второй пункт «Браузер» и перехват ссылок.
-    # Страницы входа открываются в уже установленном браузере, поэтому
-    # хранить здесь нечего.
-    r"software\clients\startmenuinternet",
-    r"software\registeredapplications",
-    r"software\microsoft\windows\shell\associations\urlassociations",
-    r"software\microsoft\windows\currentversion\applicationassociations",
 )
 
 # Отдельные записи «Программы и компоненты» могут иметь случайный GUID вместо
@@ -294,214 +285,6 @@ def is_uninstall_entry(key_path: str) -> bool:
     return bool(lowered[index + len(_UNINSTALL_MARKER):].strip("\\"))
 
 
-# --- ассоциации файлов: портатив их не трогает --------------------------------
-#
-# Жалоба: «после портатива каждый раз приходится переназначать программы для
-# расширений файлов». Ассоциация живёт не в одном ключе, а в цепочке:
-#
-#   HKCU\Software\Classes\.pdf                     — программа по умолчанию;
-#   HKCU\...\Explorer\FileExts\.pdf\UserChoice     — выбор пользователя
-#                                                    (ProgId + Hash);
-#   HKCU\...\Shell\Associations\...                — «Открыть с помощью»,
-#                                                    умолчания по протоколам;
-#   HKCU\Software\RegisteredApplications           — «Программы по умолчанию».
-#
-# Импорт «ассоциаций программы» переписывает начало цепочки, а удаление ключа
-# при выходе оставляет расширение вовсе без обработчика — Windows снова
-# спрашивает «чем открыть?», и человек заново назначает программу. Поэтому
-# такие ключи не переносятся в портатив (даже с ``--shell-integration``:
-# ассоциации — настройка конкретного ПК, а не данные программы), не
-# импортируются лончером и никогда не удаляются с машины, где портатив
-# запускали.
-_ASSOCIATION_PREFIXES: Tuple[str, ...] = (
-    r"software\microsoft\windows\currentversion\explorer\fileexts",
-    r"software\microsoft\windows\currentversion\explorer\associations",
-    r"software\microsoft\windows\shell\associations",
-    r"software\microsoft\windows\currentversion\applicationassociations",
-    r"software\registeredapplications",
-    r"software\clients\startmenuinternet",
-)
-
-#: Классы оболочки, которые задают открытие файлов и папок целиком.
-_ASSOCIATION_BASE_CLASSES = frozenset({
-    "*", "allfilesystemobjects", "applications", "appid", "directory",
-    "drive", "folder", "systemfileassociations", "unknown",
-})
-
-#: Где Windows хранит выбор программы для расширения (в HKCU).
-_ASSOC_FILEEXTS_ROOT = r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts"
-_ASSOC_CLASSES_ROOT = r"Software\Classes"
-
-
-def _classes_rest(path: str) -> Optional[str]:
-    """``software\\classes\\.pdf\\...`` -> ``.pdf\\...`` (иначе ``None``)."""
-    prefix = r"software\classes" + "\\"
-    if not path.startswith(prefix):
-        return None
-    rest = path[len(prefix):]
-    return rest or None
-
-
-def is_file_association_key(key_path: str) -> bool:
-    """Ключ задаёт, какой программой открывать файлы на ЭТОМ компьютере.
-
-    Проверяются оба представления реестра (``Software`` и
-    ``Software\\WOW6432Node``) и оба куста: ассоциации бывают и у
-    пользователя, и машинные.
-    """
-    for path in _path_variants(key_path):
-        if _matches(path, _ASSOCIATION_PREFIXES):
-            return True
-        rest = _classes_rest(path)
-        if not rest:
-            continue
-        first = rest.split("\\", 1)[0]
-        if first.startswith(".") or first.casefold() in _ASSOCIATION_BASE_CLASSES:
-            return True
-    return False
-
-
-def _association_registry(reg: object = None):
-    """Модуль ``winreg`` для работы с ассоциациями (или ``None`` вне Windows)."""
-    if reg is not None:
-        return reg
-    if not IS_WINDOWS:
-        return None
-    try:
-        import winreg  # type: ignore
-    except ImportError:  # pragma: no cover - Windows без winreg не бывает
-        return None
-    return winreg
-
-
-def _read_association_values(reg, hive: int, subkey: str,
-                             only_default: bool = False,
-                             max_values: int = 256) -> Optional[KeyValues]:
-    """Значения одного ключа ассоциации; ``None`` — ключа нет."""
-    try:
-        handle = reg.OpenKey(hive, subkey, 0, reg.KEY_READ)
-    except OSError:
-        return None
-    values: KeyValues = {}
-    try:
-        if only_default:
-            try:
-                data, typ = reg.QueryValueEx(handle, "")
-            except OSError:
-                return values
-            return {"": (int(typ), repr(data))}
-        index = 0
-        while index < max_values:
-            try:
-                name, data, typ = reg.EnumValue(handle, index)
-            except OSError:
-                break
-            values[name] = (int(typ), repr(data))
-            index += 1
-    finally:
-        try:
-            reg.CloseKey(handle)
-        except (AttributeError, OSError):
-            pass
-    return values
-
-
-def snapshot_file_associations(reg: object = None,
-                               limit: int = 400) -> Dict[str, KeyValues]:
-    """Снимок ассоциаций файлов этого ПК — до запуска установщика.
-
-    Запоминаются только умолчания пользователя: ``UserChoice`` для каждого
-    расширения (ProgId + Hash) и класс по умолчанию из ``Software\\Classes``.
-    Этого достаточно, чтобы вернуть человеку его настройки после сборки, если
-    установщик переписал ассоциации под себя.
-    """
-    snapshot_out: Dict[str, KeyValues] = {}
-    module = _association_registry(reg)
-    if module is None:
-        return snapshot_out
-    hive = module.HKEY_CURRENT_USER
-    try:
-        with module.OpenKey(hive, _ASSOC_FILEEXTS_ROOT, 0,
-                            module.KEY_READ) as root_key:
-            extensions: List[str] = []
-            index = 0
-            while index < limit:
-                try:
-                    extensions.append(module.EnumKey(root_key, index))
-                except OSError:
-                    break
-                index += 1
-    except (OSError, AttributeError):
-        return snapshot_out
-    for extension in extensions:
-        user_choice = f"{_ASSOC_FILEEXTS_ROOT}\\{extension}\\UserChoice"
-        values = _read_association_values(module, hive, user_choice)
-        if values:
-            snapshot_out[f"HKCU\\{user_choice}"] = values
-        class_key = f"{_ASSOC_CLASSES_ROOT}\\{extension}"
-        default = _read_association_values(module, hive, class_key,
-                                           only_default=True)
-        if default:
-            snapshot_out[f"HKCU\\{class_key}"] = default
-    return snapshot_out
-
-
-def restore_file_associations(before: Mapping[str, Mapping[str, object]],
-                              reg: object = None) -> List[str]:
-    """Возвращает ассоциации, которые установщик переписал за время сборки.
-
-    Пишутся ровно те значения, что были ДО сборки (ProgId и его ``Hash``
-    вместе — иначе Windows не признает выбор пользователя). Ключи, которых до
-    сборки не было, не создаются, ничего не удаляется: чужие настройки не
-    трогаем, а лишние значения, добавленные установщиком, оставляем как есть.
-    Возвращает список восстановленных ключей — для журнала.
-    """
-    module = _association_registry(reg)
-    if module is None or not before:
-        return []
-    hive = module.HKEY_CURRENT_USER
-    restored: List[str] = []
-    for key, values in before.items():
-        hive_name, _sep, subkey = str(key).partition("\\")
-        if not subkey or hive_name.casefold() != "hkcu":
-            continue
-        current = _read_association_values(module, hive, subkey)
-        if current is not None and all(
-                current.get(name) == tuple(entry)
-                for name, entry in values.items()):
-            continue
-        writable: List[Tuple[str, int, object]] = []
-        for name, entry in values.items():
-            try:
-                typ, data = tuple(entry[:2])  # type: ignore[index]
-            except (TypeError, ValueError):
-                continue
-            try:
-                payload = ast.literal_eval(str(data))
-            except (ValueError, SyntaxError):
-                continue
-            writable.append((str(name), int(typ), payload))
-        if not writable:
-            continue
-        try:
-            handle = module.CreateKeyEx(hive, subkey, 0, module.KEY_SET_VALUE)
-        except OSError:
-            continue
-        try:
-            for name, typ, payload in writable:
-                try:
-                    module.SetValueEx(handle, name, 0, typ, payload)
-                except OSError:
-                    pass
-        finally:
-            try:
-                module.CloseKey(handle)
-            except (AttributeError, OSError):
-                pass
-        restored.append(str(key))
-    return restored
-
-
 # --- URL-протоколы приложений --------------------------------------------------
 #
 # Протоколы (figma://, discord://, spotify:// и т.п.) — это браузерные
@@ -521,18 +304,6 @@ _PROTOCOL_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*$", re.IGNORECASE)
 #: Значение, которое ставит установщик в ключ схемы при регистрации
 #: протокола (``HKCU\Software\Classes\<scheme>``).
 _PROTOCOL_MARKER_VALUE = "url protocol"
-
-#: Схемы, которые принадлежат не программе, а браузеру и оболочке Windows.
-#: Регистрация ``http``/``https`` — это заявка «я браузер по умолчанию»; если
-#: перенести её в портатив, лончер на чужом ПК переназначит открытие ссылок
-#: своей копии, то есть создаст второй браузер в реестре. Ровно этого и не
-#: должно происходить: страница входа открывается в УЖЕ установленном
-#: браузере пользователя (см. BrowserLoginBridge в лончере).
-_WEB_SCHEMES = frozenset({
-    "http", "https", "ftp", "ftps", "file", "mailto", "tel", "callto", "sms",
-    "news", "nntp", "feed", "webcal", "irc", "ircs", "magnet", "mms",
-    "microsoft-edge", "ms-edge", "msedge", "ms-settings", "search-ms",
-})
 
 #: Подключ с командой открытия протокола.
 _PROTOCOL_COMMAND_SUBKEY = r"\shell\open\command"
@@ -566,11 +337,7 @@ def is_protocol_key(key_path: str,
     ``shell\open\command`` (такие регистрации встречаются у Electron-
     приложений, например Figma).
     """
-    tail = _protocol_tail(key_path)
-    if not tail:
-        return False
-    if tail.casefold() in _WEB_SCHEMES:
-        # Схема браузера/оболочки: это не протокол приложения.
+    if not _protocol_tail(key_path):
         return False
     if values is not None and _PROTOCOL_MARKER_VALUE in {
             str(name).casefold() for name in values}:

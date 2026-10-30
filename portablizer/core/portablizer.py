@@ -292,20 +292,6 @@ UNPACKABLE_TYPES = (
     InstallerType.UNKNOWN,
 )
 
-#: Имена exe, рядом с которыми лежит **раскладка дистрибутива** (``data1.cab``,
-#: ``setup.iss``, ``*.bin``, соседний MSI). Только для них папка установщика
-#: считается частью программы и может попасть в ``App`` целиком.
-_LAYOUT_INSTALLER_NAMES = frozenset({
-    "setup.exe", "set-up.exe", "install.exe", "installer.exe",
-    "instal.exe", "autorun.exe",
-})
-
-#: Слова в имени exe, по которым видно установщик, даже если внутри не нашлось
-#: ни одной сигнатуры движка. Такой файл нельзя объявлять «готовой программой»
-#: и копировать в ``App`` вместо установки.
-_INSTALLER_NAME_RE = re.compile(
-    r"(setup|install|instal|repack|bundle|unpack|extract)", re.IGNORECASE)
-
 #: Код -1 от bootstrapper'а почти всегда означает «не разобрал командную
 #: строку»: неизвестный ключ, отсутствие обязательного (например, принятия
 #: лицензии) или запрет на запуск без UAC.
@@ -326,31 +312,6 @@ def is_elevated() -> bool:
 
         return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001
-        return False
-
-
-def _is_reparse_point(path: str) -> bool:
-    """True, если путь — junction/символическая ссылка, а не каталог.
-
-    Нужен, чтобы никогда не удалять содержимое ссылки: за ней лежит
-    НАСТОЯЩИЙ профиль браузера пользователя, а не копия внутри портатива.
-    """
-    try:
-        if os.path.islink(path):
-            return True
-    except OSError:
-        return False
-    try:
-        os.readlink(path)
-        return True
-    except (OSError, AttributeError, ValueError):
-        pass
-    try:
-        import stat
-
-        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
-        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
-    except (OSError, ValueError):
         return False
 
 
@@ -765,9 +726,6 @@ class PortableResult:
     registry_keys: List[str] = field(default_factory=list)
     #: Новые записи установщика, которые увидели в «Установленных программах».
     installed_entries_detected: List[str] = field(default_factory=list)
-    #: Ассоциации файлов, которые установщик переписал, а Portablizer вернул
-    #: этому ПК (в портатив они не переносятся).
-    restored_associations: List[str] = field(default_factory=list)
     #: Записи, убранные из списка «Установленные программы» этого ПК.
     removed_from_installed_list: List[str] = field(default_factory=list)
     #: Осталось ли что-то вычистить вручную (не хватило прав).
@@ -1262,14 +1220,6 @@ class Portablizer:
         self._online_profile_targets: List[launcher_mod.TargetInfo] = []
         self._online_profile_diagnostic = ""
         self._recovered_sources: List[str] = []
-        #: Образы процессов, запущенных установщиком этой сборки. Это самое
-        #: сильное доказательство «вот эта программа действительно
-        #: установилась»: ни имя папки, ни совпадение процессов по окнам
-        #: такого доказательства не дают.
-        self._install_images: Set[str] = set()
-        #: В App попал сам выбранный exe, а не установленная программа
-        #: (пользователь дал готовый «портативный» exe).
-        self._adopted_program_exe = False
 
     # -- вспомогательное ------------------------------------------------------
     def progress(self, percent: int, stage: str) -> None:
@@ -1492,7 +1442,7 @@ class Portablizer:
             raise last
 
     def _prepare_output(self, portable_dir: str, app_dir: str,
-                        data_dir: str, installer_path: str = "") -> None:
+                        data_dir: str) -> None:
         """Готовит чистый App и удаляет лончер от незавершённого запуска.
 
         ``PortableData`` намеренно сохраняется: пользователь мог повторно
@@ -1526,10 +1476,6 @@ class Portablizer:
             self._remove_path(app_dir)
         os.makedirs(app_dir, exist_ok=True)
         os.makedirs(data_dir, exist_ok=True)
-        # Прошлая сборка могла оставить в PortableData ссылки на профиль
-        # браузера и копию браузера, созданную страницей входа.
-        self._unlink_browser_profiles(data_dir)
-        self._drop_browser_duplicates(data_dir, installer_path)
 
         # Сохранённая сессия реестра от предыдущей сборки (PortableData\Registry)
         # при запуске имеет приоритет над portable.reg и portable_machine.reg.
@@ -1981,10 +1927,6 @@ class Portablizer:
     # -- шаги -----------------------------------------------------------------
     def run(self, opts: PortableOptions) -> PortableResult:
         result = PortableResult(success=False)
-        #: Ассоциации файлов этого ПК ДО сборки. Восстанавливаются и после
-        #: успешной сборки, и после ошибки/отмены: установщик успевает
-        #: переписать умолчания раньше, чем станет ясно, что сборка не вышла.
-        associations_before: "Dict[str, Dict[str, object]]" = {}
         try:
             self.log.info(f"Portablizer {__version__}")
             self._run_started = time.time()
@@ -2033,11 +1975,6 @@ class Portablizer:
             self._online_profile_targets = []
             self._online_profile_diagnostic = ""
             self._recovered_sources = []
-            self._install_images = set()
-            #: В App попал сам выбранный exe (а не установленная программа):
-            #: значит, пользователь дал готовую программу, и итог нужно
-            #: объяснить, а не выдавать за тихую установку.
-            self._adopted_program_exe = False
             self._installer_name = opts.installer_path
             # Жалоба: в C:\Users\<user> накапливались Portablizer-*-Temp / _MEI*
             # от аварийных завершений предыдущих запусков. Убираем их сразу,
@@ -2084,8 +2021,7 @@ class Portablizer:
             # Не очищаем старую сборку, пока не закончилось распознавание:
             # анализ повреждённого/неподдерживаемого установщика не должен
             # удалять уже имеющийся App и запускатели.
-            self._prepare_output(portable_dir, app_dir, data_dir,
-                                 opts.installer_path)
+            self._prepare_output(portable_dir, app_dir, data_dir)
 
             if IS_WINDOWS:
                 self.log.warn(
@@ -2178,23 +2114,10 @@ class Portablizer:
             elif opts.capture_registry and not IS_WINDOWS:
                 self.log.warn("Захват реестра доступен только на Windows — пропускаю.")
 
-            # 3a. Ассоциации файлов этого ПК. Их трогает почти каждый
-            # установщик: монтирует свой класс для .pdf/.png/.txt, а иногда и
-            # переписывает уже выбранную человеком программу. Портатив не
-            # должен забирать ассоциации с собой, но и «следов» на этом ПК
-            # после сборки оставаться не должно — иначе после каждой сборки
-            # приходится заново назначать, чем открывать файлы. Снимок
-            # делается ВСЕГДА (он дешёвый), восстановление — после установки.
-            associations_before = reg_mod.snapshot_file_associations()
-
             # Запоминаем содержимое типовых каталогов установки. Некоторые
             # установщики игнорируют /DIR и пишут в LocalAppData/Program Files;
             # после завершения попробуем безопасно перенести созданный каталог.
             install_locations_before = self._snapshot_install_locations(data_dir)
-            # Какие процессы уже работают на этом ПК. Разница со снимком после
-            # установки покажет, что именно запустил установщик, — это и есть
-            # доказательство принадлежности файлов программе.
-            install_images_before = self._process_images()
             # Ярлыки. Запоминаем, что уже лежало на рабочем столе и в меню
             # «Пуск» ДО установщика: после сборки убираются только файлы,
             # появившиеся за время установки и ведущие внутрь портатива.
@@ -2267,10 +2190,6 @@ class Portablizer:
             finally:
                 if dx_guard is not None:
                     dx_guard.remove()
-            # Снимок процессов — сразу после лестницы попыток и до
-            # _release_after_install: программа, запущенная установщиком,
-            # чаще всего ещё жива, и её файл не будет перепутан с чужим.
-            self._remember_install_images(install_images_before)
             # Лестница закончилась на 58 %, а следующий этап ниже сам по себе
             # полосу не двигает (закрытие процессов, распаковка без запуска).
             # Честно подписываем переход, иначе выглядит как зависание.
@@ -2471,17 +2390,6 @@ class Portablizer:
             result.targets = targets
             result.main_exe_rel = os.path.relpath(main_exe, portable_dir)
             self.log.ok(f"Главный exe: {result.main_exe_rel}")
-            if self._adopted_program_exe:
-                note = (
-                    "Выбран готовый exe, а не установщик: в App лежит только "
-                    "он сам. Файлы, которые лежали рядом с исходным exe, "
-                    "намеренно не копировались — иначе в портатив попадали "
-                    "бы посторонние загрузки и документы. Если программе "
-                    "нужны её библиотеки или папка данных, скопируйте их в "
-                    "App вручную."
-                )
-                self.log.warn(note)
-                result.hints.append(note)
 
             for t in targets:
                 if t.role == "launcher":
@@ -2598,19 +2506,6 @@ class Portablizer:
             self._report_portable_services(portable_dir, result)
             if capture is not None:
                 self._cleanup_host(capture, opts, result)
-            # 9б. Ассоциации файлов: установщик мог переписать их под себя.
-            # Возвращаем ровно то, что было до сборки, — иначе после каждого
-            # портатива человек заново назначает программы для расширений.
-            restored_associations = reg_mod.restore_file_associations(
-                associations_before)
-            if restored_associations:
-                result.restored_associations = restored_associations
-                self.log.ok(
-                    "Ассоциации файлов восстановлены ("
-                    f"{len(restored_associations)}): установщик менял их под "
-                    "себя, но на этом ПК остаются прежние программы. В "
-                    "портатив ассоциации не переносятся вовсе."
-                )
 
             # 10. Папка результата должна быть свободна: её сразу копируют
             # на флешку, переносят и удаляют. Ничего запущенного из неё
@@ -2630,18 +2525,6 @@ class Portablizer:
         except Exception as exc:  # noqa: BLE001
             self.log.error(str(exc))
             result.messages.append(str(exc))
-            try:
-                restored = reg_mod.restore_file_associations(
-                    associations_before)
-                if restored:
-                    result.restored_associations = restored
-                    self.log.ok(
-                        "Ассоциации файлов этого ПК возвращены прежним "
-                        f"программам ({len(restored)}) — установщик успел их "
-                        "переписать."
-                    )
-            except Exception:  # noqa: BLE001 - уборка не срывает отчёт
-                pass
             self._fill_temp_fields(result, result.portable_dir)
             self._save_run_log(result.portable_dir)
             return result
@@ -2651,16 +2534,6 @@ class Portablizer:
             # любом случае: на компьютере пользователя не должно оставаться
             # ни гигабайта мусора, ни после успеха, ни после ошибки.
             self._cleanup_install_temp()
-            # Служебные папки самой сборки (_bundle_layout, _sfx_content,
-            # _adobe_payloads, _unpacked, _redist_cache) тоже убираются в
-            # любом случае: в готовом портативе они не нужны и только
-            # вызывают вопрос «что это за папки и зачем они созданы».
-            try:
-                finished_dir = locals().get("portable_dir", "") or getattr(
-                    result, "portable_dir", "")
-            except Exception:  # noqa: BLE001
-                finished_dir = getattr(result, "portable_dir", "")
-            self._cleanup_build_leftovers(finished_dir)
 
     # -- классический InstallShield ------------------------------------------
     def _record_command(self, det: DetectionResult, opts: PortableOptions,
@@ -2769,50 +2642,6 @@ class Portablizer:
             return True
         except OSError:
             return False
-
-    #: Строки журнала движка, которые объясняют «код 0, а файлов нет».
-    _ENGINE_LOG_MARKERS = (
-        "error", "failed", "failure", "exit code", "exception", "abort",
-        "rollback", "cancelled", "canceled", "0x8007", "0x8000", "not found",
-    )
-
-    def _report_engine_log_hints(self, plan: SilentPlan) -> None:
-        """Достаёт из журнала установщика причину «код 0, а файлов нет».
-
-        WiX Burn и Inno умеют вернуть успешный код, ничего не установив:
-        пакет внутри бандла отказался работать, установщик решил, что
-        «уже установлено», и т. п. Своими словами это не объяснить, а в
-        журнале движка причина написана прямым текстом — показываем её, а не
-        отправляем пользователя искать её самостоятельно.
-        """
-        seen: Set[str] = set()
-        for path in [*plan.progress_logs, plan.result_log]:
-            if not path or path in seen or not os.path.isfile(path):
-                continue
-            seen.add(path)
-            try:
-                with open(path, "r", encoding="utf-8",
-                          errors="replace") as handle:
-                    lines = [line.strip() for line in handle
-                             if line.strip()]
-            except OSError:
-                continue
-            if not lines:
-                continue
-            interesting = [
-                line for line in lines
-                if any(marker in line.casefold()
-                       for marker in self._ENGINE_LOG_MARKERS)
-            ]
-            shown = (interesting or lines)[-3:]
-            if not shown:
-                continue
-            self.log.warn(
-                "Журнал установщика объясняет пустую папку "
-                f"({os.path.basename(path)}):")
-            for line in shown:
-                self.log.warn("   " + line[:300])
-            return
 
     def _report_installshield_log(self, plan: SilentPlan) -> Optional[int]:
         """Расшифровывает setup.log InstallShield после попытки установки."""
@@ -3415,17 +3244,12 @@ class Portablizer:
             mk for mk in machine_keys
             if mk not in before or mk in set(reused_app_keys)
         ]
-        # Ассоциации файлов не попадают в список «удалить после выхода» даже
-        # тогда, когда интеграцию включили явно: удаление ключа расширения
-        # оставляет Windows без обработчика, и человек заново назначает
-        # программу. Портатив их не удаляет — он их вообще не касается.
-        created_for_exit = [
-            k for k in ([k for k in diff.new_keys if k in set(portable_keys)]
-                        + reused_app_keys + created_machine + virtual_keys)
-            if not reg_mod.is_file_association_key(k)
-        ]
         capture.created_keys = launcher_mod.consolidate_root_keys(
-            created_for_exit)
+            [k for k in diff.new_keys if k in set(portable_keys)]
+            + reused_app_keys
+            + created_machine
+            + virtual_keys
+        )
 
         # Безопасный режим не пытается «вернуть весь реестр как было»:
         # сравнение двух снимков не доказывает, что любое изменение вызвано
@@ -3478,17 +3302,6 @@ class Portablizer:
             self.log.info(
                 f"Ассоциации файлов и COM пропущены ({len(skipped_integration)} "
                 "ключ(ей)) — портатив не меняет настройки чужой системы."
-            )
-        association_keys = [
-            k for k in portable_keys if reg_mod.is_file_association_key(k)
-        ]
-        if association_keys:
-            self.log.info(
-                "Ассоциации файлов не применяются лончером "
-                f"({len(association_keys)} ключ(ей)): расширения на каждом ПК "
-                "остаются за прежними программами, переназначать ничего не "
-                "придётся. Записи оставлены в portable.reg только как "
-                "справочная копия."
             )
         if protocol_keys:
             self.log.ok(
@@ -3722,12 +3535,6 @@ class Portablizer:
                                         console_log=console_log)
         finally:
             self._last_install_seconds = time.monotonic() - started
-            if opts.redirect_userdirs:
-                # Ссылки на настоящий профиль живут только на время
-                # установщика: папка портатива не должна уехать со ссылками,
-                # а всё, что браузер всё-таки создал внутри, удаляется.
-                self._unlink_browser_profiles(data_dir)
-                self._drop_browser_duplicates(data_dir, opts.installer_path)
             if console_handle is not None:
                 try:
                     code = (str(rc) if rc is not None
@@ -4208,11 +4015,6 @@ class Portablizer:
             # Классический InstallShield пишет причину отказа в свой
             # setup.log — без неё «код 0 при пустой папке» необъясним.
             self._report_installshield_log(plan)
-            # «Код 0, а файлов нет» — самый непонятный исход тихой установки.
-            # Причину пишет сам движок; показываем её сразу, пока журнал на
-            # месте, а не после сборки и не в файле, который никто не откроет.
-            if not self._find_main_exe(app_dir, name):
-                self._report_engine_log_hints(plan)
             self._attempts_made += 1
             self._attempt_history.append((plan.label, rc))
             if self._install_dead_start:
@@ -4489,189 +4291,23 @@ class Portablizer:
         queue.insert(index, plan)
         return True
 
-    #: exe-пакеты Burn-бандла, которые нельзя запускать молча от имени
-    #: программы: это предустановленные runtime'ы и деинсталляторы. Они
-    #: ставятся в систему отдельным шагом (и только с явного согласия), а не
-    #: переносятся в портатив.
-    _BUNDLE_PREREQ_EXE_PREFIXES = (
-        "vcredist", "vc_redist", "vc_redist.x", "dxsetup", "dxwebsetup",
-        "directx", "oalinst", "physx", "ndp", "dotnet", "windowsdesktop-",
-        "aspnetcore-", "netfx", "msedge", "webview2", "wsl",
-        "unins", "uninstall", "setup_uninstall",
-    )
-
-    @classmethod
-    def _bundle_program_installers(cls, payloads: Sequence[str]) -> List[str]:
-        """Установщики программы среди exe-пакетов бандла.
-
-        Burn раскладывает при ``/layout`` ровно то, что потом запускает сам:
-        ``MsiPackage`` — как ``.msi``, ``ExePackage`` — как ``.exe``. Второй
-        случай (Delta и подобные сборки) раньше просто перечислялся в журнале
-        «побочные пакеты в портатив не переносятся», и бандл из одного
-        ExePackage заканчивался пустым ``App``.
-        """
-        found: List[str] = []
-        for path in payloads:
-            base = os.path.basename(path).casefold()
-            if not base.endswith(".exe"):
-                continue
-            if base.startswith(cls._BUNDLE_PREREQ_EXE_PREFIXES):
-                continue
-            found.append(path)
-
-        def _size(item: str) -> int:
-            try:
-                return os.path.getsize(item)
-            except OSError:
-                return 0
-
-        # Главный пакет почти всегда крупнейший: мелкие — это предусловия.
-        found.sort(key=_size, reverse=True)
-        return found
-
-    def _unpack_nested_bundle(
-        self, nested: str, opts: PortableOptions, app_dir: str,
-        data_dir: str, name: str, console_log: Optional[str] = None,
-        depth: int = 0,
-    ) -> bool:
-        """Распаковывает вложенный Burn-бандл через ``/layout`` и ставит пакет.
-
-        Вложенный бандл **не запускается как установщик**: он пишет в реестр
-        запись «установлено», кэширует payload в профиле и при повторном
-        запуске считает программу уже установленной. Дальше Burn уходит в
-        режим обслуживания, где ``Plan`` требует нового ``Detect`` —
-        ``Error 0x8007139f`` в цикле, а ``App`` остаётся пустым (жалоба:
-        «окно установщика раз за разом выдавало ошибку»).
-
-        ``/layout`` не регистрирует ничего: он просто раскладывает пакеты на
-        диск, а MSI из них распаковывается административной установкой
-        (``msiexec /a``) прямо в ``App``.
-        """
-        if depth >= 2:
-            return False
-        sub = os.path.join(os.path.dirname(os.path.abspath(nested)),
-                           "_nested_layout")
-        self.log.info(
-            "Файл из бандла — сам WiX Burn-бандл "
-            f"({os.path.basename(nested)}). Распаковываю его через /layout, "
-            "а не запускаю установку: так в системе не остаётся записи "
-            "«уже установлено», из-за которой установщик зацикливается."
-        )
-        plan = SilentPlan(
-            program=nested, args=["/layout", sub, "/quiet", "/norestart"],
-            notes=["Вложенный Burn-бандл: только раскладка пакетов, без "
-                   "установки в систему."],
-            label="WiX Burn внутри бандла: распаковка /layout",
-            output_dir=sub, extracts_only=True,
-        )
-        self._run_install(plan, opts, app_dir, data_dir,
-                          progress_from=58, progress_to=60,
-                          console_log=console_log)
-        if not os.path.isdir(sub):
-            self.log.warn(
-                "Вложенный бандл не разложил пакеты через /layout."
-            )
-            return False
-        if self._install_layout_packages(
-                sub, opts, app_dir, data_dir, name,
-                console_log=console_log, depth=depth + 1):
-            return True
-        return False
-
-    def _install_bundle_exe_payload(
-        self, nested: str, opts: PortableOptions, app_dir: str,
-        data_dir: str, name: str, console_log: Optional[str] = None,
-        depth: int = 0,
-    ) -> bool:
-        """Ставит exe-пакет бандла его собственными ключами тишины."""
-        if self._nested_is_burn(nested):
-            if self._unpack_nested_bundle(
-                    nested, opts, app_dir, data_dir, name,
-                    console_log=console_log, depth=depth):
-                return True
-            self.log.info(
-                "Раскладка вложенного бандла не дала программы — пробую "
-                "запустить его как установщик со своими ключами Burn."
-            )
-        self.log.info(
-            "В распакованном бандле нет MSI, но есть установщик программы: "
-            f"{os.path.basename(nested)}. Запускаю его своими ключами — "
-            "обёртка их не понимает, а он понимает."
-        )
-        plans = self._plans_for_nested_setup(
-            nested, app_dir, opts, container="бандла")
-        if self._nested_installer_kind(nested) == InstallerType.UNKNOWN:
-            # Движок пакета не опознан: после Inno/NSIS добавляем ещё два
-            # распространённых набора. Пакет из бандла — обычный установщик,
-            # и «код 0 без файлов» чаще всего означает именно чужие ключи.
-            plans.append(SilentPlan(
-                program=nested, args=["/quiet", "/norestart"],
-                notes=["Неизвестный движок: /quiet /norestart без ключа папки "
-                       "— программу потом заберут из каталога по умолчанию."],
-                label="Установщик из бандла: /quiet (папка по умолчанию)",
-                output_dir=app_dir, ignores_target_dir=True,
-                prefers_installer_default_dir=True,
-            ))
-            plans.append(SilentPlan(
-                program=nested, args=["--silent"],
-                notes=["Последняя попытка: --silent — ключ современных "
-                       "bootstrapper'ов."],
-                label="Установщик из бандла: --silent (папка по умолчанию)",
-                output_dir=app_dir, ignores_target_dir=True,
-                prefers_installer_default_dir=True,
-            ))
-        for plan in plans:
-            self._check_cancel()
-            self._run_install(plan, opts, app_dir, data_dir,
-                              progress_from=58, progress_to=60,
-                              console_log=console_log)
-            if self._find_main_exe(app_dir, name):
-                self.log.ok(f"Сработал сценарий: {plan.label}")
-                return True
-        return False
-
     def _install_layout_packages(self, layout_dir: str, opts: PortableOptions,
                                  app_dir: str, data_dir: str,
                                  name: str,
-                                 console_log: Optional[str] = None,
-                                 depth: int = 0) -> bool:
-        """Раскладывает пакеты из подготовленного ``/layout`` прямо в ``App``.
-
-        ``depth`` — сколько вложенных раскладок уже пройдено: бандл внутри
-        бандла встречается, но глубже двух уровней уходить нельзя.
-        """
+                                 console_log: Optional[str] = None) -> bool:
+        """Распаковывает MSI из подготовленного ``/layout`` прямо в ``App``."""
         msis, other_payloads = _burn_layout_payloads(layout_dir)
-        installers = self._bundle_program_installers(other_payloads)
-        skipped = [
-            path for path in other_payloads if path not in installers
-        ]
-        if skipped:
+        if other_payloads:
             self.log.info(
-                "Побочные пакеты бандла (предусловия, msu/msp, "
-                "деинсталляторы) в портатив не переносятся: "
+                "Побочные пакеты бандла (exe/msu/msp) в портатив не "
+                "переносятся: "
                 + ", ".join(sorted(
-                    os.path.basename(p) for p in skipped)[:5])
+                    os.path.basename(p) for p in other_payloads)[:5])
             )
         if not msis:
-            if not installers:
-                self.log.warn(
-                    "В распакованном бандле нет ни MSI-пакета, ни установщика "
-                    "программы — распаковывать нечего."
-                )
-                return False
-            for nested in installers:
-                if self._install_bundle_exe_payload(
-                        nested, opts, app_dir, data_dir, name,
-                        console_log=console_log, depth=depth):
-                    self.log.ok("Пакет бандла установлен в папку App.")
-                    shutil.rmtree(layout_dir, ignore_errors=True)
-                    self.log.info("Временная распаковка бандла удалена.")
-                    return True
             self.log.warn(
-                "Установщик из бандла не дал исполняемых файлов. "
-                f"Распакованное содержимое: {layout_dir} (удаляется после "
-                "сборки). Подробности — в install-layout.log и журнале "
-                "установщика, который Portablizer покажет выше."
+                "В распакованном бандле нет ни одного MSI-пакета — "
+                "распаковывать нечего."
             )
             return False
 
@@ -4692,8 +4328,7 @@ class Portablizer:
 
         self.log.warn(
             "MSI-пакеты не дали исполняемых файлов. Распакованное "
-            f"содержимое: {layout_dir} (удаляется после сборки). Подробности "
-            "— в install-layout.log."
+            f"содержимое оставлено для диагностики: {layout_dir}"
         )
         return False
 
@@ -4863,39 +4498,6 @@ class Portablizer:
             return ""
         self._external_temp_dirs.append(target)
         return target
-
-    #: Служебные папки, которые сборка создаёт в папке портатива. Нужны
-    #: только на время установки: ``_bundle_layout`` — распакованный
-    #: WiX/MSI-бандл, ``_sfx_content`` — содержимое 7-Zip/NSIS-обёртки,
-    #: ``_adobe_payloads`` — пакеты Adobe, ``_unpacked`` — результат
-    #: распаковки 7-Zip, ``_redist_cache`` — скачанные runtime-библиотеки.
-    #: В готовом портативе их быть не должно: пользователь получает ровно
-    #: программу, PortableData и лончеры.
-    _BUILD_SERVICE_DIRS = (
-        "_bundle_layout", "_sfx_content", "_adobe_payloads", "_unpacked",
-        "_redist_cache",
-    )
-
-    def _cleanup_build_leftovers(self, portable_dir: str) -> None:
-        """Удаляет служебные папки сборки из готового портатива."""
-        if not portable_dir or not os.path.isdir(portable_dir):
-            return
-        removed: List[str] = []
-        for dirname in self._BUILD_SERVICE_DIRS:
-            path = os.path.join(portable_dir, dirname)
-            if not os.path.exists(path):
-                continue
-            try:
-                self._remove_path(path)
-            except Exception as exc:  # noqa: BLE001 - уборка не срывает отчёт
-                self.log.debug(
-                    f"  • служебную папку {dirname} удалить не удалось: {exc}")
-            else:
-                removed.append(dirname)
-        if removed:
-            self.log.info(
-                "Служебные папки сборки удалены из портатива: "
-                + ", ".join(removed))
 
     def _cleanup_install_temp(self) -> None:
         """Убирает временные папки, созданные ВНЕ портатива.
@@ -5332,22 +4934,6 @@ class Portablizer:
                 return total
         return total
 
-    @staticmethod
-    def _nested_is_burn(path: str) -> bool:
-        """Вложенный файл — настоящий WiX Burn-бандл?
-
-        Проверяется **структура PE** (секция ``.wixburn``), а не подстрока в
-        байтах: у Burn v7 строки ``WixBurn`` в первых мегабайтах нет, и
-        поиск по байтам опознавал такой файл как «неизвестный установщик».
-        Из-за этого к нему применялись ключи Inno Setup (``/VERYSILENT``,
-        ``/DIR=``), Burn их игнорировал, открывал своё окно и уходил в
-        бесконечный цикл обслуживания (``Error 0x8007139f``).
-        """
-        try:
-            return read_pe_info(path).has_section(".wixburn")
-        except OSError:
-            return False
-
     def _nested_installer_kind(self, path: str) -> InstallerType:
         """Какой движок у установщика, найденного внутри архива.
 
@@ -5355,8 +4941,6 @@ class Portablizer:
         загрузчике (начало), у InstallShield — тоже рядом с ним. Полный
         разбор файла здесь не нужен и стоил бы секунд на гигабайтах.
         """
-        if self._nested_is_burn(path):
-            return InstallerType.WIX_BURN
         try:
             size = os.path.getsize(path)
             chunk = 4 * 1024 * 1024
@@ -5384,18 +4968,15 @@ class Portablizer:
         return InstallerType.UNKNOWN
 
     def _plans_for_nested_setup(self, nested: str, app_dir: str,
-                                opts: PortableOptions,
-                                container: str = "SFX") -> List[SilentPlan]:
-        """Тихие команды для установщика, найденного внутри обёртки.
+                                opts: PortableOptions) -> List[SilentPlan]:
+        """Тихие команды для установщика, найденного внутри SFX.
 
         Обёртке чужие ключи не подходят, а самому установщику — подходят его
         собственные: у Inno Setup это ``/VERYSILENT /DIR=``, у NSIS —
-        ``/S /D=``, у WiX Burn — ``/quiet /install InstallFolder=``. Порядок —
-        от точного к общему. ``container`` — откуда взят установщик (SFX или
-        бандл), только для понятных подписей в журнале.
+        ``/S /D=``. Порядок — от точного к общему.
         """
         kind = self._nested_installer_kind(nested)
-        label_suffix = f" (внутри {container}: {os.path.basename(nested)})"
+        label_suffix = f" (внутри SFX: {os.path.basename(nested)})"
         plans: List[SilentPlan] = []
         if kind == InstallerType.INNO:
             args = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
@@ -5438,32 +5019,6 @@ class Portablizer:
                        "установка через /s и свойства MSI."],
                 label="InstallShield внутри SFX: /s /v/qn" + label_suffix,
                 output_dir=app_dir,
-            ))
-        elif kind == InstallerType.WIX_BURN:
-            # Бандл внутри бандла: Delta и подобные сборки кладут на
-            # /layout не MSI, а собственный установщик, который сам является
-            # Burn-бандлом. Ему нужны его же ключи, а папка — через
-            # публичную переменную InstallFolder.
-            plans.append(SilentPlan(
-                program=nested,
-                args=["/quiet", "/norestart", "/install"],
-                raw_tail=f'InstallFolder="{app_dir}"',
-                notes=["Вложенный WiX Burn: /quiet /install + InstallFolder. "
-                       "Ключи обёртки ему не подходят."],
-                label=("WiX Burn внутри " + container + ": /quiet /install + "
-                       "InstallFolder" + label_suffix),
-                output_dir=app_dir,
-            ))
-            plans.append(SilentPlan(
-                program=nested,
-                args=["/quiet", "/norestart", "/install"],
-                notes=["Тот же вложенный бандл без InstallFolder: путь берётся "
-                       "из настроек, готовую программу сборка заберёт из "
-                       "каталога по умолчанию."],
-                label=("WiX Burn внутри " + container + " без InstallFolder"
-                       + label_suffix),
-                output_dir=app_dir, ignores_target_dir=True,
-                prefers_installer_default_dir=True,
             ))
         if not plans:
             # Движок не опознан: пробуем два самых распространённых набора.
@@ -5562,8 +5117,6 @@ class Portablizer:
                     continue
                 base = f.lower()
                 if base in cls._PAYLOAD_INSTALLER_NAMES or base.startswith(bad_prefixes):
-                    continue
-                if base in ("launchportable.exe", "portablelauncher.exe"):
                     continue
                 stem = os.path.splitext(f)[0]
                 # Даём положительный базовый балл любому не-служебному exe
@@ -6855,125 +6408,6 @@ class Portablizer:
             layout=self._adobe_layout,
         )
 
-    # -- профиль браузера ------------------------------------------------------
-    #
-    # Установщик (и программа, которую он запускает галочкой «Запустить»)
-    # получает перенаправленный профиль. Если в этот момент открывается
-    # страница входа, оболочка Windows запускает браузер по умолчанию с ЭТИМ
-    # профилем: браузер не находит своего каталога, создаёт второй профиль, а
-    # не найдя рядом обновлятор — запускает установку заново. Всё это
-    # оказывается внутри PortableData и уезжает вместе с портативом: именно
-    # так появлялся «второй такой же браузер».
-    #
-    # На запущенном портативе это решает лончер (junction'ы на настоящий
-    # профиль). Сборка обязана решить обратное: в папке портатива не должно
-    # остаться ни копии браузера, ни ссылки на чужой профиль — иначе они уедут
-    # вместе с портативом на другой компьютер.
-
-    #: Начало имени установщика (или exe) самого браузера. Такой портатив —
-    #: это браузер, и каталоги браузера в PortableData принадлежат ЕМУ.
-    _BROWSER_STEM_PREFIXES = (
-        "chrome", "chromium", "googlechrome", "msedge", "microsoftedge",
-        "edge", "firefox", "brave", "vivaldi", "opera", "yandex", "thorium",
-        "waterfox", "librewolf", "zenbrowser",
-    )
-
-    @classmethod
-    def _installer_is_browser(cls, installer_path: str) -> bool:
-        """True, если портатив собирается из установщика самого браузера.
-
-        Тогда каталоги браузера внутри ``PortableData`` — не чужая копия,
-        а данные самой программы (её профиль, ``Application`` и обновлятор).
-        Трогать их нельзя ни при какой чистке: браузер без своего каталога и
-        без обновлятора решает, что не установлен, и запускает установщик —
-        в том числе при каждом клике по ярлыку готового портатива.
-        """
-        stem = os.path.splitext(os.path.basename(str(installer_path or "")))[0]
-        stem = stem.casefold().replace(" ", "").replace("-", "").replace("_", "")
-        if not stem:
-            return False
-        return any(stem.startswith(prefix)
-                   for prefix in cls._BROWSER_STEM_PREFIXES)
-
-    @staticmethod
-    def _browser_profile_paths(data_dir: str) -> List[Tuple[str, str]]:
-        """Пары (путь в перенаправленном профиле, путь на этом ПК)."""
-        pairs: List[Tuple[str, str]] = []
-        roaming = os.path.join(data_dir, "AppData", "Roaming")
-        local = os.path.join(data_dir, "AppData", "Local")
-        for var, rel in launcher_mod.browser_profile_pairs():
-            host_root = os.environ.get(var, "")
-            if not host_root:
-                continue
-            portable_root = roaming if var.upper() == "APPDATA" else local
-            host = os.path.join(host_root, rel.replace("/", os.sep))
-            portable = os.path.join(portable_root, rel.replace("/", os.sep))
-            if os.path.isdir(host):
-                pairs.append((portable, host))
-        return pairs
-
-    def _unlink_browser_profiles(self, data_dir: str) -> None:
-        """Снять ссылки на профиль браузера: они не должны уехать с портативом."""
-        for portable, _host in self._browser_profile_paths(data_dir):
-            try:
-                if not _is_reparse_point(portable):
-                    continue
-                os.rmdir(portable)
-            except OSError:
-                try:
-                    os.unlink(portable)
-                except OSError:
-                    continue
-
-    def _drop_browser_duplicates(self, data_dir: str,
-                                installer_path: str = "") -> List[str]:
-        """Удалить профили браузеров, попавшие в портатив.
-
-        Каталог браузера внутри ``PortableData`` — не данные программы, а
-        копия браузера, созданная из-за перенаправленного профиля (или
-        приехавшая из прошлой сборки). Ссылки (junction) не трогаем: за ними
-        настоящий профиль пользователя.
-
-        Два исключения, без которых ломается обычный запуск:
-
-        * портатив собирается из установщика браузера — тогда это его
-          собственные каталоги;
-        * в каталоге лежат exe/dll — значит, это установленная программа
-          (или её обновлятор), а не профиль. Удалённый обновлятор заставляет
-          браузер запускать установщик при каждом старте.
-        """
-        removed: List[str] = []
-        if installer_path and self._installer_is_browser(installer_path):
-            self.log.debug(
-                "Собирается сам браузер: каталоги браузера в PortableData — "
-                "данные программы, а не дубликат профиля. Не трогаем их: "
-                "без них браузер при каждом запуске ставит себя заново.")
-            return removed
-        roaming = os.path.join(data_dir, "AppData", "Roaming")
-        local = os.path.join(data_dir, "AppData", "Local")
-        for var, rel in launcher_mod.browser_profile_pairs():
-            root = roaming if var.upper() == "APPDATA" else local
-            path = os.path.join(root, rel.replace("/", os.sep))
-            try:
-                if not os.path.exists(path) or _is_reparse_point(path):
-                    continue
-                if launcher_mod.browser_dir_holds_program(path):
-                    self.log.debug(
-                        "Оставлен каталог с исполняемыми файлами: " + path
-                        + " — это программа (или её обновлятор), а не профиль.")
-                    continue
-                shutil.rmtree(path, ignore_errors=True)
-                if not os.path.exists(path):
-                    removed.append(path)
-            except OSError:
-                continue
-        for path in removed[:4]:
-            self.log.debug("Удалён дубликат профиля браузера: " + path)
-        if len(removed) > 4:
-            self.log.debug(
-                f"Удалено дубликатов профиля браузера: {len(removed)}")
-        return removed
-
     def _build_isolated_env(self, opts: PortableOptions,
                             data_dir: str) -> Dict[str, str]:
         env = dict(os.environ)
@@ -7174,37 +6608,6 @@ class Portablizer:
                 ))
         return result
 
-    @staticmethod
-    def _process_images() -> Set[str]:
-        """Нормализованные пути образов всех процессов системы."""
-        try:
-            images = procutil.all_process_images()
-        except Exception:  # noqa: BLE001 - опрос процессов необязателен
-            return set()
-        return {
-            os.path.normcase(os.path.abspath(image))
-            for image in images if image
-        }
-
-    def _remember_install_images(self, before: Set[str]) -> None:
-        """Запоминает, какие процессы появились за время установки.
-
-        Установщик запускает либо саму программу (галочка «Запустить»,
-        автостарт после установки), либо свои помощники — и то и другое
-        доказывает, какие файлы относятся к этой программе. Без такого
-        доказательства Portablizer раньше мог взять в ``App`` чужой exe,
-        который просто лежал рядом (жалоба: запускался Media Player Classic
-        вместо установленной программы).
-        """
-        fresh = self._process_images() - before
-        if not fresh:
-            return
-        self._install_images |= fresh
-        names = sorted({os.path.basename(path) for path in fresh})
-        self.log.debug(
-            "Установщик запустил процессы: " + ", ".join(names[:8])
-            + ("…" if len(names) > 8 else ""))
-
     def _snapshot_install_locations(self, data_dir: str) -> Dict[str, Set[str]]:
         """Запоминает потомков типовых мест установки на глубине до двух."""
         snapshot: Dict[str, Set[str]] = {}
@@ -7397,80 +6800,6 @@ class Portablizer:
             if overwrite or not os.path.exists(destination):
                 shutil.copy2(source_abs, destination)
 
-    @classmethod
-    def _installer_is_layout(cls, installer_path: str) -> bool:
-        """Выбран ``setup.exe``-подобный файл, а не сама программа.
-
-        Рядом с таким файлом лежит раскладка дистрибутива (``data1.cab``,
-        ``setup.ins``, ``*.bin``, MSI), без которой программу не поставить.
-        Только её разрешено копировать в ``App`` целиком.
-        """
-        base = os.path.basename(installer_path or "").casefold()
-        return base in _LAYOUT_INSTALLER_NAMES
-
-    @classmethod
-    def _looks_like_ready_program(cls, det: Optional[DetectionResult],
-                                  installer_path: str) -> bool:
-        """Выбранный файл — готовая программа, а не установщик.
-
-        Так выглядит «портативный» exe: ни одной сигнатуры движка установки
-        (``UNKNOWN``), нет собственных ключей тишины, манифеста
-        ``requireAdministrator``, приклеенного ZIP и профиля производителя.
-        Такой файл незачем запускать с ключами установки: в ``App``
-        переносится **только он сам**, а файлы, лежащие рядом с ним
-        (загрузки, документы, чужие архивы), к программе не относятся.
-
-        Имя файла проверяется отдельно: если в нём есть ``setup``/``install``/
-        ``repack``, это установщик, даже когда сигнатуры внутри не нашлись.
-        """
-        if not installer_path:
-            return False
-        if os.path.splitext(installer_path)[1].casefold() != ".exe":
-            return False
-        stem = os.path.splitext(os.path.basename(installer_path))[0]
-        if (cls._installer_is_layout(installer_path)
-                or _INSTALLER_NAME_RE.search(stem)):
-            return False
-        if det is None or det.installer_type != InstallerType.UNKNOWN:
-            return False
-        if det.vendor_name or det.repack_profile is not None:
-            return False
-        if det.switch_hints or det.requires_admin or det.is_downloader_stub:
-            return False
-        if det.has_zip_payload or det.adobe_named or det.adobe_layout:
-            return False
-        if det.response_files or det.is_msi:
-            return False
-        try:
-            return read_pe_info(installer_path).is_pe
-        except OSError:
-            return False
-
-    def _copy_program_exe(self, installer_path: str, app_dir: str,
-                          app_name: str) -> bool:
-        """Копирует готовый exe в ``App``, не трогая соседние файлы."""
-        destination = os.path.join(app_dir, os.path.basename(installer_path))
-        try:
-            if os.path.normcase(os.path.abspath(destination)) != os.path.normcase(
-                    os.path.abspath(installer_path)):
-                shutil.copy2(installer_path, destination)
-        except OSError as exc:
-            self.log.warn(
-                f"Не удалось скопировать готовый exe в App: {exc}")
-            return False
-        if not self._find_main_exe(app_dir, app_name):
-            try:
-                os.remove(destination)
-            except OSError:
-                pass
-            return False
-        self._adopted_program_exe = True
-        self.log.ok(
-            f"В App скопирован только сам exe: {os.path.basename(installer_path)}. "
-            "Файлы, лежащие рядом с ним, не переносились."
-        )
-        return True
-
     def _supplement_recovered_from_registry(
         self,
         app_dir: str,
@@ -7507,16 +6836,6 @@ class Portablizer:
                 continue
             if (src_norm == installer_dir_norm
                     or src_norm.startswith(installer_dir_norm + os.sep)):
-                if not self._installer_is_layout(installer_path):
-                    # Реестр указывает внутрь папки самого переносимого exe.
-                    # Это не каталог установки: рядом могут лежать любые
-                    # чужие файлы (загрузки, документы, архивы), и раньше они
-                    # целиком уезжали в App. Докопировать отсюда нечего.
-                    self.log.debug(
-                        "  • реестр ссылается на папку самого exe — соседние "
-                        "файлы в App не копирую."
-                    )
-                    continue
                 self._remember_recovered_source(installer_dir)
                 try:
                     self._copy_recovered_tree(
@@ -7526,63 +6845,6 @@ class Portablizer:
                     pass
             elif self._name_score(os.path.basename(src), keys) >= 125:
                 self._remember_recovered_source(src)
-
-    def _confirm_install_source(
-        self,
-        source: str,
-        source_norm: str,
-        candidates: Dict[str, Tuple[int, str, str, str]],
-        known_entries: Set[str],
-        identity_score,
-        trusted: bool,
-    ) -> None:
-        """Оставляет кандидата только при доказательстве принадлежности.
-
-        Правило сборки: в ``App`` попадают файлы **только той программы,
-        которую поставил выбранный установщик**. Раньше достаточно было
-        «каталог появился во время установки», и Portablizer забирал чужую
-        папку, если её создал любой другой процесс (обновлятор, браузер,
-        открытая пользователем программа). Жалоба: портатив из
-        ``delta-...-setup.exe`` запускал Media Player Classic.
-
-        Доказательством считается одно из:
-
-        * exe источника — это процесс, **запущенный этим установщиком**
-          (снимок процессов до/после установки);
-        * имя exe совпадает с именем устанавливаемой программы;
-        * источник указан новым ярлыком или новой записью ``InstallLocation``
-          в реестре, которых до установки не существовало.
-
-        Сомнительный источник отбрасывается с записью в журнал: лучше честно
-        продолжить поиск (или сообщить о неудаче), чем выдать портатив с чужой
-        программой внутри.
-        """
-        entry = candidates.get(source_norm)
-        if entry is None:
-            return
-        score, exe, reason, _source = entry
-        exe_norm = os.path.normcase(os.path.abspath(exe))
-        started = bool(self._install_images) and exe_norm in self._install_images
-        identity = int(identity_score(exe, source) or 0)
-        if started:
-            candidates[source_norm] = (
-                max(score, 400) + 60,
-                exe,
-                "программа, запущенная установщиком",
-                source,
-            )
-            return
-        if identity >= 80:
-            candidates[source_norm] = (score, exe, reason, source)
-            return
-        if trusted and source_norm not in known_entries:
-            candidates[source_norm] = (score, exe, reason, source)
-            return
-        candidates.pop(source_norm, None)
-        self.log.debug(
-            "  • каталог пропущен: ни один exe в нём не относится к "
-            f"устанавливаемой программе — {source}"
-        )
 
     def _recover_installed_app(
         self,
@@ -7622,62 +6884,12 @@ class Portablizer:
         installer_dir_norm = (
             os.path.normcase(installer_dir) if installer_dir else ""
         )
-        installer_is_layout = self._installer_is_layout(installer_abs)
-        ready_program = self._looks_like_ready_program(
-            self._detection, installer_abs)
-        # Все потомки мест установки, которые существовали ДО установщика.
-        # Нужны, чтобы отличать «эту установку» от чужой программы, которую
-        # пользователь поставил раньше.
-        known_entries: Set[str] = set()
-        for items in before.values():
-            known_entries |= items
         # normalized source -> (score, representative exe, explanation, source)
         candidates: Dict[str, Tuple[int, str, str, str]] = {}
 
-        def identity_score(exe_path: str, source: str = "") -> int:
-            """Насколько exe и каталог похожи на устанавливаемую программу.
-
-            Имя каталога тоже доказательство: установщик с безликим
-            ``setup.exe`` внутри папки «Multitran 03.11.2023» кладёт рядом
-            ``network.exe``, и по имени файла программу не узнать.
-            """
-            base = os.path.basename(exe_path)
-            stem = os.path.splitext(base)[0]
-            score = max(self._name_score(base, keys),
-                        self._app_name_score(stem, app_name))
-            if source and os.path.isdir(source):
-                score = max(score, self._name_score(
-                    os.path.basename(source), keys))
-            return score
-
-        def add_source(source: str, score: int, reason: str,
-                       trusted: bool = False) -> None:
+        def add_source(source: str, score: int, reason: str) -> None:
             source = os.path.abspath(source)
             source_norm = os.path.normcase(source)
-            # Папка, в которой лежит сам переносимый exe (или её предок), —
-            # не «каталог установки». Раньше она копировалась целиком, и в App
-            # уезжали все соседние файлы: загрузки, документы, чужие архивы.
-            # Исключение — setup.exe с раскладкой дистрибутива: без data*.cab
-            # и *.bin он бесполезен, поэтому берём именно его папку, а не
-            # весь предок.
-            if (installer_abs_norm and os.path.isdir(source)
-                    and (installer_abs_norm == source_norm
-                         or installer_abs_norm.startswith(source_norm + os.sep))):
-                if installer_is_layout:
-                    source = installer_dir
-                    source_norm = installer_dir_norm
-                elif ready_program:
-                    source = installer_abs
-                    source_norm = installer_abs_norm
-                    score = max(score, 300)
-                    reason = ("сам переносимый exe: соседние файлы "
-                              "не копируются")
-                else:
-                    self.log.debug(
-                        "  • источник оказался папкой самого установщика — "
-                        "соседние с ним файлы в App не копирую."
-                    )
-                    return
             # Никогда не копируем Program Files/AppData/корень диска целиком
             # или саму папку собираемого портатива.
             if (source_norm in protected_roots
@@ -7694,8 +6906,7 @@ class Portablizer:
             for exe in exes:
                 exe_abs = os.path.abspath(exe)
                 exe_norm = os.path.normcase(exe_abs)
-                if (installer_abs_norm and exe_norm == installer_abs_norm
-                        and not ready_program):
+                if installer_abs_norm and exe_norm == installer_abs_norm:
                     continue
                 if (exe_norm == app_dir_norm
                         or exe_norm.startswith(app_dir_norm + os.sep)):
@@ -7714,24 +6925,18 @@ class Portablizer:
                 previous = candidates.get(source_norm)
                 if previous is None or exe_score > previous[0]:
                     candidates[source_norm] = (exe_score, exe, reason, source)
-            if source_norm in candidates:
-                self._confirm_install_source(
-                    source, source_norm, candidates, known_entries,
-                    identity_score, trusted)
 
         # Цели новых ярлыков, созданных установщиком на Рабочем столе / в Пуске.
         for location in shortcut_locations:
             location = os.path.abspath(location)
             source = os.path.dirname(location) if os.path.isfile(location) else location
-            add_source(source, 250, "цель ярлыка, созданного установщиком",
-                       trusted=True)
+            add_source(source, 250, "цель ярлыка, созданного установщиком")
 
         # InstallLocation/DisplayIcon и локальные пути из новых записей реестра.
         for location in registry_locations:
             location = os.path.abspath(location)
             source = os.path.dirname(location) if os.path.isfile(location) else location
-            add_source(source, 240, "новая запись InstallLocation в реестре",
-                       trusted=True)
+            add_source(source, 240, "новая запись InstallLocation в реестре")
 
         for root, priority, owned in search_roots:
             root_key = os.path.normcase(os.path.abspath(root))
@@ -7753,8 +6958,7 @@ class Portablizer:
                 is_exe = is_file and entry_name.lower().endswith(".exe")
                 if not is_dir and not is_exe:
                     continue
-                reason = ("перенаправленный профиль" if owned
-                          else "новый каталог установки")
+                reason = "перенаправленный профиль" if owned else "новый каталог установки"
                 bonus = 55 if is_new else 0
                 if owned:
                     bonus += 35
@@ -7827,12 +7031,6 @@ class Portablizer:
                 return True
             shutil.rmtree(app_dir, ignore_errors=True)
             os.makedirs(app_dir, exist_ok=True)
-
-        # Ни один каталог установки не подошёл, а выбранный файл — готовая
-        # программа. Копируем в App только сам exe: именно этого пользователь
-        # и ждёт, когда «портирует» уже портативную программу.
-        if ready_program:
-            return self._copy_program_exe(installer_abs, app_dir, app_name)
         return False
 
     def _cleanup_leftover_install_dirs(
@@ -8471,54 +7669,17 @@ class Portablizer:
         if not candidates:
             return None, []
 
-        # Установщик не может быть «главной программой»: если в App вместе с
-        # ним лежит настоящая программа, установщик из списка убирается.
-        # Иначе готовая сборка запускала бы мастер установки по клику —
-        # вместо предустановленной программы.
-        # «Language_Setup.exe» и «Graphic_Setup.exe» — не установщики, а
-        # утилиты настройки самой игры, поэтому слова-подсказки настроек
-        # оставляют такой файл в списке.
-        config_hints = ("config", "setting", "option", "language", "lang",
-                        "video", "graphic", "display", "resolution", "audio",
-                        "sound")
-        programs = []
-        for path in candidates:
-            stem = os.path.splitext(os.path.basename(path))[0]
-            if (_INSTALLER_NAME_RE.search(stem)
-                    and not any(hint in stem.casefold()
-                                for hint in config_hints)):
-                continue
-            programs.append(path)
-        if programs and len(programs) != len(candidates):
-            for path in candidates:
-                if path not in programs:
-                    self.log.debug(
-                        "Установщик не считается программой: "
-                        + os.path.relpath(path, app_dir))
-            candidates = programs
-        elif not programs:
-            self.log.warn(
-                "В App лежат только установщики: запускать их по клику "
-                "нельзя. Проверьте, что установка действительно завершилась.")
-
         bad_prefixes = (
             "unins", "vcredist", "vc_redist", "dxsetup", "oalinst",
             "crashpad", "crashreport", "unitycrashhandler", "werfault",
             "bugreport", "epicwebhelper", "update", "helper", "feedback",
         )
-        # Сам лончер портатива тоже лежит в App. Главной программой он быть
-        # не может: иначе Launch.bat запускает лончер, а тот — снова себя.
-        own_launchers = {
-            "launchportable.exe", "portablelauncher.exe", "relauncher.exe",
-        }
 
         non_ignored: List[Tuple[int, str, str, str, str]] = []
 
         for p in candidates:
             base = os.path.basename(p).lower()
             stem = os.path.splitext(os.path.basename(p))[0]
-            if base in own_launchers:
-                continue
             if base.startswith("unins") or base == "uninstall.exe":
                 continue
             if any(b in base for b in bad_prefixes):
@@ -8566,41 +7727,12 @@ class Portablizer:
             # Size is a weak hint: a 40 MB mod editor must not beat a 5 MB
             # game exe that actually matches the title.
             s += min(12, int(size / (1024 * 1024)))
-            # Файл, который установщик действительно запускал (галочка
-            # «Запустить программу», автостарт после установки), — самый
-            # надёжный признак главного exe. Так Launch.bat перестаёт
-            # запускать чужой бинарник, случайно оказавшийся в App.
-            if self._install_images:
-                if os.path.normcase(os.path.abspath(p)) in self._install_images:
-                    s += 200
             non_ignored.append((s, p, stem, role, desc))
 
         if not non_ignored:
             return None, []
 
         non_ignored.sort(key=lambda x: x[0], reverse=True)
-        warned = getattr(self, "_main_exe_warned", None)
-        if warned is None:
-            warned = self._main_exe_warned = set()
-        if len(non_ignored) > 1 and os.path.normcase(app_dir) not in warned:
-            best = non_ignored[0]
-            best_stem = os.path.splitext(os.path.basename(best[1]))[0]
-            started = (
-                bool(self._install_images)
-                and os.path.normcase(os.path.abspath(best[1])) in self._install_images
-            )
-            if (not started
-                    and self._app_name_score(best_stem, app_name) < 80
-                    and self._name_score(best[1], self._name_keys(
-                        app_name, getattr(self, "_installer_name", "") or "")) < 80):
-                warned.add(os.path.normcase(app_dir))
-                self.log.warn(
-                    "В App несколько исполняемых файлов, и главный «"
-                    f"{os.path.basename(best[1])}» не похож на «{app_name}». "
-                    "Проверьте содержимое App: если программа другая, "
-                    "пришлите portablizer.log — сборка не должна была "
-                    "копировать чужие файлы."
-                )
         # Launch.bat must start the game or its launcher, never a bonus
         # editor (Witcher ``djinni.exe``) just because it is large.
         preferred = [item for item in non_ignored if item[3] == "main"]
