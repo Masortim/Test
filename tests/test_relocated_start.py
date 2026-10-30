@@ -942,9 +942,15 @@ class RegistrySnapshotTests(unittest.TestCase):
             session = entry.RegistrySession(root, cfg)
             session.active = True
             calls = []
+            snapshot_text = (
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Cursor]\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Cursor2]\r\n")
             with mock.patch.object(entry, "IS_WINDOWS", True), \
                     mock.patch.object(entry, "export_registry_text",
-                                      return_value="Windows Registry Editor Version 5.00\r\n"), \
+                                      return_value=snapshot_text), \
+                    mock.patch.object(entry, "registry_key_state",
+                                      return_value=True), \
                     mock.patch.object(entry, "_reg",
                                       side_effect=lambda args: calls.append(args) or 0):
                 baseline, created = session._snapshot_host()

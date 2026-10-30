@@ -45,6 +45,25 @@ from portablizer.core.silentargs import (
 )
 
 
+_ASSOCIATION_SNAPSHOT_PATCH = None
+
+
+def setUpModule():
+    global _ASSOCIATION_SNAPSHOT_PATCH
+    # Здесь установщики — двойники, а тесты проверяют файлы и планы. На
+    # Windows полный обход Classes занимает десятки секунд на каждый run();
+    # настоящая защита HKCU/cmd/PowerShell проверяется в test_registry_safety.
+    _ASSOCIATION_SNAPSHOT_PATCH = mock.patch(
+        "portablizer.core.portablizer.reg_mod.snapshot_associations",
+        return_value={})
+    _ASSOCIATION_SNAPSHOT_PATCH.start()
+
+
+def tearDownModule():
+    if _ASSOCIATION_SNAPSHOT_PATCH is not None:
+        _ASSOCIATION_SNAPSHOT_PATCH.stop()
+
+
 def _labels(bat: str):
     return {line[1:].strip() for line in bat.splitlines()
             if line.startswith(":") and not line.startswith("::")}
