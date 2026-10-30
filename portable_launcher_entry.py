@@ -4864,6 +4864,23 @@ def _select_target(cfg: Dict[str, Any], arguments: Sequence[str]
     return target_rel, forwarded, selected_role != "main"
 
 
+#: Слова, по которым файл — установщик, а не программа.
+_INSTALLER_WORDS = ("setup", "install", "instal", "unins", "repack", "bundle",
+                    "unpack", "extract")
+
+
+def _looks_like_installer_name(value: str) -> bool:
+    """True, если имя файла принадлежит установщику, а не программе.
+
+    Готовая сборка не должна запускать мастер установки по клику: если
+    конфиг почему-то указывает на ``*Setup.exe``, лончер ищет настоящую
+    программу в ``App`` и правит конфиг, а не открывает установщик.
+    """
+    name = _image_name(str(value)).casefold()
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    return bool(stem) and any(word in stem for word in _INSTALLER_WORDS)
+
+
 #: Служебные exe, которые не могут быть «главной программой».
 _TARGET_JUNK = ("unins", "uninstall", "update", "updater", "setup", "install",
                 "crashpad", "crashhandler", "crashreport", "elevate", "helper",
@@ -4910,6 +4927,10 @@ def _find_replacement_target(root: Path, wanted: str) -> "Optional[Path]":
                 break
             path = Path(current) / name
             folded = name.casefold()
+            if _looks_like_installer_name(folded):
+                # Установщик в App — не программа: запускать его по клику
+                # нельзя, даже если имя совпало с записанной целью.
+                continue
             if folded == wanted_name:
                 same_name.append(path)
                 continue
@@ -4949,14 +4970,24 @@ def _remember_target(root: Path, new_rel: str) -> bool:
         return False
 
 
-def _repair_missing_target(root: Path, cfg: Dict[str, Any], target_rel: str) -> str:
-    """Returns a usable target path, repairing the config when it is stale."""
+def _repair_missing_target(root: Path, cfg: Dict[str, Any], target_rel: str,
+                           allow_installer: bool = False) -> str:
+    """Returns a usable target path, repairing the config when it is stale.
+
+    ``allow_installer`` — цель выбрана явно (``--target`` от вспомогательного
+    запускателя): тогда имя файла не повод искать замену.
+    """
     target = _as_relative_path(root, target_rel)
+    installer_like = (not allow_installer
+                      and _looks_like_installer_name(target_rel))
     try:
-        if target.is_file():
+        if target.is_file() and not installer_like:
             return target_rel
     except OSError:
         pass
+    if installer_like:
+        _run_log(root, f"target: {target_rel} is an installer, not the "
+                       "program; looking for the real program in App")
     replacement = _find_replacement_target(root, target_rel)
     if replacement is None:
         return target_rel
@@ -5821,6 +5852,36 @@ def _remove_tree(path: Path) -> bool:
     return not path.exists()
 
 
+#: Расширения файлов, по которым каталог — установленная программа.
+_PROGRAM_SUFFIXES = (".exe", ".dll")
+
+
+def _dir_holds_program(path: Path, max_depth: int = 3) -> bool:
+    """True, если в каталоге лежит сама программа (exe/dll), а не профиль.
+
+    У браузера, установленного для одного пользователя, профиль и программа
+    делят один каталог: ``Local\\Google\\Chrome`` содержит и ``User Data``, и
+    ``Application\\chrome.exe``, а рядом стоит ``Google\\Update`` со своим
+    ``GoogleUpdate.exe``. Такой каталог — установленная программа, а не
+    дубликат профиля: удалять его (особенно обновлятор) нельзя, иначе
+    браузер решает, что не установлен, и запускает УСТАНОВЩИК при каждом
+    старте. Профиль же никогда не содержит exe/dll.
+    """
+    root = str(path).replace("\\", os.sep)
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    try:
+        for current, dirs, files in os.walk(root, followlinks=False):
+            depth = current.rstrip(os.sep).count(os.sep) - base_depth
+            if depth >= max_depth:
+                dirs[:] = []
+            for name in files:
+                if name.casefold().endswith(_PROGRAM_SUFFIXES):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def _process_table(full_paths: bool = False) -> "list[tuple[int, int, str]]":
     """Все процессы системы: ``(pid, parent_pid, имя или путь к exe)``.
 
@@ -6237,6 +6298,11 @@ class BrowserLoginBridge:
             try:
                 if not path.exists() or _is_junction(path):
                     continue
+                if _dir_holds_program(path):
+                    self.log("browser login: kept " + str(path)
+                             + " - it holds the program itself (exe/dll), "
+                               "not a duplicate profile")
+                    continue
                 if _remove_tree(path):
                     removed.append(str(path))
             except OSError:
@@ -6294,6 +6360,11 @@ class BrowserLoginBridge:
                 continue
             try:
                 if not path.exists() or _is_junction(path):
+                    continue
+                if _dir_holds_program(path):
+                    self.log("browser login: kept " + str(path)
+                             + " - it holds the program itself (exe/dll), "
+                               "not a duplicate profile")
                     continue
                 if _remove_tree(path):
                     removed.append(str(path))
@@ -12351,7 +12422,8 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # Cursor уносит exe в промежуточную папку), переименование, конфиг от
     # сборки на прежнем диске. Ищем программу в App и правим конфиг, вместо
     # того чтобы показать «файл не найден» и не запустить ничего.
-    target_rel = _repair_missing_target(root, cfg, target_rel)
+    target_rel = _repair_missing_target(root, cfg, target_rel,
+                                        allow_installer=needs_machine)
     already_elevated = any(
         str(arg).casefold() == "--elevated" for arg in raw_arguments)
     registry_cfg = cfg.get("registry", {})
@@ -12463,6 +12535,18 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                 "Похоже, папка App неполная (или программу обновил её "
                 "собственный апдейтер). Запустите Launch.bat --diagnose: "
                 "отчёт покажет, что лежит в App.")
+    if not needs_machine and _looks_like_installer_name(target.name):
+        # Мастер установки по клику не запускаем: он поставил бы программу
+        # заново (ровно на это и жаловались — «запускается установщик»).
+        _run_log(root, f"target: {target.name} is an installer; refusing to "
+                       "start it as the program")
+        raise FileNotFoundError(
+            f"В папке программы нет готовой программы — только установщик:"
+            f"\n{target}\n\n"
+            "Установщик по клику не запускается: он поставил бы программу "
+            "заново. Пересоберите портатив (Portablizer) или укажите в "
+            "launcher_config.json настоящий exe программы. Отчёт о том, что "
+            "лежит в App: Launch.bat --diagnose.")
 
     # Предстартовая проверка распространяемых компонентов: лучше назвать
     # пакет, чем оставить пользователя наедине с окном Windows
