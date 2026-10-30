@@ -263,6 +263,27 @@ jobs:
               Format-Table -AutoSize
             throw "Delta.exe was not unpacked into App"
           }
+          $deltaApp = Get-ChildItem (Join-Path $portable "App") `
+            -Recurse -File -Filter "delta-app.exe" | Select-Object -First 1
+          if (-not $deltaApp) {
+            throw "delta-app.exe was not unpacked into App"
+          }
+          $versionOut = Join-Path $root "delta-version.out"
+          $versionErr = Join-Path $root "delta-version.err"
+          $versionProcess = Start-Process -FilePath $deltaApp.FullName `
+            -ArgumentList "--version" -PassThru `
+            -RedirectStandardOutput $versionOut -RedirectStandardError $versionErr
+          if (-not $versionProcess.WaitForExit(30000)) {
+            $versionProcess.Kill()
+            throw "delta-app.exe --version did not exit within 30 s"
+          }
+          $versionText = ((Get-Content $versionOut -Raw) +
+            (Get-Content $versionErr -Raw)).Trim()
+          if ($versionProcess.ExitCode -ne 0 -or
+              $versionText -notmatch '0\.23\.0') {
+            throw "delta-app.exe --version failed ($($versionProcess.ExitCode)): $versionText"
+          }
+          Write-Host "Delta runtime check: $versionText"
           $appFiles = @(Get-ChildItem (Join-Path $portable "App") -Recurse -File)
           $appBytes = ($appFiles | Measure-Object Length -Sum).Sum
           if ($appFiles.Count -lt 5 -or $appBytes -lt 1MB) {
