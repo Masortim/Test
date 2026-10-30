@@ -240,9 +240,25 @@ jobs:
             throw "Delta portable build failed with exit $($process.ExitCode)"
           }
 
+          Write-Host "Delta builder exit: $($process.ExitCode)"
+          $debugBuildLog = Join-Path $portable "portablizer.log"
+          if (Test-Path $debugBuildLog) {
+            Write-Host "--- Delta portablizer.log (tail) ---"
+            Get-Content $debugBuildLog -Tail 220 | ForEach-Object { Write-Host $_ }
+          }
+          $debugInstallerOutput = Join-Path $portable "installer-output.log"
+          if (Test-Path $debugInstallerOutput) {
+            Write-Host "--- Delta installer-output.log (tail) ---"
+            Get-Content $debugInstallerOutput -Tail 140 |
+              ForEach-Object { Write-Host $_ }
+          }
+
           $mainExe = Get-ChildItem (Join-Path $portable "App") `
             -Recurse -File -Filter "Delta.exe" | Select-Object -First 1
           if (-not $mainExe) {
+            Get-ChildItem (Join-Path $portable "App") -Recurse -File |
+              Select-Object -First 100 FullName, Length |
+              Format-Table -AutoSize
             throw "Delta.exe was not unpacked into App"
           }
           $appFiles = @(Get-ChildItem (Join-Path $portable "App") -Recurse -File)
