@@ -216,10 +216,17 @@ class AssociationSnapshotTests(unittest.TestCase):
                          {"ProgId": (1, "Notepad++"),
                           "Hash": (1, "def456")})
 
-    def test_snapshot_is_empty_off_windows(self):
-        self.assertEqual(registry.snapshot_file_associations(), {})
-        self.assertEqual(registry.restore_file_associations(
-            {r"HKCU\Software\Classes\.pdf": {"": (1, repr("x"))}}), [])
+    def test_outside_windows_nothing_is_read_or_written(self):
+        """Без Windows реестра нет: снимок пуст, восстанавливать нечего.
+
+        ``IS_WINDOWS`` подменяется явно: на настоящей Windows этот тест иначе
+        снял бы снимок НАСТОЯЩИХ ассоциаций раннера и (во второй части) полез
+        бы писать в них — тест не должен трогать живой реестр.
+        """
+        before = {r"HKCU\Software\Classes\.pdf": {"": (1, repr("x"))}}
+        with mock.patch.object(registry, "IS_WINDOWS", False):
+            self.assertEqual(registry.snapshot_file_associations(), {})
+            self.assertEqual(registry.restore_file_associations(before), [])
 
 
 class BuilderKeepsAssociationsTests(unittest.TestCase):
@@ -240,11 +247,15 @@ class BuilderKeepsAssociationsTests(unittest.TestCase):
                 "": (registry.REG_SZ, repr("MyApp.File")),
             },
         }
-        capture = engine._capture_registry(
-            str(portable), {}, after,
-            portablizer_mod.PortableOptions(
-                installer_path="x", output_dir=temp, app_name="My Application",
-                **opts))
+        # IS_WINDOWS=False: сборщик на настоящей Windows сразу импортирует
+        # захваченные ключи в реестр раннера, а тест не должен писать в живой
+        # реестр — тем более в ассоциации файлов.
+        with mock.patch.object(portablizer_mod, "IS_WINDOWS", False):
+            capture = engine._capture_registry(
+                str(portable), {}, after,
+                portablizer_mod.PortableOptions(
+                    installer_path="x", output_dir=temp,
+                    app_name="My Application", **opts))
         return capture
 
     def test_association_keys_are_never_deleted_after_exit(self):
