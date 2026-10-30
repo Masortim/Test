@@ -54,6 +54,16 @@ FIREFOX_LOGIN = ('"C:\\Program Files\\Mozilla Firefox\\firefox.exe" '
                  '-osint -url "https://accounts.example.com/sign-in"')
 
 
+def isolated_host():
+    """Не дать тесту соединить НАСТОЯЩИЕ каталоги профиля этого компьютера.
+
+    На Windows такой вызов создал бы junction'ы к реальному профилю (тест
+    работает с временным каталогом, но окружение-то настоящее).
+    """
+    return mock.patch.object(entry.BrowserLoginBridge, "connect_host_profiles",
+                             return_value=[])
+
+
 def make_portable(root: Path, target_name: str = "Figma.exe") -> Path:
     app = root / "App"
     app.mkdir(parents=True, exist_ok=True)
@@ -115,6 +125,9 @@ class BridgePlanTests(unittest.TestCase):
         windows = mock.patch.object(entry, "IS_WINDOWS", True)
         windows.start()
         self.addCleanup(windows.stop)
+        host = isolated_host()
+        host.start()
+        self.addCleanup(host.stop)
         with mock.patch.object(entry, "_process_table",
                                return_value=self.baseline):
             self.bridge.prepare()
@@ -240,7 +253,8 @@ class DuplicateProfileTests(unittest.TestCase):
             target = make_portable(root)
             bridge = make_bridge(root, target)
             with mock.patch.object(entry, "IS_WINDOWS", True), \
-                    mock.patch.object(entry, "_process_table", return_value=[]):
+                    mock.patch.object(entry, "_process_table", return_value=[]), \
+                    isolated_host():
                 bridge.prepare()
                 profile = root / "PortableData/AppData/Local/Google/Chrome"
                 (profile / "User Data/Default").mkdir(parents=True)
@@ -260,7 +274,8 @@ class DuplicateProfileTests(unittest.TestCase):
             (profile / "User Data/Default/Cookies").write_bytes(b"x")
             bridge = make_bridge(root, target)
             with mock.patch.object(entry, "IS_WINDOWS", True), \
-                    mock.patch.object(entry, "_process_table", return_value=[]):
+                    mock.patch.object(entry, "_process_table", return_value=[]), \
+                    isolated_host():
                 bridge.prepare()
                 self.assertFalse(profile.exists())
 
@@ -272,7 +287,8 @@ class DuplicateProfileTests(unittest.TestCase):
             profile.mkdir(parents=True)
             bridge = make_bridge(root, target, {"clean_duplicates": False})
             with mock.patch.object(entry, "IS_WINDOWS", True), \
-                    mock.patch.object(entry, "_process_table", return_value=[]):
+                    mock.patch.object(entry, "_process_table", return_value=[]), \
+                    isolated_host():
                 self.assertEqual(bridge.drop_duplicate_profiles(), [])
                 self.assertTrue(profile.exists())
 
@@ -291,6 +307,10 @@ class HostProfileBridgeTests(unittest.TestCase):
         bridge = entry.BrowserLoginBridge(
             root, {"browser_login": kwargs}, target, env=env,
             log=lambda message: None)
+        preferred = mock.patch.object(entry, "_default_browser_images",
+                                      return_value={"chrome.exe"})
+        preferred.start()
+        self.addCleanup(preferred.stop)
         return bridge, target
 
     def test_host_profile_is_linked_and_survives_the_session(self):
@@ -458,6 +478,7 @@ class BridgePollTests(unittest.TestCase):
             with mock.patch.object(entry, "IS_WINDOWS", True), \
                     mock.patch.object(entry, "_process_table",
                                       return_value=[(100, 0, "Figma.exe")]), \
+                    isolated_host(), \
                     mock.patch.object(entry, "_process_command_line",
                                       return_value=CHROME_LOGIN), \
                     mock.patch.object(entry, "_terminate_pids") as terminated, \
