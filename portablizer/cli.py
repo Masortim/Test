@@ -99,8 +99,12 @@ def build_parser() -> argparse.ArgumentParser:
                          help="оставить в списке установленных запись, которую "
                               "создал установщик внутри портатива")
     toggles.add_argument("--shell-integration", action="store_true",
-                         help="перенести и ассоциации файлов/COM (по умолчанию "
-                              "нет: чужому ПК они не нужны)")
+                         help="перенести интеграцию с оболочкой: COM-классы, "
+                              "App Paths, контекстные меню (по умолчанию нет: "
+                              "чужому ПК они не нужны). Ассоциации расширений "
+                              "лончер не применяет в любом случае: иначе "
+                              "после портатива приходится заново назначать "
+                              "программы для файлов")
     toggles.add_argument("--no-exe-launcher", action="store_true",
                          help="не класть готовый LaunchPortable.exe в App")
     toggles.add_argument("--no-runtimes", action="store_true",

@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 from .. import __version__
+from . import registry as reg_mod
 from .redist import REDIST_DIR_NAME, SILENT_SCRIPT_NAME as REDIST_SCRIPT_NAME
 from .netstack import (NETSTACK_DIR_NAME, SETUP_SCRIPT_NAME,
                       TEARDOWN_SCRIPT_NAME, STATE_DIR_NAME,
@@ -100,6 +101,13 @@ class LauncherConfig:
     registry_created_keys: List[str] = field(default_factory=list)
     # Нужна ли подстановка пути портатива в .reg при запуске.
     registry_has_root_token: bool = False
+    #: Не трогать ассоциации файлов этого ПК: лончер не импортирует ключи
+    #: расширений и не удаляет их при выходе. Ассоциация — настройка
+    #: конкретной машины, а не данные программы: импорт меняет умолчание, а
+    #: удаление оставляет расширение без обработчика, после чего Windows
+    #: снова спрашивает «чем открыть?». Выключать имеет смысл только тому,
+    #: кто сознательно хочет принести ассоциации программы на чужой ПК.
+    keep_host_associations: bool = True
     # Дополнительные переменные окружения (имя -> значение; поддерживает %VAR%).
     extra_env: Dict[str, str] = field(default_factory=dict)
     # Относительные папки, добавляемые в PATH.
@@ -189,6 +197,14 @@ class LauncherConfig:
     # запуска) или переносит программу на свободный порт через её же конфиг.
     # Пустой словарь - значит «взять профиль программы, если он есть».
     service_ports: Dict[str, object] = field(default_factory=dict)
+    # --- вход в аккаунт через браузер по умолчанию ---------------------------
+    # Блок ``browser_login`` из launcher_config.json: лончер следит за тем,
+    # чтобы страница входа открывалась в УЖЕ установленном браузере с обычным
+    # профилем, а не в копии, которую программа запускает внутри
+    # перенаправленного профиля портатива. {"enabled": true, "poll_seconds"}.
+    # Пустой словарь - значит «включено по умолчанию» (так ведут себя и
+    # портативы, собранные прежней версией, — им достаточно нового лончера).
+    browser_login: Dict[str, object] = field(default_factory=dict)
     # Сетевые компоненты (драйвер TAP-Windows и службы), перенесённые в
     # папку NetStack/ портатива: {"manifest", "setup", "teardown",
     # "driver_services", "service_names", "stop_on_exit"}. Пусто — компонентов
@@ -536,6 +552,23 @@ def consolidate_root_keys(keys: Sequence[str]) -> List[str]:
     return usable_registry_keys(roots)
 
 
+def keep_association_keys(keys: Sequence[str],
+                          keep_host_associations: bool = True) -> List[str]:
+    """Убрать ключи ассоциаций файлов, если этот ПК их трогать нельзя.
+
+    Ассоциация — настройка конкретной машины, а не данные программы. Импорт
+    ключа расширения меняет умолчание, а ``reg delete`` при выходе оставляет
+    расширение без обработчика: Windows снова спрашивает «чем открыть?», и
+    человек заново назначает программы. Поэтому по умолчанию такие ключи не
+    попадают ни в импорт, ни в список «удалить после выхода» — ни в exe-лончере,
+    ни в запасном ``Launch.bat``.
+    """
+    items = [str(key) for key in keys]
+    if not keep_host_associations:
+        return items
+    return [key for key in items if not reg_mod.is_file_association_key(key)]
+
+
 def _registry_load_block(cfg: LauncherConfig) -> str:
     if not cfg.apply_registry:
         return "rem (registry support is disabled for this portable app)\ngoto :eof"
@@ -548,8 +581,11 @@ def _registry_load_block(cfg: LauncherConfig) -> str:
 
     # Прежнее состояние чужого ПК сохраняем до любых изменений, чтобы после
     # выхода вернуть всё как было.
-    keys = consolidate_root_keys(cfg.registry_keys)
-    created = set(consolidate_root_keys(cfg.registry_created_keys))
+    keys = keep_association_keys(consolidate_root_keys(cfg.registry_keys),
+                                 cfg.keep_host_associations)
+    created = set(keep_association_keys(
+        consolidate_root_keys(cfg.registry_created_keys),
+        cfg.keep_host_associations))
     for index, key in enumerate(keys):
         backup = f'%PORTABLE_REG_BACKUP%\\k{index:02d}.reg'
         lines.append(
@@ -593,11 +629,14 @@ def _registry_load_block(cfg: LauncherConfig) -> str:
 def _registry_save_block(cfg: LauncherConfig) -> str:
     if not cfg.apply_registry:
         return "goto :eof"
-    keys = consolidate_root_keys(cfg.registry_keys)
+    keys = keep_association_keys(consolidate_root_keys(cfg.registry_keys),
+                                 cfg.keep_host_associations)
     if not keys:
         return "goto :eof"
 
-    created = set(consolidate_root_keys(cfg.registry_created_keys))
+    created = set(keep_association_keys(
+        consolidate_root_keys(cfg.registry_created_keys),
+        cfg.keep_host_associations))
     lines: List[str] = [
         'if not defined PORTABLE_REGISTRY goto :eof',
         'if not defined PORTABLE_RESTORE goto :eof',
@@ -632,7 +671,9 @@ def _machine_elevation_block(cfg: LauncherConfig) -> str:
     # captured HKLM keys are really absent here, the machine file must be
     # imported for real - which needs administrator rights for this run.
     machine_keys = [
-        key for key in consolidate_root_keys(cfg.registry_keys)
+        key for key in keep_association_keys(
+            consolidate_root_keys(cfg.registry_keys),
+            cfg.keep_host_associations)
         if key.upper().startswith("HKLM\\") or key.upper().startswith("HKEY_LOCAL_MACHINE\\")
     ]
     probe: List[str] = []
@@ -1945,6 +1986,9 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
             str(k) for k in registry.get("created_keys", [])
             if isinstance(registry.get("created_keys", []), list)],
         registry_has_root_token=bool(registry.get("root_token")),
+        # По умолчанию ассоциации файлов этого ПК не трогаем — ни импортом,
+        # ни удалением (см. LauncherConfig.keep_host_associations).
+        keep_host_associations=bool(registry.get("keep_host_associations", True)),
         extra_env=mapping("extra_env"),
         path_prepend=items("path_prepend"),
         redirect_known_folders=bool(data.get("redirect_known_folders", False)),
@@ -1954,6 +1998,8 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
                 if isinstance(data.get("update"), dict) else {}),
         service_ports=(dict(data["service_ports"])
                        if isinstance(data.get("service_ports"), dict) else {}),
+        browser_login=(dict(data["browser_login"])
+                       if isinstance(data.get("browser_login"), dict) else {}),
         netstack=(dict(data["netstack"])
                   if isinstance(data.get("netstack"), dict) else {}),
         targets=targets,
@@ -2285,6 +2331,112 @@ def service_port_settings(cfg: "LauncherConfig") -> Dict[str, object]:
     if isinstance(explicit, dict):
         profile.update(explicit)
     return profile
+
+
+#: Параметры входа в аккаунт по умолчанию.
+BROWSER_LOGIN_DEFAULTS: Dict[str, object] = {
+    # Профиль браузера внутри портатива соединяется с настоящим профилем
+    # пользователя: вход идёт в уже открытом браузере, второй копии нет.
+    "enabled": True,
+    "connect_host_profile": True,
+    # Дубликаты профиля, оставшиеся от прежних запусков (и от сборки),
+    # удаляются при старте: это данные той самой лишней копии браузера.
+    "clean_duplicates": True,
+    # Шаг наблюдения за процессами — второй рубеж для файловых систем без
+    # junction'ов (FAT/exFAT, сетевые папки).
+    "poll_seconds": 0.3,
+}
+
+#: Каталоги браузеров внутри профиля пользователя: (переменная, путь).
+#: Список продублирован в ``portable_launcher_entry.py``: лончер обязан быть
+#: автономным (только стандартная библиотека, без пакета Portablizer), а
+#: совпадение двух списков проверяется тестом.
+BROWSER_PROFILE_DIRS: Tuple[Tuple[str, str], ...] = (
+    ("LOCALAPPDATA", "Google/Chrome"),
+    ("LOCALAPPDATA", "Microsoft/Edge"),
+    ("LOCALAPPDATA", "BraveSoftware"),
+    ("LOCALAPPDATA", "Vivaldi"),
+    ("LOCALAPPDATA", "Chromium"),
+    ("LOCALAPPDATA", "Thorium"),
+    ("APPDATA", "Opera Software"),
+    ("LOCALAPPDATA", "Opera Software"),
+    ("APPDATA", "Yandex"),
+    ("LOCALAPPDATA", "Yandex"),
+    ("APPDATA", "Mozilla"),
+    ("LOCALAPPDATA", "Mozilla"),
+    ("APPDATA", "zen"),
+    ("LOCALAPPDATA", "zen"),
+    # Обновляторы: без них браузер в перенаправленном профиле решает, что не
+    # установлен, и ставит себя заново — внутрь портатива.
+    ("LOCALAPPDATA", "Google/Update"),
+    ("LOCALAPPDATA", "Google/GoogleUpdater"),
+)
+
+
+#: Расширения файлов, по которым видно, что каталог — УСТАНОВЛЕННАЯ
+#: ПРОГРАММА, а не профиль.
+_PROGRAM_SUFFIXES: Tuple[str, ...] = (".exe", ".dll")
+
+
+def browser_profile_pairs() -> Tuple[Tuple[str, str], ...]:
+    """Каталоги браузеров в порядке «профиль, затем обновлятор»."""
+    return BROWSER_PROFILE_DIRS
+
+
+def browser_dir_holds_program(path, max_depth: int = 3) -> bool:
+    """True, если в каталоге лежит сама программа, а не только профиль.
+
+    У браузера, установленного «для одного пользователя», профиль и программа
+    делят один каталог: ``%LOCALAPPDATA%\\Google\\Chrome`` содержит и
+    ``User Data`` (профиль), и ``Application\\chrome.exe`` (программа), а рядом
+    стоит ``Google\\Update`` с ``GoogleUpdate.exe``. Профиль же никогда не
+    содержит exe/dll.
+
+    Считать такой каталог «дубликатом профиля» и удалять его нельзя: это
+    установленная программа. Особенно плохо удалять обновлятор — браузер без
+    него решает, что не установлен, и запускает УСТАНОВЩИК заново (а если это
+    данные самой портативной программы, установщик запускается при каждом
+    клике по ярлыку). Поэтому проверка общая: и сборщик, и лончер трогают
+    только каталоги без исполняемых файлов.
+    """
+    if not path:
+        return False
+    root = str(path).replace("\\", os.sep)
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    try:
+        for current, dirs, files in os.walk(root, followlinks=False):
+            depth = current.rstrip(os.sep).count(os.sep) - base_depth
+            if depth >= max_depth:
+                dirs[:] = []
+            for name in files:
+                if name.casefold().endswith(_PROGRAM_SUFFIXES):
+                    dirs[:] = []
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def browser_login_settings(cfg: "LauncherConfig") -> Dict[str, object]:
+    """Блок ``browser_login`` для launcher_config.json.
+
+    Программа, которой нужен вход в аккаунт, открывает страницу через
+    оболочку Windows — и та запускает браузер с окружением программы, то есть
+    с профилем внутри ``PortableData``. Получается вторая копия браузера по
+    умолчанию: без закладок и сохранённых входов, с лишними ключами в
+    реестре. Лончер перехватывает такой запуск и открывает тот же адрес сам —
+    своей оболочкой, с настоящим профилем пользователя.
+
+    Явные значения из ``cfg.browser_login`` перекрывают умолчания, поэтому
+    блок можно выключить для конкретного портатива.
+    """
+    settings = dict(BROWSER_LOGIN_DEFAULTS)
+    explicit = cfg.browser_login or {}
+    if isinstance(explicit, dict):
+        settings.update(explicit)
+    if settings.get("enabled") is not False:
+        settings["enabled"] = True
+    return settings
 
 
 # --- Вспомогательные лаунчеры и меню ------------------------------------------
@@ -2793,6 +2945,9 @@ def render_config_json(cfg: LauncherConfig) -> str:
             "machine_file": cfg.machine_reg_file_name,
             "root_token": ROOT_TOKEN if cfg.registry_has_root_token else "",
             "restore_on_exit": True,
+            # Ассоциации файлов лончер не применяет и не удаляет: иначе после
+            # портатива приходится заново назначать программы для расширений.
+            "keep_host_associations": bool(cfg.keep_host_associations),
             "keys": consolidate_root_keys(cfg.registry_keys),
             "created_keys": consolidate_root_keys(cfg.registry_created_keys),
         },
@@ -2837,4 +2992,9 @@ def render_config_json(cfg: LauncherConfig) -> str:
     ports = service_port_settings(cfg)
     if ports:
         payload["service_ports"] = ports
+    # Вход в аккаунт: лончер обязан открыть страницу входа в настоящем
+    # браузере пользователя, а не в копии внутри PortableData. Блок пишется
+    # всегда, чтобы решение было видно в конфиге и его можно было выключить
+    # для отдельного портатива.
+    payload["browser_login"] = browser_login_settings(cfg)
     return json.dumps(payload, ensure_ascii=False, indent=2)

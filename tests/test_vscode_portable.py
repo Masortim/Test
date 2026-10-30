@@ -334,6 +334,63 @@ class CursorLauncherRuntimeTests(unittest.TestCase):
             saved = json.loads(config.read_text(encoding="utf-8"))
             self.assertEqual(saved["target_exe_rel"], "App/Cursor.exe")
 
+    def test_config_that_points_at_an_installer_is_repaired(self):
+        """Клик должен запускать программу, а не мастер установки.
+
+        Жалоба после 1.36.0: «при клике запускается не предустановленный
+        портатив, а установщик». Установщик не может быть целью запуска,
+        даже если именно он записан в launcher_config.json.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            make_cursor_app(root)
+            (root / "App" / "CursorSetup.exe").write_bytes(b"MZ" + b"\x00" * 64)
+            config = root / "launcher_config.json"
+            config.write_text(json.dumps({
+                "app_name": "Cursor",
+                "target_exe_rel": "App/CursorSetup.exe",
+                "data_dir_name": "PortableData",
+            }, indent=2), encoding="utf-8")
+            cfg = exe_launcher.read_launcher_config(root)
+
+            repaired = exe_launcher._repair_missing_target(
+                root, cfg, cfg["target_exe_rel"])
+
+            self.assertEqual(repaired, "App/Cursor.exe")
+            saved = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(saved["target_exe_rel"], "App/Cursor.exe")
+
+    def test_an_installer_is_never_chosen_as_a_replacement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = root / "App"
+            app.mkdir(parents=True)
+            (app / "Figma.exe").write_bytes(b"MZ" + b"\x00" * 16)
+            installer = app / "Setup.exe"
+            installer.write_bytes(b"MZ" + b"\x00" * 4096)  # самый большой
+
+            # Настоящая программа находится, установщик — нет.
+            self.assertEqual(
+                exe_launcher._find_replacement_target(root, "App/Missing.exe"),
+                app / "Figma.exe")
+
+    def test_only_installers_in_app_give_no_replacement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = root / "App"
+            app.mkdir(parents=True)
+            (app / "Setup.exe").write_bytes(b"MZ" + b"\x00" * 64)
+            self.assertIsNone(
+                exe_launcher._find_replacement_target(root, "App/Missing.exe"))
+
+    def test_installer_names_are_recognised(self):
+        for name in ("FigmaSetup.exe", "Setup.exe", "app-installer.exe",
+                     "unins000.exe", "repack-1.2.exe"):
+            self.assertTrue(exe_launcher._looks_like_installer_name(name), name)
+        for name in ("Figma.exe", "Cursor.exe", "chrome.exe", "code.exe",
+                     "ollama app.exe"):
+            self.assertFalse(exe_launcher._looks_like_installer_name(name), name)
+
     def test_absolute_legacy_target_is_not_prefixed_with_the_root(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
