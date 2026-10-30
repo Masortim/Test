@@ -49,7 +49,7 @@ import tempfile
 import threading
 import time
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -611,10 +611,30 @@ def _cleanup_stale_temp_dirs(log: Optional["Logger"] = None,
     return removed
 
 
+def _stage_single_file(installer_path: str) -> Tuple[str, str]:
+    """Копирует выбранный файл в отдельную пустую папку.
+
+    Возвращает (каталог, путь к копии); вызывающая сторона отвечает за
+    удаление каталога после сборки.
+    """
+    source = os.path.abspath(installer_path)
+    staging = tempfile.mkdtemp(prefix="Portablizer-single-file-")
+    target = os.path.join(staging, os.path.basename(source))
+    try:
+        shutil.copy2(source, target)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return staging, target
+
+
 @dataclass
 class PortableOptions:
     installer_path: str
     output_dir: str                    # куда положить портативную папку
+    # Считать установщик самодостаточным файлом: перед запуском он копируется
+    # в пустой временный каталог, поэтому соседние части/пакеты не подхватятся.
+    single_file: bool = False
     app_name: str = ""                 # имя приложения (для папки/лончера)
     redirect_userdirs: bool = True     # изолировать AppData/Temp/...
     capture_registry: bool = True      # захватывать изменения реестра
@@ -1177,6 +1197,7 @@ class Portablizer:
         self._last_install_seconds = 0.0
         #: Имя упавшего процесса: по нему ищутся записи в журнале событий.
         self._installer_name = ""
+        self._source_staging_dir = ""
         #: Чем закончилась распаковка без запуска (для подсказок).
         self._unpacker_result = ""
         #: Каким распаковщиком воспользовались (пусто — ни одним).
@@ -1976,6 +1997,7 @@ class Portablizer:
             self._online_profile_diagnostic = ""
             self._recovered_sources = []
             self._installer_name = opts.installer_path
+            self._source_staging_dir = ""
             # Жалоба: в C:\Users\<user> накапливались Portablizer-*-Temp / _MEI*
             # от аварийных завершений предыдущих запусков. Убираем их сразу,
             # до любой новой работы с TEMP — иначе их будет всё больше.
@@ -1990,6 +2012,18 @@ class Portablizer:
             self.progress(2, "Проверка входных данных")
             if not os.path.isfile(opts.installer_path):
                 raise FileNotFoundError(f"Установщик не найден: {opts.installer_path}")
+
+            if opts.single_file:
+                # Изоляция копированием надёжнее отдельных флагов обхода:
+                # все детекторы/распаковщики/поисковики redist видят пустую
+                # папку рядом с входным файлом и не могут случайно добавить
+                # соседний .bin, .cab, payloads или prerequisites.
+                self._source_staging_dir, staged_path = _stage_single_file(
+                    opts.installer_path)
+                opts = replace(opts, installer_path=staged_path)
+                self.log.info(
+                    "Режим единичного файла включён: установщик скопирован "
+                    "в пустую папку, соседние файлы использоваться не будут.")
 
             name = self._safe_name(opts)
             # normpath убирает «смешанные» пути вида E:/Portable\App (QFileDialog
@@ -2543,6 +2577,9 @@ class Portablizer:
             # любом случае: на компьютере пользователя не должно оставаться
             # ни гигабайта мусора, ни после успеха, ни после ошибки.
             self._cleanup_install_temp()
+            if self._source_staging_dir:
+                shutil.rmtree(self._source_staging_dir, ignore_errors=True)
+                self._source_staging_dir = ""
 
     # -- классический InstallShield ------------------------------------------
     def _record_command(self, det: DetectionResult, opts: PortableOptions,

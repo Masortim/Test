@@ -197,6 +197,16 @@ class MainWindow(QMainWindow):
         row.addWidget(browse)
         lay.addLayout(row)
 
+        self.cb_single_file = QCheckBox(
+            "Это единичный файл — использовать только его, не искать файлы рядом")
+        self.cb_single_file.setToolTip(
+            "Включайте для самодостаточного EXE/MSI. Portablizer временно "
+            "копирует выбранный файл в пустую папку, чтобы соседние части "
+            "установщика, payloads и пакеты не попали в портатив. Если "
+            "установщику нужны .bin/.cab или другие файлы рядом, оставьте "
+            "флажок выключенным.")
+        lay.addWidget(self.cb_single_file)
+
         self.detect_label = QLabel("Тип установщика: —")
         self.detect_label.setObjectName("Hint")
         lay.addWidget(self.detect_label)
@@ -874,6 +884,7 @@ class MainWindow(QMainWindow):
         return PortableOptions(
             installer_path=installer,
             output_dir=output,
+            single_file=self.cb_single_file.isChecked(),
             app_name=self.name_edit.text().strip(),
             redirect_userdirs=self.cb_redirect.isChecked(),
             capture_registry=self.cb_registry.isChecked(),

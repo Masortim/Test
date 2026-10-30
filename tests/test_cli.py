@@ -67,16 +67,18 @@ class ParserMappingTests(unittest.TestCase):
         self.assertFalse(opts.silent_runtime_install)
         self.assertTrue(opts.shared_saves)
         self.assertFalse(opts.allow_assisted_install)
+        self.assertFalse(opts.single_file)
 
     def test_toggles(self):
         opts = self._opts([
-            "--no-registry", "--no-userdirs", "--no-cleanup",
+            "--single-file", "--no-registry", "--no-userdirs", "--no-cleanup",
             "--shell-integration", "--no-exe-launcher", "--no-runtimes",
             "--no-shared-saves", "--assisted",
             "--extra-args", "/FOO", "/BAR", "--env", "A=1", "--env", "B=x=y",
             "--idle-timeout", "77", "--hard-timeout", "9999",
             "--assisted-timeout", "120", "--lang", "ru", "--name", "Planeta VPN",
         ])
+        self.assertTrue(opts.single_file)
         self.assertFalse(opts.capture_registry)
         self.assertFalse(opts.redirect_userdirs)
         self.assertFalse(opts.cleanup_host)

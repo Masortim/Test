@@ -88,6 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="абсолютный потолок одной попытки установки")
 
     toggles = b.add_argument_group("режимы, как в окне интерфейса")
+    toggles.add_argument("--single-file", action="store_true",
+                         help="использовать только выбранный файл: временно "
+                              "копировать его в пустую папку, не брать файлы "
+                              "рядом")
     toggles.add_argument("--no-registry", action="store_true",
                          help="не захватывать изменения реестра")
     toggles.add_argument("--no-userdirs", action="store_true",
@@ -180,6 +184,7 @@ def options_from_args(ns: argparse.Namespace) -> "object":
     opts = PortableOptions(
         installer_path=installer,
         output_dir=out,
+        single_file=bool(ns.single_file),
         app_name=(ns.name or "").strip(),
         redirect_userdirs=not ns.no_userdirs,
         capture_registry=not ns.no_registry,
