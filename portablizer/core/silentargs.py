@@ -1094,6 +1094,28 @@ def build_attempts(
         attempts.append(build_burn_layout_plan(
             installer_path, layout_dir, log_file=log_path("install-layout.log"),
             extra_args=extra))
+        if allow_assisted:
+            # Последний шанс только по явному согласию пользователя: некоторые
+            # bundle'ы возвращают 0 в quiet mode, но требуют подтверждения в
+            # штатном мастере. Видимое окно позволяет выбрать Install, а не
+            # принять пустой Package Cache за установленное приложение.
+            args = ["/install", f"InstallFolder={native_target}"]
+            if log_file := log_path("install-interactive.log"):
+                args += ["/log", log_file]
+            attempts.append(SilentPlan(
+                program=installer_path, args=args,
+                notes=["Последний сценарий WiX Burn показывает штатный "
+                       "мастер. Проверьте, что выбрано Install/Установить "
+                       "(не Repair/Восстановить и не Remove/Удалить)."],
+                label="WiX Burn: штатное окно мастера (opt-in)",
+                output_dir=native_target, needs_admin=True, interactive=True,
+                instructions=[
+                    "В окне установщика выберите Install/Установить, не "
+                    "Repair/Восстановить и не Remove/Удалить.",
+                    "Если появится выбор папки, укажите папку App портатива.",
+                    "Дождитесь завершения мастера.",
+                ],
+            ))
 
     # Тип, опознанный ненадёжно (например, по одиночной слабой подстроке
     # «nsis»), не должен заканчиваться единственной типо-специфичной

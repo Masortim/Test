@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import configparser
+import hashlib
 import math
 import os
 import re
@@ -1199,6 +1200,9 @@ class Portablizer:
         self._installer_name = ""
         self._source_staging_dir = ""
         self._burn_embedded_depth = 0
+        self._burn_seen_hashes: Set[str] = set()
+        self._burn_seen_names: Set[str] = set()
+        self._burn_cycle_detected = False
         #: Чем закончилась распаковка без запуска (для подсказок).
         self._unpacker_result = ""
         #: Каким распаковщиком воспользовались (пусто — ни одним).
@@ -2000,6 +2004,9 @@ class Portablizer:
             self._installer_name = opts.installer_path
             self._source_staging_dir = ""
             self._burn_embedded_depth = 0
+            self._burn_seen_hashes = set()
+            self._burn_seen_names = set()
+            self._burn_cycle_detected = False
             # Жалоба: в C:\Users\<user> накапливались Portablizer-*-Temp / _MEI*
             # от аварийных завершений предыдущих запусков. Убираем их сразу,
             # до любой новой работы с TEMP — иначе их будет всё больше.
@@ -2877,6 +2884,30 @@ class Portablizer:
                 "могут требоваться даже при хранении файлов в App; "
                 "распаковка файлов не заменяет их установку."
             )
+        elif det.installer_type == InstallerType.WIX_BURN:
+            if self._burn_cycle_detected:
+                hints.append(
+                    "WiX Burn завершил тихие команды с кодом 0, но не "
+                    "установил файлы программы. Вложенный DeltaSetup.exe "
+                    "повторил уже обработанный Burn payload (совпало имя "
+                    "или SHA-256); повторный запуск остановлен, чтобы не "
+                    "зациклить установку. "
+                    "Включите «Разрешить окно мастера установки» и повторите "
+                    "сборку: в штатном окне выберите Install/Установить, а "
+                    "не Repair/Восстановить или Remove/Удалить. Если мастер "
+                    "тоже не разложит приложение, нужен полный офлайн-"
+                    "дистрибутив или установщик от разработчика: из одного "
+                    "maintenance/bootstrapper без файлов программы рабочий "
+                    "портатив создать нельзя."
+                )
+            else:
+                hints.append(
+                    "WiX Burn вернул успешный код, но не создал файлы "
+                    "программы в App. Проверьте, что выбрано действие "
+                    "Install/Установить, а не Repair или Remove; при "
+                    "необходимости включите «Разрешить окно мастера установки» "
+                    "либо используйте полный офлайн-дистрибутив."
+                )
         else:
             hints.append(
                 "Если установщик требует аккаунт или лицензию, проверьте "
@@ -4359,6 +4390,18 @@ class Portablizer:
         keys = cls._name_keys(app_name, installer_path)
         return cls._name_score(product_stem, keys) >= 200
 
+    @staticmethod
+    def _file_sha256(path: str) -> str:
+        """Хеш для распознанного Burn, чтобы не запускать вложенную копию повторно."""
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+        except OSError:
+            return ""
+        return digest.hexdigest()
+
     def _run_burn_embedded_installers(
         self, payloads: Sequence[str], opts: PortableOptions,
         app_dir: str, data_dir: str, portable_dir: str, name: str,
@@ -4375,6 +4418,13 @@ class Portablizer:
         """
         if self._burn_embedded_depth >= 2:
             return False
+        source_hash = self._file_sha256(opts.installer_path)
+        if source_hash:
+            self._burn_seen_hashes.add(source_hash)
+        if (getattr(self._detection, "installer_type", None)
+                == InstallerType.WIX_BURN):
+            self._burn_seen_names.add(
+                os.path.basename(opts.installer_path).casefold())
         for payload in payloads:
             if (not payload.casefold().endswith(".exe")
                     or not os.path.isfile(payload)):
@@ -4382,8 +4432,30 @@ class Portablizer:
             if not self._burn_embedded_installer_match(
                     payload, name, opts.installer_path):
                 continue
+            payload_hash = self._file_sha256(payload)
+            if payload_hash and payload_hash in self._burn_seen_hashes:
+                self._burn_cycle_detected = True
+                self.log.warn(
+                    "Вложенный setup.exe совпадает с уже обработанным "
+                    "WiX Burn-файлом (SHA-256). Повторно запускать тот же "
+                    "бандл или его /layout не буду: это создало бы "
+                    "рекурсивную установку без новых файлов программы.")
+                continue
+            if payload_hash:
+                self._burn_seen_hashes.add(payload_hash)
             self._check_cancel()
             child_detection = detect_installer(payload)
+            payload_name = os.path.basename(payload).casefold()
+            if (child_detection.installer_type == InstallerType.WIX_BURN
+                    and payload_name in self._burn_seen_names):
+                self._burn_cycle_detected = True
+                self.log.warn(
+                    "WiX Burn снова выдал вложенный bundle с тем же именем "
+                    f"{os.path.basename(payload)}; прекращаю повторный запуск "
+                    "одинаковой цепочки. В /layout не появился новый payload.")
+                continue
+            if child_detection.installer_type == InstallerType.WIX_BURN:
+                self._burn_seen_names.add(payload_name)
             self.log.info(
                 "В WiX Burn найден установщик самого приложения: "
                 f"{os.path.basename(payload)} ({child_detection.human}). "
