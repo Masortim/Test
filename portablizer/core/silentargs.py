@@ -232,7 +232,8 @@ def build_silent_plan(
         notes.append(
             "WiX Burn: /quiet /install + /log. Папку бандл принимает только "
             "при публичной переменной InstallFolder; при неудаче Portablizer "
-            "повторит запуск без неё и распакует бандл через /layout."
+            "повторит запуск без неё. Распаковка /layout уже была первой "
+            "попыткой: она не регистрирует бандл как установленный."
         )
         label = ("WiX Burn: /quiet /install + InstallFolder"
                  if override_install_folder else "WiX Burn: /quiet /install")
@@ -1055,6 +1056,16 @@ def build_attempts(
             visible.label = "Собственные ключи без --hidden"
             attempts.append(visible)
     elif itype == InstallerType.WIX_BURN:
+        # /layout обязан идти ПЕРВЫМ. Он только раскладывает payload на диск
+        # и не переводит bundle в состояние Present. Запуск /install до него
+        # регистрирует bundle и его Package Cache даже тогда, когда в App не
+        # появилось ни одного файла. Следующий запуск тогда видит Present,
+        # планирует execute: None, а повторный Plan после Apply без нового
+        # Detect завершается ошибкой 0x8007139f (регрессия Delta).
+        if layout_dir:
+            attempts.append(build_burn_layout_plan(
+                installer_path, layout_dir,
+                log_file=log_path("install-layout.log"), extra_args=extra))
         attempts.append(build_silent_plan(
             InstallerType.WIX_BURN, installer_path, target_dir,
             log_file=log_path("install.log"), extra_args=extra))
@@ -1089,33 +1100,11 @@ def build_attempts(
         attempts.append(build_custom_cli_plan(
             installer_path, target_dir, detection=detection, extra_args=extra))
 
-    # Распаковка бандла: не требует прав администратора и не меняет систему.
-    if itype == InstallerType.WIX_BURN and layout_dir:
-        attempts.append(build_burn_layout_plan(
-            installer_path, layout_dir, log_file=log_path("install-layout.log"),
-            extra_args=extra))
-        if allow_assisted:
-            # Последний шанс только по явному согласию пользователя: некоторые
-            # bundle'ы возвращают 0 в quiet mode, но требуют подтверждения в
-            # штатном мастере. Видимое окно позволяет выбрать Install, а не
-            # принять пустой Package Cache за установленное приложение.
-            args = ["/install", f"InstallFolder={native_target}"]
-            if log_file := log_path("install-interactive.log"):
-                args += ["/log", log_file]
-            attempts.append(SilentPlan(
-                program=installer_path, args=args,
-                notes=["Последний сценарий WiX Burn показывает штатный "
-                       "мастер. Проверьте, что выбрано Install/Установить "
-                       "(не Repair/Восстановить и не Remove/Удалить)."],
-                label="WiX Burn: штатное окно мастера (opt-in)",
-                output_dir=native_target, needs_admin=True, interactive=True,
-                instructions=[
-                    "В окне установщика выберите Install/Установить, не "
-                    "Repair/Восстановить и не Remove/Удалить.",
-                    "Если появится выбор папки, укажите папку App портатива.",
-                    "Дождитесь завершения мастера.",
-                ],
-            ))
+    # Для WiX Burn интерактивный /install здесь намеренно отсутствует.
+    # Он не добавляет нового способа извлечения payload, зато после уже
+    # выполненного Apply штатный WixStdBA позволяет нажать Install повторно
+    # без Detect и падает с 0x8007139f. Помогает не ещё один клик по Install,
+    # а /layout выше и распаковка полученных MSI административной установкой.
 
     # Тип, опознанный ненадёжно (например, по одиночной слабой подстроке
     # «nsis»), не должен заканчиваться единственной типо-специфичной

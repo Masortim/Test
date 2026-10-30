@@ -1698,27 +1698,33 @@ class BurnPlanTests(unittest.TestCase):
         log_index = plan.args.index("/log")
         self.assertEqual(plan.args[log_index + 1], r"E:\Type_Portable\install.log")
 
-    def test_burn_assisted_fallback_is_opt_in_and_runs_after_layout(self):
+    def test_burn_layout_is_first_and_assisted_never_repeats_install(self):
+        """Delta: повторный Install после Apply даёт 0x8007139f.
+
+        Поэтому безопасная распаковка идёт до любого /install, а галочка
+        assisted (нужная InstallShield) не добавляет для Burn штатное окно.
+        """
         detection = DetectionResult(InstallerType.WIX_BURN, 0.97)
-        normal = build_attempts(
-            detection, r"C:\Downloads\DeltaSetup.exe",
-            r"D:\Portable\Delta\App",
-            log_dir=r"D:\Portable\Delta",
-            layout_dir=r"D:\Portable\Delta\_bundle_layout")
-        assisted = build_attempts(
-            detection, r"C:\Downloads\DeltaSetup.exe",
-            r"D:\Portable\Delta\App",
+        kwargs = dict(
+            installer_path=r"C:\Downloads\DeltaSetup.exe",
+            target_dir=r"D:\Portable\Delta\App",
             log_dir=r"D:\Portable\Delta",
             layout_dir=r"D:\Portable\Delta\_bundle_layout",
-            allow_assisted=True)
+        )
+        normal = build_attempts(detection, **kwargs)
+        assisted = build_attempts(detection, allow_assisted=True, **kwargs)
 
-        self.assertEqual(len(normal), 3)
-        self.assertEqual(len(assisted), 4)
-        self.assertTrue(assisted[-1].interactive)
-        self.assertNotIn("/quiet", assisted[-1].args)
-        self.assertIn("InstallFolder=D:\\Portable\\Delta\\App",
-                      assisted[-1].args)
-        self.assertIn("штатное окно мастера", assisted[-1].label)
+        for attempts in (normal, assisted):
+            self.assertEqual(len(attempts), 3)
+            self.assertIn("/layout", attempts[0].args)
+            self.assertNotIn("/install", attempts[0].args)
+            self.assertTrue(attempts[0].extracts_only)
+            self.assertIn("/install", attempts[1].args)
+            self.assertIn("/install", attempts[2].args)
+            self.assertFalse(any(plan.interactive for plan in attempts))
+            self.assertFalse(any(
+                "install-interactive.log" in arg
+                for plan in attempts for arg in plan.args))
 
     def test_burn_plan_can_drop_install_folder_override(self):
         plan = build_silent_plan(
@@ -1757,6 +1763,13 @@ class ExitCodeTests(unittest.TestCase):
         # сборка VC++ — отдельная подсказка, а не «неизвестный код».
         self.assertIn("side-by-side", _exit_code_hint(14001))
         self.assertIn("Install-Redist.cmd", _exit_code_hint(14001))
+
+    def test_burn_state_error_is_not_reported_as_missing_admin_rights(self):
+        hint = _exit_code_hint(0x8007139F)
+        self.assertIn("Apply", hint)
+        self.assertIn("Detect", hint)
+        self.assertIn("/layout", hint)
+        self.assertNotIn("администратора", hint)
 
     def test_success_and_unknown_codes_have_no_hint(self):
         self.assertEqual(_format_exit_code(None), "неизвестен")
@@ -1827,16 +1840,14 @@ class BurnFallbackTests(unittest.TestCase):
             rc, used = engine._run_attempts(attempts, opts, str(app),
                                             str(data), str(portable), "Type")
 
-            # С InstallFolder, без него, затем /layout, затем msiexec /a.
-            self.assertEqual(len(engine.calls), 4)
-            self.assertTrue(any(a.startswith("InstallFolder=")
-                                for a in engine.calls[0].args))
-            self.assertFalse(any(a.startswith("InstallFolder=")
-                                 for a in engine.calls[1].args))
-            self.assertIn("/layout", engine.calls[2].args)
-            self.assertEqual(engine.calls[3].program, "msiexec.exe")
-            self.assertIn("/a", engine.calls[3].args)
-            self.assertNotIn("/i", engine.calls[3].args)
+            # /layout идёт ПЕРВЫМ и не регистрирует bundle; затем msiexec /a.
+            # До настоящего /install дело даже не доходит.
+            self.assertEqual(len(engine.calls), 2)
+            self.assertIn("/layout", engine.calls[0].args)
+            self.assertNotIn("/install", engine.calls[0].args)
+            self.assertEqual(engine.calls[1].program, "msiexec.exe")
+            self.assertIn("/a", engine.calls[1].args)
+            self.assertNotIn("/i", engine.calls[1].args)
             self.assertEqual(rc, 0)
             self.assertIn("/layout", used.args)
             self.assertTrue((app / "Type.exe").exists())
@@ -1931,6 +1942,64 @@ class BurnFallbackTests(unittest.TestCase):
             self.assertTrue(engine.calls[0].program.endswith(nested.name))
             self.assertIn("В WiX Burn найден установщик самого приложения",
                           engine.log.text)
+
+    def test_nested_burn_uses_layout_without_registering_an_install(self):
+        """Точная цепочка Delta: outer Burn → DeltaSetup.exe → Delta.msi.
+
+        Вложенный Burn тоже начинается с /layout. Поэтому успешная сборка не
+        выполняет ни одного /install и не создаёт состояние Present, после
+        которого WixStdBA показывал 0x8007139f при каждом повторном Install.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "delta-windows-x86_64-setup.exe")
+            installer.write_bytes(b"outer bundle")
+            portable = Path(temp, "Delta_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            layout = portable / "_bundle_layout"
+            app.mkdir(parents=True)
+            data.mkdir()
+            layout.mkdir()
+            nested = layout / "DeltaSetup.exe"
+            _fake_pe(str(nested), [".text", ".rsrc", ".wixburn"],
+                     b"wixstdba without legacy WixBurn marker")
+
+            class FakeBurn(Portablizer):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.calls = []
+
+                def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                    self.calls.append(plan)
+                    if "/layout" in plan.args:
+                        out = Path(plan.output_dir)
+                        out.mkdir(parents=True, exist_ok=True)
+                        (out / "Delta.msi").write_bytes(b"MSI payload")
+                        return 0
+                    if plan.program == "msiexec.exe":
+                        Path(app_dir, "Delta.exe").write_bytes(b"MZ application")
+                        return 0
+                    return 0x8007139F
+
+            engine = FakeBurn(Logger())
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Delta",
+                                   allow_assisted_install=True)
+
+            ok = engine._install_layout_packages(
+                str(layout), opts, str(app), str(data), "Delta",
+                console_log=str(portable / "installer-output.log"))
+
+            self.assertTrue(ok)
+            self.assertTrue((app / "Delta.exe").is_file())
+            self.assertEqual(len(engine.calls), 2)
+            self.assertIn("/layout", engine.calls[0].args)
+            self.assertEqual(engine.calls[1].program, "msiexec.exe")
+            self.assertIn("/a", engine.calls[1].args)
+            self.assertFalse(any("/install" in plan.args
+                                 for plan in engine.calls))
+            self.assertFalse(any(plan.interactive for plan in engine.calls))
+            self.assertFalse(layout.exists())
 
     def test_burn_package_cache_is_not_recovered_as_application(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2082,7 +2151,7 @@ class BurnFallbackTests(unittest.TestCase):
 
             self.assertFalse(result.success)
             self.assertFalse(Path(temp, "Type_Portable", "Launch.bat").exists())
-            # Первая попытка + повтор + /layout.
+            # /layout + две запасные тихие команды установки.
             self.assertEqual(len(engine.calls), 3)
             message = "; ".join(result.messages)
             self.assertIn("4294967295 (-1, 0xFFFFFFFF)", message)
