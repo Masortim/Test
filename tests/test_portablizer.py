@@ -1821,6 +1821,74 @@ class BurnFallbackTests(unittest.TestCase):
             # Временная распаковка бандла удалена.
             self.assertFalse((portable / "_bundle_layout").exists())
 
+    def test_burn_fallback_runs_matching_embedded_product_setup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "delta-windows-x86_64-setup.exe")
+            installer.write_bytes(b"outer bundle")
+            portable = Path(temp, "Delta_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            layout = portable / "_bundle_layout"
+            app.mkdir(parents=True)
+            data.mkdir()
+            layout.mkdir()
+            nested = layout / "DeltaSetup.exe"
+            _fake_pe(str(nested), [".text", ".rsrc"], b"Inno Setup")
+
+            class FakeBurn(Portablizer):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.calls = []
+
+                def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                    self.calls.append(plan)
+                    if plan.program.endswith(nested.name):
+                        Path(app_dir, "Delta.exe").write_bytes(b"MZ application")
+                        return 0
+                    return 1
+
+            engine = FakeBurn(Logger())
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Delta")
+            ok = engine._install_layout_packages(
+                str(layout), opts, str(app), str(data), "Delta",
+                console_log=str(portable / "installer-output.log"))
+
+            self.assertTrue(ok)
+            self.assertTrue((app / "Delta.exe").is_file())
+            self.assertEqual(len(engine.calls), 1)
+            self.assertTrue(engine.calls[0].program.endswith(nested.name))
+            self.assertIn("В WiX Burn найден установщик самого приложения",
+                          engine.log.text)
+
+    def test_burn_package_cache_is_not_recovered_as_application(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "delta-windows-x86_64-setup.exe")
+            installer.write_bytes(b"outer bundle")
+            cache = Path(temp, "ProgramData", "Package Cache", "{bundle-guid}")
+            cache.mkdir(parents=True)
+            (cache / "DeltaSetup.exe").write_bytes(b"MZ maintenance")
+            app = Path(temp, "Delta_Portable", "App")
+            data = Path(temp, "Delta_Portable", "PortableData")
+            app.mkdir(parents=True)
+            data.mkdir()
+            engine = Portablizer(Logger())
+
+            recovered = engine._recover_installed_app(
+                str(app), str(data), "Delta", str(installer), {},
+                registry_locations=[str(cache)])
+
+            self.assertFalse(recovered)
+            self.assertEqual(list(app.iterdir()), [])
+
+    def test_setup_executable_is_not_accepted_as_main_program(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp, "App")
+            app.mkdir()
+            (app / "DeltaSetup.exe").write_bytes(b"MZ setup")
+            self.assertIsNone(Portablizer(Logger())._find_main_exe(
+                str(app), "Delta"))
+
     def test_burn_fallback_keeps_layout_when_no_msi_found(self):
         with tempfile.TemporaryDirectory() as temp:
             installer = Path(temp, "TypeSetup.exe")
