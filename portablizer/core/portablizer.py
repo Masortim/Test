@@ -231,6 +231,17 @@ _EXIT_CODE_HINTS: Dict[int, str] = {
     **adobe_mod.ADOBE_CODES,
 }
 
+# HRESULT-состояния Burn нельзя подменять общей фразой про права: у них уже
+# есть точная причина. В частности, 0x8007139f — это не отказ Windows и не
+# «группа ресурсов» в смысле кластера, а нарушенный цикл Detect → Plan → Apply.
+_BURN_STATE_EXIT_HINTS: Dict[int, str] = {
+    0x8007139F: (
+        "WiX Burn уже выполнил Apply; повторный Plan без нового Detect "
+        "недопустим. Повторное нажатие Install не поможет — payload нужно "
+        "извлекать через /layout"
+    ),
+}
+
 _NEGATIVE_EXIT_HINT = (
     "процесс установщика аварийно завершился: как правило, не хватило прав "
     "администратора или тихий режим не поддерживается"
@@ -343,6 +354,8 @@ def _exit_code_hint(rc: Optional[int],
     crash = crash_mod.crash_code(rc)
     if crash is not None:
         return crash.hint
+    if rc in _BURN_STATE_EXIT_HINTS:
+        return _BURN_STATE_EXIT_HINTS[rc]
     if rc > 0x7FFFFFFF:
         return _NEGATIVE_EXIT_HINT
     if installer_type == InstallerType.INNO:
@@ -1540,8 +1553,8 @@ class Portablizer:
             "launcher_config.json", "README_PORTABLE.txt", "portable.reg",
             "portable_machine.reg", "cleanup_host.reg", "cleanup_host.cmd",
             "install.log",
-            "install-retry.log", "install-layout.log", "installer-engine.log",
-            "installer-output.log", "installer-crash.log",
+            "install-retry.log", "install-layout.log", "install-interactive.log",
+            "installer-engine.log", "installer-output.log", "installer-crash.log",
             "unpacker-output.log", "portablizer.log", "_bundle_layout",
             "_unpacked", "setup-installshield.log", redist_mod.REPORT_NAME,
             "_redist_cache",
@@ -2887,26 +2900,25 @@ class Portablizer:
         elif det.installer_type == InstallerType.WIX_BURN:
             if self._burn_cycle_detected:
                 hints.append(
-                    "WiX Burn завершил тихие команды с кодом 0, но не "
-                    "установил файлы программы. Вложенный DeltaSetup.exe "
-                    "повторил уже обработанный Burn payload (совпало имя "
-                    "или SHA-256); повторный запуск остановлен, чтобы не "
-                    "зациклить установку. "
-                    "Включите «Разрешить окно мастера установки» и повторите "
-                    "сборку: в штатном окне выберите Install/Установить, а "
-                    "не Repair/Восстановить или Remove/Удалить. Если мастер "
-                    "тоже не разложит приложение, нужен полный офлайн-"
-                    "дистрибутив или установщик от разработчика: из одного "
-                    "maintenance/bootstrapper без файлов программы рабочий "
-                    "портатив создать нельзя."
+                    "WiX Burn завершил команды с кодом 0, но не установил "
+                    "файлы программы. Вложенный setup.exe повторил уже "
+                    "обработанный Burn payload (совпало имя или SHA-256), "
+                    "поэтому рекурсивный запуск остановлен. Повторный Install "
+                    "в штатном окне здесь не помогает: после Apply Burn "
+                    "требует новый Detect и возвращает 0x8007139f. Нужен "
+                    "полный офлайн-дистрибутив с реальным payload программы; "
+                    "из одного maintenance/bootstrapper рабочий портатив "
+                    "создать нельзя."
                 )
             else:
                 hints.append(
-                    "WiX Burn вернул успешный код, но не создал файлы "
-                    "программы в App. Проверьте, что выбрано действие "
-                    "Install/Установить, а не Repair или Remove; при "
-                    "необходимости включите «Разрешить окно мастера установки» "
-                    "либо используйте полный офлайн-дистрибутив."
+                    "WiX Burn не создал файлы программы в App. Первым теперь "
+                    "всегда выполняется /layout — он не регистрирует бандл "
+                    "как уже установленный. Проверьте install-layout.log: "
+                    "если payload отсутствует или не скачан, нужен полный "
+                    "офлайн-дистрибутив. Повторно нажимать Install в штатном "
+                    "окне не следует: после Apply это вызывает 0x8007139f, "
+                    "а не новую установку."
                 )
         else:
             hints.append(
