@@ -2770,6 +2770,50 @@ class Portablizer:
         except OSError:
             return False
 
+    #: Строки журнала движка, которые объясняют «код 0, а файлов нет».
+    _ENGINE_LOG_MARKERS = (
+        "error", "failed", "failure", "exit code", "exception", "abort",
+        "rollback", "cancelled", "canceled", "0x8007", "0x8000", "not found",
+    )
+
+    def _report_engine_log_hints(self, plan: SilentPlan) -> None:
+        """Достаёт из журнала установщика причину «код 0, а файлов нет».
+
+        WiX Burn и Inno умеют вернуть успешный код, ничего не установив:
+        пакет внутри бандла отказался работать, установщик решил, что
+        «уже установлено», и т. п. Своими словами это не объяснить, а в
+        журнале движка причина написана прямым текстом — показываем её, а не
+        отправляем пользователя искать её самостоятельно.
+        """
+        seen: Set[str] = set()
+        for path in [*plan.progress_logs, plan.result_log]:
+            if not path or path in seen or not os.path.isfile(path):
+                continue
+            seen.add(path)
+            try:
+                with open(path, "r", encoding="utf-8",
+                          errors="replace") as handle:
+                    lines = [line.strip() for line in handle
+                             if line.strip()]
+            except OSError:
+                continue
+            if not lines:
+                continue
+            interesting = [
+                line for line in lines
+                if any(marker in line.casefold()
+                       for marker in self._ENGINE_LOG_MARKERS)
+            ]
+            shown = (interesting or lines)[-3:]
+            if not shown:
+                continue
+            self.log.warn(
+                "Журнал установщика объясняет пустую папку "
+                f"({os.path.basename(path)}):")
+            for line in shown:
+                self.log.warn("   " + line[:300])
+            return
+
     def _report_installshield_log(self, plan: SilentPlan) -> Optional[int]:
         """Расшифровывает setup.log InstallShield после попытки установки."""
         code = read_installshield_result(plan.result_log)
@@ -4164,6 +4208,11 @@ class Portablizer:
             # Классический InstallShield пишет причину отказа в свой
             # setup.log — без неё «код 0 при пустой папке» необъясним.
             self._report_installshield_log(plan)
+            # «Код 0, а файлов нет» — самый непонятный исход тихой установки.
+            # Причину пишет сам движок; показываем её сразу, пока журнал на
+            # месте, а не после сборки и не в файле, который никто не откроет.
+            if not self._find_main_exe(app_dir, name):
+                self._report_engine_log_hints(plan)
             self._attempts_made += 1
             self._attempt_history.append((plan.label, rc))
             if self._install_dead_start:
@@ -4440,23 +4489,125 @@ class Portablizer:
         queue.insert(index, plan)
         return True
 
+    #: exe-пакеты Burn-бандла, которые нельзя запускать молча от имени
+    #: программы: это предустановленные runtime'ы и деинсталляторы. Они
+    #: ставятся в систему отдельным шагом (и только с явного согласия), а не
+    #: переносятся в портатив.
+    _BUNDLE_PREREQ_EXE_PREFIXES = (
+        "vcredist", "vc_redist", "vc_redist.x", "dxsetup", "dxwebsetup",
+        "directx", "oalinst", "physx", "ndp", "dotnet", "windowsdesktop-",
+        "aspnetcore-", "netfx", "msedge", "webview2", "wsl",
+        "unins", "uninstall", "setup_uninstall",
+    )
+
+    @classmethod
+    def _bundle_program_installers(cls, payloads: Sequence[str]) -> List[str]:
+        """Установщики программы среди exe-пакетов бандла.
+
+        Burn раскладывает при ``/layout`` ровно то, что потом запускает сам:
+        ``MsiPackage`` — как ``.msi``, ``ExePackage`` — как ``.exe``. Второй
+        случай (Delta и подобные сборки) раньше просто перечислялся в журнале
+        «побочные пакеты в портатив не переносятся», и бандл из одного
+        ExePackage заканчивался пустым ``App``.
+        """
+        found: List[str] = []
+        for path in payloads:
+            base = os.path.basename(path).casefold()
+            if not base.endswith(".exe"):
+                continue
+            if base.startswith(cls._BUNDLE_PREREQ_EXE_PREFIXES):
+                continue
+            found.append(path)
+
+        def _size(item: str) -> int:
+            try:
+                return os.path.getsize(item)
+            except OSError:
+                return 0
+
+        # Главный пакет почти всегда крупнейший: мелкие — это предусловия.
+        found.sort(key=_size, reverse=True)
+        return found
+
+    def _install_bundle_exe_payload(
+        self, nested: str, opts: PortableOptions, app_dir: str,
+        data_dir: str, name: str, console_log: Optional[str] = None,
+    ) -> bool:
+        """Ставит exe-пакет бандла его собственными ключами тишины."""
+        self.log.info(
+            "В распакованном бандле нет MSI, но есть установщик программы: "
+            f"{os.path.basename(nested)}. Запускаю его своими ключами — "
+            "обёртка их не понимает, а он понимает."
+        )
+        plans = self._plans_for_nested_setup(
+            nested, app_dir, opts, container="бандла")
+        if self._nested_installer_kind(nested) == InstallerType.UNKNOWN:
+            # Движок пакета не опознан: после Inno/NSIS добавляем ещё два
+            # распространённых набора. Пакет из бандла — обычный установщик,
+            # и «код 0 без файлов» чаще всего означает именно чужие ключи.
+            plans.append(SilentPlan(
+                program=nested, args=["/quiet", "/norestart"],
+                notes=["Неизвестный движок: /quiet /norestart без ключа папки "
+                       "— программу потом заберут из каталога по умолчанию."],
+                label="Установщик из бандла: /quiet (папка по умолчанию)",
+                output_dir=app_dir, ignores_target_dir=True,
+                prefers_installer_default_dir=True,
+            ))
+            plans.append(SilentPlan(
+                program=nested, args=["--silent"],
+                notes=["Последняя попытка: --silent — ключ современных "
+                       "bootstrapper'ов."],
+                label="Установщик из бандла: --silent (папка по умолчанию)",
+                output_dir=app_dir, ignores_target_dir=True,
+                prefers_installer_default_dir=True,
+            ))
+        for plan in plans:
+            self._check_cancel()
+            self._run_install(plan, opts, app_dir, data_dir,
+                              progress_from=58, progress_to=60,
+                              console_log=console_log)
+            if self._find_main_exe(app_dir, name):
+                self.log.ok(f"Сработал сценарий: {plan.label}")
+                return True
+        return False
+
     def _install_layout_packages(self, layout_dir: str, opts: PortableOptions,
                                  app_dir: str, data_dir: str,
                                  name: str,
                                  console_log: Optional[str] = None) -> bool:
-        """Распаковывает MSI из подготовленного ``/layout`` прямо в ``App``."""
+        """Раскладывает пакеты из подготовленного ``/layout`` прямо в ``App``."""
         msis, other_payloads = _burn_layout_payloads(layout_dir)
-        if other_payloads:
+        installers = self._bundle_program_installers(other_payloads)
+        skipped = [
+            path for path in other_payloads if path not in installers
+        ]
+        if skipped:
             self.log.info(
-                "Побочные пакеты бандла (exe/msu/msp) в портатив не "
-                "переносятся: "
+                "Побочные пакеты бандла (предусловия, msu/msp, "
+                "деинсталляторы) в портатив не переносятся: "
                 + ", ".join(sorted(
-                    os.path.basename(p) for p in other_payloads)[:5])
+                    os.path.basename(p) for p in skipped)[:5])
             )
         if not msis:
+            if not installers:
+                self.log.warn(
+                    "В распакованном бандле нет ни MSI-пакета, ни установщика "
+                    "программы — распаковывать нечего."
+                )
+                return False
+            for nested in installers:
+                if self._install_bundle_exe_payload(
+                        nested, opts, app_dir, data_dir, name,
+                        console_log=console_log):
+                    self.log.ok("Пакет бандла установлен в папку App.")
+                    shutil.rmtree(layout_dir, ignore_errors=True)
+                    self.log.info("Временная распаковка бандла удалена.")
+                    return True
             self.log.warn(
-                "В распакованном бандле нет ни одного MSI-пакета — "
-                "распаковывать нечего."
+                "Установщик из бандла не дал исполняемых файлов. "
+                f"Распакованное содержимое: {layout_dir} (удаляется после "
+                "сборки). Подробности — в install-layout.log и журнале "
+                "установщика, который Portablizer покажет выше."
             )
             return False
 
@@ -4477,7 +4628,8 @@ class Portablizer:
 
         self.log.warn(
             "MSI-пакеты не дали исполняемых файлов. Распакованное "
-            f"содержимое оставлено для диагностики: {layout_dir}"
+            f"содержимое: {layout_dir} (удаляется после сборки). Подробности "
+            "— в install-layout.log."
         )
         return False
 
@@ -5150,15 +5302,18 @@ class Portablizer:
         return InstallerType.UNKNOWN
 
     def _plans_for_nested_setup(self, nested: str, app_dir: str,
-                                opts: PortableOptions) -> List[SilentPlan]:
-        """Тихие команды для установщика, найденного внутри SFX.
+                                opts: PortableOptions,
+                                container: str = "SFX") -> List[SilentPlan]:
+        """Тихие команды для установщика, найденного внутри обёртки.
 
         Обёртке чужие ключи не подходят, а самому установщику — подходят его
         собственные: у Inno Setup это ``/VERYSILENT /DIR=``, у NSIS —
-        ``/S /D=``. Порядок — от точного к общему.
+        ``/S /D=``, у WiX Burn — ``/quiet /install InstallFolder=``. Порядок —
+        от точного к общему. ``container`` — откуда взят установщик (SFX или
+        бандл), только для понятных подписей в журнале.
         """
         kind = self._nested_installer_kind(nested)
-        label_suffix = f" (внутри SFX: {os.path.basename(nested)})"
+        label_suffix = f" (внутри {container}: {os.path.basename(nested)})"
         plans: List[SilentPlan] = []
         if kind == InstallerType.INNO:
             args = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
@@ -5201,6 +5356,32 @@ class Portablizer:
                        "установка через /s и свойства MSI."],
                 label="InstallShield внутри SFX: /s /v/qn" + label_suffix,
                 output_dir=app_dir,
+            ))
+        elif kind == InstallerType.WIX_BURN:
+            # Бандл внутри бандла: Delta и подобные сборки кладут на
+            # /layout не MSI, а собственный установщик, который сам является
+            # Burn-бандлом. Ему нужны его же ключи, а папка — через
+            # публичную переменную InstallFolder.
+            plans.append(SilentPlan(
+                program=nested,
+                args=["/quiet", "/norestart", "/install"],
+                raw_tail=f'InstallFolder="{app_dir}"',
+                notes=["Вложенный WiX Burn: /quiet /install + InstallFolder. "
+                       "Ключи обёртки ему не подходят."],
+                label=("WiX Burn внутри " + container + ": /quiet /install + "
+                       "InstallFolder" + label_suffix),
+                output_dir=app_dir,
+            ))
+            plans.append(SilentPlan(
+                program=nested,
+                args=["/quiet", "/norestart", "/install"],
+                notes=["Тот же вложенный бандл без InstallFolder: путь берётся "
+                       "из настроек, готовую программу сборка заберёт из "
+                       "каталога по умолчанию."],
+                label=("WiX Burn внутри " + container + " без InstallFolder"
+                       + label_suffix),
+                output_dir=app_dir, ignores_target_dir=True,
+                prefers_installer_default_dir=True,
             ))
         if not plans:
             # Движок не опознан: пробуем два самых распространённых набора.
