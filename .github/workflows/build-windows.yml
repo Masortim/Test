@@ -36,6 +36,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Record build source
+        shell: pwsh
+        run: |
+          "## Windows EXE build source" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "Commit: ``$env:GITHUB_SHA``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "Ref: ``$env:GITHUB_REF_NAME``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
