@@ -563,6 +563,66 @@ def _burn_cache_snapshot(data_dir: str) -> Dict[str, Tuple[int, int]]:
     return snapshot
 
 
+def _burn_present_noop(plan: SilentPlan) -> bool:
+    """Доказанный журналом Burn no-op: пакет Present, выполнять нечего.
+
+    В этом состоянии повторный ``/install`` снова завершится нулём без
+    файлов. Это не общая эвристика по коду возврата: обе отметки должны
+    относиться к одному пакету в журнале именно текущей попытки.
+    """
+    for log_path in plan.progress_logs:
+        try:
+            with open(log_path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 2 * 1024 * 1024))
+                text = handle.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if "Detected package:" not in line or "state: Present" not in line:
+                continue
+            package = line.split("Detected package:", 1)[1] \
+                .split(",", 1)[0].strip()
+            if not package:
+                continue
+            planned = re.compile(
+                r"Planned package:\s*" + re.escape(package)
+                + r"\s*,.*?execute:\s*None\b", re.IGNORECASE)
+            if planned.search(text):
+                return True
+    return False
+
+
+def _burn_repair_plan(plan: SilentPlan) -> Optional[SilentPlan]:
+    """Создаёт отдельный ``/repair`` для no-op ``/install`` с новым журналом."""
+    args = list(plan.args)
+    try:
+        install_index = next(
+            index for index, arg in enumerate(args)
+            if arg.casefold() == "/install"
+        )
+    except StopIteration:
+        return None
+    args[install_index] = "/repair"
+    repair_log = ""
+    for index, arg in enumerate(args[:-1]):
+        if arg.casefold() != "/log":
+            continue
+        old_log = args[index + 1]
+        stem, suffix = os.path.splitext(old_log)
+        repair_log = stem + "-repair" + suffix
+        args[index + 1] = repair_log
+        break
+    label = plan.label.replace("/install", "/repair")
+    if label == plan.label:
+        label = "WiX Burn: /quiet /repair"
+    return replace(
+        plan, args=args, label=label,
+        progress_logs=[repair_log] if repair_log else [],
+    )
+
+
 #: Временные каталоги, которые предыдущие версии оставляли в профиле
 #: пользователя (C:\Users\<user>). Они появляются, когда Portablizer
 #: аварийно завершается до уборки внешнего TEMP или когда PyInstaller
@@ -4130,6 +4190,7 @@ class Portablizer:
         # каждого следующего Burn-плана: код ошибки/модальное окно от этого
         # не изменится, а пользователь снова будет ждать тот же таймаут.
         burn_cache_attempted: Set[Tuple[str, int, int]] = set()
+        burn_repair_queued = False
         payload_seen = False
         index = 0
         while index < len(queue):
@@ -4217,6 +4278,28 @@ class Portablizer:
                     return rc, plan
                 continue
 
+            # Если Burn сам записал Present + execute: None, тихий /install
+            # был доказанным no-op. Не извлекаем уже установленный MSI через
+            # отдельный msiexec (Delta при этом показывает Windows Installer
+            # и зависает): родной /repair использует тот же Package Cache и
+            # InstallFolder и восстанавливает отсутствующие файлы приложения.
+            repair_queued_now = False
+            if (is_burn and not plan.extracts_only and not plan.payload_kind
+                    and rc in (0, 3010) and not burn_repair_queued
+                    and not self._find_main_exe(app_dir, name)
+                    and _burn_present_noop(plan)):
+                repair_plan = _burn_repair_plan(plan)
+                if repair_plan is not None:
+                    queue.insert(index, repair_plan)
+                    burn_repair_queued = True
+                    repair_queued_now = True
+                    self.log.info(
+                        "Burn подтвердил пакет Present и execute: None: "
+                        "/install ничего не устанавливал. Запускаю /repair "
+                        "с тем же InstallFolder — Burn восстановит файлы из "
+                        "Package Cache без повторного Install и очистки реестра."
+                    )
+
             # Некоторые Burn-бандлы (Delta 0.23.0) раскладывают в /layout
             # только собственный setup.exe. Повторять его бессмысленно, но
             # quiet /install кэширует настоящий Delta.msi в redirected
@@ -4224,7 +4307,7 @@ class Portablizer:
             # программа из кэша»: MSI извлекается отдельной административной
             # установкой, а bootstrapper и Package Cache в App не копируются.
             if (is_burn and not plan.extracts_only and not plan.payload_kind
-                    and rc in (0, 3010)
+                    and rc in (0, 3010) and not repair_queued_now
                     and not self._find_main_exe(app_dir, name)
                     and self._install_burn_cached_packages(
                         data_dir, opts, app_dir, name,

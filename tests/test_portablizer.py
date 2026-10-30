@@ -2123,6 +2123,75 @@ class BurnFallbackTests(unittest.TestCase):
             self.assertIn("сохранённый MSI-пакет", engine.log.text)
             self.assertFalse(cache.exists())
 
+    def test_burn_present_noop_uses_repair_before_cached_msi(self):
+        """Present + execute: None чинится родным Burn /repair, не повтором."""
+        with tempfile.TemporaryDirectory() as temp:
+            installer = Path(temp, "DeltaSetup.exe")
+            installer.write_bytes(b"same Delta Burn bundle")
+            portable = Path(temp, "Delta_Portable")
+            app = portable / "App"
+            data = portable / "PortableData"
+            app.mkdir(parents=True)
+            data.mkdir()
+            cache = (data / "ProgramData" / "Package Cache" /
+                     "{delta-package-guid}")
+            cache.mkdir(parents=True)
+            (cache / "Delta.msi").write_bytes(b"cached MSI from 1.41.0")
+            detection = DetectionResult(InstallerType.WIX_BURN, 0.97)
+
+            class FakeBurn(Portablizer):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.calls = []
+
+                def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                    self.calls.append(plan)
+                    if "/layout" in plan.args:
+                        out = Path(plan.output_dir)
+                        out.mkdir(parents=True, exist_ok=True)
+                        (out / "DeltaSetup.exe").write_bytes(
+                            installer.read_bytes())
+                    elif "/install" in plan.args:
+                        native_log = Path(portable, "install.log")
+                        log_index = plan.args.index("/log") + 1
+                        plan.args[log_index] = str(native_log)
+                        plan.progress_logs[:] = [str(native_log)]
+                        native_log.write_text(
+                            "[0001:0002]i101: Detected package: DeltaPackage, "
+                            "state: Present, cached: Yes\n"
+                            "[0001:0002]i201: Planned package: DeltaPackage, "
+                            "state: Present, execute: None, rollback: None\n",
+                            encoding="utf-8")
+                    elif "/repair" in plan.args:
+                        Path(app_dir, "Delta.exe").write_bytes(b"MZ application")
+                    return 0
+
+            engine = FakeBurn(Logger())
+            engine._detection = detection
+            opts = PortableOptions(installer_path=str(installer),
+                                   output_dir=temp, app_name="Delta")
+            attempts = build_attempts(
+                detection, str(installer), str(app), log_dir=str(portable),
+                layout_dir=str(portable / "_bundle_layout"))
+
+            rc, used = engine._run_attempts(
+                attempts, opts, str(app), str(data), str(portable), "Delta")
+
+            self.assertEqual(rc, 0)
+            self.assertIsNotNone(used)
+            self.assertIn("/repair", used.args)
+            self.assertTrue((app / "Delta.exe").is_file())
+            self.assertEqual(len(engine.calls), 3)
+            self.assertIn("/layout", engine.calls[0].args)
+            self.assertIn("/install", engine.calls[1].args)
+            self.assertIn("/repair", engine.calls[2].args)
+            self.assertTrue(engine.calls[2].progress_logs[0].endswith(
+                "install-repair.log"))
+            self.assertFalse(any(call.program == "msiexec.exe"
+                                 for call in engine.calls))
+            self.assertIn("без повторного Install и очистки реестра",
+                          engine.log.text)
+
     def test_burn_does_not_retry_unchanged_cached_msi_after_failure(self):
         """Неизменный MSI после ошибки не запускается заново на каждом плане."""
         with tempfile.TemporaryDirectory() as temp:

@@ -229,6 +229,7 @@ jobs:
                 "out/Delta_Portable/portablizer.log",
                 "out/Delta_Portable/install-layout.log",
                 "out/Delta_Portable/install.log",
+                "out/Delta_Portable/install-repair.log",
                 "out/Delta_Portable/install-retry.log",
                 "out/Delta_Portable/burn-cache-msi-1.log",
                 "out/Delta_Portable/installer-output.log")) {
@@ -278,9 +279,9 @@ jobs:
           }
           $buildLog = Join-Path $portable "portablizer.log"
           $buildLogText = Get-Content $buildLog -Raw
-          if ($buildLogText -notmatch 'MSI из Package Cache распакован в App') {
+          if ($buildLogText -notmatch 'Сработал запасной сценарий: WiX Burn: /quiet /repair') {
             Get-Content $buildLog -Tail 160 | ForEach-Object { Write-Host $_ }
-            throw "Delta did not exercise the cached-MSI recovery path"
+            throw "Delta did not recover the Present package through Burn repair"
           }
           $cacheDirs = @(Get-ChildItem $portable -Recurse -Directory `
             -Filter "Package Cache" -ErrorAction SilentlyContinue)
