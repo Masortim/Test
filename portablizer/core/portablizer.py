@@ -4529,11 +4529,70 @@ class Portablizer:
         found.sort(key=_size, reverse=True)
         return found
 
+    def _unpack_nested_bundle(
+        self, nested: str, opts: PortableOptions, app_dir: str,
+        data_dir: str, name: str, console_log: Optional[str] = None,
+        depth: int = 0,
+    ) -> bool:
+        """Распаковывает вложенный Burn-бандл через ``/layout`` и ставит пакет.
+
+        Вложенный бандл **не запускается как установщик**: он пишет в реестр
+        запись «установлено», кэширует payload в профиле и при повторном
+        запуске считает программу уже установленной. Дальше Burn уходит в
+        режим обслуживания, где ``Plan`` требует нового ``Detect`` —
+        ``Error 0x8007139f`` в цикле, а ``App`` остаётся пустым (жалоба:
+        «окно установщика раз за разом выдавало ошибку»).
+
+        ``/layout`` не регистрирует ничего: он просто раскладывает пакеты на
+        диск, а MSI из них распаковывается административной установкой
+        (``msiexec /a``) прямо в ``App``.
+        """
+        if depth >= 2:
+            return False
+        sub = os.path.join(os.path.dirname(os.path.abspath(nested)),
+                           "_nested_layout")
+        self.log.info(
+            "Файл из бандла — сам WiX Burn-бандл "
+            f"({os.path.basename(nested)}). Распаковываю его через /layout, "
+            "а не запускаю установку: так в системе не остаётся записи "
+            "«уже установлено», из-за которой установщик зацикливается."
+        )
+        plan = SilentPlan(
+            program=nested, args=["/layout", sub, "/quiet", "/norestart"],
+            notes=["Вложенный Burn-бандл: только раскладка пакетов, без "
+                   "установки в систему."],
+            label="WiX Burn внутри бандла: распаковка /layout",
+            output_dir=sub, extracts_only=True,
+        )
+        self._run_install(plan, opts, app_dir, data_dir,
+                          progress_from=58, progress_to=60,
+                          console_log=console_log)
+        if not os.path.isdir(sub):
+            self.log.warn(
+                "Вложенный бандл не разложил пакеты через /layout."
+            )
+            return False
+        if self._install_layout_packages(
+                sub, opts, app_dir, data_dir, name,
+                console_log=console_log, depth=depth + 1):
+            return True
+        return False
+
     def _install_bundle_exe_payload(
         self, nested: str, opts: PortableOptions, app_dir: str,
         data_dir: str, name: str, console_log: Optional[str] = None,
+        depth: int = 0,
     ) -> bool:
         """Ставит exe-пакет бандла его собственными ключами тишины."""
+        if self._nested_is_burn(nested):
+            if self._unpack_nested_bundle(
+                    nested, opts, app_dir, data_dir, name,
+                    console_log=console_log, depth=depth):
+                return True
+            self.log.info(
+                "Раскладка вложенного бандла не дала программы — пробую "
+                "запустить его как установщик со своими ключами Burn."
+            )
         self.log.info(
             "В распакованном бандле нет MSI, но есть установщик программы: "
             f"{os.path.basename(nested)}. Запускаю его своими ключами — "
@@ -4574,8 +4633,13 @@ class Portablizer:
     def _install_layout_packages(self, layout_dir: str, opts: PortableOptions,
                                  app_dir: str, data_dir: str,
                                  name: str,
-                                 console_log: Optional[str] = None) -> bool:
-        """Раскладывает пакеты из подготовленного ``/layout`` прямо в ``App``."""
+                                 console_log: Optional[str] = None,
+                                 depth: int = 0) -> bool:
+        """Раскладывает пакеты из подготовленного ``/layout`` прямо в ``App``.
+
+        ``depth`` — сколько вложенных раскладок уже пройдено: бандл внутри
+        бандла встречается, но глубже двух уровней уходить нельзя.
+        """
         msis, other_payloads = _burn_layout_payloads(layout_dir)
         installers = self._bundle_program_installers(other_payloads)
         skipped = [
@@ -4598,7 +4662,7 @@ class Portablizer:
             for nested in installers:
                 if self._install_bundle_exe_payload(
                         nested, opts, app_dir, data_dir, name,
-                        console_log=console_log):
+                        console_log=console_log, depth=depth):
                     self.log.ok("Пакет бандла установлен в папку App.")
                     shutil.rmtree(layout_dir, ignore_errors=True)
                     self.log.info("Временная распаковка бандла удалена.")
@@ -5268,6 +5332,22 @@ class Portablizer:
                 return total
         return total
 
+    @staticmethod
+    def _nested_is_burn(path: str) -> bool:
+        """Вложенный файл — настоящий WiX Burn-бандл?
+
+        Проверяется **структура PE** (секция ``.wixburn``), а не подстрока в
+        байтах: у Burn v7 строки ``WixBurn`` в первых мегабайтах нет, и
+        поиск по байтам опознавал такой файл как «неизвестный установщик».
+        Из-за этого к нему применялись ключи Inno Setup (``/VERYSILENT``,
+        ``/DIR=``), Burn их игнорировал, открывал своё окно и уходил в
+        бесконечный цикл обслуживания (``Error 0x8007139f``).
+        """
+        try:
+            return read_pe_info(path).has_section(".wixburn")
+        except OSError:
+            return False
+
     def _nested_installer_kind(self, path: str) -> InstallerType:
         """Какой движок у установщика, найденного внутри архива.
 
@@ -5275,6 +5355,8 @@ class Portablizer:
         загрузчике (начало), у InstallShield — тоже рядом с ним. Полный
         разбор файла здесь не нужен и стоил бы секунд на гигабайтах.
         """
+        if self._nested_is_burn(path):
+            return InstallerType.WIX_BURN
         try:
             size = os.path.getsize(path)
             chunk = 4 * 1024 * 1024
@@ -5480,6 +5562,8 @@ class Portablizer:
                     continue
                 base = f.lower()
                 if base in cls._PAYLOAD_INSTALLER_NAMES or base.startswith(bad_prefixes):
+                    continue
+                if base in ("launchportable.exe", "portablelauncher.exe"):
                     continue
                 stem = os.path.splitext(f)[0]
                 # Даём положительный базовый балл любому не-служебному exe
@@ -8422,12 +8506,19 @@ class Portablizer:
             "crashpad", "crashreport", "unitycrashhandler", "werfault",
             "bugreport", "epicwebhelper", "update", "helper", "feedback",
         )
+        # Сам лончер портатива тоже лежит в App. Главной программой он быть
+        # не может: иначе Launch.bat запускает лончер, а тот — снова себя.
+        own_launchers = {
+            "launchportable.exe", "portablelauncher.exe", "relauncher.exe",
+        }
 
         non_ignored: List[Tuple[int, str, str, str, str]] = []
 
         for p in candidates:
             base = os.path.basename(p).lower()
             stem = os.path.splitext(os.path.basename(p))[0]
+            if base in own_launchers:
+                continue
             if base.startswith("unins") or base == "uninstall.exe":
                 continue
             if any(b in base for b in bad_prefixes):
