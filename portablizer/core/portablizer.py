@@ -292,6 +292,20 @@ UNPACKABLE_TYPES = (
     InstallerType.UNKNOWN,
 )
 
+#: Имена exe, рядом с которыми лежит **раскладка дистрибутива** (``data1.cab``,
+#: ``setup.iss``, ``*.bin``, соседний MSI). Только для них папка установщика
+#: считается частью программы и может попасть в ``App`` целиком.
+_LAYOUT_INSTALLER_NAMES = frozenset({
+    "setup.exe", "set-up.exe", "install.exe", "installer.exe",
+    "instal.exe", "autorun.exe",
+})
+
+#: Слова в имени exe, по которым видно установщик, даже если внутри не нашлось
+#: ни одной сигнатуры движка. Такой файл нельзя объявлять «готовой программой»
+#: и копировать в ``App`` вместо установки.
+_INSTALLER_NAME_RE = re.compile(
+    r"(setup|install|instal|repack|bundle|unpack|extract)", re.IGNORECASE)
+
 #: Код -1 от bootstrapper'а почти всегда означает «не разобрал командную
 #: строку»: неизвестный ключ, отсутствие обязательного (например, принятия
 #: лицензии) или запрет на запуск без UAC.
@@ -1220,6 +1234,9 @@ class Portablizer:
         self._online_profile_targets: List[launcher_mod.TargetInfo] = []
         self._online_profile_diagnostic = ""
         self._recovered_sources: List[str] = []
+        #: В App попал сам выбранный exe, а не установленная программа
+        #: (пользователь дал готовый «портативный» exe).
+        self._adopted_program_exe = False
 
     # -- вспомогательное ------------------------------------------------------
     def progress(self, percent: int, stage: str) -> None:
@@ -1975,6 +1992,10 @@ class Portablizer:
             self._online_profile_targets = []
             self._online_profile_diagnostic = ""
             self._recovered_sources = []
+            #: В App попал сам выбранный exe (а не установленная программа):
+            #: значит, пользователь дал готовую программу, и итог нужно
+            #: объяснить, а не выдавать за тихую установку.
+            self._adopted_program_exe = False
             self._installer_name = opts.installer_path
             # Жалоба: в C:\Users\<user> накапливались Portablizer-*-Temp / _MEI*
             # от аварийных завершений предыдущих запусков. Убираем их сразу,
@@ -2390,6 +2411,17 @@ class Portablizer:
             result.targets = targets
             result.main_exe_rel = os.path.relpath(main_exe, portable_dir)
             self.log.ok(f"Главный exe: {result.main_exe_rel}")
+            if self._adopted_program_exe:
+                note = (
+                    "Выбран готовый exe, а не установщик: в App лежит только "
+                    "он сам. Файлы, которые лежали рядом с исходным exe, "
+                    "намеренно не копировались — иначе в портатив попадали "
+                    "бы посторонние загрузки и документы. Если программе "
+                    "нужны её библиотеки или папка данных, скопируйте их в "
+                    "App вручную."
+                )
+                self.log.warn(note)
+                result.hints.append(note)
 
             for t in targets:
                 if t.role == "launcher":
@@ -6800,6 +6832,80 @@ class Portablizer:
             if overwrite or not os.path.exists(destination):
                 shutil.copy2(source_abs, destination)
 
+    @classmethod
+    def _installer_is_layout(cls, installer_path: str) -> bool:
+        """Выбран ``setup.exe``-подобный файл, а не сама программа.
+
+        Рядом с таким файлом лежит раскладка дистрибутива (``data1.cab``,
+        ``setup.ins``, ``*.bin``, MSI), без которой программу не поставить.
+        Только её разрешено копировать в ``App`` целиком.
+        """
+        base = os.path.basename(installer_path or "").casefold()
+        return base in _LAYOUT_INSTALLER_NAMES
+
+    @classmethod
+    def _looks_like_ready_program(cls, det: Optional[DetectionResult],
+                                  installer_path: str) -> bool:
+        """Выбранный файл — готовая программа, а не установщик.
+
+        Так выглядит «портативный» exe: ни одной сигнатуры движка установки
+        (``UNKNOWN``), нет собственных ключей тишины, манифеста
+        ``requireAdministrator``, приклеенного ZIP и профиля производителя.
+        Такой файл незачем запускать с ключами установки: в ``App``
+        переносится **только он сам**, а файлы, лежащие рядом с ним
+        (загрузки, документы, чужие архивы), к программе не относятся.
+
+        Имя файла проверяется отдельно: если в нём есть ``setup``/``install``/
+        ``repack``, это установщик, даже когда сигнатуры внутри не нашлись.
+        """
+        if not installer_path:
+            return False
+        if os.path.splitext(installer_path)[1].casefold() != ".exe":
+            return False
+        stem = os.path.splitext(os.path.basename(installer_path))[0]
+        if (cls._installer_is_layout(installer_path)
+                or _INSTALLER_NAME_RE.search(stem)):
+            return False
+        if det is None or det.installer_type != InstallerType.UNKNOWN:
+            return False
+        if det.vendor_name or det.repack_profile is not None:
+            return False
+        if det.switch_hints or det.requires_admin or det.is_downloader_stub:
+            return False
+        if det.has_zip_payload or det.adobe_named or det.adobe_layout:
+            return False
+        if det.response_files or det.is_msi:
+            return False
+        try:
+            return read_pe_info(installer_path).is_pe
+        except OSError:
+            return False
+
+    def _copy_program_exe(self, installer_path: str, app_dir: str,
+                          app_name: str) -> bool:
+        """Копирует готовый exe в ``App``, не трогая соседние файлы."""
+        destination = os.path.join(app_dir, os.path.basename(installer_path))
+        try:
+            if os.path.normcase(os.path.abspath(destination)) != os.path.normcase(
+                    os.path.abspath(installer_path)):
+                shutil.copy2(installer_path, destination)
+        except OSError as exc:
+            self.log.warn(
+                f"Не удалось скопировать готовый exe в App: {exc}")
+            return False
+        if not self._find_main_exe(app_dir, app_name):
+            try:
+                os.remove(destination)
+            except OSError:
+                pass
+            return False
+        self._adopted_program_exe = True
+        self.log.ok(
+            f"В App скопирован только сам exe: {os.path.basename(installer_path)}. "
+            "Файлы, лежащие рядом с ним, не переносились."
+        )
+        return True
+
     def _supplement_recovered_from_registry(
         self,
         app_dir: str,
@@ -6836,6 +6942,16 @@ class Portablizer:
                 continue
             if (src_norm == installer_dir_norm
                     or src_norm.startswith(installer_dir_norm + os.sep)):
+                if not self._installer_is_layout(installer_path):
+                    # Реестр указывает внутрь папки самого переносимого exe.
+                    # Это не каталог установки: рядом могут лежать любые
+                    # чужие файлы (загрузки, документы, архивы), и раньше они
+                    # целиком уезжали в App. Докопировать отсюда нечего.
+                    self.log.debug(
+                        "  • реестр ссылается на папку самого exe — соседние "
+                        "файлы в App не копирую."
+                    )
+                    continue
                 self._remember_recovered_source(installer_dir)
                 try:
                     self._copy_recovered_tree(
@@ -6884,12 +7000,39 @@ class Portablizer:
         installer_dir_norm = (
             os.path.normcase(installer_dir) if installer_dir else ""
         )
+        installer_is_layout = self._installer_is_layout(installer_abs)
+        ready_program = self._looks_like_ready_program(
+            self._detection, installer_abs)
         # normalized source -> (score, representative exe, explanation, source)
         candidates: Dict[str, Tuple[int, str, str, str]] = {}
 
         def add_source(source: str, score: int, reason: str) -> None:
             source = os.path.abspath(source)
             source_norm = os.path.normcase(source)
+            # Папка, в которой лежит сам переносимый exe (или её предок), —
+            # не «каталог установки». Раньше она копировалась целиком, и в App
+            # уезжали все соседние файлы: загрузки, документы, чужие архивы.
+            # Исключение — setup.exe с раскладкой дистрибутива: без data*.cab
+            # и *.bin он бесполезен, поэтому берём именно его папку, а не
+            # весь предок.
+            if (installer_abs_norm and os.path.isdir(source)
+                    and (installer_abs_norm == source_norm
+                         or installer_abs_norm.startswith(source_norm + os.sep))):
+                if installer_is_layout:
+                    source = installer_dir
+                    source_norm = installer_dir_norm
+                elif ready_program:
+                    source = installer_abs
+                    source_norm = installer_abs_norm
+                    score = max(score, 300)
+                    reason = ("сам переносимый exe: соседние файлы "
+                              "не копируются")
+                else:
+                    self.log.debug(
+                        "  • источник оказался папкой самого установщика — "
+                        "соседние с ним файлы в App не копирую."
+                    )
+                    return
             # Никогда не копируем Program Files/AppData/корень диска целиком
             # или саму папку собираемого портатива.
             if (source_norm in protected_roots
@@ -6906,7 +7049,8 @@ class Portablizer:
             for exe in exes:
                 exe_abs = os.path.abspath(exe)
                 exe_norm = os.path.normcase(exe_abs)
-                if installer_abs_norm and exe_norm == installer_abs_norm:
+                if (installer_abs_norm and exe_norm == installer_abs_norm
+                        and not ready_program):
                     continue
                 if (exe_norm == app_dir_norm
                         or exe_norm.startswith(app_dir_norm + os.sep)):
@@ -7031,6 +7175,12 @@ class Portablizer:
                 return True
             shutil.rmtree(app_dir, ignore_errors=True)
             os.makedirs(app_dir, exist_ok=True)
+
+        # Ни один каталог установки не подошёл, а выбранный файл — готовая
+        # программа. Копируем в App только сам exe: именно этого пользователь
+        # и ждёт, когда «портирует» уже портативную программу.
+        if ready_program:
+            return self._copy_program_exe(installer_abs, app_dir, app_name)
         return False
 
     def _cleanup_leftover_install_dirs(
