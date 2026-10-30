@@ -757,6 +757,9 @@ class LauncherExternalRegSwitchTests(unittest.TestCase):
                         exe_launcher, "delete_key_tree", side_effect=fake_delete
                     ), \
                     mock.patch.object(
+                        exe_launcher, "registry_key_state", return_value=False
+                    ), \
+                    mock.patch.object(
                         exe_launcher, "_reg", side_effect=fake_reg
                     ):
                 session = exe_launcher.RegistrySession(root, cfg)

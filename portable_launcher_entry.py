@@ -1928,6 +1928,17 @@ def import_reg_command(root: "Optional[Path]" = None,
         _run_log(root, "registry: --import-reg: the marker is still present, "
                        "the file is not imported")
         return 1
+    # BAT вызывает этот путь, если PowerShell недоступен. Старые portable.reg
+    # могут ещё содержать Explorer\FileExts\UserChoice: его хэш и ProgID
+    # принадлежат другому пользователю и не должны навязываться этому ПК.
+    text, dropped = sanitize_reg_text(text)
+    if not text:
+        _run_log(root, "registry: --import-reg: only protected shell sections; "
+                       "nothing to import")
+        return 0
+    if dropped:
+        _run_log(root, "registry: --import-reg: protected shell sections "
+                       f"skipped ({len(dropped)})")
     runtime = _data_dir(root, {}) / "Runtime"
     try:
         runtime.mkdir(parents=True, exist_ok=True)
@@ -3676,6 +3687,10 @@ REGISTRY_SNAPSHOT_NAME = "all-keys.reg"
 #: Экспорт ключей, созданных установщиком: нужен для сведения настроек.
 REGISTRY_CREATED_NAME = "created-keys.reg"
 
+#: Состояние ключей именно текущего ПК до импорта портатива. Без этого файла
+#: нельзя отличить «ключ был новым на сборочном ПК» от «ключа здесь не было».
+REGISTRY_STATE_NAME = "host-state.json"
+
 #: Потолок глубины обхода: ключи приложения не бывают глубже.
 REG_SNAPSHOT_MAX_DEPTH = 32
 
@@ -3977,6 +3992,105 @@ def delete_key_tree(key: str) -> bool:
     except OSError:
         return True
     return False
+
+
+def registry_key_state(key: str) -> Optional[bool]:
+    """True/False — ключ есть/отсутствует; None — прочитать не удалось.
+
+    Используется только для решения об удалении после сеанса. Неизвестное
+    состояние никогда не трактуется как отсутствие: отказ в доступе не должен
+    превращаться в разрешение удалить пользовательский ключ.
+    """
+    reg = _winreg()
+    if reg is None:
+        return None
+    located = _reg_hive_handle(reg, key)
+    if located is None:
+        return None
+    hive, path = located
+    try:
+        with reg.OpenKey(hive, path, 0, reg.KEY_READ):
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 2 or getattr(exc, "errno", None) == 2:
+            return False
+        return None
+
+
+def delete_registry_value(key: str, name: str) -> bool:
+    """Удаляет одно значение; отсутствующее значение считается успехом."""
+    reg = _winreg()
+    if reg is not None:
+        located = _reg_hive_handle(reg, key)
+        if located is not None:
+            hive, path = located
+            try:
+                with reg.OpenKey(hive, path, 0, reg.KEY_WRITE) as handle:
+                    reg.DeleteValue(handle, name)
+                return True
+            except FileNotFoundError:
+                return True
+            except OSError:
+                pass
+    args = ["delete", key]
+    if name:
+        args += ["/v", name]
+    else:
+        args += ["/ve"]
+    args.append("/f")
+    return _reg(tuple(args)) == 0
+
+
+def _snapshot_contains_key(text: str, key: str) -> bool:
+    """Есть ли точный корневой ключ (не только его потомок) в REG-снимке."""
+    if not text:
+        return False
+    wanted = (_normalize_reg_section_header(key) or "").casefold()
+    if not wanted:
+        return False
+    for header in _parse_reg_sections(text):
+        normalized = (_normalize_reg_section_header(header) or "").casefold()
+        if normalized == wanted:
+            return True
+    return False
+
+
+def _drop_registry_roots(text: str, roots: Sequence[str]) -> tuple[str, list[str]]:
+    """Удаляет секции неизвестных корней из runtime-копии REG."""
+    blocked = {
+        (_normalize_reg_section_header(root) or "").casefold()
+        for root in roots
+    }
+    blocked.discard("")
+    if not blocked:
+        return text, []
+    kept: "list[str]" = []
+    dropped: "list[str]" = []
+    skip = False
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            raw = stripped[1:-1].strip()
+            deleting = raw.startswith("-")
+            normalized = _normalize_reg_section_header(
+                raw[1:] if deleting else raw)
+            folded = (normalized or "").casefold()
+            skip = bool(folded and any(
+                folded == root or folded.startswith(root + "\\")
+                for root in blocked))
+            if skip:
+                dropped.append(raw)
+                continue
+        if not skip:
+            kept.append(line)
+    if not any(line.strip().startswith("[") for line in kept):
+        return "", dropped
+    body = "\r\n".join(kept).strip()
+    if not body.casefold().startswith("windows registry editor"):
+        body = "Windows Registry Editor Version 5.00\r\n\r\n" + body
+    return body + "\r\n", dropped
 
 
 #: Результат последнего ``sync_external_changes`` по корню портатива:
@@ -4329,52 +4443,118 @@ class RegistrySession:
             (created if text.casefold() in self.created else plain).append(text)
         return plain, created
 
+    def _tracked_keys(self) -> "list[str]":
+        """Все ключи, которые сеанс может изменить или удалить после выхода."""
+        result: "list[str]" = []
+        seen: "set[str]" = set()
+        for key in list(self.keys) + list(self.cfg.get("created_keys", [])):
+            text = str(key)
+            folded = text.casefold()
+            if not text or folded in seen:
+                continue
+            seen.add(folded)
+            result.append(text)
+        return result
+
+    @property
+    def _state_file(self) -> Path:
+        return self.backup / REGISTRY_STATE_NAME
+
+    def _read_host_state(self) -> Optional[Dict[str, list[str]]]:
+        try:
+            data = json.loads(self._state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, AttributeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        result: Dict[str, list[str]] = {}
+        for name in ("present", "absent", "unknown"):
+            values = data.get(name, [])
+            if not isinstance(values, list):
+                return None
+            result[name] = [str(item) for item in values]
+        return result
+
+    def _write_host_state(self, state: Dict[str, list[str]]) -> bool:
+        temporary = self._state_file.with_suffix(".tmp")
+        try:
+            temporary.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+            os.replace(temporary, self._state_file)
+            return True
+        except OSError:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            return False
+
     def _snapshot_host(self) -> "tuple[list[Path], list[Path]]":
-        """Снимок реестра машины одним .reg вместо процесса на каждый ключ.
+        """Снимок и исходное состояние ключей именно этого ПК.
 
-        Прямой обход через winreg дешевле ``reg export``: у программы вроде
-        Cursor ключей десятки, и каждый запуск ``reg.exe`` стоил 40-150 мс —
-        окно открывалось заметно позже прямого запуска её exe.
-
-        Возвращает ``(базовые файлы, экспорты созданных ключей)``. Вторые нужны
-        не для восстановления, а как «состояние ключа на хосте» для сведения
-        настроек (см. ``sync_external_changes``), поэтому пишутся отдельно.
+        ``created_keys`` описывает машину СБОРКИ и не говорит ничего о текущем
+        компьютере. Поэтому в baseline попадают и обычные, и созданные там
+        ключи: существующая здесь ассоциация будет восстановлена, а не удалена.
+        Для каждого ключа дополнительно записывается present/absent/unknown;
+        удалять после сеанса разрешено только подтверждённо отсутствовавшее.
         """
-        plain, created = self._split_keys()
         baseline: "list[Path]" = []
         target = self.backup / REGISTRY_SNAPSHOT_NAME
+        legacy = sorted(self.backup.glob("k[0-9][0-9].reg"))
+        state = self._read_host_state()
         if target.is_file():
             # Снимок остался от прошлого запуска, который не дошёл до
             # восстановления: это по-прежнему исходное состояние машины.
             baseline.append(target)
-        else:
-            legacy = sorted(self.backup.glob("k[0-9][0-9].reg"))
-            if legacy:
-                # Базовый снимок прежней версии (файл на ключ) — используем его.
-                baseline.extend(legacy)
-            else:
-                text = export_registry_text(plain, self.root)
-                if text and write_reg_file(target, text):
-                    baseline.append(target)
-                else:
-                    # Запасной путь прежней версии: файл на каждый ключ. Номера
-                    # файлов считаются по полному списку ``keys`` — так их
-                    # потом найдёт восстановление.
-                    created_cf = {str(key).casefold() for key in created}
-                    for index, key in enumerate(self.keys):
-                        text_key = str(key)
-                        if text_key.casefold() in created_cf:
-                            continue
-                        legacy_file = self.backup / f"k{index:02d}.reg"
-                        if _reg(("export", text_key, str(legacy_file),
-                                 "/y")) == 0 and legacy_file.is_file():
-                            baseline.append(legacy_file)
+        baseline.extend(path for path in legacy if path not in baseline)
 
-        created_exports: "list[Path]" = []
+        _plain, created = self._split_keys()
+        if state is not None or baseline or self._state_file.exists():
+            # Старый backup без host-state тоже сохраняем, но не выдумываем
+            # отметки отсутствия задним числом: удаления будут запрещены.
+            created_exports: "list[Path]" = []
+            if created:
+                text = export_registry_text(created, self.root)
+                created_file = self.backup / REGISTRY_CREATED_NAME
+                if text and write_reg_file(created_file, text):
+                    created_exports.append(created_file)
+            return baseline, created_exports
+
+        tracked = self._tracked_keys()
+        text = export_registry_text(tracked, self.root)
+        if text and write_reg_file(target, text):
+            baseline.append(target)
+
+        new_state: Dict[str, list[str]] = {
+            "present": [], "absent": [], "unknown": []}
+        for index, key in enumerate(tracked):
+            status = registry_key_state(key)
+            if status is False:
+                new_state["absent"].append(key)
+                continue
+            if status is not True:
+                new_state["unknown"].append(key)
+                continue
+
+            covered = target.is_file() and _snapshot_contains_key(text, key)
+            if not covered:
+                # Редкий fallback: конкретный ключ не удалось прочитать общим
+                # обходом (лимит/тип/доступ). Экспортируем только его, а не
+                # запускаем reg.exe для каждого ключа при обычном запуске.
+                legacy_file = self.backup / f"k{index:02d}.reg"
+                if _reg(("export", key, str(legacy_file), "/y")) == 0 \
+                        and legacy_file.is_file():
+                    baseline.append(legacy_file)
+                    covered = True
+            new_state["present" if covered else "unknown"].append(key)
+        self._write_host_state(new_state)
+
+        created_exports = []
         if created:
-            text = export_registry_text(created, self.root)
+            created_text = export_registry_text(created, self.root)
             created_file = self.backup / REGISTRY_CREATED_NAME
-            if text and write_reg_file(created_file, text):
+            if created_text and write_reg_file(created_file, created_text):
                 created_exports.append(created_file)
         return baseline, created_exports
 
@@ -4449,6 +4629,26 @@ class RegistrySession:
                 text = _decode_reg(imported.read_bytes())
             except OSError:
                 text = ""
+            if not text:
+                _run_log(self.root, "registry import " + source.name
+                         + ": skipped (runtime copy is unreadable)")
+                continue
+            state = self._read_host_state()
+            unknown = state.get("unknown", []) if state is not None else []
+            if unknown and text:
+                text, dropped = _drop_registry_roots(text, unknown)
+                if dropped:
+                    _run_log(self.root, "registry import: keys with unknown "
+                             f"baseline skipped ({len(dropped)})")
+                if not text:
+                    continue
+                if dropped:
+                    safe_copy = self.runtime / f"safe-{index:03d}.reg"
+                    if not write_reg_file(safe_copy, text):
+                        _run_log(self.root, "registry import: cannot write "
+                                 "the filtered runtime copy; skipped")
+                        continue
+                    imported = safe_copy
             if import_registry_text(text):
                 _run_log(self.root, f"registry import {source.name}: ok "
                                     "(direct)")
@@ -4477,6 +4677,64 @@ class RegistrySession:
         self.prepare()
         self.apply()
 
+    def _prune_to_baseline(
+            self, state: Optional[Dict[str, list[str]]],
+            baseline_text: str, current_text: str) -> bool:
+        """Удаляет значения/подключи, которых не было в исходном snapshot.
+
+        ``reg import backup.reg`` восстанавливает старые значения, но не убирает
+        добавленные. Для ассоциаций это важно: новый default/ProgId нельзя
+        оставить рядом с восстановленными. Обрабатываются только ветки, для
+        которых host-state подтверждает наличие полного baseline.
+        """
+        if state is None or not state.get("present"):
+            return True
+        if not current_text:
+            # Пустой экспорт допустим только если все исходные ключи действительно
+            # удалены программой. Ошибку чтения нельзя принять за «ничего не
+            # добавлено»: иначе baseline будет удалён вместе с доказательствами.
+            return all(registry_key_state(key) is False
+                       for key in state.get("present", []))
+        baseline = _parse_reg_sections(baseline_text)
+        current = _parse_reg_sections(current_text)
+        baseline_cf = {key.casefold(): (key, values)
+                       for key, values in baseline.items()}
+        success = True
+        new_subkeys: "list[str]" = []
+        absent_roots = [(_normalize_reg_section_header(key) or "").casefold()
+                        for key in state.get("absent", [])]
+
+        for original_root in state.get("present", []):
+            root = (_normalize_reg_section_header(original_root) or "").casefold()
+            if not root or root not in baseline_cf:
+                # Нет доказательства полного снимка корня — не удаляем ничего.
+                success = False
+                continue
+            for header, values in current.items():
+                folded = header.casefold()
+                if folded != root and not folded.startswith(root + "\\"):
+                    continue
+                if any(folded == absent or folded.startswith(absent + "\\")
+                       for absent in absent_roots if absent):
+                    continue
+                base = baseline_cf.get(folded)
+                if base is None:
+                    if folded != root:
+                        new_subkeys.append(header)
+                    continue
+                base_names = {name.casefold() for name in base[1]}
+                for name in values:
+                    if name.casefold() in base_names:
+                        continue
+                    if not delete_registry_value(header, name):
+                        success = False
+
+        for header in sorted(new_subkeys, key=lambda item: item.count("\\"),
+                             reverse=True):
+            if not delete_key_tree(header) and _reg(("delete", header, "/f")) != 0:
+                success = False
+        return success
+
     def save_and_restore(self) -> None:
         if not self.active or not self.started:
             return
@@ -4498,45 +4756,66 @@ class RegistrySession:
             if write_reg_file(session_file, session_text):
                 _pack_reg(session_file, self.root)
 
-        # Ключи, созданные установщиком: их нет в базовом снимке, поэтому
-        # импорт их не уберёт — удаляем явно. Список берётся из ``created_keys``
-        # и из помеченных ключей, а не только из ``keys``: созданный ключ может
-        # быть подключом сохранённого и отдельно в списке ключей не значиться.
-        removed: "set[str]" = set()
-        for key in list(self.keys) + list(self.cfg.get("created_keys", [])):
-            text = str(key)
-            if text.casefold() in removed or text.casefold() not in self.created:
-                continue
-            removed.add(text.casefold())
-            # winreg быстрее, reg.exe — запасной путь, если ключ занят или
-            # доступ закрыт.
-            if not delete_key_tree(text):
-                _reg(("delete", text, "/f"))
-
+        # Удаляем только то, чего подтверждённо не было на ЭТОМ ПК до сеанса.
+        # created_keys с машины сборки здесь намеренно не используется: на
+        # другом компьютере такой же ProgID/расширение могло уже существовать.
+        tracked = self._tracked_keys()
+        state = self._read_host_state()
+        absent = ({key.casefold() for key in state.get("absent", [])}
+                  if state is not None else set())
         snapshot = self.backup / REGISTRY_SNAPSHOT_NAME
+        delete_failed = False
+        if state is not None and state.get("present"):
+            baseline_parts: "list[str]" = []
+            backup_files = ([snapshot] if snapshot.is_file() else [])
+            backup_files += sorted(self.backup.glob("k[0-9][0-9].reg"))
+            for path in backup_files:
+                try:
+                    baseline_parts.append(_decode_reg(path.read_bytes()))
+                except OSError:
+                    delete_failed = True
+            current_text = export_registry_text(tracked, self.root)
+            if not self._prune_to_baseline(
+                    state, "\r\n".join(baseline_parts), current_text):
+                delete_failed = True
+        for key in tracked:
+            if key.casefold() not in absent:
+                continue
+            if not delete_key_tree(key):
+                code = _reg(("delete", key, "/f"))
+                if code != 0:
+                    delete_failed = True
+
+        # Все существовавшие ключи — включая created_keys — восстанавливаются
+        # из снимка текущего ПК. При неудаче backup и state остаются для
+        # повторного восстановления при следующем запуске, а не удаляются.
         if snapshot.is_file():
             if import_registry_file(snapshot, self.root):
                 _run_log(self.root, "registry restore: ok")
+                if not delete_failed:
+                    try:
+                        snapshot.unlink()
+                    except OSError:
+                        pass
             else:
                 _run_log(self.root, "registry restore: FAILED")
-            try:
-                snapshot.unlink()
-            except OSError:
-                pass
-        else:
-            # Снимка одним файлом нет — значит, он не получился, и лежат
-            # пофайловые снимки прежнего пути. Файл созданного ключа не
-            # импортируется никогда: такой ключ должен исчезнуть с машины.
-            for index, key in enumerate(self.keys):
-                backup_file = self.backup / f"k{index:02d}.reg"
-                if not backup_file.is_file():
-                    continue
-                if str(key).casefold() not in self.created:
-                    import_registry_file(backup_file, self.root)
+        for index, _key in enumerate(tracked):
+            backup_file = self.backup / f"k{index:02d}.reg"
+            if not backup_file.is_file():
+                continue
+            if import_registry_file(backup_file, self.root):
                 try:
                     backup_file.unlink()
                 except OSError:
                     pass
+
+        backups_left = snapshot.is_file() or any(
+            self.backup.glob("k[0-9][0-9].reg"))
+        if state is not None and not backups_left and not delete_failed:
+            try:
+                self._state_file.unlink()
+            except OSError:
+                pass
 
         for leftover in (self.backup / REGISTRY_CREATED_NAME,):
             try:
@@ -8921,12 +9200,12 @@ def retarget_record_text(text: str, stale_roots: "Sequence[str]",
     return expand_root_token_text(result, base)
 
 
-def _registry_views():
+def _registry_views(include_app_paths: bool = True):
     """Корни реестра, в которых установщик мог оставить запись об установке."""
     reg = _winreg()
     if reg is None:
         return []
-    return [
+    views = [
         (reg.HKEY_CURRENT_USER, _UNINSTALL_KEY, reg.KEY_READ | reg.KEY_SET_VALUE),
         (reg.HKEY_CURRENT_USER, _APP_PATHS_KEY, reg.KEY_READ | reg.KEY_SET_VALUE),
         (reg.HKEY_LOCAL_MACHINE, _UNINSTALL_KEY,
@@ -8936,6 +9215,9 @@ def _registry_views():
         (reg.HKEY_LOCAL_MACHINE, _UNINSTALL_KEY,
          reg.KEY_READ | reg.KEY_SET_VALUE | reg.KEY_WOW64_32KEY),
     ]
+    if not include_app_paths:
+        views = [item for item in views if item[1] != _APP_PATHS_KEY]
+    return views
 
 
 def _winreg():
@@ -8982,7 +9264,8 @@ def replace_app_prefix(value: str, current_root: Path,
 
 def retarget_host_install_records(stale_roots: "Sequence[str]",
                                   current_root: Path,
-                                  app_names: "Sequence[str]" = ()
+                                  app_names: "Sequence[str]" = (),
+                                  *, include_app_paths: bool = True
                                   ) -> "list[str]":
     """Переводит записи об установке на текущий корень портатива.
 
@@ -9007,7 +9290,7 @@ def retarget_host_install_records(stale_roots: "Sequence[str]",
     if reg is None:
         return []
     changed: "list[str]" = []
-    for hive, path, access in _registry_views():
+    for hive, path, access in _registry_views(include_app_paths):
         try:
             with reg.OpenKey(hive, path, 0, access) as parent:
                 names = []
@@ -10041,13 +10324,25 @@ def _captured_registry_views(cfg: "Optional[Dict[str, Any]]" = None
     return views
 
 
+def _is_association_registry_view(reg, hive, path: str) -> bool:
+    if hive == getattr(reg, "HKEY_CURRENT_USER", object()):
+        prefix = "HKCU\\"
+    elif hive == getattr(reg, "HKEY_LOCAL_MACHINE", object()):
+        prefix = "HKLM\\"
+    else:
+        return False
+    return _is_association_snapshot_header(prefix + path)
+
+
 def _heal_registry_tree(reg, hive, path: str, access: int,
                         stale_roots: "Sequence[str]", root: Path,
                         names: "Sequence[str]", budget: "list[int]",
                         depth: int = 0) -> "list[str]":
     """Разворачивает маркер и прежние корни в значениях ключа и его подключах."""
     changed: "list[str]" = []
-    if budget[0] <= 0:
+    if budget[0] <= 0 or _is_association_registry_view(reg, hive, path):
+        # Эта функция чинит записи об установке, а не shell-ассоциации.
+        # App Paths временно переводится только под защитой apply_update().
         return changed
     try:
         with reg.OpenKey(hive, path, 0, access) as key:
@@ -10100,7 +10395,8 @@ def _heal_registry_tree(reg, hive, path: str, access: int,
 
 def heal_host_registry(root: Path,
                        cfg: "Optional[Dict[str, Any]]" = None,
-                       stale_roots: "Optional[Sequence[str]]" = None
+                       stale_roots: "Optional[Sequence[str]]" = None,
+                       *, for_update: bool = False
                        ) -> "list[str]":
     """Правит реестр этого ПК до запуска программы и до установки обновления.
 
@@ -10137,7 +10433,8 @@ def heal_host_registry(root: Path,
     names = _app_shortcut_names(root, settings)
     changed: "list[str]" = []
     try:
-        changed.extend(retarget_host_install_records(stale, root, names))
+        changed.extend(retarget_host_install_records(
+            stale, root, names, include_app_paths=for_update))
     except Exception:  # noqa: BLE001 - реестр не срывает запуск
         pass
     budget = [REGISTRY_HEAL_MAX_VALUES]
@@ -10352,6 +10649,250 @@ class UpdateResult:
         self.ok = False
         self.message = message
         return self
+
+
+# Ассоциации, которые сторонний обновитель может сменить на этом ПК. Это
+# отдельная защита хоста: перенос shell-интеграции в портатив здесь не нужен.
+_ASSOCIATION_EXPORT_ROOTS = (
+    r"HKCU\Software\Classes",
+    r"HKLM\Software\Classes",
+    r"HKCU\Software\Wow6432Node\Classes",
+    r"HKLM\Software\Wow6432Node\Classes",
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts",
+    r"HKLM\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts",
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\ApplicationAssociationToasts",
+    r"HKLM\Software\Microsoft\Windows\CurrentVersion\ApplicationAssociationToasts",
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths",
+    r"HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths",
+    r"HKCU\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths",
+    r"HKLM\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths",
+    r"HKCU\Software\RegisteredApplications",
+    r"HKLM\Software\RegisteredApplications",
+    r"HKCU\Software\Clients",
+    r"HKLM\Software\Clients",
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Shell Extensions",
+    r"HKLM\Software\Microsoft\Windows\CurrentVersion\Shell Extensions",
+)
+_ASSOCIATION_ALLOWED_PREFIXES = (
+    r"software\classes",
+    r"software\microsoft\windows\currentversion\explorer\fileexts",
+    r"software\microsoft\windows\currentversion\applicationassociationtoasts",
+    r"software\microsoft\windows\currentversion\app paths",
+    r"software\registeredapplications",
+    r"software\clients",
+    r"software\microsoft\windows\shell",
+    r"software\microsoft\windows\currentversion\shell extensions",
+)
+_ASSOCIATION_EXCLUDED_PREFIXES = (
+    r"software\classes\installer",
+    r"software\classes\virtualstore",
+    r"software\classes\local settings",
+    r"software\classes\activatableclasses",
+)
+
+
+def _reg_path_matches(path: str, prefixes: Sequence[str]) -> bool:
+    return any(path == prefix or path.startswith(prefix + "\\")
+               for prefix in prefixes)
+
+
+def _is_association_snapshot_header(header: str) -> bool:
+    normalized = _normalize_reg_section_header(header)
+    if not normalized or "\\" not in normalized:
+        return False
+    path = normalized.split("\\", 1)[1].casefold()
+    variants = [path]
+    wow = "software\\wow6432node\\"
+    if path.startswith(wow):
+        variants.append("software\\" + path[len(wow):])
+    if any(_reg_path_matches(item, _ASSOCIATION_EXCLUDED_PREFIXES)
+           for item in variants):
+        return False
+    return any(_reg_path_matches(item, _ASSOCIATION_ALLOWED_PREFIXES)
+               for item in variants)
+
+
+def _association_sections(text: str) -> Dict[str, tuple]:
+    """REG-текст -> case-insensitive ключи и ``(имя, RHS)`` значений."""
+    result: Dict[str, tuple] = {}
+    for header, values in _parse_reg_sections(text).items():
+        if not _is_association_snapshot_header(header):
+            continue
+        normalized_values = {
+            str(name).casefold(): (str(name), rhs)
+            for name, rhs in values.items()
+        }
+        result[header.casefold()] = (header, normalized_values)
+    return result
+
+
+def _association_values_signature(section: tuple) -> Dict[str, str]:
+    return {name: rhs for name, (_original, rhs) in section[1].items()}
+
+
+def _reg_assignment(name: str, rhs: str) -> str:
+    if not name:
+        return "@" + "=" + rhs
+    escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"={rhs}'
+
+
+def _association_restore_text(before: str, after: str) -> str:
+    """Точечный REG-откат: добавленное удаляется, старое восстанавливается."""
+    old = _association_sections(before)
+    new = _association_sections(after)
+    lines: "list[str]" = []
+
+    # Один минимальный корень удаляет и все добавленные подключи.
+    added_roots: "list[str]" = []
+    for folded in sorted(set(new) - set(old),
+                         key=lambda item: (item.count("\\"), item)):
+        if any(folded.startswith(root + "\\") for root in added_roots):
+            continue
+        added_roots.append(folded)
+        lines += [f"[-{new[folded][0]}]", ""]
+
+    for folded in sorted(set(old) & set(new)):
+        old_values = old[folded][1]
+        new_values = new[folded][1]
+        if _association_values_signature(old[folded]) == \
+                _association_values_signature(new[folded]):
+            continue
+        added = [name for name in new_values if name not in old_values]
+        restored = [entry for name, entry in old_values.items()
+                    if name not in new_values
+                    or new_values[name][1] != entry[1]]
+        if not added and not restored:
+            continue
+        lines.append(f"[{old[folded][0]}]")
+        for name in sorted(added):
+            lines.append(_reg_assignment(new_values[name][0], "-"))
+        for name, rhs in sorted(restored, key=lambda item: item[0].casefold()):
+            lines.append(_reg_assignment(name, rhs))
+        lines.append("")
+
+    # Родители раньше детей: reg import создаст промежуточные ключи, после чего
+    # каждая секция вернёт собственные значения удалённой ветки.
+    for folded in sorted(set(old) - set(new),
+                         key=lambda item: (item.count("\\"), item)):
+        header, values = old[folded]
+        lines.append(f"[{header}]")
+        for name, rhs in sorted(values.values(),
+                                key=lambda item: item[0].casefold()):
+            lines.append(_reg_assignment(name, rhs))
+        lines.append("")
+    return "Windows Registry Editor Version 5.00\r\n\r\n" + "\r\n".join(lines)
+
+
+def _association_mismatches(before: str, after: str, current: str) -> list[str]:
+    old = _association_sections(before)
+    new = _association_sections(after)
+    now = _association_sections(current)
+    missing = object()
+    touched = {
+        key for key in set(old) | set(new)
+        if (old.get(key, missing) is missing
+            or new.get(key, missing) is missing
+            or _association_values_signature(old[key])
+            != _association_values_signature(new[key]))
+    }
+    mismatches = []
+    for key in touched:
+        expected = old.get(key, missing)
+        actual = now.get(key, missing)
+        if expected is missing or actual is missing:
+            if expected is not actual:
+                mismatches.append((old.get(key) or new.get(key))[0])
+        elif _association_values_signature(expected) != \
+                _association_values_signature(actual):
+            mismatches.append(expected[0])
+    return sorted(mismatches, key=str.casefold)
+
+
+class HostAssociationGuard:
+    """Сохраняет ассоциации текущего ПК вокруг стороннего обновителя."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.directory = root / UPDATE_DIR_NAME / "AssociationBackup"
+        self.before_file = self.directory / "before.reg"
+        self.before_text: Optional[str] = None
+        self.active = False
+
+    def _export(self, folder: Path) -> str:
+        if folder.exists():
+            shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True, exist_ok=True)
+        parts: "list[str]" = []
+        for index, key in enumerate(_ASSOCIATION_EXPORT_ROOTS):
+            path = folder / f"{index:02d}.reg"
+            code = _reg(("export", key, str(path), "/y"))
+            if code == 0 and path.is_file():
+                parts.append(_decode_reg(path.read_bytes()))
+                continue
+            # Ошибка экспорта несуществующего ключа безопасна. Ошибку чтения
+            # существующего/неизвестного ключа нельзя выдать за пустой снимок.
+            if registry_key_state(key) is False:
+                continue
+            raise OSError(f"reg export failed for {key} (code {code})")
+        return "\r\n".join(parts)
+
+    def snapshot(self) -> bool:
+        if not IS_WINDOWS:
+            return True
+        # Backup от прерванного обновления важнее нового снимка: сначала
+        # повторяем его восстановление и только потом разрешаем новый запуск.
+        if self.before_file.is_file() and self.restore():
+            return False
+        if self.directory.exists():
+            shutil.rmtree(self.directory, ignore_errors=True)
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            text = self._export(self.directory / "before-parts")
+            if not write_reg_file(self.before_file, text):
+                raise OSError("cannot write association baseline")
+            self.before_text = text
+            self.active = True
+            shutil.rmtree(self.directory / "before-parts", ignore_errors=True)
+            return True
+        except (OSError, UnicodeError) as exc:
+            _update_log(self.root, f"associations: baseline failed ({exc})")
+            self.active = False
+            return False
+
+    def restore(self) -> list[str]:
+        if not IS_WINDOWS:
+            return []
+        if not self.active and not self.before_file.is_file():
+            return []
+        try:
+            before = (self.before_text if self.before_text is not None
+                      else _decode_reg(self.before_file.read_bytes()))
+            after = self._export(self.directory / "after")
+        except (OSError, UnicodeError) as exc:
+            return [f"cannot compare association state: {exc}"]
+
+        restore_text = _association_restore_text(before, after)
+        if "[" in restore_text:
+            restore_file = self.directory / "restore.reg"
+            if not write_reg_file(restore_file, restore_text):
+                return ["cannot write association restore file"]
+            code = _reg(("import", str(restore_file)))
+            if code != 0:
+                return [f"reg import failed with code {code}"]
+        try:
+            verified = self._export(self.directory / "verified")
+        except (OSError, UnicodeError) as exc:
+            return [f"cannot verify association state: {exc}"]
+        mismatches = _association_mismatches(before, after, verified)
+        if mismatches:
+            return mismatches
+
+        self.active = False
+        self.before_text = None
+        shutil.rmtree(self.directory, ignore_errors=True)
+        _update_log(self.root, "associations: original host state restored")
+        return []
 
 
 def _pid_alive(pid: int) -> bool:
@@ -10824,6 +11365,27 @@ def _report_removed_shortcuts(root: Path, removed: "Sequence[str]") -> None:
 def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
                  progress: "Optional[Any]" = None,
                  runner: "Optional[Any]" = None) -> UpdateResult:
+    """Обновляет портатив, не оставляя ассоциации стороннего установщика."""
+    associations = HostAssociationGuard(root)
+    result: Optional[UpdateResult] = None
+    try:
+        result = _apply_update(root, cfg, installer, progress, runner,
+                               associations)
+        return result
+    finally:
+        problems = associations.restore()
+        if problems:
+            detail = ", ".join(problems[:3])
+            warning = ("Не удалось подтвердить восстановление программ по "
+                       f"умолчанию ({detail}). Backup: {associations.directory}")
+            _update_log(root, "associations: " + warning)
+            if result is not None:
+                result.message += ("\n" if result.message else "") + warning
+
+
+def _apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
+                  progress: "Optional[Any]", runner: "Optional[Any]",
+                  associations: HostAssociationGuard) -> UpdateResult:
     """Ставит новую версию программы внутрь портатива.
 
     Порядок продуман так, чтобы в любой момент можно было вернуться назад:
@@ -10851,6 +11413,12 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
         return result.fail(f"Установщик не найден: {installer}")
     if not app_dir.is_dir():
         return result.fail(f"В портативе нет папки App: {app_dir}")
+    if not associations.snapshot():
+        return result.fail(
+            "Обновление остановлено: не удалось сохранить текущие ассоциации "
+            "файлов и программы по умолчанию. Установщик не запускался, "
+            "прежние настройки не изменены. Подробности: PortableData\\"
+            + UPDATE_LOG_NAME)
 
     started = time.time()
     # Перенос между дисками: путь прежнего корня внутри портатива (настройки
@@ -10881,7 +11449,7 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
     # именно там. Если запись помнит прежний диск портатива, новая версия
     # встанет по старому адресу — переводим её на текущий корень.
     try:
-        moved = heal_host_registry(root, cfg, stale_roots)
+        moved = heal_host_registry(root, cfg, stale_roots, for_update=True)
     except Exception as exc:  # noqa: BLE001 - реестр не должен срывать обновление
         moved = []
         _update_log(root, f"install records: retarget failed ({exc})")

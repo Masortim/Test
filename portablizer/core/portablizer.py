@@ -874,6 +874,11 @@ class PortableResult:
     removed_from_installed_list: List[str] = field(default_factory=list)
     #: Осталось ли что-то вычистить вручную (не хватило прав).
     cleanup_pending: bool = False
+    #: Сколько изменённых shell-ключей возвращено к состоянию до установки.
+    association_changes_restored: int = 0
+    #: Не удалось подтвердить восстановление ассоциаций (например, не хватило
+    #: прав на HKLM/UserChoice). Такой результат нельзя молча считать чистым.
+    association_restore_pending: bool = False
     #: Сетевые компоненты, перенесённые в NetStack (драйверы и службы).
     netstack_drivers: List[str] = field(default_factory=list)
     netstack_services: List[str] = field(default_factory=list)
@@ -2076,6 +2081,9 @@ class Portablizer:
     # -- шаги -----------------------------------------------------------------
     def run(self, opts: PortableOptions) -> PortableResult:
         result = PortableResult(success=False)
+        association_before: "Optional[reg_mod.Snapshot]" = None
+        association_restore_attempted = False
+        association_include_user = True
         try:
             self.log.info(f"Portablizer {__version__}")
             self._run_started = time.time()
@@ -2272,12 +2280,22 @@ class Portablizer:
             if switched_user:
                 self.log.warn(switched_user)
             before = {}
-            if opts.capture_registry and IS_WINDOWS:
+            association_include_user = not switched_user
+            if IS_WINDOWS:
                 self.progress(22, "Снимок реестра (до установки)")
-                self.log.info("Делаю снимок реестра до установки...")
-                before = reg_mod.snapshot(include_user=not switched_user)
-                self.log.debug(f"  зафиксировано веток: {len(before)}")
-            elif opts.capture_registry and not IS_WINDOWS:
+                if opts.capture_registry:
+                    self.log.info("Делаю снимок реестра до установки...")
+                    before = reg_mod.snapshot(include_user=not switched_user)
+                    association_before = reg_mod.association_snapshot(before)
+                    self.log.debug(f"  зафиксировано веток: {len(before)}")
+                else:
+                    # Отключение ПЕРЕНОСА реестра не отключает защиту хоста.
+                    association_before = reg_mod.snapshot_associations(
+                        include_user=not switched_user)
+                self.log.debug(
+                    "  ассоциаций под защитой: "
+                    f"{len(association_before)}")
+            elif opts.capture_registry:
                 self.log.warn("Захват реестра доступен только на Windows — пропускаю.")
 
             # Запоминаем содержимое типовых каталогов установки. Некоторые
@@ -2410,6 +2428,21 @@ class Portablizer:
                 self.progress(65, "Снимок реестра (после установки)")
                 self.log.info("Делаю снимок реестра после установки...")
                 after = reg_mod.snapshot(include_user=not switched_user)
+
+            # Сначала фиксируем изменения для portable-REG, затем возвращаем
+            # ассоциации хоста. Дальше _capture_registry работает только с
+            # snapshots в памяти и больше не импортирует ничего в систему.
+            if association_before is not None:
+                association_after = (
+                    reg_mod.association_snapshot(after)
+                    if opts.capture_registry
+                    else reg_mod.snapshot_associations(
+                        include_user=not switched_user)
+                )
+                self._restore_host_associations(
+                    association_before, association_after, result,
+                    include_user=not switched_user)
+                association_restore_attempted = True
 
             app_names_for_reg = sorted(
                 set(shortcuts_mod.app_name_candidates(name, opts.installer_path))
@@ -2708,6 +2741,20 @@ class Portablizer:
             self._save_run_log(result.portable_dir)
             return result
         finally:
+            late_association_restore = False
+            if association_before is not None and not association_restore_attempted:
+                # Ошибка/отмена до шага 65: portable-REG мог ещё не появиться,
+                # но установщик уже успел изменить ассоциации. Возвращаем их и
+                # на аварийном пути, используя свежий отдельный снимок.
+                late_association_restore = True
+                try:
+                    self._restore_host_associations(
+                        association_before, None, result,
+                        include_user=association_include_user)
+                except Exception as exc:  # noqa: BLE001 - не маскируем исходный сбой
+                    result.association_restore_pending = True
+                    self.log.warn(
+                        "Аварийный возврат ассоциаций не завершён: " + str(exc))
             # Временные папки вне портатива (если установщику не хватило
             # места на диске портатива и его TEMP перенесли) убираются в
             # любом случае: на компьютере пользователя не должно оставаться
@@ -2716,6 +2763,8 @@ class Portablizer:
             if self._source_staging_dir:
                 shutil.rmtree(self._source_staging_dir, ignore_errors=True)
                 self._source_staging_dir = ""
+            if late_association_restore:
+                self._save_run_log(result.portable_dir)
 
     # -- классический InstallShield ------------------------------------------
     def _record_command(self, det: DetectionResult, opts: PortableOptions,
@@ -3243,6 +3292,73 @@ class Portablizer:
         )
 
     # -- реестр ---------------------------------------------------------------
+    def _restore_host_associations(
+            self, before: "reg_mod.Snapshot",
+            after: "Optional[reg_mod.Snapshot]", result: PortableResult,
+            *, include_user: bool = True) -> None:
+        """Возвращает shell-ассоциации сборочного ПК после установщика.
+
+        Это не общий откат реестра: REG содержит только Classes, FileExts,
+        App Paths и смежные ветки выбора приложений. Сначала изменения уже
+        находятся в снимке ``after`` и могут быть захвачены в портатив; затем
+        хост возвращается к ``before`` и результат проверяется новым снимком.
+        """
+        if not IS_WINDOWS:
+            return
+        current_after = (
+            reg_mod.snapshot_associations(include_user=include_user)
+            if after is None else after
+        )
+        restore_text = reg_mod.render_association_restore(before, current_after)
+        if not reg_mod.has_entries(restore_text):
+            return
+
+        missing = object()
+        old = reg_mod.association_snapshot(before)
+        new = reg_mod.association_snapshot(current_after)
+        changed = {
+            key for key in set(old) | set(new)
+            if old.get(key, missing) != new.get(key, missing)
+        }
+        tmp_reg = ""
+        rc = 1
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode="wb", suffix=".reg", delete=False) as handle:
+                tmp_reg = handle.name
+            reg_mod.write_reg_file(tmp_reg, restore_text)
+            rc = self._reg_import(tmp_reg)
+        except Exception as exc:  # noqa: BLE001 - ниже отмечаем незавершённый откат
+            self.log.warn(f"Не удалось подготовить возврат ассоциаций: {exc}")
+        finally:
+            if tmp_reg:
+                try:
+                    os.remove(tmp_reg)
+                except OSError:
+                    pass
+
+        verified_after = reg_mod.snapshot_associations(include_user=include_user)
+        mismatches = reg_mod.association_restore_mismatches(
+            before, current_after, verified_after)
+        if rc == 0 and not mismatches:
+            result.association_changes_restored += len(changed)
+            self.log.ok(
+                "Ассоциации файлов и программы по умолчанию восстановлены "
+                f"на этом ПК ({len(changed)} изменённых ключей)."
+            )
+            return
+
+        result.association_restore_pending = True
+        detail = ", ".join(mismatches[:4]) if mismatches else f"reg import: код {rc}"
+        warning = (
+            "Не удалось подтвердить восстановление всех ассоциаций после "
+            f"установщика ({detail}). Проверьте программы по умолчанию; для "
+            "машинных ключей и UserChoice могут потребоваться права администратора."
+        )
+        self.log.warn(warning)
+        if warning not in result.hints:
+            result.hints.append(warning)
+
     def _capture_registry(self, portable_dir: str,
                           before: "reg_mod.Snapshot",
                           after: "reg_mod.Snapshot",
@@ -3343,6 +3459,17 @@ class Portablizer:
             if k not in set(protocol_keys)
         ]
 
+        # UserChoice содержит машинно/пользовательский хэш Windows и не является
+        # переносимой настройкой программы. Даже явный --shell-integration
+        # переносит ProgID/COM, но не навязывает выбор приложения по умолчанию
+        # другому ПК. BAT-фолбэк дополнительно отфильтровывает старые REG-файлы.
+        skipped_user_choice = [k for k in portable_keys
+                               if reg_mod.is_file_exts_key(k)]
+        if skipped_user_choice:
+            blocked = {key.casefold() for key in skipped_user_choice}
+            portable_keys = [key for key in portable_keys
+                             if key.casefold() not in blocked]
+
         # Путь портативной папки заменяем маркером: иначе настройки указывали
         # бы на каталог того ПК, где собирали портатив.
         tokens = [(portable_dir, launcher_mod.ROOT_TOKEN)]
@@ -3404,44 +3531,11 @@ class Portablizer:
                 reg_mod.write_reg_file(machine_path, machine_text)
                 capture.machine_reg_file = machine_path
 
-        # На сборочном ПК установщик уже записал в реестр хоста сырые пути
-        # (например, c:\multitran и исходную папку дистрибутива). Сразу
-        # применяем перенаправленные пути в реестр хоста, чтобы первый запуск
-        # программы на этом же ПК не читал старый c:\multitran из HKCU/HKLM.
-        if IS_WINDOWS and (all_user_keys or machine_keys):
-            for snap_view, keys_view in (
-                (after_virtualized, all_user_keys),
-                (portable_after, machine_keys),
-            ):
-                if not keys_view:
-                    continue
-                expanded_text = reg_mod.render_keys(snap_view, keys_view, ())
-                if not reg_mod.has_entries(expanded_text):
-                    continue
-                tmp_reg = ""
-                try:
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb", suffix=".reg", delete=False
-                    ) as fh:
-                        tmp_reg = fh.name
-                    reg_mod.write_reg_file(tmp_reg, expanded_text)
-                    subprocess.run(
-                        ["reg.exe", "import", tmp_reg],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        timeout=15,
-                        check=False,
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-                finally:
-                    if tmp_reg:
-                        try:
-                            os.remove(tmp_reg)
-                        except OSError:
-                            pass
-
+        # Перенаправленные пути остаются ТОЛЬКО в portable-REG. Раньше здесь
+        # тот же файл разворачивался и повторно импортировался в реестр
+        # сборочного ПК: Portablizer сам перезаписывал Classes/протоколы после
+        # работы установщика. Для первого запуска это не нужно — лончер сам
+        # развернёт маркер в изолированном сеансе и восстановит состояние ПК.
         capture.has_root_token = (
             launcher_mod.ROOT_TOKEN in user_text
             or launcher_mod.ROOT_TOKEN in machine_text
@@ -3511,6 +3605,12 @@ class Portablizer:
             self.log.info(
                 f"Ассоциации файлов и COM пропущены ({len(skipped_integration)} "
                 "ключ(ей)) — портатив не меняет настройки чужой системы."
+            )
+        if skipped_user_choice:
+            self.log.info(
+                "Выбор программ по умолчанию (Explorer\\FileExts\\UserChoice) "
+                "в портатив не переносится: эти настройки принадлежат Windows "
+                "и конкретному пользователю."
             )
         if protocol_keys:
             self.log.ok(

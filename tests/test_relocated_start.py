@@ -971,8 +971,8 @@ class RegistrySnapshotTests(unittest.TestCase):
             self.assertEqual(baseline, [marker])
             self.assertEqual(marker.read_bytes(), b"old")
 
-    def test_created_key_is_not_part_of_the_baseline(self):
-        """Созданный установщиком ключ не восстанавливается, а удаляется."""
+    def test_created_key_is_deleted_only_if_absent_on_this_pc(self):
+        """created_keys с машины сборки не заменяет состояние текущего ПК."""
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             cfg = {"registry": {
@@ -993,8 +993,12 @@ class RegistrySnapshotTests(unittest.TestCase):
                                    return_value="Windows Registry Editor Version 5.00\r\n"), \
                     mock.patch.object(entry, "_pack_reg"), \
                     mock.patch.object(entry, "_reg", return_value=0), \
+                    mock.patch.object(
+                        entry, "registry_key_state",
+                        side_effect=lambda key: key == r"HKCU\Software\Cursor"), \
                     mock.patch.object(entry, "delete_key_tree",
                                       side_effect=lambda key: deleted.append(key) or True):
+                session._snapshot_host()
                 session.save_and_restore()
             # Подключ исходного ключа и ключ Uninstall (его нет в списке keys).
             self.assertEqual(deleted, [r"HKCU\Software\Cursor\Install",

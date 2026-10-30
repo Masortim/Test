@@ -546,23 +546,28 @@ def _registry_load_block(cfg: LauncherConfig) -> str:
         'for %%F in ("%PORTABLE_REG_SESSION%\\*.reg") do set "PORTABLE_SESSION_FOUND=1"',
     ]
 
-    # Прежнее состояние чужого ПК сохраняем до любых изменений, чтобы после
-    # выхода вернуть всё как было.
+    # Состояние определяется на ЭТОМ ПК, а не на машине сборки. Старый код
+    # удалял registry_created_keys даже тогда, когда такой ключ уже существовал
+    # у пользователя: после выхода исчезали чужие Classes/ассоциации. Теперь:
+    # backup = ключ был; .absent = query до импорта подтвердил отсутствие;
+    # ни файла = состояние неизвестно, удалять его на выходе запрещено.
     keys = consolidate_root_keys(cfg.registry_keys)
-    created = set(consolidate_root_keys(cfg.registry_created_keys))
     for index, key in enumerate(keys):
         backup = f'%PORTABLE_REG_BACKUP%\\k{index:02d}.reg'
-        lines.append(
-            f'if not exist "{backup}" reg export "{key}" "{backup}" /y >nul 2>&1'
-        )
-
-    external_overrides: List[str] = []
-    for index, key in enumerate(keys):
-        if key in created:
-            backup = f'%PORTABLE_REG_BACKUP%\\k{index:02d}.reg'
-            external_overrides.append(
-                f'if exist "{backup}" del /f /q "{backup}" >nul 2>&1'
-            )
+        absent = f'%PORTABLE_REG_BACKUP%\\k{index:02d}.absent'
+        lines += [
+            f'if not exist "{backup}" (',
+            f'  if not exist "{absent}" (',
+            f'    reg export "{key}" "{backup}" /y >nul 2>&1',
+            f'    if not exist "{backup}" (',
+            f'      reg query "{key}" >nul 2>&1',
+            '      if errorlevel 1 (',
+            f'        type nul >"{absent}"',
+            '      )',
+            '    )',
+            '  )',
+            ')',
+        ]
 
     # Настройки прошлого запуска имеют приоритет над исходным снимком.
     initial = '%PORTABLE_ROOT%\\' + _bat_set_value(cfg.reg_file_name)
@@ -575,16 +580,12 @@ def _registry_load_block(cfg: LauncherConfig) -> str:
         f'  if exist "{machine}" call :portable_registry_import "{machine}"',
         '  for %%F in ("%PORTABLE_REG_SESSION%\\*.reg") do '
         'call :portable_registry_import "%%~fF"',
-        *(['  rem Apply external .reg changes imported on host while closed']
-          + [f'  {line}' for line in external_overrides]
-          if external_overrides else []),
         '  goto :eof',
         ')',
         f'if exist "{initial}" call :portable_registry_import "{initial}"',
         'rem HKLM entries need administrator rights; keep them in a separate',
         'rem file so a failure here cannot abort the user-level import.',
         f'if exist "{machine}" call :portable_registry_import "{machine}"',
-        *external_overrides,
         'goto :eof',
     ]
     return "\n".join(lines)
@@ -597,7 +598,6 @@ def _registry_save_block(cfg: LauncherConfig) -> str:
     if not keys:
         return "goto :eof"
 
-    created = set(consolidate_root_keys(cfg.registry_created_keys))
     lines: List[str] = [
         'if not defined PORTABLE_REGISTRY goto :eof',
         'if not defined PORTABLE_RESTORE goto :eof',
@@ -607,16 +607,20 @@ def _registry_save_block(cfg: LauncherConfig) -> str:
     for index, key in enumerate(keys):
         session = f'%PORTABLE_REG_SESSION%\\k{index:02d}.reg'
         backup = f'%PORTABLE_REG_BACKUP%\\k{index:02d}.reg'
+        absent = f'%PORTABLE_REG_BACKUP%\\k{index:02d}.absent'
         lines.append(f'del /f /q "{session}" >nul 2>&1')
         lines.append(f'reg export "{key}" "{session}" /y >nul 2>&1')
         # Абсолютный путь этой папки заменяем маркером, иначе на следующем
         # компьютере (другая буква диска) настройки укажут в никуда.
         lines.append(f'if exist "{session}" call :portable_registry_pack "{session}"')
-        if key in created:
-            lines.append(f'reg delete "{key}" /f >nul 2>&1')
-        else:
-            lines.append(f'if exist "{backup}" reg import "{backup}" >nul 2>&1')
-        lines.append(f'del /f /q "{backup}" >nul 2>&1')
+        lines += [
+            f'if exist "{backup}" call :portable_registry_restore_existing '
+            f'"{backup}" "{session}" {index:02d}',
+            f'if not exist "{backup}" if exist "{absent}" (',
+            f'  reg delete "{key}" /f >nul 2>&1',
+            f'  if not errorlevel 1 del /f /q "{absent}" >nul 2>&1',
+            ')',
+        ]
     lines.append("goto :eof")
     return "\n".join(lines)
 
@@ -1399,12 +1403,40 @@ if exist "%PORTABLE_REG_OUT%" (
 )
 goto :eof
 
+:portable_registry_restore_existing
+rem %1 = host baseline, %2 = current session export, %3 = key index
+set "PORTABLE_REG_BASE=%~f1"
+set "PORTABLE_REG_CURRENT=%~f2"
+set "PORTABLE_REG_PRUNE=%TEMP%\portable_prune_%~3_%RANDOM%.reg"
+del /f /q "%PORTABLE_REG_PRUNE%" >nul 2>&1
+call :portable_registry_prune
+if exist "%PORTABLE_REG_PRUNE%" (
+  reg import "%PORTABLE_REG_PRUNE%" >nul 2>&1
+  if not errorlevel 1 (
+    reg import "%PORTABLE_REG_BASE%" >nul 2>&1
+    if not errorlevel 1 del /f /q "%PORTABLE_REG_BASE%" >nul 2>&1
+  )
+  del /f /q "%PORTABLE_REG_PRUNE%" >nul 2>&1
+) else (
+  rem Legacy fallback without PowerShell: restore old values and keep the
+  rem baseline if the import fails.
+  reg import "%PORTABLE_REG_BASE%" >nul 2>&1
+  if not errorlevel 1 del /f /q "%PORTABLE_REG_BASE%" >nul 2>&1
+)
+goto :eof
+
+:portable_registry_prune
+rem Build deletion-only REG for keys/values added after the host backup.
+rem The baseline is imported afterwards; it is never deleted before import.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { function Read-Reg { param($path); $map=@{}; $section=$null; if(-not [IO.File]::Exists($path)){return $map}; $text=[IO.File]::ReadAllText($path,[Text.Encoding]::Unicode); foreach($line in ($text -split '\r?\n')){ if($line -match '^\[(?!-)(.+)\]\s*$'){ $section=$matches[1]; if(-not $map.ContainsKey($section)){$map[$section]=@{}}; continue }; if($null -ne $section -and $line -match '^(@|\x22(?:\\.|[^\x22])+\x22)\s*='){ $name=$matches[1]; if(-not $map[$section].ContainsKey($name)){$map[$section][$name]=$true} } }; return $map }; $base=Read-Reg $env:PORTABLE_REG_BASE; $current=Read-Reg $env:PORTABLE_REG_CURRENT; $out=@('Windows Registry Editor Version 5.00',''); $added=@{}; foreach($key in ($current.Keys | Sort-Object Length)){ if(-not $base.ContainsKey($key)){ $covered=$false; foreach($parent in $added.Keys){ if($key.StartsWith($parent+'\',[StringComparison]::OrdinalIgnoreCase)){$covered=$true;break} }; if(-not $covered){$added[$key]=$true;$out+='[-'+$key+']';$out+=''} } }; foreach($key in $base.Keys){ if($current.ContainsKey($key)){ $names=@($current[$key].Keys | Where-Object {-not $base[$key].ContainsKey($_)}); if($names.Count -gt 0){$out+='['+$key+']';foreach($name in $names){$out+=$name+'=-'};$out+=''} } }; [IO.File]::WriteAllLines($env:PORTABLE_REG_PRUNE,[string[]]$out,[Text.Encoding]::Unicode) } catch { exit 1 }" >nul 2>&1
+goto :eof
+
 :portable_registry_rewrite
 rem %1 = pack   : absolute path  -> marker
 rem %1 = unpack : marker         -> absolute path
 set "PORTABLE_REG_MODE=%~1"
 set "PORTABLE_REG_TOKEN=%PORTABLE_REG_MARKER%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $p=[IO.File]::ReadAllBytes($env:PORTABLE_REG_SRC); $e=if($p.Length -ge 2 -and $p[0] -eq 255 -and $p[1] -eq 254){[Text.Encoding]::Unicode}else{[Text.Encoding]::UTF8}; $t=$e.GetString($p).TrimStart([char]0xFEFF); $r=$env:PORTABLE_ROOT.Replace('\','\\'); if($env:PORTABLE_REG_MODE -eq 'pack'){ $t=$t.Replace($r,$env:PORTABLE_REG_TOKEN); $t=$t.Replace($env:PORTABLE_ROOT,$env:PORTABLE_REG_TOKEN) } else { $t=$t.Replace($env:PORTABLE_REG_TOKEN,$r) }; if($t.Contains($env:PORTABLE_REG_TOKEN)){ exit 2 }; [IO.File]::WriteAllText($env:PORTABLE_REG_OUT,$t,[Text.Encoding]::Unicode) } catch { exit 1 }" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $p=[IO.File]::ReadAllBytes($env:PORTABLE_REG_SRC); $e=if($p.Length -ge 2 -and $p[0] -eq 255 -and $p[1] -eq 254){[Text.Encoding]::Unicode}else{[Text.Encoding]::UTF8}; $t=$e.GetString($p).TrimStart([char]0xFEFF); $r=$env:PORTABLE_ROOT.Replace('\','\\'); if($env:PORTABLE_REG_MODE -eq 'pack'){ $t=$t.Replace($r,$env:PORTABLE_REG_TOKEN); $t=$t.Replace($env:PORTABLE_ROOT,$env:PORTABLE_REG_TOKEN) } else { $t=$t.Replace($env:PORTABLE_REG_TOKEN,$r) }; $keep=@(); $skip=$false; foreach($line in ($t -split '\r?\n')){ $trim=$line.TrimStart(); if($trim.StartsWith('[')){ $skip=($trim -match '(?i)\\Explorer\\FileExts(?:\\|\])') }; if(-not $skip){$keep+=$line} }; $t=[string]::Join([Environment]::NewLine,$keep); if($t.Contains($env:PORTABLE_REG_TOKEN)){ exit 2 }; [IO.File]::WriteAllText($env:PORTABLE_REG_OUT,$t,[Text.Encoding]::Unicode) } catch { exit 1 }" >nul 2>&1
 goto :eof
 """
 
@@ -2407,6 +2439,7 @@ _PY_LAUNCHER = r'''#!/usr/bin/env python3
 """
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -2470,11 +2503,11 @@ def reg_import(path, root, token, runtime):
     return code
 
 
-def reg_export(path, root, token):
-    """Export passthrough: the absolute path is replaced by the marker."""
+def reg_export(key, path, root, token):
+    """Export a key and replace this folder with the portable marker."""
     if os.path.exists(path):
         os.remove(path)
-    code = reg("export", path, "/y")
+    code = reg("export", key, path, "/y")
     if code != 0 or not token:
         return code
     try:
@@ -2486,6 +2519,54 @@ def reg_export(path, root, token):
     with open(path, "w", encoding=encoding, newline="\r\n") as fh:
         fh.write(text)
     return code
+
+
+def _reg_value_names(path):
+    """Section -> value tokens; enough to find additions, not to rewrite data."""
+    sections = {}
+    try:
+        text, _encoding = _read_reg_text(path)
+    except OSError:
+        return sections
+    current = None
+    for line in text.splitlines():
+        header = re.match(r"^\[(?!-)(.+)\]\s*$", line)
+        if header:
+            current = header.group(1)
+            sections.setdefault(current, {})
+            continue
+        value = re.match(r'^(@|"(?:\\.|[^"])+")\s*=', line)
+        if current is not None and value:
+            sections[current][value.group(1).casefold()] = value.group(1)
+    return sections
+
+
+def prune_added_registry_values(baseline, current, output):
+    """Write deletion-only REG for keys/values absent from the baseline."""
+    old = _reg_value_names(baseline)
+    new = _reg_value_names(current)
+    lines = ["Windows Registry Editor Version 5.00", ""]
+    added_roots = []
+    for key in sorted(set(new) - set(old), key=lambda item: (len(item), item)):
+        folded = key.casefold()
+        if any(folded.startswith(root.casefold() + "\\")
+               for root in added_roots):
+            continue
+        added_roots.append(key)
+        lines += ["[-" + key + "]", ""]
+    for key in sorted(set(old) & set(new)):
+        names = [new[key][name] for name in sorted(set(new[key]) - set(old[key]))]
+        if not names:
+            continue
+        lines.append("[" + key + "]")
+        lines.extend(name + "=-" for name in names)
+        lines.append("")
+    try:
+        with open(output, "w", encoding="utf-16", newline="\r\n") as handle:
+            handle.write("\n".join(lines))
+        return True
+    except OSError:
+        return False
 
 
 @@REPAIR_JSON@@
@@ -2569,8 +2650,17 @@ def main():
     if active:
         for index, key in enumerate(keys):
             path = os.path.join(backup, "k%02d.reg" % index)
-            if not os.path.exists(path):
-                reg("export", key, path, "/y")
+            absent = os.path.join(backup, "k%02d.absent" % index)
+            if not os.path.exists(path) and not os.path.exists(absent):
+                if reg("export", key, path, "/y") != 0:
+                    # Только query после неудачного export отличает отсутствие
+                    # ключа от ошибки доступа. Неизвестное состояние не удаляем.
+                    if reg("query", key) != 0:
+                        try:
+                            with open(absent, "w", encoding="ascii"):
+                                pass
+                        except OSError:
+                            pass
         token = registry.get("root_token") or ""
         saved = [f for f in os.listdir(session) if f.lower().endswith(".reg")]
         machine = os.path.join(root, registry.get("machine_file", ""))
@@ -2655,13 +2745,24 @@ def main():
         token = registry.get("root_token") or ""
         for index, key in enumerate(keys):
             path = os.path.join(session, "k%02d.reg" % index)
-            reg_export(path, root, token)
-            if key in created:
-                reg("delete", key, "/f")
+            reg_export(key, path, root, token)
             saved_backup = os.path.join(backup, "k%02d.reg" % index)
+            absent = os.path.join(backup, "k%02d.absent" % index)
             if os.path.exists(saved_backup):
-                reg("import", saved_backup)
-                os.remove(saved_backup)
+                prune = os.path.join(session, "prune%02d.reg" % index)
+                if prune_added_registry_values(saved_backup, path, prune):
+                    if (reg("import", prune) == 0
+                            and reg("import", saved_backup) == 0):
+                        os.remove(saved_backup)
+                    try:
+                        os.remove(prune)
+                    except OSError:
+                        pass
+                elif reg("import", saved_backup) == 0:
+                    os.remove(saved_backup)
+            elif os.path.exists(absent):
+                if reg("delete", key, "/f") == 0:
+                    os.remove(absent)
     return code
 
 
