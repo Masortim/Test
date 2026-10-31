@@ -402,17 +402,20 @@ def is_external_browser_key(key_path: str) -> bool:
     охватывает и корень обработчика, и всё дерево ``shell\\open\\command``.
     Детский ключ приложения вроде ``figma`` сюда не входит.
     """
-    for path in _path_variants(key_path):
-        for prefix in (r"software\classes",):
-            marker = prefix + "\\"
-            if not path.startswith(marker):
-                continue
-            tail = path[len(marker):]
-            handler = tail.split("\\", 1)[0].casefold()
-            if handler in _EXTERNAL_WEB_SCHEMES:
-                return True
-            if handler.startswith(_EXTERNAL_BROWSER_PROGID_PREFIXES):
-                return True
+    paths = _path_variants(key_path)
+    head, separator, tail = str(key_path).strip().partition("\\")
+    if separator and head.upper() in ("HKCR", "HKEY_CLASSES_ROOT"):
+        paths.append("software\\classes\\" + tail.casefold())
+    marker = "software\\classes\\"
+    for path in paths:
+        if not path.startswith(marker):
+            continue
+        tail = path[len(marker):]
+        handler = tail.split("\\", 1)[0].casefold()
+        if handler in _EXTERNAL_WEB_SCHEMES:
+            return True
+        if handler.startswith(_EXTERNAL_BROWSER_PROGID_PREFIXES):
+            return True
     return False
 
 
