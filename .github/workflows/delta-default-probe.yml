@@ -1,0 +1,124 @@
+name: Delta default browser diagnostic
+
+on:
+  push:
+    branches: ["arena/**"]
+    paths: [".github/workflows/delta-default-probe.yml"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Probe default browser configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $report = [System.Collections.Generic.List[string]]::new()
+          $root = Join-Path $env:RUNNER_TEMP "Delta Default Browser Probe With Long Path"
+          $portable = Join-Path $root "out/Delta_Portable"
+          $browserNames = @("msedge", "chrome", "browser", "yandex", "firefox", "brave")
+          try {
+            New-Item -ItemType Directory -Force -Path (Join-Path $root "out") | Out-Null
+            $installer = Join-Path $root "delta-setup.exe"
+            Invoke-WebRequest -UseBasicParsing `
+              -Uri "https://releases.delta.dev/releases/stable/0.23.0/delta-windows-x86_64-setup.exe" `
+              -OutFile $installer
+            $arguments = 'build "' + $installer + '" --out "' +
+              (Join-Path $root "out") + '" --name Delta --single-file --no-registry ' +
+              '--no-netstack --hard-timeout 180'
+            $builder = Start-Process -FilePath (Resolve-Path "dist-windows/Portablizer.exe").Path `
+              -ArgumentList $arguments -PassThru
+            if (-not $builder.WaitForExit(600000)) { $builder.Kill(); throw "Builder timed out" }
+            $report.Add("Builder exit: $($builder.ExitCode)")
+            if ($builder.ExitCode -ne 0) { throw "Builder failed" }
+            $config = Get-Content (Join-Path $portable "launcher_config.json") -Raw | ConvertFrom-Json
+            $report.Add("connect_host_profile=$($config.browser_login.connect_host_profile)")
+            $report.Add("clean_duplicates=$($config.browser_login.clean_duplicates)")
+            $before = @(Get-Process -Name $browserNames -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.Id })
+            $report.Add("Browser processes before: $($before -join ',')")
+            $env:PORTABLE_LAUNCHER_NO_UI = "1"
+            $runLog = Join-Path $portable "PortableData/launcher-run.log"
+            $gui = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
+              -WorkingDirectory $portable -PassThru
+            Start-Sleep -Seconds 15
+
+            Add-Type -AssemblyName UIAutomationClient
+            Add-Type -AssemblyName UIAutomationTypes
+            Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class DeltaDefaultInput { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y); [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e); }'
+            $automationRoot = [System.Windows.Automation.AutomationElement]::RootElement
+            $windowCondition = [System.Windows.Automation.PropertyCondition]::new(
+              [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+              [System.Windows.Automation.ControlType]::Window)
+            $windows = $automationRoot.FindAll(
+              [System.Windows.Automation.TreeScope]::Children, $windowCondition)
+            $deltaWindow = $null
+            foreach ($window in $windows) {
+              if ($window.Current.Name -match '(?i)^delta$') { $deltaWindow = $window; break }
+            }
+            if (-not $deltaWindow) { throw "Delta window was not found" }
+            [void][DeltaDefaultInput]::SetForegroundWindow(
+              [IntPtr]$deltaWindow.Current.NativeWindowHandle)
+            $bounds = $deltaWindow.Current.BoundingRectangle
+            [void][DeltaDefaultInput]::SetCursorPos(
+              [int]$bounds.X + 520, [int]$bounds.Y + 434)
+            [DeltaDefaultInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+            [DeltaDefaultInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+            $report.Add("Sign In clicked with default browser_login config")
+            Start-Sleep -Seconds 25
+
+            $after = @(Get-Process -Name $browserNames -ErrorAction SilentlyContinue)
+            foreach ($process in $after) {
+              if ($before -contains $process.Id) { continue }
+              try {
+                $command = (Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)").CommandLine
+                $report.Add("NEW BROWSER pid=$($process.Id) name=$($process.ProcessName) command=$command")
+              }
+              catch {
+                $report.Add("NEW BROWSER pid=$($process.Id) name=$($process.ProcessName)")
+              }
+            }
+            if (Test-Path $runLog) {
+              $text = Get-Content $runLog -Raw
+              $report.Add("Host reopen observed: $($text -match 'browser login: opened https://')")
+              $report.Add("Profile linked: $($text -match 'browser profiles are connected')")
+              $report.Add("--- launcher-run.log ---")
+              foreach ($line in @(Get-Content $runLog -Tail 100)) { $report.Add([string]$line) }
+            }
+          }
+          catch {
+            $report.Add("ERROR: $($_.Exception.Message)")
+          }
+          finally {
+            $prefix = $portable.TrimEnd('\') + '\'
+            foreach ($candidate in @(Get-Process -ErrorAction SilentlyContinue)) {
+              try {
+                $image = $candidate.Path
+                if ($image -and $image.StartsWith($prefix,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                  Stop-Process -Id $candidate.Id -Force -ErrorAction SilentlyContinue
+                }
+              }
+              catch { }
+            }
+            $report | Set-Content -Encoding utf8 "delta-default-probe.txt"
+          }
+
+      - name: Publish report
+        shell: bash
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f delta-default-probe.txt
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "ci: update Delta default browser diagnostic [skip ci]"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
