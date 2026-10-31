@@ -64,6 +64,7 @@ jobs:
             $windows = $automationRoot.FindAll(
               [System.Windows.Automation.TreeScope]::Children, $windowCondition)
             $termsElement = $null
+            $deltaWindow = $null
             $deltaPids = @(Get-Process -Name "delta-app" -ErrorAction SilentlyContinue |
               ForEach-Object { $_.Id })
             foreach ($window in $windows) {
@@ -71,6 +72,7 @@ jobs:
               $pidValue = $window.Current.ProcessId
               if ($name -notmatch '(?i)delta' -and $deltaPids -notcontains $pidValue) { continue }
               $report.Add("WINDOW pid=$pidValue name=$name")
+              $deltaWindow = $window
               $bounds = $window.Current.BoundingRectangle
               $report.Add("WINDOW bounds=$bounds")
               if ($bounds.Width -gt 0 -and $bounds.Height -gt 0) {
@@ -135,6 +137,32 @@ jobs:
                 }
               }
             }
+            if (-not $termsElement -and $deltaWindow) {
+              try {
+                Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class DeltaInput { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y); [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e); }'
+                [void][DeltaInput]::SetForegroundWindow(
+                  [IntPtr]$deltaWindow.Current.NativeWindowHandle)
+                $menuBounds = $deltaWindow.Current.BoundingRectangle
+                [void][DeltaInput]::SetCursorPos(
+                  [int]$menuBounds.X + 24, [int]$menuBounds.Y + 17)
+                [DeltaInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [DeltaInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+                Start-Sleep -Seconds 2
+                $menuBitmap = [System.Drawing.Bitmap]::new(
+                  [int]$menuBounds.Width, [int]$menuBounds.Height)
+                $menuGraphics = [System.Drawing.Graphics]::FromImage($menuBitmap)
+                $menuGraphics.CopyFromScreen([int]$menuBounds.X,
+                  [int]$menuBounds.Y, 0, 0, $menuBitmap.Size)
+                $menuBitmap.Save((Join-Path $env:GITHUB_WORKSPACE "delta-terms-menu.png"),
+                  [System.Drawing.Imaging.ImageFormat]::Png)
+                $menuGraphics.Dispose()
+                $menuBitmap.Dispose()
+                $report.Add("Delta menu clicked and captured")
+              }
+              catch {
+                $report.Add("Menu click/capture failed: $($_.Exception.Message)")
+              }
+            }
             $found = $false
             for ($attempt = 0; $attempt -lt 30; $attempt++) {
               if (Test-Path $runLog) {
@@ -181,6 +209,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f delta-terms-probe.txt
           if [ -f delta-terms-window.png ]; then git add -f delta-terms-window.png; fi
+          if [ -f delta-terms-menu.png ]; then git add -f delta-terms-menu.png; fi
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "ci: update Delta terms diagnostic [skip ci]"
           git push origin HEAD:"${GITHUB_REF_NAME}"
