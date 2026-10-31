@@ -310,6 +310,54 @@ UNPACKABLE_TYPES = (
 _BAD_COMMAND_LINE_CODES = frozenset({0xFFFFFFFF, 0x80070057, 1639, 87})
 
 
+def _is_reparse_point(path: str) -> bool:
+    """True, если путь — junction/символическая ссылка, а не каталог.
+
+    Нужен, чтобы никогда не удалять содержимое ссылки: за ней лежит
+    НАСТОЯЩИЙ профиль браузера пользователя, а не копия внутри портатива.
+    """
+    try:
+        if os.path.islink(path):
+            return True
+    except OSError:
+        return False
+    try:
+        os.readlink(path)
+        return True
+    except (OSError, AttributeError, ValueError):
+        pass
+    try:
+        import stat
+
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    except (OSError, ValueError):
+        return False
+
+
+
+def _remove_tree_avoiding_links(path: str) -> None:
+    """Удалить дерево, не проходя через вложенные junction/symlink."""
+    try:
+        for current, dirs, _files in os.walk(path, topdown=True,
+                                             followlinks=False):
+            for name in list(dirs):
+                child = os.path.join(current, name)
+                if not _is_reparse_point(child):
+                    continue
+                try:
+                    os.rmdir(child)
+                except OSError:
+                    try:
+                        os.unlink(child)
+                    except OSError:
+                        pass
+                dirs.remove(name)
+    except OSError:
+        pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def is_elevated() -> bool:
     """True, если Portablizer запущен с правами администратора.
 
@@ -1596,7 +1644,7 @@ class Portablizer:
             raise last
 
     def _prepare_output(self, portable_dir: str, app_dir: str,
-                        data_dir: str) -> None:
+                        data_dir: str, installer_path: str = "") -> None:
         """Готовит чистый App и удаляет лончер от незавершённого запуска.
 
         ``PortableData`` намеренно сохраняется: пользователь мог повторно
@@ -1630,6 +1678,10 @@ class Portablizer:
             self._remove_path(app_dir)
         os.makedirs(app_dir, exist_ok=True)
         os.makedirs(data_dir, exist_ok=True)
+        # Старые ссылки и профили браузера не должны переходить в новую
+        # сборку. Сначала снимаем ссылку, не заходя в настоящий профиль.
+        self._unlink_browser_profiles(data_dir)
+        self._drop_browser_duplicates(data_dir, installer_path)
 
         # Сохранённая сессия реестра от предыдущей сборки (PortableData\Registry)
         # при запуске имеет приоритет над portable.reg и portable_machine.reg.
@@ -2195,7 +2247,8 @@ class Portablizer:
             # Не очищаем старую сборку, пока не закончилось распознавание:
             # анализ повреждённого/неподдерживаемого установщика не должен
             # удалять уже имеющийся App и запускатели.
-            self._prepare_output(portable_dir, app_dir, data_dir)
+            self._prepare_output(portable_dir, app_dir, data_dir,
+                                 opts.installer_path)
 
             if IS_WINDOWS:
                 self.log.warn(
@@ -3864,6 +3917,13 @@ class Portablizer:
                                         console_log=console_log)
         finally:
             self._last_install_seconds = time.monotonic() - started
+            if opts.redirect_userdirs:
+                # Ссылки нужны только во время установки. Готовый портатив
+                # не должен содержать ни junction на чужой профиль, ни
+                # вторую копию браузера, даже если установщик завершился
+                # ошибкой или был снят по таймауту.
+                self._unlink_browser_profiles(data_dir)
+                self._drop_browser_duplicates(data_dir, opts.installer_path)
             if console_handle is not None:
                 try:
                     code = (str(rc) if rc is not None
@@ -7054,6 +7114,110 @@ class Portablizer:
             salvage_attempted=self._adobe_salvage_attempted,
             layout=self._adobe_layout,
         )
+
+    #: Начало имени установщика (или exe) самого браузера. Такой портатив —
+    #: это браузер, и каталоги браузера в PortableData принадлежат ЕМУ.
+    _BROWSER_STEM_PREFIXES = (
+        "chrome", "chromium", "googlechrome", "msedge", "microsoftedge",
+        "edge", "firefox", "brave", "vivaldi", "opera", "yandex", "thorium",
+        "waterfox", "librewolf", "zenbrowser",
+    )
+
+    @classmethod
+    def _installer_is_browser(cls, installer_path: str) -> bool:
+        """True, если портатив собирается из установщика самого браузера.
+
+        Тогда каталоги браузера внутри ``PortableData`` — не чужая копия,
+        а данные самой программы (её профиль, ``Application`` и обновлятор).
+        Трогать их нельзя ни при какой чистке: браузер без своего каталога и
+        без обновлятора решает, что не установлен, и запускает установщик —
+        в том числе при каждом клике по ярлыку готового портатива.
+        """
+        stem = os.path.splitext(os.path.basename(str(installer_path or "")))[0]
+        stem = stem.casefold().replace(" ", "").replace("-", "").replace("_", "")
+        if not stem:
+            return False
+        return stem == "browser" or any(
+            stem.startswith(prefix) for prefix in cls._BROWSER_STEM_PREFIXES)
+
+    @staticmethod
+    def _browser_profile_paths(data_dir: str) -> List[Tuple[str, str]]:
+        """Пары (путь в перенаправленном профиле, путь на этом ПК)."""
+        pairs: List[Tuple[str, str]] = []
+        roaming = os.path.join(data_dir, "AppData", "Roaming")
+        local = os.path.join(data_dir, "AppData", "Local")
+        for var, rel in launcher_mod.browser_profile_pairs():
+            host_root = os.environ.get(var, "")
+            portable_root = roaming if var.upper() == "APPDATA" else local
+            host = (os.path.join(host_root, rel.replace("/", os.sep))
+                    if host_root else "")
+            portable = os.path.join(portable_root, rel.replace("/", os.sep))
+            # Для unlink важны даже ссылки, чья host-папка уже исчезла:
+            # иначе stale junction останется в следующей сборке.
+            pairs.append((portable, host))
+        return pairs
+
+    def _unlink_browser_profiles(self, data_dir: str) -> None:
+        """Снять ссылки на профиль браузера: они не должны уехать с портативом."""
+        for portable, _host in self._browser_profile_paths(data_dir):
+            try:
+                if not _is_reparse_point(portable):
+                    continue
+                os.rmdir(portable)
+            except OSError:
+                try:
+                    os.unlink(portable)
+                except OSError:
+                    continue
+
+    def _drop_browser_duplicates(self, data_dir: str,
+                                installer_path: str = "") -> List[str]:
+        """Удалить профили браузеров, попавшие в портатив.
+
+        Каталог браузера внутри ``PortableData`` — не данные программы, а
+        копия браузера, созданная из-за перенаправленного профиля (или
+        приехавшая из прошлой сборки). Ссылки (junction) не трогаем: за ними
+        настоящий профиль пользователя.
+
+        Два исключения, без которых ломается обычный запуск:
+
+        * портатив собирается из установщика браузера — тогда это его
+          собственные каталоги;
+        * в каталоге лежат exe/dll — значит, это установленная программа
+          (или её обновлятор), а не профиль. Удалённый обновлятор заставляет
+          браузер запускать установщик при каждом старте.
+        """
+        removed: List[str] = []
+        if installer_path and self._installer_is_browser(installer_path):
+            self.log.debug(
+                "Собирается сам браузер: каталоги браузера в PortableData — "
+                "данные программы, а не дубликат профиля. Не трогаем их: "
+                "без них браузер при каждом запуске ставит себя заново.")
+            return removed
+        roaming = os.path.join(data_dir, "AppData", "Roaming")
+        local = os.path.join(data_dir, "AppData", "Local")
+        for var, rel in launcher_mod.browser_profile_pairs():
+            root = roaming if var.upper() == "APPDATA" else local
+            path = os.path.join(root, rel.replace("/", os.sep))
+            try:
+                if not os.path.exists(path) or _is_reparse_point(path):
+                    continue
+                if launcher_mod.browser_dir_holds_program(path):
+                    self.log.debug(
+                        "Оставлен каталог с исполняемыми файлами: " + path
+                        + " — это программа (или её обновлятор), а не профиль.")
+                    continue
+                _remove_tree_avoiding_links(path)
+                if not os.path.exists(path):
+                    removed.append(path)
+            except OSError:
+                continue
+        for path in removed[:4]:
+            self.log.debug("Удалён дубликат профиля браузера: " + path)
+        if len(removed) > 4:
+            self.log.debug(
+                f"Удалено дубликатов профиля браузера: {len(removed)}")
+        return removed
 
     def _build_isolated_env(self, opts: PortableOptions,
                             data_dir: str) -> Dict[str, str]:
