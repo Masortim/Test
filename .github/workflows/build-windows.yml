@@ -546,36 +546,6 @@ jobs:
             $config.target_exe_rel, $appFiles.Count, ($appBytes / 1MB))
           Remove-Item -Recurse -Force $root -ErrorAction Stop
 
-      - name: Publish Delta smoke diagnostics on failure
-        if: failure()
-        shell: pwsh
-        run: |
-          $root = Join-Path $env:RUNNER_TEMP "Delta Burn Smoke"
-          $portable = Join-Path $root "out/Delta_Portable"
-          $report = [System.Collections.Generic.List[string]]::new()
-          $report.Add("Delta smoke failed; see the captured launcher state below.")
-          foreach ($item in @(
-              @{Name = "launcher-run.log"; Path = (Join-Path $portable "PortableData/launcher-run.log")},
-              @{Name = "launcher-exe-error.log"; Path = (Join-Path $portable "PortableData/launcher-exe-error.log")},
-              @{Name = "delta-auth.out"; Path = (Join-Path $root "delta-auth.out")},
-              @{Name = "delta-auth.err"; Path = (Join-Path $root "delta-auth.err")},
-              @{Name = "delta-gui.err"; Path = (Join-Path $root "delta-gui.err")})) {
-            if (Test-Path $item.Path) {
-              $report.Add("--- $($item.Name) ---")
-              foreach ($line in @(Get-Content $item.Path -Tail 100)) {
-                $report.Add([string]$line)
-              }
-            }
-          }
-          $report | Set-Content -Encoding utf8 "delta-smoke-report.txt"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f delta-smoke-report.txt
-          if (-not (git diff --cached --quiet)) {
-            git commit -m "ci: publish Delta smoke diagnostics [skip ci]"
-            git push origin HEAD:$env:GITHUB_REF_NAME
-          }
-
       - name: Smoke test portable App EXE
         shell: pwsh
         run: |
