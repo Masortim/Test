@@ -375,6 +375,63 @@ jobs:
             throw "Launch.bat did not run delta-app.exe through LaunchPortable.exe"
           }
           Write-Host "Delta Launch.bat handoff: delta-app.exe exited with code 0"
+
+          # Browser sign-in regression: use the real Delta CLI, but start it
+          # through the ordinary Launch.bat -> LaunchPortable.exe path.  The
+          # profile junction is deliberately disabled for this probe so the
+          # process/URL fallback must prove that it saw the terms page.  No
+          # credentials are entered and the temporary process is stopped.
+          $configText = Get-Content $configPath -Raw
+          $authOutput = Join-Path $root "delta-auth.out"
+          $authError = Join-Path $root "delta-auth.err"
+          $authProcess = $null
+          $authUrlFound = $false
+          try {
+            $authConfig = $configText | ConvertFrom-Json
+            $authConfig.browser_login.connect_host_profile = $false
+            $authConfig.browser_login.clean_duplicates = $false
+            $authConfig | ConvertTo-Json -Depth 20 |
+              Set-Content -Encoding utf8 $configPath
+            $authProcess = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
+              -ArgumentList @("--target", "App/Delta.exe", "auth", "login") `
+              -WorkingDirectory $portable -PassThru `
+              -RedirectStandardOutput $authOutput -RedirectStandardError $authError
+            for ($attempt = 0; $attempt -lt 45; $attempt++) {
+              if (Test-Path $runLog) {
+                $runText = Get-Content $runLog -Raw
+                if ($runText -match 'browser login: opened https://dashboard\.zed\.dev/delta-beta') {
+                  $authUrlFound = $true
+                  break
+                }
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $authUrlFound) {
+              $details = @()
+              if (Test-Path $authOutput) { $details += Get-Content $authOutput -Tail 40 }
+              if (Test-Path $authError) { $details += Get-Content $authError -Tail 40 }
+              if (Test-Path $runLog) { $details += Get-Content $runLog -Tail 100 }
+              throw ("Delta auth login did not forward the terms URL through " +
+                "Launch.bat. " + ($details -join "`n"))
+            }
+            Write-Host "Delta browser auth handoff: dashboard.zed.dev/delta-beta opened"
+          }
+          finally {
+            # Only processes whose image is inside this temporary portable
+            # are stopped; the host browser and its existing windows remain.
+            $prefix = $portable.TrimEnd('\') + '\'
+            foreach ($candidate in @(Get-Process -ErrorAction SilentlyContinue)) {
+              try {
+                $image = $candidate.Path
+                if ($image -and $image.StartsWith($prefix,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                  Stop-Process -Id $candidate.Id -Force -ErrorAction SilentlyContinue
+                }
+              }
+              catch { }
+            }
+            Set-Content -Encoding utf8 -Path $configPath -Value $configText
+          }
           $buildLog = Join-Path $portable "portablizer.log"
           $buildLogText = Get-Content $buildLog -Raw
           if ($buildLogText -notmatch 'Сработал запасной сценарий: WiX Burn: /quiet /repair') {
