@@ -12,5 +12,11 @@
     "package_sha256": "4ee562192cf21716f3c38cac3c2b17ef73b76708001d8a075d31df0996f0c6b3",
     "dll_sha256": "fd3cc271308e1c1fd21821e0ecaf29498edd46839a4a2712b2fab7aa96b755e2",
     "dll_size": 4296704
+  },
+  {
+    "architecture": "arm64",
+    "source": "Windows SDK 10 Redist/D3D/arm64",
+    "dll_sha256": "db2bd081879bc74478b3e80c194a67f7ea1b6fdf2b99ba9f1ada3f6c18b3e5cd",
+    "dll_size": 8140760
   }
 ]
