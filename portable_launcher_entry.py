@@ -6977,10 +6977,17 @@ class BrowserLoginBridge:
         planned: "list[tuple[int, str, str]]" = []
         planned_urls: "set[str]" = set()
         for pid, image in candidates:
-            if self._bridged_image(image):
-                # Профиль уже настоящий: браузер открывает вход там, где надо.
+            descends = self._descends_from_target(
+                parents.get(pid, 0), parents)
+            if self._bridged_image(image) and not descends:
+                # Посторонний браузер с уже настоящим профилем не трогаем.
+                # Но потомок самой программы — другое дело: OpenCode и другие
+                # Electron-приложения запускают новый browser process даже
+                # после junction'а. Его URL всё равно нужно вернуть через
+                # host ShellExecute, чтобы открылась существующая копия
+                # системного браузера, а не второй экземпляр.
                 continue
-            if not (self._descends_from_target(parents.get(pid, 0), parents)
+            if not (descends
                     or self._profile_appeared(image, new_profiles)
                     or self._brokered_launch(pid, parents, images)):
                 continue

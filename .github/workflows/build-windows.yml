@@ -544,6 +544,325 @@ jobs:
             $config.target_exe_rel, $appFiles.Count, ($appBytes / 1MB))
           Remove-Item -Recurse -Force $root -ErrorAction Stop
 
+      - name: Smoke test - real OpenCode startup and browser login
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:RUNNER_TEMP "OpenCode Startup Browser Smoke"
+          $portable = Join-Path $root "out/OpenCode_Portable"
+          $runLog = Join-Path $portable "PortableData/launcher-run.log"
+          try {
+            New-Item -ItemType Directory -Force -Path (Join-Path $root "out") | Out-Null
+            $installer = Join-Path $root "opencode-setup.exe"
+            Invoke-WebRequest -UseBasicParsing `
+              -Uri "https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-win-x64.exe" `
+              -OutFile $installer
+            $arguments = 'build "' + $installer + '" --out "' +
+              (Join-Path $root "out") + '" --name OpenCode --single-file --no-registry ' +
+              '--no-netstack --hard-timeout 180'
+            $builder = Start-Process -FilePath (Resolve-Path "dist-windows/Portablizer.exe").Path `
+              -ArgumentList $arguments -PassThru
+            if (-not $builder.WaitForExit(600000)) {
+              $builder.Kill()
+              throw "OpenCode portable builder timed out"
+            }
+            if ($builder.ExitCode -ne 0) {
+              $buildLog = Join-Path $portable "portablizer.log"
+              if (Test-Path $buildLog) { Get-Content $buildLog -Tail 100 }
+              throw "OpenCode portable builder failed with exit $($builder.ExitCode)"
+            }
+            $config = Get-Content (Join-Path $portable "launcher_config.json") -Raw |
+              ConvertFrom-Json
+            if ($config.target_exe_rel -notmatch '(?i)(^|/)OpenCode\.exe$') {
+              throw "Unexpected OpenCode target: $($config.target_exe_rel)"
+            }
+            if (-not $config.browser_login.enabled -or
+                -not $config.browser_login.connect_host_profile) {
+              throw "OpenCode smoke must use the default browser protection"
+            }
+
+            $env:PORTABLE_LAUNCHER_NO_UI = "1"
+            $browserNames = @("msedge", "chrome", "browser", "yandex", "firefox", "brave")
+            $existingBrowserIds = @(Get-Process -Name $browserNames `
+              -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+            $gui = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
+              -WorkingDirectory $portable -PassThru
+            Add-Type -AssemblyName UIAutomationClient
+            Add-Type -AssemblyName UIAutomationTypes
+            Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class OpenCodeSmokeInput { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y); [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e); }'
+            $automationRoot = [System.Windows.Automation.AutomationElement]::RootElement
+            $windowCondition = [System.Windows.Automation.PropertyCondition]::new(
+              [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+              [System.Windows.Automation.ControlType]::Window)
+            $appWindow = $null
+            for ($attempt = 0; $attempt -lt 45 -and -not $appWindow; $attempt++) {
+              Start-Sleep -Seconds 1
+              $windows = $automationRoot.FindAll(
+                [System.Windows.Automation.TreeScope]::Children, $windowCondition)
+              foreach ($window in $windows) {
+                if ($window.Current.Name -match '(?i)^opencode$') {
+                  $appWindow = $window
+                  break
+                }
+              }
+            }
+            if (-not $appWindow) {
+              if (Test-Path $runLog) { Get-Content $runLog -Tail 120 }
+              throw "OpenCode did not show its window through ordinary Launch.bat"
+            }
+            # The native window appears before the Electron UI is ready.
+            # Match the successful standalone probe: do not click a blank
+            # frame while the model selector is still being rendered.
+            Start-Sleep -Seconds 30
+            [void][OpenCodeSmokeInput]::SetForegroundWindow(
+              [IntPtr]$appWindow.Current.NativeWindowHandle)
+            $bounds = $appWindow.Current.BoundingRectangle
+            $click = {
+              param($x, $y)
+              [void][OpenCodeSmokeInput]::SetCursorPos(
+                [int]$bounds.X + $x, [int]$bounds.Y + $y)
+              [OpenCodeSmokeInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+              [OpenCodeSmokeInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+            }
+
+            # Current OpenCode Desktop: model selector -> OpenCode -> Zen link.
+            # UIA exposes only the native window frame for this Electron UI.
+            # The menu click also gives the window reliable foreground focus
+            # after the preceding Delta/browser smoke on the same runner.
+            & $click 40 22
+            Start-Sleep -Seconds 3
+            & $click 390 477
+            Start-Sleep -Seconds 3
+            & $click 490 532
+            Start-Sleep -Seconds 25
+            [void][OpenCodeSmokeInput]::SetForegroundWindow(
+              [IntPtr]$appWindow.Current.NativeWindowHandle)
+            Start-Sleep -Seconds 1
+            $appProcessIds = @(Get-CimInstance Win32_Process -Filter "Name = 'OpenCode.exe'" `
+              -ErrorAction SilentlyContinue | Where-Object {
+                $_.CommandLine -and $_.CommandLine.Contains($portable)
+              } | ForEach-Object { $_.ProcessId })
+            $browserStartEvent = "OpenCodeBrowserStart"
+            Register-CimIndicationEvent -SourceIdentifier $browserStartEvent `
+              -Query "SELECT * FROM Win32_ProcessStartTrace WHERE ProcessName = 'msedge.exe' OR ProcessName = 'chrome.exe' OR ProcessName = 'browser.exe'"
+            & $click 430 326
+
+            $handoff = $false
+            $handoffMode = ""
+            $shortLivedBrowserId = 0
+            for ($attempt = 0; $attempt -lt 300; $attempt++) {
+              $startEvents = @(Get-Event -SourceIdentifier $browserStartEvent `
+                -ErrorAction SilentlyContinue)
+              foreach ($startEvent in $startEvents) {
+                $started = $startEvent.SourceEventArgs.NewEvent
+                if ($appProcessIds -contains $started.ParentProcessId) {
+                  $handoff = $true
+                  $shortLivedBrowserId = [int]$started.ProcessId
+                  $handoffMode = "browser start event: $($started.ProcessName) $($started.ProcessId)"
+                }
+              }
+              $startEvents | Remove-Event -ErrorAction SilentlyContinue
+              if ($handoff) { break }
+              if ($attempt % 10 -eq 0 -and (Test-Path $runLog)) {
+                $text = Get-Content $runLog -Raw
+                if ($text -match 'browser login: opened https://opencode\.ai/zen(?:\s|$)') {
+                  $handoff = $true
+                  $handoffMode = "host reopen"
+                  break
+                }
+              }
+              # With an existing default browser, its short-lived URL launcher
+              # can exit between the launcher's normal 0.3 s polls. Observe the
+              # app -> browser handoff directly; the linked real profile makes
+              # this reuse, not a second persistent browser/profile.
+              if ($existingBrowserIds.Count -gt 0 -and $appProcessIds.Count -gt 0) {
+                $samples = @(Get-CimInstance Win32_Process `
+                  -Filter "Name = 'msedge.exe' OR Name = 'chrome.exe' OR Name = 'browser.exe'" `
+                  -ErrorAction SilentlyContinue)
+                foreach ($sample in $samples) {
+                  if ($existingBrowserIds -contains $sample.ProcessId) { continue }
+                  if ($appProcessIds -contains $sample.ParentProcessId -and
+                      $sample.CommandLine -match 'https://opencode\.ai/zen(?:\s|$)') {
+                    $handoff = $true
+                    $handoffMode = "short-lived default-browser launcher: $($sample.ProcessId)"
+                    break
+                  }
+                }
+              }
+              if ($handoff) { break }
+              if ($attempt % 10 -eq 0) {
+                # Also accept a visible page or background tab in the existing
+                # browser, even if its top-level window title did not change.
+                $windows = $automationRoot.FindAll(
+                  [System.Windows.Automation.TreeScope]::Children, $windowCondition)
+                foreach ($window in $windows) {
+                  if ($existingBrowserIds -notcontains $window.Current.ProcessId) {
+                    continue
+                  }
+                  $windowMatch = $window.Current.Name -match '(?i)(opencode|zen)'
+                  if (-not $windowMatch) {
+                    $controls = $window.FindAll(
+                      [System.Windows.Automation.TreeScope]::Descendants,
+                      [System.Windows.Automation.Condition]::TrueCondition)
+                    $count = 0
+                    foreach ($control in $controls) {
+                      if ($count++ -ge 400) { break }
+                      if ([string]$control.Current.Name -match '(?i)(opencode|zen)') {
+                        $windowMatch = $true
+                        break
+                      }
+                    }
+                  }
+                  if ($windowMatch) {
+                    $handoff = $true
+                    $handoffMode = "existing browser window/tab: $($window.Current.Name)"
+                    break
+                  }
+                }
+              }
+              if ($handoff) { break }
+              Start-Sleep -Milliseconds 100
+            }
+            Unregister-Event -SourceIdentifier $browserStartEvent -ErrorAction SilentlyContinue
+            Remove-Event -SourceIdentifier $browserStartEvent -ErrorAction SilentlyContinue
+            if (-not $handoff) {
+              if (Test-Path $runLog) { Get-Content $runLog -Tail 120 }
+              Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -in @("msedge.exe", "chrome.exe", "browser.exe") } |
+                ForEach-Object { Write-Host "BROWSER: $($_.ProcessId) $($_.ParentProcessId) $($_.CommandLine)" }
+              throw "OpenCode link produced no host reopen, existing tab, or URL launcher"
+            }
+            Write-Host "OpenCode URL handoff mode: $handoffMode"
+            Start-Sleep -Seconds 3
+            if ($shortLivedBrowserId -gt 0) {
+              $remainingLauncher = Get-Process -Id $shortLivedBrowserId `
+                -ErrorAction SilentlyContinue
+              if ($remainingLauncher -and $remainingLauncher.ProcessName -in $browserNames) {
+                throw "The app-spawned browser launcher remained running instead of reusing the host browser"
+              }
+            }
+
+            # Prevention and fallback must work together: the Edge directory is
+            # a link to the real profile, not a second profile in PortableData.
+            $edgeProfile = Join-Path $portable "PortableData/AppData/Local/Microsoft/Edge"
+            if (-not (Test-Path $edgeProfile)) {
+              throw "OpenCode smoke did not create the expected Edge profile link"
+            }
+            $edgeItem = Get-Item -Force $edgeProfile
+            $isProfileLink = $edgeItem.LinkType -eq "Junction" -or
+              [bool]($edgeItem.Attributes -band [IO.FileAttributes]::ReparsePoint)
+            if (-not $isProfileLink) {
+              throw "OpenCode Edge profile is not a link (LinkType=$($edgeItem.LinkType), Attributes=$($edgeItem.Attributes))"
+            }
+            $transient = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Name -in @("msedge.exe", "chrome.exe", "browser.exe") -and
+                $_.CommandLine -and $_.CommandLine.Contains($portable)
+              })
+            if ($transient.Count -gt 0) {
+              $transient | ForEach-Object { Write-Host "TRANSIENT: $($_.CommandLine)" }
+              throw "A browser process still uses the redirected OpenCode profile"
+            }
+            $windows = $automationRoot.FindAll(
+              [System.Windows.Automation.TreeScope]::Children, $windowCondition)
+            $stillRunning = $false
+            foreach ($window in $windows) {
+              if ($window.Current.Name -match '(?i)^opencode$') {
+                $stillRunning = $true
+                break
+              }
+            }
+            if (-not $stillRunning) {
+              throw "OpenCode closed during the external browser handoff"
+            }
+            Write-Host "OpenCode Launch.bat window, linked profile and host browser handoff: OK"
+          }
+          catch {
+            $message = $_.Exception.Message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=OpenCode startup/browser smoke failed::$message"
+            $failure = [System.Collections.Generic.List[string]]::new()
+            $failure.Add("ERROR: $($_.Exception.Message)")
+            if (Test-Path $runLog) {
+              Write-Host "--- OpenCode launcher-run.log ---"
+              $failure.Add("--- launcher-run.log ---")
+              foreach ($line in @(Get-Content $runLog -Tail 120)) {
+                Write-Host $line
+                $failure.Add([string]$line)
+              }
+            }
+            $failure.Add("--- browser profile paths ---")
+            foreach ($relative in @(
+                "PortableData/AppData/Local/Microsoft/Edge",
+                "PortableData/User/AppData/Local/Microsoft/Edge")) {
+              $candidatePath = Join-Path $portable $relative
+              if (Test-Path $candidatePath) {
+                $candidateItem = Get-Item -Force $candidatePath
+                $failure.Add("PROFILE: $relative LinkType=$($candidateItem.LinkType) Attributes=$($candidateItem.Attributes) Target=$($candidateItem.Target)")
+              } else {
+                $failure.Add("PROFILE: $relative MISSING")
+              }
+            }
+            $failure.Add("--- processes ---")
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Name -in @("OpenCode.exe", "msedge.exe", "chrome.exe", "browser.exe")
+              } | ForEach-Object {
+                $line = "PROCESS: $($_.ProcessId) parent=$($_.ParentProcessId) $($_.Name) $($_.CommandLine)"
+                Write-Host $line
+                $failure.Add($line)
+              }
+            if ($automationRoot -and $windowCondition) {
+              $failure.Add("--- windows ---")
+              foreach ($window in @($automationRoot.FindAll(
+                  [System.Windows.Automation.TreeScope]::Children, $windowCondition))) {
+                $failure.Add("WINDOW: pid=$($window.Current.ProcessId) $($window.Current.Name)")
+              }
+            }
+            $failure | Set-Content -Encoding utf8 "opencode-smoke-failure.txt"
+            try {
+              Add-Type -AssemblyName System.Windows.Forms
+              Add-Type -AssemblyName System.Drawing
+              $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
+              $bitmap = [System.Drawing.Bitmap]::new($screen.Width, $screen.Height)
+              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+              $graphics.CopyFromScreen($screen.Left, $screen.Top, 0, 0, $screen.Size)
+              $bitmap.Save((Join-Path $env:GITHUB_WORKSPACE "opencode-smoke-failure.png"),
+                [System.Drawing.Imaging.ImageFormat]::Png)
+              $graphics.Dispose()
+              $bitmap.Dispose()
+            }
+            catch { Write-Host "Could not capture OpenCode failure screenshot: $($_.Exception.Message)" }
+            throw
+          }
+          finally {
+            # Never close the host browser or its existing windows. Stop only
+            # processes whose image belongs to this temporary portable.
+            $prefix = $portable.TrimEnd('\') + '\'
+            foreach ($candidate in @(Get-Process -ErrorAction SilentlyContinue)) {
+              try {
+                $image = $candidate.Path
+                if ($image -and $image.StartsWith($prefix,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                  Stop-Process -Id $candidate.Id -Force -ErrorAction SilentlyContinue
+                }
+              }
+              catch { }
+            }
+          }
+
+      - name: Publish OpenCode smoke failure details
+        if: failure()
+        shell: bash
+        run: |
+          set -e
+          if ! test -f opencode-smoke-failure.txt; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f opencode-smoke-failure.txt
+          if test -f opencode-smoke-failure.png; then git add -f opencode-smoke-failure.png; fi
+          git commit -m "ci: publish OpenCode smoke failure [skip ci]"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
+
       - name: Smoke test portable App EXE
         shell: pwsh
         run: |
