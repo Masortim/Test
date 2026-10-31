@@ -13,6 +13,7 @@ from typing import Iterable, Optional, Sequence
 
 MACHINE_X86 = 0x014C
 MACHINE_X64 = 0x8664
+MACHINE_ARM64 = 0xAA64
 
 _SECTION_RVA = 0x1000
 _RESOURCE_RVA = 0x8000
@@ -52,7 +53,7 @@ def write_pe(path: str | Path, imports: Sequence[str] = (),
              machine: int = MACHINE_X86, dotnet: bool = False,
              manifest: str = "", extra: bytes = b"") -> str:
     """Пишет валидный PE с заданными зависимостями и возвращает путь."""
-    pe32plus = machine == MACHINE_X64
+    pe32plus = machine in (MACHINE_X64, MACHINE_ARM64)
     optional_size = 240
     sections = 2 if manifest else 1
     headers = 0x40 + 4 + 20 + optional_size + 40 * sections
