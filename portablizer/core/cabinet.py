@@ -519,7 +519,7 @@ def _safe_name(name: str) -> str:
 
 
 #: Расширения вложенных контейнеров, внутри которых может лежать нужный файл.
-CONTAINER_EXTENSIONS = (".cab", ".msi", ".msp", ".exe", ".zip")
+CONTAINER_EXTENSIONS = (".cab", ".msu", ".msi", ".msp", ".exe", ".zip")
 
 #: Сигнатуры контейнеров: кабинет и составной документ OLE (это .msi).
 _CONTAINER_MAGIC = (b"MSCF", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", b"MZ")

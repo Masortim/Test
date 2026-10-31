@@ -153,6 +153,16 @@ class RedistPackage:
         return out
 
 
+def _download_provides_dll(package: RedistPackage, dll: str) -> bool:
+    """Содержит ли скачиваемый пакет запрошенную библиотеку.
+
+    У d3dcompiler_modern один пакет описывает _44…_47, но KB4019990 несёт
+    только _47. Не скачиваем его впустую ради _46 и не оставляем пользователю
+    обновление, которое заведомо не решит его проблему.
+    """
+    return package.key != "d3dcompiler_modern" or dll == "d3dcompiler_47.dll"
+
+
 _VC_LICENSE_NOTE = (
     "Файлы Visual C++ Runtime разрешено распространять вместе с программой "
     "(см. условия лицензии Visual Studio)."
@@ -320,10 +330,21 @@ REDIST_PACKAGES: Tuple[RedistPackage, ...] = (
         title="D3DCompiler_46/47 (входит в Windows 8 и новее)",
         ascii_title="D3DCompiler 46/47 (part of Windows 8 and newer)",
         pattern=r"d3dcompiler_4[4-7]\.dll",
-        downloads={},
+        # KB4019990 содержит именно _47 (в x64-пакете — обе разрядности).
+        # Это не DirectX June 2010: там современных компиляторов нет.
+        downloads={
+            "x86": "https://download.microsoft.com/download/2/F/4/"
+                   "2F4F48F4-D980-43AA-906A-8FFF40BCB832/"
+                   "Windows6.1-KB4019990-x86.msu",
+            "x64": "https://download.microsoft.com/download/2/F/4/"
+                   "2F4F48F4-D980-43AA-906A-8FFF40BCB832/"
+                   "Windows6.1-KB4019990-x64.msu",
+        },
         page="https://support.microsoft.com/help/4019990",
-        note="На Windows 8 и новее файл системный. Для Windows 7 его "
-             "приносит обновление KB4019990 или сама программа.",
+        size_hint=3_000_000,
+        note="На Windows 8 и новее файл системный. Обе разрядности также "
+             "лежат в Windows SDK\\Redist\\D3D и разрешены для копирования "
+             "рядом с программой. Для Windows 7 _47 приносит KB4019990.",
     ),
     RedistPackage(
         key="openal",
@@ -1117,6 +1138,35 @@ def system_dirs_for(arch: str) -> List[str]:
     return [path for path in order if os.path.isdir(path)]
 
 
+def windows_sdk_d3d_dirs_for(arch: str) -> List[str]:
+    """Официальные app-local копии D3DCompiler из установленных Windows SDK.
+
+    В отличие от System32/SysWOW64 здесь Microsoft специально кладёт обе
+    разрядности для распространения рядом с desktop-приложением. Это важно,
+    когда x64-файл в системе есть, а x86-импортёру взять нечего. На машине
+    без SDK функция просто возвращает пустой список.
+    """
+    if arch not in ("x86", "x64", "arm64"):
+        return []
+    roots: List[str] = []
+    for variable in ("ProgramFiles(x86)", "ProgramW6432", "ProgramFiles"):
+        base = os.environ.get(variable)
+        if base and base not in roots:
+            roots.append(base)
+    result: List[str] = []
+    seen = set()
+    for base in roots:
+        for version in ("10", "8.1", "8.0"):
+            candidate = os.path.join(
+                base, "Windows Kits", version, "Redist", "D3D", arch)
+            key = os.path.normcase(os.path.abspath(candidate))
+            if key in seen or not os.path.isdir(candidate):
+                continue
+            seen.add(key)
+            result.append(candidate)
+    return result
+
+
 def winsxs_dir() -> str:
     if not IS_WINDOWS:
         return ""
@@ -1214,8 +1264,8 @@ def package_file_problem(path: str) -> str:
     lower = path.lower()
     if lower.endswith((".msi", ".msp")):
         expected, what = b"\xd0\xcf\x11\xe0", "MSI"
-    elif lower.endswith(".cab"):
-        expected, what = b"MSCF", "CAB"
+    elif lower.endswith((".cab", ".msu")):
+        expected, what = b"MSCF", "CAB/MSU"
     else:
         expected, what = b"MZ", "программа Windows"
     if not head.startswith(expected):
@@ -2773,7 +2823,9 @@ def extraction_commands(archive: str, destination: str,
     archive = os.path.abspath(archive)
     lower = os.path.basename(archive).lower()
     kind = kind or installer_kind(archive)
-    if lower.endswith(".cab") or kind == "cab":
+    if lower.endswith((".cab", ".msu")) or kind in ("cab", "msu"):
+        # MSU — это CAB с обновлением Windows, а не исполняемый файл.
+        # Никогда не передаём его самому себе с EXE-ключами: только извлечение.
         return [
             [system_tool("expand"), "-F:*", archive, destination],
             [system_tool("expand"), "-r", archive, destination],
@@ -3595,9 +3647,10 @@ class RuntimeProvisioner:
 
     1. файлы и пакеты, приложенные к установщику (``_CommonRedist`` и т. п.);
     2. системные папки этого ПК (с обязательной проверкой разрядности);
-    3. WinSxS — для VC++ 2005/2008, которые живут только там; рядом с
+    3. Windows SDK ``Redist/D3D`` — официальные app-local D3DCompiler;
+    4. WinSxS — для VC++ 2005/2008, которые живут только там; рядом с
        программой создаётся private-манифест сборки;
-    4. официальная загрузка с сайта Microsoft (только если разрешена).
+    5. официальная загрузка с сайта Microsoft (только если разрешена).
     """
 
     def __init__(self, log, *, source_dirs: Sequence[str] = (),
@@ -3824,6 +3877,19 @@ class RuntimeProvisioner:
             found.append((version, path))
         found.sort(reverse=True)
         return [path for _version, path in found]
+
+    def _from_windows_sdk(self, requirement: RuntimeRequirement
+                          ) -> Tuple[str, str]:
+        """Берёт D3DCompiler из официального redist-каталога Windows SDK."""
+        package = requirement.package
+        if package is None or package.key != "d3dcompiler_modern":
+            return "", ""
+        for directory in windows_sdk_d3d_dirs_for(requirement.arch):
+            candidate = os.path.join(directory, requirement.dll)
+            if os.path.isfile(candidate) \
+                    and self._arch_matches(candidate, requirement.arch):
+                return candidate, "Windows SDK (app-local redist)"
+        return "", ""
 
     def _from_sxs(self, requirement: RuntimeRequirement) -> Tuple[str, str]:
         package = requirement.package
@@ -4275,7 +4341,8 @@ class RuntimeProvisioner:
     def _from_download(self, requirement: RuntimeRequirement,
                        portable_dir: str, work_dir: str) -> Tuple[str, str]:
         package = requirement.package
-        if package is None or not self.allow_download:
+        if package is None or not self.allow_download \
+                or not _download_provides_dll(package, requirement.dll):
             return "", ""
         url = package.downloads.get(requirement.arch) or package.downloads.get("any")
         if not url:
@@ -4375,7 +4442,8 @@ class RuntimeProvisioner:
         self._download_tried.add(key)
         redist_dir = os.path.join(portable_dir, REDIST_DIR_NAME)
         filename = urls[0].rsplit("/", 1)[-1] or f"{package.key}.exe"
-        if not filename.lower().endswith((".exe", ".msi", ".cab", ".zip")):
+        if not filename.lower().endswith(
+                (".exe", ".msi", ".msu", ".cab", ".zip")):
             filename = f"{package.key}_{arch or 'any'}.exe"
         archive = os.path.join(redist_dir, filename)
         try:
@@ -4448,7 +4516,14 @@ class RuntimeProvisioner:
         обычная ступень ``_from_system`` и заберёт его в портатив.
         """
         package = requirement.package
-        if package is None or not self.allow_install or not IS_WINDOWS:
+        if package is None or not self.allow_install or not IS_WINDOWS \
+                or not _download_provides_dll(package, requirement.dll):
+            return "", ""
+        if package.key == "d3dcompiler_modern":
+            # KB4019990 — это обновление Windows (MSU/WUSA), а не обычный
+            # redist. Даже включённая пользователем тихая установка пакетов
+            # не должна превращать app-local копирование D3DCompiler в
+            # изменение системы: выше пакет распаковывается как CAB.
             return "", ""
         key = f"install:{package.key}:{requirement.arch}"
         if key in self._failed_packages:
@@ -4689,6 +4764,8 @@ class RuntimeProvisioner:
                 if not path:
                     path, source = self._from_system(requirement)
                 if not path:
+                    path, source = self._from_windows_sdk(requirement)
+                if not path:
                     path, source = self._from_sxs(requirement)
                 if not path:
                     path, source = self._from_package_payload(requirement, work_dir)
@@ -4801,7 +4878,8 @@ class RuntimeProvisioner:
         staged: Dict[str, Dict[str, str]] = {}
         for requirement in repair:
             package = requirement.package
-            if package is None:
+            if package is None \
+                    or not _download_provides_dll(package, requirement.dll):
                 continue
             key = f"{package.key}:{requirement.arch}"
             if key in staged:
