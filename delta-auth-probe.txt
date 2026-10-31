@@ -1,0 +1,81 @@
+Installer downloaded
+Builder exit: 0
+Target: App/delta-app.exe
+Terms URL observed in launcher log: False
+BAT process exited: True
+BAT exit: 0
+PROBE RESULT: URL WAS NOT FORWARDED
+--- auth.out ---
+--- auth.err ---
+--- launcher-run.log ---
+[2026-10-31 09:12:40] paths: replaced the portable marker in 2 file(s): Launch.bat, portability-report.txt
+[2026-10-31 09:12:40] paths: the portable marker is gone from 2 file(s)
+[2026-10-31 09:12:40] stale session: cleaned up after the previous session: очищена временная папка портатива (2)
+[2026-10-31 09:12:40] target: App/Delta.exe is missing; found App/bin/delta.exe in App
+[2026-10-31 09:12:40] target: launcher_config.json now points to App/bin/delta.exe
+[2026-10-31 09:12:40] pre-launch (from LaunchPortable.exe start): 0.28s before the program starts (slowest: stale session 0.06s, saves 0.06s)
+[2026-10-31 09:12:40] start: "D:\a\_temp\Delta Browser Probe\out\Delta_Portable\App\bin\delta.exe" auth login (cwd=D:\a\_temp\Delta Browser Probe\out\Delta_Portable\App\bin, elevated=True, job=yes)
+[2026-10-31 09:12:40] browser login: the file system cannot link the browser profile; watching the processes started by the program instead
+[2026-10-31 09:12:40] installed programs: installed programs: не удалось удалить запись «Delta» ([WinError 5] Access is denied)
+[2026-10-31 09:12:40] installed programs: installed programs: удалена запись «Delta» из списка установленных приложений (HKLM)
+[2026-10-31 09:12:40] delta.exe exited with code 2 after 0.2s
+[2026-10-31 09:12:47] delta.exe closed within 0.2s and left nothing running
+[2026-10-31 09:12:47] pre-launch work: 0.63s of host cleanup, done in parallel with the program start
+[2026-10-31 09:12:47] installed programs (after exit): не удалось удалить запись «Delta» ([WinError 5] Access is denied)
+[2026-10-31 09:12:47] portable folder released: no processes left
+--- portablizer.log ---
+[09:10:52] INFO  Portablizer 1.43.3
+[09:10:52] INFO  Режим единичного файла включён: установщик скопирован в пустую папку, соседние файлы использоваться не будут.
+[09:10:52] INFO  Портативная папка: D:\a\_temp\Delta Browser Probe\out\Delta_Portable
+[09:11:00] OK    Тип установщика: WiX Burn Bundle (уверенность 97%)
+[09:11:00] DEBUG   • в PE есть секция .wixburn — это настоящий Burn-бандл
+[09:11:00] DEBUG   • ключи внутри файла: /NORESTART, /quiet, /passive, /qn, /qb, /uninstall, /repair
+[09:11:00] WARN  Важно: сторонний установщик запускается без полной виртуализации — Portablizer не является песочницей. Перенаправление профиля не блокирует изменения реестра, служб, драйверов, ассоциаций, активации Windows/Office или Edge/WebView2. Portablizer не может надёжно отменить неизвестные изменения установщика; для недоверенного файла остановитесь и используйте Windows Sandbox или VM.
+[09:11:00] INFO  Место под распаковку: свободно 146.7 ГБ, установщику нужно около 152.9 МБ (TEMP — в папке портатива).
+[09:11:00] INFO  Язык установщика: по умолчанию (как в самом установщике).
+[09:11:00] INFO  Команда: C:\Users\RUNNER~1\AppData\Local\Temp\Portablizer-single-file-e5raznnm\delta-setup.exe /layout "D:\a\_temp\Delta Browser Probe\out\Delta_Portable\_bundle_layout" /quiet /norestart /log "D:\a\_temp\Delta Browser Probe\out\Delta_Portable\install-layout.log"
+[09:11:00] DEBUG   • WiX Burn /layout: содержимое бандла собирается в папку без установки в систему и без прав администратора.
+[09:11:00] INFO  Подготовлено запасных сценариев установки: 2. Они запустятся автоматически, если основной не даст файлов.
+[09:11:00] DEBUG   • запасной: WiX Burn: /quiet /install + InstallFolder
+[09:11:00] DEBUG   • запасной: WiX Burn: /quiet /install
+[09:11:15] DEBUG   ассоциаций под защитой: 266170
+[09:11:16] DEBUG Подготовлено дерево перенаправленного профиля: D:\a\_temp\Delta Browser Probe\out\Delta_Portable\PortableData\User
+[09:11:16] DEBUG Подготовлен Known Folder UserPinned: D:\a\_temp\Delta Browser Probe\out\Delta_Portable\PortableData\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned
+[09:11:16] DEBUG Подготовлен Known Folder UserPinned: D:\a\_temp\Delta Browser Probe\out\Delta_Portable\PortableData\User\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned
+[09:11:16] INFO  Запуск установщика (тихо, изолированно)...
+[09:11:16] INFO    Тихая установка... идёт 0:00; процессор: 0:00, журнал установщика растёт
+[09:11:17] OK    Установка завершена (код 0).
+[09:11:17] WARN  Целевая папка пуста. Установщик мог проигнорировать ключ папки; проверяю перенаправленный профиль и системные каталоги установки.
+[09:11:17] INFO  Побочные пакеты бандла (exe/msu/msp) в портатив не переносятся: DeltaSetup.exe
+[09:11:17] WARN  Вложенный setup.exe совпадает с уже обработанным WiX Burn-файлом (SHA-256). Повторно запускать тот же бандл или его /layout не буду: это создало бы рекурсивную установку без новых файлов программы.
+[09:11:17] WARN  В распакованном бандле нет MSI-пакета и не найден подходящий вложенный установщик приложения — переносить файлы бандла как готовую программу нельзя.
+[09:11:17] INFO  Сценарий 2 из 3: WiX Burn: /quiet /install + InstallFolder
+[09:11:17] DEBUG cmdline: C:\Users\RUNNER~1\AppData\Local\Temp\Portablizer-single-file-e5raznnm\delta-setup.exe /quiet /norestart /install "InstallFolder=D:\a\_temp\Delta Browser Probe\out\Delta_Portable\App" /log "D:\a\_temp\Delta Browser Probe\out\Delta_Portable\install.log"
+[09:11:17] DEBUG Подготовлено дерево перенаправленного профиля: D:\a\_temp\Delta Browser Probe\out\Delta_Portable\PortableData\User
+[09:11:17] DEBUG Подготовлен Known Folder UserPinned: D:\a\_temp\Delta Browser Probe\out\Delta_Portable\PortableData\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned
+[09:11:17] DEBUG Подготовлен Known Folder UserPinned: D:\a\_temp\Delta Browser Probe\out\Delta_Portable\PortableData\User\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned
+[09:11:17] INFO  Запуск установщика (тихо, изолированно)...
+[09:11:17] INFO    Тихая установка... идёт 0:00; распаковано 16 Б в 1 файлах, журнал установщика растёт
+[09:11:21] OK    Установка завершена (код 0).
+[09:11:21] OK    Сработал запасной сценарий: WiX Burn: /quiet /install + InstallFolder
+[09:11:22] OK    Убрано ярлыков, созданных установщиком: 1 (Delta.lnk). Портатив запускается из App\LaunchPortable.exe; ярлык установщика содержал статичный путь и после переноса папки на другой диск вёл бы в прежнее место.
+[09:12:31] OK    Ассоциации файлов и программы по умолчанию восстановлены на этом ПК (5 изменённых ключей).
+[09:12:32] INFO  Установочные файлы Burn удалены из готового портатива: _bundle_layout, Package Cache
+[09:12:32] OK    Главный exe: App\delta-app.exe
+[09:12:32] INFO  Разобрано исполняемых файлов: 5; внешних библиотек: 164; из них требует внимания: 2.
+[09:12:38] OK    В портатив добавлена d3dcompiler_47.dll [arm64] — D3DCompiler_46/47 (входит в Windows 8 и новее) (Windows SDK (app-local redist))
+[09:12:38] OK    В портатив добавлена d3dcompiler_47.dll [x64] — D3DCompiler_46/47 (входит в Windows 8 и новее) (системная папка Windows)
+[09:12:38] OK    Полный комплект «про запас»: рядом с exe дополнительно разложено 31 библиотек из найденных версий VC++ и DirectX. Они закрывают динамические загрузки, плагины и моды.
+[09:12:38] INFO  Полный комплект: ещё 136 библиотек не нашлись на этом ПК. Программе они, скорее всего, не нужны; список — в redistributables.txt.
+[09:12:38] OK    Все системные компоненты, нужные программе, теперь лежат внутри портатива — установка на чужом ПК не потребуется.
+[09:12:39] INFO  Папки с зависимостями (dll) добавлены в PATH: 4 шт.
+[09:12:39] INFO  Сквозные сохранения: отдельного хранилища сейвов у программы нет, все данные и так внутри PortableData.
+[09:12:39] OK    Создано интерактивное меню выбора программ: Launch_Menu.bat
+[09:12:39] INFO  Лончер разложен папкой (_internal): запуск без распаковки во временную папку.
+[09:12:39] OK    Создан переносимый EXE-лончер: App\LaunchPortable.exe. Его можно запускать двойным кликом без Python и без Launch.bat.
+[09:12:39] OK    Создан лончер с именем программы: App\Launch Delta.exe — именно он виден в Диспетчере задач как «Launch <программа>».
+[09:12:39] OK    Лончер и сопроводительные файлы созданы.
+[09:12:39] OK    Пути внутри портатива относительные — проверено 10 текстовых файлов. Папку можно переносить на другой диск или в другой каталог.
+[09:12:39] INFO  Пути вне портатива: 3. Перенести их нельзя — подробности в portability-report.txt.
+[09:12:39] OK    Папка портатива свободна: её можно удалить, перенести или скопировать на флешку прямо сейчас.
+[09:12:39] OK    Портативное приложение успешно создано!
