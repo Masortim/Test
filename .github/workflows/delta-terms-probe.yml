@@ -158,6 +158,23 @@ jobs:
                 $menuGraphics.Dispose()
                 $menuBitmap.Dispose()
                 $report.Add("Delta menu clicked and captured")
+                Add-Type -AssemblyName System.Windows.Forms
+                [System.Windows.Forms.SendKeys]::SendWait("{ESC}")
+                [void][DeltaInput]::SetCursorPos(
+                  [int]$menuBounds.X + 520, [int]$menuBounds.Y + 434)
+                [DeltaInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [DeltaInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+                Start-Sleep -Seconds 5
+                $signinBitmap = [System.Drawing.Bitmap]::new(
+                  [int]$menuBounds.Width, [int]$menuBounds.Height)
+                $signinGraphics = [System.Drawing.Graphics]::FromImage($signinBitmap)
+                $signinGraphics.CopyFromScreen([int]$menuBounds.X,
+                  [int]$menuBounds.Y, 0, 0, $signinBitmap.Size)
+                $signinBitmap.Save((Join-Path $env:GITHUB_WORKSPACE "delta-after-signin.png"),
+                  [System.Drawing.Imaging.ImageFormat]::Png)
+                $signinGraphics.Dispose()
+                $signinBitmap.Dispose()
+                $report.Add("Initial Sign In button clicked")
               }
               catch {
                 $report.Add("Menu click/capture failed: $($_.Exception.Message)")
@@ -175,6 +192,10 @@ jobs:
               Start-Sleep -Seconds 1
             }
             $report.Add("Terms URL observed: $found")
+            if (Test-Path $runLog) {
+              $handoffText = Get-Content $runLog -Raw
+              $report.Add("Any browser handoff observed: $($handoffText -match 'browser login: opened https://')")
+            }
           }
           catch {
             $report.Add("ERROR: $($_.Exception.Message)")
@@ -210,6 +231,7 @@ jobs:
           git add -f delta-terms-probe.txt
           if [ -f delta-terms-window.png ]; then git add -f delta-terms-window.png; fi
           if [ -f delta-terms-menu.png ]; then git add -f delta-terms-menu.png; fi
+          if [ -f delta-after-signin.png ]; then git add -f delta-after-signin.png; fi
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "ci: update Delta terms diagnostic [skip ci]"
           git push origin HEAD:"${GITHUB_REF_NAME}"
