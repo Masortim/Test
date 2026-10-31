@@ -22,7 +22,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $report = [System.Collections.Generic.List[string]]::new()
-          $root = Join-Path $env:RUNNER_TEMP "Delta Browser Probe"
+          $root = Join-Path $env:RUNNER_TEMP "d"
           $portable = Join-Path $root "out/Delta_Portable"
           try {
             New-Item -ItemType Directory -Force -Path (Join-Path $root "out") | Out-Null
