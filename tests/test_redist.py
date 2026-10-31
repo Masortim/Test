@@ -862,9 +862,14 @@ class FullKitProvisionTests(unittest.TestCase):
             portable, app = self._portable(temp)
             write_pe(app / "game.exe", imports=("KERNEL32.dll",))
             scan = redist.scan_app_runtime(str(app))
-            report = redist.RuntimeProvisioner(
-                self.log, system_dirs=[], sxs_dir="",
-            ).provision(scan, str(app), str(portable), "Game", full_kit=True)
+            # Тест намеренно моделирует ПК без источников. Иначе установленный
+            # на Windows-раннере SDK законно принесёт запасной D3DCompiler и
+            # сценарий «ничего не найдено» перестанет быть изолированным.
+            with mock.patch.object(redist, "windows_sdk_d3d_dirs_for",
+                                   return_value=[]):
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="",
+                ).provision(scan, str(app), str(portable), "Game", full_kit=True)
 
             self.assertEqual(report.missing, [])
             self.assertEqual(report.provided, [])
