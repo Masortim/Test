@@ -135,6 +135,23 @@ jobs:
                   $menuGraphics.Dispose()
                   $menuBitmap.Dispose()
                 }
+                [void][OpenCodeProbeInput]::SetCursorPos(
+                  [int]$windowBounds.X + 390, [int]$windowBounds.Y + 477)
+                [OpenCodeProbeInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [OpenCodeProbeInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+                Start-Sleep -Seconds 3
+                $report.Add("Provider selector clicked")
+                $providerBitmap = [System.Drawing.Bitmap]::new(
+                  [int]$windowBounds.Width, [int]$windowBounds.Height)
+                $providerGraphics = [System.Drawing.Graphics]::FromImage($providerBitmap)
+                $providerGraphics.CopyFromScreen(
+                  [int]$windowBounds.X, [int]$windowBounds.Y, 0, 0,
+                  [System.Drawing.Size]::new([int]$windowBounds.Width,
+                    [int]$windowBounds.Height))
+                $providerBitmap.Save((Join-Path $env:GITHUB_WORKSPACE "opencode-provider.png"),
+                  [System.Drawing.Imaging.ImageFormat]::Png)
+                $providerGraphics.Dispose()
+                $providerBitmap.Dispose()
               }
             }
 
@@ -203,6 +220,7 @@ jobs:
           git add -f opencode-browser-probe.txt
           if test -f opencode-window.png; then git add -f opencode-window.png; fi
           if test -f opencode-menu.png; then git add -f opencode-menu.png; fi
+          if test -f opencode-provider.png; then git add -f opencode-provider.png; fi
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "ci: update OpenCode browser diagnostic [skip ci]"
           git push origin HEAD:"${GITHUB_REF_NAME}"
