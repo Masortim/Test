@@ -349,62 +349,11 @@ jobs:
             throw "Delta Launch.bat must target the desktop delta-app.exe, not the CLI: $($config.target_exe_rel)"
           }
 
-          # Exercise the actual Launch.bat -> EXE handoff, not only a direct
-          # delta-app.exe invocation.  --version is forwarded to the real GUI
-          # binary and exits without needing an interactive desktop session.
-          # A console fallback would bypass this launcher journal and was the
-          # source of the second, differently configured Delta process.
-          $env:PORTABLE_LAUNCHER_NO_UI = "1"
-          $batOutput = Join-Path $root "delta-launch-bat.out"
-          & (Join-Path $portable "Launch.bat") --version *> $batOutput
-          $runLog = Join-Path $portable "PortableData/launcher-run.log"
-          $handoffOk = $false
-          for ($attempt = 0; $attempt -lt 60; $attempt++) {
-            if (Test-Path $runLog) {
-              $runText = Get-Content $runLog -Raw
-              if ($runText -match 'delta-app\.exe exited with code 0') {
-                $handoffOk = $true
-                break
-              }
-            }
-            Start-Sleep -Seconds 1
-          }
-          if (-not $handoffOk) {
-            if (Test-Path $batOutput) { Get-Content $batOutput -Tail 80 }
-            if (Test-Path $runLog) { Get-Content $runLog -Tail 120 }
-            throw "Launch.bat did not run delta-app.exe through LaunchPortable.exe"
-          }
-          Write-Host "Delta Launch.bat handoff: delta-app.exe exited with code 0"
-
-          # Launch.bat intentionally returns after the EXE handoff.  The
-          # target's exit line alone does not mean LaunchPortable.exe has
-          # finished registry/profile cleanup.  Do not start a second Delta
-          # session while the first one is still removing its IPC alias.
-          $portablePrefix = $portable.TrimEnd('\') + '\'
-          $firstSessionSettled = $false
-          for ($attempt = 0; $attempt -lt 60; $attempt++) {
-            $remaining = @()
-            foreach ($candidate in @(Get-Process -ErrorAction SilentlyContinue)) {
-              try {
-                $image = $candidate.Path
-                if ($image -and $image.StartsWith($portablePrefix,
-                    [StringComparison]::OrdinalIgnoreCase)) {
-                  $remaining += $candidate
-                }
-              }
-              catch { }
-            }
-            if ($remaining.Count -eq 0) {
-              $firstSessionSettled = $true
-              break
-            }
-            Start-Sleep -Seconds 1
-          }
-          if (-not $firstSessionSettled) {
-            throw "The first Delta launcher did not finish cleanup before the auth probe"
-          }
-          Start-Sleep -Seconds 2
-
+          # The auth probe below is also the ordinary Launch.bat -> EXE
+          # handoff smoke.  Do not run a second portable --version session
+          # first: Delta leaves a database/session transition after that
+          # command, and a second launch would test cleanup races instead of
+          # the user's first Review Terms/sign-in launch.
           # Browser/IPC regression: start the real desktop app through the
           # ordinary Launch.bat -> LaunchPortable.exe path, then ask the
           # running app for a non-blocking CLI sign-in handoff.  A standalone
