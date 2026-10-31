@@ -635,6 +635,9 @@ jobs:
             Start-Sleep -Seconds 3
             & $click 490 532
             Start-Sleep -Seconds 25
+            [void][OpenCodeSmokeInput]::SetForegroundWindow(
+              [IntPtr]$appWindow.Current.NativeWindowHandle)
+            Start-Sleep -Seconds 1
             & $click 430 326
 
             $handoff = $false
@@ -654,10 +657,28 @@ jobs:
               $windows = $automationRoot.FindAll(
                 [System.Windows.Automation.TreeScope]::Children, $windowCondition)
               foreach ($window in $windows) {
-                if ($existingBrowserIds -contains $window.Current.ProcessId -and
-                    $window.Current.Name -match '(?i)(opencode|zen)') {
+                if ($existingBrowserIds -notcontains $window.Current.ProcessId) {
+                  continue
+                }
+                $windowMatch = $window.Current.Name -match '(?i)(opencode|zen)'
+                if (-not $windowMatch) {
+                  # ShellExecute may open a background tab without changing
+                  # the top-level window title. Chromium exposes that tab via UIA.
+                  $controls = $window.FindAll(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    [System.Windows.Automation.Condition]::TrueCondition)
+                  $count = 0
+                  foreach ($control in $controls) {
+                    if ($count++ -ge 400) { break }
+                    if ([string]$control.Current.Name -match '(?i)(opencode|zen)') {
+                      $windowMatch = $true
+                      break
+                    }
+                  }
+                }
+                if ($windowMatch) {
                   $handoff = $true
-                  $handoffMode = "existing browser window: $($window.Current.Name)"
+                  $handoffMode = "existing browser window/tab: $($window.Current.Name)"
                   break
                 }
               }
