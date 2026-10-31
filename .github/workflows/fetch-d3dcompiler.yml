@@ -1,13 +1,13 @@
 name: Fetch official D3DCompiler redist
 
 # Временный служебный прогон: получает эталонные app-local DLL прямо из
-# Microsoft KB4019990 и публикует их как короткоживущий артефакт для ресурсов.
+# Microsoft KB4019990 и коммитит только их и хеши в ресурсы рабочей ветки.
 on:
   push:
     branches: ["arena/782f6c71-test"]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   extract:
@@ -95,8 +95,21 @@ jobs:
             # Payload Windows Update подписывается каталогом пакета, поэтому у
             # отдельной DLL встроенной Authenticode-подписи может не быть.
           }
-      - uses: actions/upload-artifact@v4
-        with:
-          name: d3dcompiler47-official-redist
-          path: ${{ runner.temp }}/d3dcompiler47-official/out
-          retention-days: 1
+      - name: Commit official resources to the working branch
+        shell: pwsh
+        run: |
+          $source = Join-Path $env:RUNNER_TEMP "d3dcompiler47-official/out"
+          $target = "portablizer/resources/redist"
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Copy-Item "$source/*" $target -Recurse -Force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$target"
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Official D3DCompiler resources are already up to date"
+            exit 0
+          }
+          git commit -m "Add official D3DCompiler 47 redist resources [skip ci]"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git push origin HEAD:arena/782f6c71-test
