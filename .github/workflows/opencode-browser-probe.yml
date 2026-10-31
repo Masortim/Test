@@ -169,6 +169,12 @@ jobs:
                   [System.Drawing.Imaging.ImageFormat]::Png)
                 $loginGraphics.Dispose()
                 $loginBitmap.Dispose()
+                [void][OpenCodeProbeInput]::SetCursorPos(
+                  [int]$windowBounds.X + 430, [int]$windowBounds.Y + 326)
+                [OpenCodeProbeInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [OpenCodeProbeInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+                $report.Add("OpenCode Zen external link clicked")
+                Start-Sleep -Seconds 25
               }
             }
 
@@ -176,8 +182,11 @@ jobs:
             foreach ($process in $after) {
               if ($before -contains $process.Id) { continue }
               try {
-                $command = (Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)").CommandLine
-                $report.Add("NEW BROWSER pid=$($process.Id) name=$($process.ProcessName) command=$command")
+                $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)"
+                $command = $cim.CommandLine
+                $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($cim.ParentProcessId)" `
+                  -ErrorAction SilentlyContinue
+                $report.Add("NEW BROWSER pid=$($process.Id) name=$($process.ProcessName) parent=$($cim.ParentProcessId):$($parent.Name) command=$command")
               }
               catch {
                 $report.Add("NEW BROWSER pid=$($process.Id) name=$($process.ProcessName)")
