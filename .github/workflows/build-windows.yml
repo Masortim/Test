@@ -638,12 +638,16 @@ jobs:
             [void][OpenCodeSmokeInput]::SetForegroundWindow(
               [IntPtr]$appWindow.Current.NativeWindowHandle)
             Start-Sleep -Seconds 1
+            $appProcessIds = @(Get-CimInstance Win32_Process -Filter "Name = 'OpenCode.exe'" `
+              -ErrorAction SilentlyContinue | Where-Object {
+                $_.CommandLine -and $_.CommandLine.Contains($portable)
+              } | ForEach-Object { $_.ProcessId })
             & $click 430 326
 
             $handoff = $false
             $handoffMode = ""
-            for ($attempt = 0; $attempt -lt 45; $attempt++) {
-              if (Test-Path $runLog) {
+            for ($attempt = 0; $attempt -lt 300; $attempt++) {
+              if ($attempt % 10 -eq 0 -and (Test-Path $runLog)) {
                 $text = Get-Content $runLog -Raw
                 if ($text -match 'browser login: opened https://opencode\.ai/zen(?:\s|$)') {
                   $handoff = $true
@@ -651,46 +655,64 @@ jobs:
                   break
                 }
               }
-              # If the default browser was already running, its existing main
-              # process can receive the URL directly through the linked real
-              # profile. No new process and no reopen log is required then.
-              $windows = $automationRoot.FindAll(
-                [System.Windows.Automation.TreeScope]::Children, $windowCondition)
-              foreach ($window in $windows) {
-                if ($existingBrowserIds -notcontains $window.Current.ProcessId) {
-                  continue
-                }
-                $windowMatch = $window.Current.Name -match '(?i)(opencode|zen)'
-                if (-not $windowMatch) {
-                  # ShellExecute may open a background tab without changing
-                  # the top-level window title. Chromium exposes that tab via UIA.
-                  $controls = $window.FindAll(
-                    [System.Windows.Automation.TreeScope]::Descendants,
-                    [System.Windows.Automation.Condition]::TrueCondition)
-                  $count = 0
-                  foreach ($control in $controls) {
-                    if ($count++ -ge 400) { break }
-                    if ([string]$control.Current.Name -match '(?i)(opencode|zen)') {
-                      $windowMatch = $true
-                      break
-                    }
+              # With an existing default browser, its short-lived URL launcher
+              # can exit between the launcher's normal 0.3 s polls. Observe the
+              # app -> browser handoff directly; the linked real profile makes
+              # this reuse, not a second persistent browser/profile.
+              if ($existingBrowserIds.Count -gt 0 -and $appProcessIds.Count -gt 0) {
+                $samples = @(Get-CimInstance Win32_Process `
+                  -Filter "Name = 'msedge.exe' OR Name = 'chrome.exe' OR Name = 'browser.exe'" `
+                  -ErrorAction SilentlyContinue)
+                foreach ($sample in $samples) {
+                  if ($existingBrowserIds -contains $sample.ProcessId) { continue }
+                  if ($appProcessIds -contains $sample.ParentProcessId -and
+                      $sample.CommandLine -match 'https://opencode\.ai/zen(?:\s|$)') {
+                    $handoff = $true
+                    $handoffMode = "short-lived default-browser launcher: $($sample.ProcessId)"
+                    break
                   }
-                }
-                if ($windowMatch) {
-                  $handoff = $true
-                  $handoffMode = "existing browser window/tab: $($window.Current.Name)"
-                  break
                 }
               }
               if ($handoff) { break }
-              Start-Sleep -Seconds 1
+              if ($attempt % 10 -eq 0) {
+                # Also accept a visible page or background tab in the existing
+                # browser, even if its top-level window title did not change.
+                $windows = $automationRoot.FindAll(
+                  [System.Windows.Automation.TreeScope]::Children, $windowCondition)
+                foreach ($window in $windows) {
+                  if ($existingBrowserIds -notcontains $window.Current.ProcessId) {
+                    continue
+                  }
+                  $windowMatch = $window.Current.Name -match '(?i)(opencode|zen)'
+                  if (-not $windowMatch) {
+                    $controls = $window.FindAll(
+                      [System.Windows.Automation.TreeScope]::Descendants,
+                      [System.Windows.Automation.Condition]::TrueCondition)
+                    $count = 0
+                    foreach ($control in $controls) {
+                      if ($count++ -ge 400) { break }
+                      if ([string]$control.Current.Name -match '(?i)(opencode|zen)') {
+                        $windowMatch = $true
+                        break
+                      }
+                    }
+                  }
+                  if ($windowMatch) {
+                    $handoff = $true
+                    $handoffMode = "existing browser window/tab: $($window.Current.Name)"
+                    break
+                  }
+                }
+              }
+              if ($handoff) { break }
+              Start-Sleep -Milliseconds 100
             }
             if (-not $handoff) {
               if (Test-Path $runLog) { Get-Content $runLog -Tail 120 }
               Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -in @("msedge.exe", "chrome.exe", "browser.exe") } |
                 ForEach-Object { Write-Host "BROWSER: $($_.ProcessId) $($_.ParentProcessId) $($_.CommandLine)" }
-              throw "OpenCode link reached neither host reopen nor an existing browser window"
+              throw "OpenCode link produced no host reopen, existing tab, or URL launcher"
             }
             Write-Host "OpenCode URL handoff mode: $handoffMode"
             Start-Sleep -Seconds 3
