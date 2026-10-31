@@ -607,7 +607,10 @@ jobs:
               if (Test-Path $runLog) { Get-Content $runLog -Tail 120 }
               throw "OpenCode did not show its window through ordinary Launch.bat"
             }
-            Start-Sleep -Seconds 3
+            # The native window appears before the Electron UI is ready.
+            # Match the successful standalone probe: do not click a blank
+            # frame while the model selector is still being rendered.
+            Start-Sleep -Seconds 30
             [void][OpenCodeSmokeInput]::SetForegroundWindow(
               [IntPtr]$appWindow.Current.NativeWindowHandle)
             $bounds = $appWindow.Current.BoundingRectangle
@@ -628,7 +631,7 @@ jobs:
             & $click 390 477
             Start-Sleep -Seconds 3
             & $click 490 532
-            Start-Sleep -Seconds 15
+            Start-Sleep -Seconds 25
             & $click 430 326
 
             $handoff = $false
@@ -687,16 +690,39 @@ jobs:
           catch {
             $message = $_.Exception.Message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Host "::error title=OpenCode startup/browser smoke failed::$message"
+            $failure = [System.Collections.Generic.List[string]]::new()
+            $failure.Add("ERROR: $($_.Exception.Message)")
             if (Test-Path $runLog) {
               Write-Host "--- OpenCode launcher-run.log ---"
-              Get-Content $runLog -Tail 120
+              $failure.Add("--- launcher-run.log ---")
+              foreach ($line in @(Get-Content $runLog -Tail 120)) {
+                Write-Host $line
+                $failure.Add([string]$line)
+              }
             }
+            $failure.Add("--- processes ---")
             Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
               Where-Object {
                 $_.Name -in @("OpenCode.exe", "msedge.exe", "chrome.exe", "browser.exe")
               } | ForEach-Object {
-                Write-Host "PROCESS: $($_.ProcessId) parent=$($_.ParentProcessId) $($_.Name) $($_.CommandLine)"
+                $line = "PROCESS: $($_.ProcessId) parent=$($_.ParentProcessId) $($_.Name) $($_.CommandLine)"
+                Write-Host $line
+                $failure.Add($line)
               }
+            $failure | Set-Content -Encoding utf8 "opencode-smoke-failure.txt"
+            try {
+              Add-Type -AssemblyName System.Windows.Forms
+              Add-Type -AssemblyName System.Drawing
+              $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
+              $bitmap = [System.Drawing.Bitmap]::new($screen.Width, $screen.Height)
+              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+              $graphics.CopyFromScreen($screen.Left, $screen.Top, 0, 0, $screen.Size)
+              $bitmap.Save((Join-Path $env:GITHUB_WORKSPACE "opencode-smoke-failure.png"),
+                [System.Drawing.Imaging.ImageFormat]::Png)
+              $graphics.Dispose()
+              $bitmap.Dispose()
+            }
+            catch { Write-Host "Could not capture OpenCode failure screenshot: $($_.Exception.Message)" }
             throw
           }
           finally {
@@ -714,6 +740,19 @@ jobs:
               catch { }
             }
           }
+
+      - name: Publish OpenCode smoke failure details
+        if: failure()
+        shell: bash
+        run: |
+          set -e
+          if ! test -f opencode-smoke-failure.txt; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f opencode-smoke-failure.txt
+          if test -f opencode-smoke-failure.png; then git add -f opencode-smoke-failure.png; fi
+          git commit -m "ci: publish OpenCode smoke failure [skip ci]"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
 
       - name: Smoke test portable App EXE
         shell: pwsh
