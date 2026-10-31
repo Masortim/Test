@@ -54,19 +54,19 @@ jobs:
             $env:DELTA_CLI_FOR_STRINGS = $deltaCli.FullName
             $env:PYTHONIOENCODING = "utf-8"
             $stringReport = @'
-import os, re
-path = os.environ["DELTA_CLI_FOR_STRINGS"]
-data = open(path, "rb").read()
-pattern = re.compile(rb"[\x20-\x7e]{4,}")
-need = re.compile(r"(?i)(delta[-_ ]?ipc|ipc[-_ ]?dir|config_dir|userprofile|localappdata|appdata|sun_len|socket|runtime_dir|DELTA_)")
-found = set()
-for match in pattern.finditer(data):
-    text = match.group().decode("ascii", "ignore")
-    if len(text) <= 240 and need.search(text):
-        found.add(text)
-for text in sorted(found):
-    print(text)
-'@ | python -
+          import os, re
+          path = os.environ["DELTA_CLI_FOR_STRINGS"]
+          data = open(path, "rb").read()
+          pattern = re.compile(rb"[\x20-\x7e]{4,}")
+          need = re.compile(r"(?i)(delta[-_ ]?ipc|ipc[-_ ]?dir|config_dir|userprofile|localappdata|appdata|sun_len|socket|runtime_dir|DELTA_)")
+          found = set()
+          for match in pattern.finditer(data):
+              text = match.group().decode("ascii", "ignore")
+              if len(text) <= 240 and need.search(text):
+                  found.add(text)
+          for text in sorted(found):
+              print(text)
+          '@ | python -
             $report.Add("--- relevant CLI strings ---")
             foreach ($line in @($stringReport)) { $report.Add([string]$line) }
             $helpOut = Join-Path $root "auth-help.out"
