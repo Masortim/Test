@@ -3,10 +3,11 @@ Target: App/OpenCode.exe
 connect_host_profile=True
 clean_duplicates=True
 Existing Edge started before OpenCode
-Browser processes before: 1328,2052,2172,2252,3600,5068,6084,8592,8692,9084
+Browser processes before: 1924,4332,5264,6092,6456,6624,7856,8092,8496,9860
 WINDOW: OpenCode
 WINDOW: Sign in to GitHub · GitHub - Profile 1 - Microsoft​ Edge
 WINDOW: C:\ProgramData\GitHub\HostedComputeAgent\hosted-compute-agent
+WINDOW: System Properties
 OpenCode window found: True
 CONTROL: ControlType.Pane :: OpenCode
 CONTROL: ControlType.Button :: Minimize
@@ -18,21 +19,25 @@ Application menu clicked
 Provider selector clicked
 OpenCode provider clicked
 OpenCode Zen external link clicked
+TRANSIENT SAMPLE: pid=7024 parent=8700 command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --single-argument https://opencode.ai/zen
 NO OPENCODE HISTORY
-NEW BROWSER pid=5716 name=msedge parent=3600:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=utility --utility-sub-type=edge_search_indexer.mojom.SearchIndexerInterfaceBroker --lang=en-US --service-sandbox-type=search_indexer --message-loop-type-ui --skip-read-main-dll --metrics-shmem-handle=4844,i,15866296936851787608,15672080138305138514,524288 --field-trial-handle=2136,i,2312640747257079799,7166279060408212885,262144 --variations-seed-version --pseudonymization-salt-handle=2140,i,12624269828369582049,3844425357961724504,4 --trace-process-track-uuid=3190709011612001417 --mojo-platform-channel-handle=6104 /prefetch:14
-PORTABLE PROCESS: 5072 parent=6704 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\LaunchPortable.exe
-PORTABLE PROCESS: 3520 parent=6412 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
-PORTABLE PROCESS: 4616 parent=6412 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
-PORTABLE PROCESS: 5868 parent=6412 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
-PORTABLE PROCESS: 6412 parent=5072 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
-PORTABLE PROCESS: 8136 parent=6412 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
-PORTABLE PROCESS: 9188 parent=6412 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+DIRECT SHELLEXECUTE: NO OPENCODE HISTORY
+NEW BROWSER pid=676 name=msedge parent=1924:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=utility --utility-sub-type=edge_search_indexer.mojom.SearchIndexerInterfaceBroker --lang=en-US --service-sandbox-type=search_indexer --message-loop-type-ui --skip-read-main-dll --metrics-shmem-handle=7104,i,9462679049848034707,675486079947198857,524288 --field-trial-handle=2080,i,6826142503394657897,12461353541786248739,262144 --variations-seed-version --pseudonymization-salt-handle=2092,i,5470100788277507935,15791196721814545540,4 --trace-process-track-uuid=3190709011612001417 --mojo-platform-channel-handle=5208 /prefetch:14
+NEW BROWSER pid=1876 name=msedge parent=1924:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=utility --utility-sub-type=audio.mojom.AudioService --lang=en-US --service-sandbox-type=audio --skip-read-main-dll --metrics-shmem-handle=7200,i,16250189481886736455,13180201590905259180,524288 --field-trial-handle=2080,i,6826142503394657897,12461353541786248739,262144 --variations-seed-version --pseudonymization-salt-handle=2092,i,5470100788277507935,15791196721814545540,4 --trace-process-track-uuid=3190709016297210662 --mojo-platform-channel-handle=5800 /prefetch:12
+NEW BROWSER pid=7680 name=msedge parent=1924:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=renderer --pdf-upsell-enabled --disable-gpu-compositing --video-capture-use-gpu-memory-buffer --lang=en-US --js-flags --device-scale-factor=1 --num-raster-threads=2 --enable-main-frame-before-activation --renderer-client-id=31 --ssd-no-pressure-read-main-dll --launch-time-ticks=449378917 --metrics-shmem-handle=7016,i,13997293987860058230,1314841944636055297,1048576 --field-trial-handle=2080,i,6826142503394657897,12461353541786248739,262144 --variations-seed-version --pseudonymization-salt-handle=2092,i,5470100788277507935,15791196721814545540,4 --trace-process-track-uuid=3190709015360168813 --mojo-platform-channel-handle=5640 /prefetch:1
+PORTABLE PROCESS: 5292 parent=2172 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\LaunchPortable.exe
+PORTABLE PROCESS: 1352 parent=8700 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 4324 parent=8700 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 4648 parent=8700 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 6380 parent=8700 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 6992 parent=8700 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 8700 parent=5292 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
 Host reopen observed: False
 Profile linked: True
 --- launcher-run.log ---
-[2026-10-31 17:11:39] paths: replaced the portable marker in 2 file(s): Launch.bat, portability-report.txt
-[2026-10-31 17:11:39] paths: the portable marker is gone from 2 file(s)
-[2026-10-31 17:11:39] installed programs: installed programs: удалена запись «OpenCode 1.19.5» из списка установленных приложений (HKCU)
-[2026-10-31 17:11:39] pre-launch (from LaunchPortable.exe start): 0.33s before the program starts (slowest: profile setup 0.07s, stale session 0.07s, service ports 0.07s, marker sweep 0.05s)
-[2026-10-31 17:11:39] start: "D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe" (cwd=D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App, elevated=True, job=no)
-[2026-10-31 17:11:39] browser login: browser profiles are connected to the real user profile (1 folder(s)); a login opens the installed browser
+[2026-10-31 17:18:39] paths: replaced the portable marker in 2 file(s): Launch.bat, portability-report.txt
+[2026-10-31 17:18:39] paths: the portable marker is gone from 2 file(s)
+[2026-10-31 17:18:40] installed programs: installed programs: удалена запись «OpenCode 1.19.5» из списка установленных приложений (HKCU)
+[2026-10-31 17:18:40] pre-launch (from LaunchPortable.exe start): 0.31s before the program starts (slowest: service ports 0.08s, stale session 0.06s, profile setup 0.06s)
+[2026-10-31 17:18:40] start: "D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe" (cwd=D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App, elevated=True, job=no)
+[2026-10-31 17:18:40] browser login: browser profiles are connected to the real user profile (1 folder(s)); a login opens the installed browser
