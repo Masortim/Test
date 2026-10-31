@@ -749,8 +749,10 @@ jobs:
               throw "OpenCode smoke did not create the expected Edge profile link"
             }
             $edgeItem = Get-Item -Force $edgeProfile
-            if ($edgeItem.LinkType -ne "Junction") {
-              throw "OpenCode browser profile is a duplicate directory, not a junction"
+            $isProfileLink = $edgeItem.LinkType -eq "Junction" -or
+              [bool]($edgeItem.Attributes -band [IO.FileAttributes]::ReparsePoint)
+            if (-not $isProfileLink) {
+              throw "OpenCode Edge profile is not a link (LinkType=$($edgeItem.LinkType), Attributes=$($edgeItem.Attributes))"
             }
             $transient = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
               Where-Object {
@@ -786,6 +788,18 @@ jobs:
               foreach ($line in @(Get-Content $runLog -Tail 120)) {
                 Write-Host $line
                 $failure.Add([string]$line)
+              }
+            }
+            $failure.Add("--- browser profile paths ---")
+            foreach ($relative in @(
+                "PortableData/AppData/Local/Microsoft/Edge",
+                "PortableData/User/AppData/Local/Microsoft/Edge")) {
+              $candidatePath = Join-Path $portable $relative
+              if (Test-Path $candidatePath) {
+                $candidateItem = Get-Item -Force $candidatePath
+                $failure.Add("PROFILE: $relative LinkType=$($candidateItem.LinkType) Attributes=$($candidateItem.Attributes) Target=$($candidateItem.Target)")
+              } else {
+                $failure.Add("PROFILE: $relative MISSING")
               }
             }
             $failure.Add("--- processes ---")
