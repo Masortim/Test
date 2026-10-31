@@ -3459,6 +3459,20 @@ class Portablizer:
             if k not in set(protocol_keys)
         ]
 
+        # http/https и ProgID внешних браузеров — не deep links приложения.
+        # Даже явный --shell-integration не должен переносить браузер по
+        # умолчанию или его регистрацию на другой ПК.
+        skipped_external_browser = [
+            key for key in portable_keys
+            if reg_mod.is_external_browser_key(key)
+        ]
+        if skipped_external_browser:
+            blocked = {key.casefold() for key in skipped_external_browser}
+            portable_keys = [
+                key for key in portable_keys
+                if key.casefold() not in blocked
+            ]
+
         # UserChoice содержит машинно/пользовательский хэш Windows и не является
         # переносимой настройкой программы. Даже явный --shell-integration
         # переносит ProgID/COM, но не навязывает выбор приложения по умолчанию
@@ -3605,6 +3619,12 @@ class Portablizer:
             self.log.info(
                 f"Ассоциации файлов и COM пропущены ({len(skipped_integration)} "
                 "ключ(ей)) — портатив не меняет настройки чужой системы."
+            )
+        if skipped_external_browser:
+            self.log.info(
+                "Системные обработчики http/https и регистрации внешних "
+                "браузеров в портатив НЕ переносятся: страница входа будет "
+                "открыта текущим браузером пользователя по умолчанию."
             )
         if skipped_user_choice:
             self.log.info(

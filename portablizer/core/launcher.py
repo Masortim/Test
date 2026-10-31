@@ -1436,7 +1436,7 @@ rem %1 = pack   : absolute path  -> marker
 rem %1 = unpack : marker         -> absolute path
 set "PORTABLE_REG_MODE=%~1"
 set "PORTABLE_REG_TOKEN=%PORTABLE_REG_MARKER%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $p=[IO.File]::ReadAllBytes($env:PORTABLE_REG_SRC); $e=if($p.Length -ge 2 -and $p[0] -eq 255 -and $p[1] -eq 254){[Text.Encoding]::Unicode}else{[Text.Encoding]::UTF8}; $t=$e.GetString($p).TrimStart([char]0xFEFF); $r=$env:PORTABLE_ROOT.Replace('\','\\'); if($env:PORTABLE_REG_MODE -eq 'pack'){ $t=$t.Replace($r,$env:PORTABLE_REG_TOKEN); $t=$t.Replace($env:PORTABLE_ROOT,$env:PORTABLE_REG_TOKEN) } else { $t=$t.Replace($env:PORTABLE_REG_TOKEN,$r) }; $keep=@(); $skip=$false; foreach($line in ($t -split '\r?\n')){ $trim=$line.TrimStart(); if($trim.StartsWith('[')){ $skip=($trim -match '(?i)\\Explorer\\FileExts(?:\\|\])') }; if(-not $skip){$keep+=$line} }; $t=[string]::Join([Environment]::NewLine,$keep); if($t.Contains($env:PORTABLE_REG_TOKEN)){ exit 2 }; [IO.File]::WriteAllText($env:PORTABLE_REG_OUT,$t,[Text.Encoding]::Unicode) } catch { exit 1 }" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $p=[IO.File]::ReadAllBytes($env:PORTABLE_REG_SRC); $e=if($p.Length -ge 2 -and $p[0] -eq 255 -and $p[1] -eq 254){[Text.Encoding]::Unicode}else{[Text.Encoding]::UTF8}; $t=$e.GetString($p).TrimStart([char]0xFEFF); $r=$env:PORTABLE_ROOT.Replace('\','\\'); if($env:PORTABLE_REG_MODE -eq 'pack'){ $t=$t.Replace($r,$env:PORTABLE_REG_TOKEN); $t=$t.Replace($env:PORTABLE_ROOT,$env:PORTABLE_REG_TOKEN) } else { $t=$t.Replace($env:PORTABLE_REG_TOKEN,$r) }; $keep=@(); $skip=$false; $browserPrefixes=@('chromehtml','chromiumhtm','msedgehtm','firefoxurl','firefoxhtml','bravehtml','vivaldihtm','yandexhtml','duckduckgohtml','archtml','operastable','operagxstable','operairstable','operacryptostable'); foreach($line in ($t -split '\r?\n')){ $trim=$line.TrimStart(); if($trim.StartsWith('[')){ $skip=($trim -match '(?i)\\Explorer\\FileExts(?:\\|\])'); if(-not $skip -and $trim -match '(?i)\\Software(?:\\Wow6432Node)?\\Classes\\([A-Za-z0-9]+)'){ $handler=$matches[1].ToLowerInvariant(); $skip=($handler -in @('http','https')) -or (@($browserPrefixes | Where-Object {$handler.StartsWith($_)}).Count -gt 0) } }; if(-not $skip){$keep+=$line} }; $t=[string]::Join([Environment]::NewLine,$keep); if($t.Contains($env:PORTABLE_REG_TOKEN)){ exit 2 }; [IO.File]::WriteAllText($env:PORTABLE_REG_OUT,$t,[Text.Encoding]::Unicode) } catch { exit 1 }" >nul 2>&1
 goto :eof
 """
 
@@ -2470,6 +2470,41 @@ def _read_reg_text(path):
     return raw.decode("utf-8-sig"), "utf-8"
 
 
+_BROWSER_PROGID_PREFIXES = (
+    "chromehtml", "chromiumhtm", "msedgehtm", "firefoxurl",
+    "firefoxhtml", "bravehtml", "vivaldihtm", "yandexhtml",
+    "duckduckgohtml", "archtml", "operastable", "operagxstable",
+    "operairstable", "operacryptostable",
+)
+
+
+def filter_external_browser_registry(text):
+    """Keep app deep links, but never import/export the default browser."""
+    kept = []
+    skip = False
+    dropped = False
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            match = re.search(
+                r"(?i)\\Software(?:\\Wow6432Node)?\\Classes\\([A-Za-z0-9]+)",
+                stripped,
+            )
+            skip = False
+            if match:
+                handler = match.group(1).lower()
+                skip = handler in ("http", "https") or handler.startswith(
+                    _BROWSER_PROGID_PREFIXES)
+                dropped = dropped or skip
+        if not skip:
+            kept.append(line)
+    if not dropped:
+        return text
+    if not any(line.lstrip().startswith("[") for line in kept):
+        return ""
+    return "\n".join(kept).strip() + "\n\n"
+
+
 def reg_import(path, root, token, runtime):
     """Import a .reg file with the location marker expanded to this folder.
 
@@ -2479,18 +2514,21 @@ def reg_import(path, root, token, runtime):
     then tries to install into a folder with that name and fails with
     "Error opening file for writing".  Never import a file that still has it.
     """
-    if not token:
-        return reg("import", path)
     try:
         text, encoding = _read_reg_text(path)
     except OSError:
-        return 1
-    if token.casefold() not in text.casefold():
+        return 1 if token else reg("import", path)
+    filtered = filter_external_browser_registry(text)
+    if not filtered:
+        return 0
+    if filtered == text and (not token or token.casefold() not in text.casefold()):
         return reg("import", path)
-    fixed = text.replace(token, root.replace("\\", "\\\\"))
-    fixed = fixed.replace(token, root)
-    if token.casefold() in fixed.casefold():
-        return 1
+    fixed = filtered
+    if token:
+        fixed = fixed.replace(token, root.replace("\\", "\\\\"))
+        fixed = fixed.replace(token, root)
+        if token.casefold() in fixed.casefold():
+            return 1
     temporary = os.path.join(runtime, "_imported_%d.reg" % os.getpid())
     os.makedirs(runtime, exist_ok=True)
     with open(temporary, "w", encoding=encoding, newline="\r\n") as fh:
@@ -2508,14 +2546,22 @@ def reg_export(key, path, root, token):
     if os.path.exists(path):
         os.remove(path)
     code = reg("export", key, path, "/y")
-    if code != 0 or not token:
+    if code != 0:
         return code
     try:
         text, encoding = _read_reg_text(path)
     except OSError:
         return code
-    text = text.replace(root.replace("\\", "\\\\"), token)
-    text = text.replace(root, token)
+    text = filter_external_browser_registry(text)
+    if not text:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return code
+    if token:
+        text = text.replace(root.replace("\\", "\\\\"), token)
+        text = text.replace(root, token)
     with open(path, "w", encoding=encoding, newline="\r\n") as fh:
         fh.write(text)
     return code
