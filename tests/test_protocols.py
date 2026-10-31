@@ -125,6 +125,43 @@ class ProtocolDetectionTests(unittest.TestCase):
             reg_mod.protocol_keys_of(diff, after),
             [r"HKLM\Software\Classes\figma"])
 
+    def test_external_web_and_browser_handlers_are_not_app_protocols(self):
+        handlers = (
+            "http", "https", "ChromeHTML", "MSEdgeHTM",
+            "FirefoxURL-308046B0AF4A39CB", "BraveHTML", "OperaGXStable",
+        )
+        for handler in handlers:
+            with self.subTest(handler=handler):
+                after = {
+                    rf"HKCU\Software\Classes\{handler}": {
+                        "URL Protocol": (reg_mod.REG_SZ, repr("")),
+                    },
+                    rf"HKCU\Software\Classes\{handler}\shell\open\command": {
+                        "": (reg_mod.REG_SZ,
+                             repr(r'"C:\Browser\browser.exe" "%1"')),
+                    },
+                }
+                diff = reg_mod.compute_diff({}, after)
+                self.assertTrue(reg_mod.is_external_browser_key(
+                    rf"HKCU\Software\Classes\{handler}\shell\open\command"))
+                self.assertEqual(reg_mod.protocol_keys_of(diff, after), [])
+
+    def test_external_browser_filter_does_not_hide_custom_deep_link(self):
+        after = _figma_snapshot()
+        after.update({
+            r"HKCU\Software\Classes\https": {
+                "URL Protocol": (reg_mod.REG_SZ, repr("")),
+            },
+            r"HKCU\Software\Classes\https\shell\open\command": {
+                "": (reg_mod.REG_SZ, repr(r'"C:\Browser\browser.exe" "%1"')),
+            },
+        })
+        diff = reg_mod.compute_diff({}, after)
+        self.assertEqual(reg_mod.protocol_keys_of(diff, after), [
+            r"HKCU\Software\Classes\figma",
+            r"HKCU\Software\Classes\figma\shell\open\command",
+        ])
+
 
 class ProtocolRetargetTests(unittest.TestCase):
     def test_default_icon_path_is_retargeted(self):
@@ -164,6 +201,21 @@ class ProtocolRetargetTests(unittest.TestCase):
         # Аргументы не трогаются: браузер ждёт --open и URL.
         self.assertIn("--open", command)
         self.assertIn('"%1"', command)
+
+    def test_retarget_never_rewrites_external_browser_command(self):
+        after = _figma_snapshot()
+        browser_key = r"HKCU\Software\Classes\https\shell\open\command"
+        browser_command = r'"C:\Users\me\AppData\Local\Browser\browser.exe" "%1"'
+        after[browser_key] = {"": (reg_mod.REG_SZ, repr(browser_command))}
+        out = reg_mod.retarget_protocol_paths(
+            after, [browser_key, r"HKCU\Software\Classes\figma"],
+            r"C:\Portable\Figma_Portable\App")
+        self.assertEqual(
+            reg_mod._entry_value(out[browser_key][""]), browser_command)
+        self.assertIn(
+            r"C:\Portable\Figma_Portable\App\Figma.exe",
+            reg_mod._entry_value(out[
+                r"HKCU\Software\Classes\figma\shell\open\command"][""]))
 
     def test_old_install_root_does_not_survive(self):
         after = _figma_snapshot()
@@ -296,6 +348,17 @@ class ProtocolCaptureTests(unittest.TestCase):
             r"HKCU\Software\Classes\figma\shell\open\command": {
                 "": (reg_mod.REG_SZ, repr(FIGMA_COMMAND)),
             },
+            # Изменение браузера по умолчанию во время сборки не является
+            # регистрацией deep link самого приложения.
+            r"HKCU\Software\Classes\http": {
+                "URL Protocol": (reg_mod.REG_SZ, repr("")),
+            },
+            r"HKCU\Software\Classes\http\shell\open\command": {
+                "": (reg_mod.REG_SZ, repr(r'"C:\Browser\browser.exe" "%1"')),
+            },
+            r"HKCU\Software\Classes\ChromeHTML\shell\open\command": {
+                "": (reg_mod.REG_SZ, repr(r'"C:\Browser\browser.exe" "%1"')),
+            },
         }
         opts = PortableOptions(
             installer_path="x", output_dir=self.temp,
@@ -340,6 +403,18 @@ class ProtocolCaptureTests(unittest.TestCase):
         capture, files = self._capture(include_shell_integration=True)
         self.assertIn(r"HKCU\Software\Classes\figma", capture.keys)
         self.assertIn(r"HKLM\Software\Classes\.myext", capture.keys)
+
+    def test_external_browser_handlers_are_never_captured(self):
+        capture, files = self._capture(include_shell_integration=True)
+        self.assertFalse(any(
+            reg_mod.is_external_browser_key(key) for key in capture.keys))
+        text = files["portable.reg"]
+        self.assertNotIn(r"Software\Classes\http", text)
+        self.assertNotIn("ChromeHTML", text)
+        self.assertNotIn("browser.exe", text)
+        # Пользовательский deep link приложения по-прежнему переносится.
+        self.assertIn(r"Software\Classes\figma", text)
+        self.assertIn("Figma.exe", text)
 
     def test_protocol_without_installer_registration_is_not_invented(self):
         # Установщик не регистрировал протокол — nothing to capture.

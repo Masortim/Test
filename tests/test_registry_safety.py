@@ -320,6 +320,48 @@ class ExeLauncherRegistrySafetyTests(unittest.TestCase):
             self.assertEqual(deleted, [])
 
 
+class ExternalBrowserRegistrySafetyTests(unittest.TestCase):
+    def test_legacy_reg_is_sanitized_but_custom_deep_link_survives(self):
+        text = (
+            "Windows Registry Editor Version 5.00\r\n\r\n"
+            "[HKEY_CURRENT_USER\\Software\\Classes\\http]\r\n"
+            '"URL Protocol"=""\r\n\r\n'
+            "[HKEY_CURRENT_USER\\Software\\Classes\\https\\shell\\open\\command]\r\n"
+            '@="\\"C:\\\\Browser\\\\browser.exe\\" \\"%1\\""\r\n\r\n'
+            "[HKEY_CURRENT_USER\\Software\\Classes\\ChromeHTML\\shell\\open\\command]\r\n"
+            '@="\\"C:\\\\Browser\\\\browser.exe\\" \\"%1\\""\r\n\r\n'
+            "[HKEY_CURRENT_USER\\Software\\Classes\\FirefoxURL-308046B0AF4A39CB]\r\n"
+            '"URL Protocol"=""\r\n\r\n'
+            "[HKEY_CURRENT_USER\\Software\\Classes\\figma\\shell\\open\\command]\r\n"
+            '@="\\"@@PORTABLE_ROOT@@\\\\App\\\\Figma.exe\\" --open \\"%1\\""\r\n'
+        )
+        sanitized, dropped = entry.sanitize_reg_text(text)
+        self.assertGreaterEqual(len(dropped), 4)
+        self.assertNotIn(r"Software\Classes\http", sanitized)
+        self.assertNotIn(r"Software\Classes\https", sanitized)
+        self.assertNotIn("ChromeHTML", sanitized)
+        self.assertNotIn("FirefoxURL", sanitized)
+        self.assertNotIn("browser.exe", sanitized)
+        self.assertIn(r"Software\Classes\figma", sanitized)
+        self.assertIn("Figma.exe", sanitized)
+
+    def test_runtime_session_forgets_legacy_browser_keys(self):
+        browser = r"HKCU\Software\Classes\https"
+        progid = r"HKCU\Software\Classes\MSEdgeHTM"
+        custom = r"HKCU\Software\Classes\figma"
+        with tempfile.TemporaryDirectory() as temp:
+            session = entry.RegistrySession(Path(temp), {
+                "registry": {
+                    "enabled": True,
+                    "keys": [browser, progid, custom],
+                    "created_keys": [browser, progid, custom],
+                },
+            })
+            self.assertEqual(session.keys, [custom])
+            self.assertEqual(session.created, {custom.casefold()})
+            self.assertEqual(session._tracked_keys(), [custom])
+
+
 class BatLauncherRegistrySafetyTests(unittest.TestCase):
     ROOT = r"E:\Demo_Portable"
 
@@ -358,6 +400,9 @@ class BatLauncherRegistrySafetyTests(unittest.TestCase):
         bat, _result = self._run()
         self.assertIn("Explorer\\\\FileExts", bat)
         self.assertIn("$skip", bat)
+        self.assertIn("$browserPrefixes", bat)
+        self.assertIn("'http','https'", bat)
+        self.assertIn("Software(?:\\\\Wow6432Node)?\\\\Classes", bat)
 
 
 class PythonFallbackRegistrySafetyTests(unittest.TestCase):
@@ -366,6 +411,55 @@ class PythonFallbackRegistrySafetyTests(unittest.TestCase):
         source = launcher_mod.render_py_launcher(None)
         exec(compile(source, "<fallback-test>", "exec"), namespace)
         return namespace
+
+    def test_generated_fallback_filters_browser_sections_on_import(self):
+        namespace = self._namespace()
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp, "portable.reg")
+            source.write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Classes\\https]\r\n"
+                '"URL Protocol"=""\r\n\r\n'
+                "[HKEY_CURRENT_USER\\Software\\Classes\\ChromeHTML\\shell\\open\\command]\r\n"
+                '@="\\"C:\\\\Browser\\\\browser.exe\\" \\"%1\\""\r\n\r\n'
+                "[HKEY_CURRENT_USER\\Software\\Classes\\figma]\r\n"
+                '"URL Protocol"=""\r\n', encoding="utf-16")
+            imported = []
+
+            def fake_reg(*args):
+                self.assertEqual(args[0], "import")
+                imported.append(Path(args[1]).read_text(encoding="utf-16"))
+                return 0
+
+            namespace["reg"] = fake_reg
+            self.assertEqual(namespace["reg_import"](
+                str(source), r"C:\Portable", "", temp), 0)
+            self.assertEqual(len(imported), 1)
+            self.assertNotIn("ChromeHTML", imported[0])
+            self.assertNotIn(r"Classes\https", imported[0])
+            self.assertIn(r"Classes\figma", imported[0])
+
+    def test_generated_fallback_filters_browser_sections_on_export(self):
+        namespace = self._namespace()
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp, "session.reg")
+
+            def fake_reg(*args):
+                Path(args[2]).write_text(
+                    "Windows Registry Editor Version 5.00\r\n\r\n"
+                    "[HKEY_CURRENT_USER\\Software\\Classes\\http]\r\n"
+                    '"URL Protocol"=""\r\n\r\n'
+                    "[HKEY_CURRENT_USER\\Software\\Classes\\figma]\r\n"
+                    '"URL Protocol"=""\r\n', encoding="utf-16")
+                return 0
+
+            namespace["reg"] = fake_reg
+            self.assertEqual(namespace["reg_export"](
+                "HKCU\\Software\\Classes", str(output),
+                r"C:\Portable", "@@PORTABLE_ROOT@@"), 0)
+            text = output.read_text(encoding="utf-16")
+            self.assertNotIn(r"Classes\http", text)
+            self.assertIn(r"Classes\figma", text)
 
     def test_generated_fallback_builds_deletion_only_restore(self):
         namespace = self._namespace()
@@ -621,6 +715,51 @@ class WindowsRegistryIntegrationTests(unittest.TestCase):
             self._read(key, "Added")
         with self.assertRaises(FileNotFoundError):
             self._read(key + r"\NewChild")
+
+    def test_real_cmd_rewrite_drops_browser_handlers_without_registry_writes(self):
+        """BAT fallback фильтрует REG сам, не импортируя его в HKCU."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "legacy.reg"
+            output = root / "filtered.reg"
+            source.write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\Classes\\http]\r\n"
+                '"URL Protocol"=""\r\n\r\n'
+                "[HKEY_CURRENT_USER\\Software\\Classes\\ChromeHTML\\shell\\open\\command]\r\n"
+                '@="\\"C:\\\\Browser\\\\browser.exe\\" \\"%1\\""\r\n\r\n'
+                "[HKEY_CURRENT_USER\\Software\\Classes\\figma]\r\n"
+                '"URL Protocol"=""\r\n\r\n'
+                "[HKEY_CURRENT_USER\\Software\\Vendor\\Demo]\r\n"
+                '"Keep"="yes"\r\n', encoding="utf-16")
+            bat = launcher_mod.render_bat(launcher_mod.LauncherConfig(
+                app_name="Demo", target_exe_rel="App/Demo.exe",
+                apply_registry=True))
+            helper = ":" + bat.split(":portable_registry_rewrite", 1)[1]
+            script = root / "rewrite.cmd"
+            script.write_text(
+                "@echo off\r\n"
+                f"set \"PORTABLE_ROOT={root}\"\r\n"
+                "set \"PORTABLE_REG_MARKER=@@PORTABLE_ROOT@@\"\r\n"
+                f"set \"PORTABLE_REG_SRC={source}\"\r\n"
+                f"set \"PORTABLE_REG_OUT={output}\"\r\n"
+                "call :portable_registry_rewrite unpack\r\n"
+                "if errorlevel 1 exit /b 1\r\n"
+                "exit /b 0\r\n" + helper,
+                encoding="ascii", newline="\r\n")
+            completed = subprocess.run(
+                [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(script)],
+                check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=60)
+            self.assertEqual(completed.returncode, 0,
+                             completed.stdout + completed.stderr)
+            text = output.read_text(encoding="utf-16")
+            self.assertNotIn(r"Classes\http", text)
+            self.assertNotIn("ChromeHTML", text)
+            self.assertNotIn("browser.exe", text)
+            self.assertIn(r"Classes\figma", text)
+            self.assertIn(r"Vendor\Demo", text)
 
     def test_update_guard_restores_real_hkcu_associations(self):
         suffix = f".pbu{os.getpid()}"

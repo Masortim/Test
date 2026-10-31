@@ -383,6 +383,39 @@ def _protocol_tail(key_path: str) -> Optional[str]:
     return None
 
 
+#: Это обработчики внешнего браузера, а не deep links портабилизируемого
+#: приложения. Их перенос подменял бы браузер, назначенный пользователем на
+#: текущем ПК, и мог запускать вторую/перенесённую копию при входе в аккаунт.
+_EXTERNAL_WEB_SCHEMES = frozenset({"http", "https"})
+_EXTERNAL_BROWSER_PROGID_PREFIXES = (
+    "chromehtml", "chromiumhtm", "msedgehtm", "firefoxurl",
+    "firefoxhtml", "bravehtml", "vivaldihtm", "yandexhtml",
+    "duckduckgohtml", "archtml", "operastable", "operagxstable",
+    "operairstable", "operacryptostable",
+)
+
+
+def is_external_browser_key(key_path: str) -> bool:
+    """Ключ относится к системному web-URL или ProgID внешнего браузера.
+
+    Проверяется первый компонент под ``Software\\Classes``: поэтому фильтр
+    охватывает и корень обработчика, и всё дерево ``shell\\open\\command``.
+    Детский ключ приложения вроде ``figma`` сюда не входит.
+    """
+    for path in _path_variants(key_path):
+        for prefix in (r"software\classes",):
+            marker = prefix + "\\"
+            if not path.startswith(marker):
+                continue
+            tail = path[len(marker):]
+            handler = tail.split("\\", 1)[0].casefold()
+            if handler in _EXTERNAL_WEB_SCHEMES:
+                return True
+            if handler.startswith(_EXTERNAL_BROWSER_PROGID_PREFIXES):
+                return True
+    return False
+
+
 def is_protocol_key(key_path: str,
                     values: Optional[Mapping[str, object]] = None,
                     after: Optional[Mapping[str, Mapping[str, object]]] = None
@@ -393,9 +426,10 @@ def is_protocol_key(key_path: str,
     ``shell\open\command``. Самый сильный признак — значение
     ``URL Protocol``; без него срабатывает наличие дочернего
     ``shell\open\command`` (такие регистрации встречаются у Electron-
-    приложений, например Figma).
+    приложений, например Figma). Системные ``http/https`` и ProgID браузеров
+    сюда не входят: они принадлежат пользователю текущего ПК.
     """
-    if not _protocol_tail(key_path):
+    if is_external_browser_key(key_path) or not _protocol_tail(key_path):
         return False
     if values is not None and _PROTOCOL_MARKER_VALUE in {
             str(name).casefold() for name in values}:
@@ -507,6 +541,8 @@ def retarget_protocol_paths(snapshot: Mapping[str, Mapping[str, object]],
     }
     destination = os.path.normpath(app_dir)
     for key in protocol_keys:
+        if is_external_browser_key(key):
+            continue
         command_key = key + _PROTOCOL_COMMAND_SUBKEY
         values = result.get(command_key)
         if not values:

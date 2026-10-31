@@ -1170,8 +1170,52 @@ _REG_DROPPED_SUBKEYS = tuple(dict.fromkeys(
     _SHELL_PROTECTED_SUBKEYS + _REG_TRACE_SUBKEYS))
 
 
+#: ProgID внешних браузеров. Суффикс у Firefox и части Chromium-сборок
+#: зависит от установки, поэтому сравнение по началу имени, а не по полному
+#: списку конкретных машин.
+_EXTERNAL_BROWSER_PROGID_PREFIXES = (
+    "chromehtml", "chromiumhtm", "msedgehtm", "firefoxurl",
+    "firefoxhtml", "bravehtml", "vivaldihtm", "yandexhtml",
+    "duckduckgohtml", "archtml", "operastable", "operagxstable",
+    "operairstable", "operacryptostable",
+)
+
+
+def _reg_path_is_external_browser(path: str) -> bool:
+    """Нижний регистр пути без hive: системный web-URL/ProgID браузера."""
+    prefix = "software\\classes\\"
+    if not path.startswith(prefix):
+        return False
+    tail = path[len(prefix):]
+    handler = tail.split("\\", 1)[0].casefold()
+    return handler in {"http", "https"} or handler.startswith(
+        _EXTERNAL_BROWSER_PROGID_PREFIXES)
+
+
+def _reg_section_is_external_browser(header: str) -> bool:
+    """Секция принадлежит внешнему браузеру, а не deep link приложения."""
+    parts = [p for p in str(header or "").strip().strip("[]").split("\\") if p]
+    if len(parts) < 2:
+        return False
+    up = parts[0].upper()
+    if up in ("HKEY_CURRENT_USER", "HKCU", "HKEY_LOCAL_MACHINE", "HKLM"):
+        rest = parts[1:]
+    elif up in ("HKEY_USERS", "HKU"):
+        rest = parts[2:] if len(parts) > 2 else []
+    elif up in ("HKEY_CLASSES_ROOT", "HKCR"):
+        rest = ["Software", "Classes"] + parts[1:]
+    else:
+        return False
+    path = "\\".join(rest).casefold()
+    if path.startswith("software\\wow6432node\\"):
+        path = "software\\" + path[len("software\\wow6432node\\"):]
+    return _reg_path_is_external_browser(path)
+
+
 def _reg_section_is_dropped(header: str) -> bool:
     """Секция .reg непригодна для импорта: оболочка Windows или след установки."""
+    if _reg_section_is_external_browser(header):
+        return True
     parts = [p for p in str(header or "").strip().strip("[]").split("\\") if p]
     if len(parts) < 2:
         return False
@@ -2754,6 +2798,8 @@ class DriveRootDataSession:
 
         reg_cfg = self.cfg.get("registry", {}) or {}
         for key in reg_cfg.get("keys", []) or []:
+            if _reg_section_is_external_browser(str(key)):
+                continue
             parts = [p for p in str(key).replace("/", "\\").split("\\") if p]
             for idx, part in enumerate(parts):
                 if part.casefold() != "software" or idx + 1 >= len(parts):
@@ -4111,8 +4157,18 @@ class RegistrySession:
         self.session = data / "Registry"
         self.backup = data / "RegistryHostBackup"
         self.runtime = self.backup / "RuntimeImports"
-        self.keys = list(self.cfg.get("keys", []))
-        self.created = {str(key).casefold() for key in self.cfg.get("created_keys", [])}
+        # Старые конфиги могли записать http/https и ProgID браузера как
+        # «протокол приложения». Не только не импортируем их, но и не
+        # экспортируем обратно в session.reg после завершения программы.
+        self.keys = [
+            key for key in self.cfg.get("keys", [])
+            if not _reg_section_is_external_browser(str(key))
+        ]
+        self.created_keys = [
+            key for key in self.cfg.get("created_keys", [])
+            if not _reg_section_is_external_browser(str(key))
+        ]
+        self.created = {str(key).casefold() for key in self.created_keys}
         self.active = bool(self.cfg.get("enabled")) and IS_WINDOWS
         self.started = False
         #: Снимок машины уже снят (см. prepare) — повторно его не делаем.
@@ -4326,7 +4382,7 @@ class RegistrySession:
                         m_map[v_name.casefold()] = (v_name, v_rhs)
 
         candidate_tails: Dict[str, str] = {}
-        for k in list(self.cfg.get("created_keys", [])) + list(self.keys):
+        for k in list(self.created_keys) + list(self.keys):
             tail = _extract_software_tail(str(k))
             if tail:
                 candidate_tails.setdefault(tail.casefold(), tail)
@@ -4447,7 +4503,7 @@ class RegistrySession:
         """Все ключи, которые сеанс может изменить или удалить после выхода."""
         result: "list[str]" = []
         seen: "set[str]" = set()
-        for key in list(self.keys) + list(self.cfg.get("created_keys", [])):
+        for key in list(self.keys) + list(self.created_keys):
             text = str(key)
             folded = text.casefold()
             if not text or folded in seen:
@@ -5261,6 +5317,8 @@ def _hklm_key_missing(
             "HKEY_LOCAL_MACHINE": winreg.HKEY_LOCAL_MACHINE,
         }
         for key in keys:
+            if _reg_section_is_external_browser(str(key)):
+                continue
             head, _, tail = str(key).replace("/", "\\").partition("\\")
             handle = roots.get(head.upper())
             if handle is None or not tail:
@@ -5284,6 +5342,8 @@ def _hklm_key_missing(
             sections = {}
         escaped_root = str(root).replace("\\", "\\\\") if root is not None else ""
         for header, expected_vals in sections.items():
+            if _reg_section_is_external_browser(header):
+                continue
             head, _, tail = header.partition("\\")
             if head.upper() not in hklm_names or not tail:
                 continue
@@ -10306,6 +10366,8 @@ def _captured_registry_views(cfg: "Optional[Dict[str, Any]]" = None
     views: "list[tuple[Any, str, int]]" = []
     seen = set()
     for key in keys:
+        if _reg_section_is_external_browser(key):
+            continue
         head, _, tail = key.strip().partition("\\")
         hive_name = _HIVE_NAMES.get(head.strip().upper())
         if not hive_name or not tail:
