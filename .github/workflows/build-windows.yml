@@ -642,11 +642,27 @@ jobs:
               -ErrorAction SilentlyContinue | Where-Object {
                 $_.CommandLine -and $_.CommandLine.Contains($portable)
               } | ForEach-Object { $_.ProcessId })
+            $browserStartEvent = "OpenCodeBrowserStart"
+            Register-CimIndicationEvent -SourceIdentifier $browserStartEvent `
+              -Query "SELECT * FROM Win32_ProcessStartTrace WHERE ProcessName = 'msedge.exe' OR ProcessName = 'chrome.exe' OR ProcessName = 'browser.exe'"
             & $click 430 326
 
             $handoff = $false
             $handoffMode = ""
+            $shortLivedBrowserId = 0
             for ($attempt = 0; $attempt -lt 300; $attempt++) {
+              $startEvents = @(Get-Event -SourceIdentifier $browserStartEvent `
+                -ErrorAction SilentlyContinue)
+              foreach ($startEvent in $startEvents) {
+                $started = $startEvent.SourceEventArgs.NewEvent
+                if ($appProcessIds -contains $started.ParentProcessId) {
+                  $handoff = $true
+                  $shortLivedBrowserId = [int]$started.ProcessId
+                  $handoffMode = "browser start event: $($started.ProcessName) $($started.ProcessId)"
+                }
+              }
+              $startEvents | Remove-Event -ErrorAction SilentlyContinue
+              if ($handoff) { break }
               if ($attempt % 10 -eq 0 -and (Test-Path $runLog)) {
                 $text = Get-Content $runLog -Raw
                 if ($text -match 'browser login: opened https://opencode\.ai/zen(?:\s|$)') {
@@ -707,6 +723,8 @@ jobs:
               if ($handoff) { break }
               Start-Sleep -Milliseconds 100
             }
+            Unregister-Event -SourceIdentifier $browserStartEvent -ErrorAction SilentlyContinue
+            Remove-Event -SourceIdentifier $browserStartEvent -ErrorAction SilentlyContinue
             if (-not $handoff) {
               if (Test-Path $runLog) { Get-Content $runLog -Tail 120 }
               Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -716,6 +734,13 @@ jobs:
             }
             Write-Host "OpenCode URL handoff mode: $handoffMode"
             Start-Sleep -Seconds 3
+            if ($shortLivedBrowserId -gt 0) {
+              $remainingLauncher = Get-Process -Id $shortLivedBrowserId `
+                -ErrorAction SilentlyContinue
+              if ($remainingLauncher -and $remainingLauncher.ProcessName -in $browserNames) {
+                throw "The app-spawned browser launcher remained running instead of reusing the host browser"
+              }
+            }
 
             # Prevention and fallback must work together: the Edge directory is
             # a link to the real profile, not a second profile in PortableData.
