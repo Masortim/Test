@@ -71,6 +71,26 @@ jobs:
               $pidValue = $window.Current.ProcessId
               if ($name -notmatch '(?i)delta' -and $deltaPids -notcontains $pidValue) { continue }
               $report.Add("WINDOW pid=$pidValue name=$name")
+              $bounds = $window.Current.BoundingRectangle
+              $report.Add("WINDOW bounds=$bounds")
+              if ($bounds.Width -gt 0 -and $bounds.Height -gt 0) {
+                try {
+                  Add-Type -AssemblyName System.Drawing
+                  $bitmap = [System.Drawing.Bitmap]::new(
+                    [int]$bounds.Width, [int]$bounds.Height)
+                  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                  $graphics.CopyFromScreen([int]$bounds.X, [int]$bounds.Y,
+                    0, 0, $bitmap.Size)
+                  $bitmap.Save((Join-Path $env:GITHUB_WORKSPACE "delta-terms-window.png"),
+                    [System.Drawing.Imaging.ImageFormat]::Png)
+                  $graphics.Dispose()
+                  $bitmap.Dispose()
+                  $report.Add("Window screenshot saved")
+                }
+                catch {
+                  $report.Add("Screenshot failed: $($_.Exception.Message)")
+                }
+              }
               $elements = $window.FindAll(
                 [System.Windows.Automation.TreeScope]::Subtree, $trueCondition)
               $count = 0
@@ -160,6 +180,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f delta-terms-probe.txt
+          if [ -f delta-terms-window.png ]; then git add -f delta-terms-window.png; fi
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "ci: update Delta terms diagnostic [skip ci]"
           git push origin HEAD:"${GITHUB_REF_NAME}"
