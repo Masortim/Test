@@ -216,6 +216,12 @@ jobs:
                   [Convert]::FromBase64String("aW1wb3J0IG9zCmltcG9ydCBwYXRobGliCmltcG9ydCBzaHV0aWwKaW1wb3J0IHNxbGl0ZTMKaW1wb3J0IHRlbXBmaWxlCgpyb290ID0gcGF0aGxpYi5QYXRoKG9zLmVudmlyb25bIkVER0VfVVNFUl9EQVRBIl0pCmZvdW5kID0gRmFsc2UKZm9yIGhpc3RvcnkgaW4gcm9vdC5nbG9iKCIqL0hpc3RvcnkiKToKICAgIHRyeToKICAgICAgICBmZCwgY29weSA9IHRlbXBmaWxlLm1rc3RlbXAoc3VmZml4PSIuc3FsaXRlIikKICAgICAgICBvcy5jbG9zZShmZCkKICAgICAgICBzaHV0aWwuY29weTIoaGlzdG9yeSwgY29weSkKICAgICAgICBjb25uZWN0aW9uID0gc3FsaXRlMy5jb25uZWN0KGNvcHkpCiAgICAgICAgcm93cyA9IGNvbm5lY3Rpb24uZXhlY3V0ZSgKICAgICAgICAgICAgInNlbGVjdCB1cmwsIHRpdGxlIGZyb20gdXJscyB3aGVyZSB1cmwgbGlrZSA/IG9yZGVyIGJ5IGxhc3RfdmlzaXRfdGltZSBkZXNjIGxpbWl0IDUiLAogICAgICAgICAgICAoIiVvcGVuY29kZS5haS96ZW4lIiwpLAogICAgICAgICkuZmV0Y2hhbGwoKQogICAgICAgIGNvbm5lY3Rpb24uY2xvc2UoKQogICAgICAgIG9zLnVubGluayhjb3B5KQogICAgICAgIGZvciB1cmwsIHRpdGxlIGluIHJvd3M6CiAgICAgICAgICAgIGZvdW5kID0gVHJ1ZQogICAgICAgICAgICBwcmludChmIkhJU1RPUlkge2hpc3RvcnkucGFyZW50Lm5hbWV9OiB7dXJsfSA6OiB7dGl0bGV9IikKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZXhjOgogICAgICAgIHByaW50KGYiSElTVE9SWSBFUlJPUiB7aGlzdG9yeX06IHtleGN9IikKaWYgbm90IGZvdW5kOgogICAgcHJpbnQoIk5PIE9QRU5DT0RFIEhJU1RPUlkiKQo="))
                 $historyLines = @($pythonCode | python -)
                 foreach ($line in $historyLines) { $report.Add([string]$line) }
+                Start-Process "https://opencode.ai/zen"
+                Start-Sleep -Seconds 8
+                $directHistoryLines = @($pythonCode | python -)
+                foreach ($line in $directHistoryLines) {
+                  $report.Add("DIRECT SHELLEXECUTE: $line")
+                }
               }
             }
 
