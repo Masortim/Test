@@ -8553,6 +8553,14 @@ class Portablizer:
             # (Ollama). Prefer that over the CLI/server sibling of the same name.
             if base.endswith(" app.exe"):
                 s += 40
+            # Delta ships a pair of programs: Delta.exe is the terminal CLI,
+            # while delta-app.exe owns the desktop window and its browser
+            # sign-in flow.  The CLI can be larger on a particular release,
+            # so name/size scoring alone is not enough for Launch.bat.
+            if base == "delta-app.exe" and any(
+                    os.path.basename(other).casefold() == "delta.exe"
+                    for other in candidates):
+                s += 60
             if os.path.isfile(os.path.join(os.path.dirname(p), "chrome_elf.dll")):
                 s += 25
             # exe в корне App/ или в App/bin обычно важнее

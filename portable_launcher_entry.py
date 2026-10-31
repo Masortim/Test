@@ -5346,6 +5346,31 @@ def _remember_target(root: Path, new_rel: str) -> bool:
         return False
 
 
+def _prefer_paired_gui_target(root: Path, cfg: Dict[str, Any],
+                              target_rel: str) -> str:
+    """Use Delta's desktop binary for the ordinary (main) launch.
+
+    Older portable configs could choose ``Delta.exe`` (the terminal CLI) as
+    the main target.  If the paired ``delta-app.exe`` is present, migrate the
+    default target before environment/registry setup so the whole session is
+    the same as direct ``App/delta-app.exe`` execution.  Auxiliary targets
+    never pass through this helper and remain usable for CLI commands.
+    """
+    normalized = str(target_rel or "").replace("\\", "/")
+    if normalized.rsplit("/", 1)[-1].casefold() != "delta.exe":
+        return target_rel
+    candidate_rel = (normalized.rsplit("/", 1)[0] + "/delta-app.exe"
+                     if "/" in normalized else "delta-app.exe")
+    candidate = _as_relative_path(root, candidate_rel)
+    if not candidate.is_file():
+        return target_rel
+    cfg["target_exe_rel"] = candidate_rel
+    _remember_target(root, candidate_rel)
+    _run_log(root, "Delta: using delta-app.exe (desktop) instead of "
+                   "Delta.exe (CLI) for the main launch")
+    return candidate_rel
+
+
 def _repair_missing_target(root: Path, cfg: Dict[str, Any], target_rel: str) -> str:
     """Returns a usable target path, repairing the config when it is stale."""
     target = _as_relative_path(root, target_rel)
@@ -13295,6 +13320,8 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
         cfg, list(argv if argv is not None else sys.argv[1:])
     )
     target_rel, forwarded, needs_machine = _select_target(cfg, raw_arguments)
+    if not needs_machine:
+        target_rel = _prefer_paired_gui_target(root, cfg, target_rel)
     # Записанная цель могла исчезнуть: неудачное обновление (родной апдейтер
     # Cursor уносит exe в промежуточную папку), переименование, конфиг от
     # сборки на прежнем диске. Ищем программу в App и правим конфиг, вместо
