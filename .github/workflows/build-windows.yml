@@ -582,6 +582,9 @@ jobs:
             }
 
             $env:PORTABLE_LAUNCHER_NO_UI = "1"
+            $browserNames = @("msedge", "chrome", "browser", "yandex", "firefox", "brave")
+            $existingBrowserIds = @(Get-Process -Name $browserNames `
+              -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
             $gui = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
               -WorkingDirectory $portable -PassThru
             Add-Type -AssemblyName UIAutomationClient
@@ -635,14 +638,30 @@ jobs:
             & $click 430 326
 
             $handoff = $false
+            $handoffMode = ""
             for ($attempt = 0; $attempt -lt 45; $attempt++) {
               if (Test-Path $runLog) {
                 $text = Get-Content $runLog -Raw
                 if ($text -match 'browser login: opened https://opencode\.ai/zen(?:\s|$)') {
                   $handoff = $true
+                  $handoffMode = "host reopen"
                   break
                 }
               }
+              # If the default browser was already running, its existing main
+              # process can receive the URL directly through the linked real
+              # profile. No new process and no reopen log is required then.
+              $windows = $automationRoot.FindAll(
+                [System.Windows.Automation.TreeScope]::Children, $windowCondition)
+              foreach ($window in $windows) {
+                if ($existingBrowserIds -contains $window.Current.ProcessId -and
+                    $window.Current.Name -match '(?i)(opencode|zen)') {
+                  $handoff = $true
+                  $handoffMode = "existing browser window: $($window.Current.Name)"
+                  break
+                }
+              }
+              if ($handoff) { break }
               Start-Sleep -Seconds 1
             }
             if (-not $handoff) {
@@ -650,8 +669,9 @@ jobs:
               Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -in @("msedge.exe", "chrome.exe", "browser.exe") } |
                 ForEach-Object { Write-Host "BROWSER: $($_.ProcessId) $($_.ParentProcessId) $($_.CommandLine)" }
-              throw "OpenCode external link did not reach the host default browser"
+              throw "OpenCode link reached neither host reopen nor an existing browser window"
             }
+            Write-Host "OpenCode URL handoff mode: $handoffMode"
             Start-Sleep -Seconds 3
 
             # Prevention and fallback must work together: the Edge directory is
@@ -709,6 +729,13 @@ jobs:
                 Write-Host $line
                 $failure.Add($line)
               }
+            if ($automationRoot -and $windowCondition) {
+              $failure.Add("--- windows ---")
+              foreach ($window in @($automationRoot.FindAll(
+                  [System.Windows.Automation.TreeScope]::Children, $windowCondition))) {
+                $failure.Add("WINDOW: pid=$($window.Current.ProcessId) $($window.Current.Name)")
+              }
+            }
             $failure | Set-Content -Encoding utf8 "opencode-smoke-failure.txt"
             try {
               Add-Type -AssemblyName System.Windows.Forms
