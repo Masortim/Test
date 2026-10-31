@@ -195,7 +195,9 @@ class DeltaIpcProfileTests(unittest.TestCase):
         import portable_launcher_entry as entry
 
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            # Do not let the CI machine's deep TEMP make this "short" case
+            # accidentally exceed Delta's 108-byte socket budget on Windows.
+            root = Path(Path(temp).anchor) / "p"
             profile = root / "PortableData" / "User"
             env = {"USERPROFILE": str(profile)}
             with mock.patch.object(entry, "IS_WINDOWS", True), \

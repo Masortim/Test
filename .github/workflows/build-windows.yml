@@ -435,6 +435,10 @@ jobs:
               TEMP = Join-Path $data "Temp"
               TMP = Join-Path $data "Temp"
             }
+            if ($ipcProfile.Length -ge 2 -and $ipcProfile[1] -eq ':') {
+              $childEnv["HOMEDRIVE"] = $ipcProfile.Substring(0, 2)
+              $childEnv["HOMEPATH"] = $ipcProfile.Substring(2)
+            }
             $oldEnv = @{}
             foreach ($entry in $childEnv.GetEnumerator()) {
               $oldEnv[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key)

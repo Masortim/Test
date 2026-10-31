@@ -2350,7 +2350,11 @@ def _delta_alias_bases(root: Path) -> "list[Path]":
         # tempfile can fail when the host temporary directory is unavailable;
         # the portable parent below remains a usable candidate.
         pass
-    values.append(str(root.parent))
+    # Same-volume links are preferable: some Windows socket/path code does
+    # not tolerate a cross-volume junction even though ordinary file I/O does.
+    # Ancestors of the portable are usually writable and often provide a much
+    # shorter spelling than the host profile TEMP.
+    values.extend(str(parent) for parent in list(root.parents)[:8])
     result: "list[Path]" = []
     seen: "set[str]" = set()
     for value in values:
@@ -2367,7 +2371,11 @@ def _delta_alias_bases(root: Path) -> "list[Path]":
             continue
         seen.add(key)
         result.append(path)
-    return sorted(result, key=lambda item: len(str(item)))
+    root_drive = root.drive.casefold()
+    return sorted(result, key=lambda item: (
+        item.drive.casefold() != root_drive,
+        item.parent == item,  # avoid the drive root unless it is necessary
+        len(str(item))))
 
 
 class DeltaProfileAlias:
