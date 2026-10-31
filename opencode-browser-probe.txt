@@ -11,19 +11,20 @@ CONTROL: ControlType.Button :: Minimize
 CONTROL: ControlType.Button :: Maximize
 CONTROL: ControlType.Button :: Close
 No visible login/register control was found
-PORTABLE PROCESS: 6236 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\LaunchPortable.exe
-PORTABLE PROCESS: 1420 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
-PORTABLE PROCESS: 2252 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
-PORTABLE PROCESS: 2408 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
-PORTABLE PROCESS: 3472 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
-PORTABLE PROCESS: 3672 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
-PORTABLE PROCESS: 9348 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+Window screenshot captured
+PORTABLE PROCESS: 4176 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\LaunchPortable.exe
+PORTABLE PROCESS: 4308 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 4620 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 7016 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 9008 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 9188 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 9240 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
 Host reopen observed: False
 Profile linked: True
 --- launcher-run.log ---
-[2026-10-31 15:16:04] paths: replaced the portable marker in 2 file(s): Launch.bat, portability-report.txt
-[2026-10-31 15:16:04] paths: the portable marker is gone from 2 file(s)
-[2026-10-31 15:16:04] installed programs: installed programs: удалена запись «OpenCode 1.19.5» из списка установленных приложений (HKCU)
-[2026-10-31 15:16:05] pre-launch (from LaunchPortable.exe start): 1.04s before the program starts (slowest: saves 0.78s, marker sweep 0.07s, profile setup 0.06s, stale session 0.05s)
-[2026-10-31 15:16:05] start: "D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe" (cwd=D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App, elevated=True, job=no)
-[2026-10-31 15:16:05] browser login: browser profiles are connected to the real user profile (1 folder(s)); a login opens the installed browser
+[2026-10-31 15:20:07] paths: replaced the portable marker in 2 file(s): Launch.bat, portability-report.txt
+[2026-10-31 15:20:07] paths: the portable marker is gone from 2 file(s)
+[2026-10-31 15:20:07] installed programs: installed programs: удалена запись «OpenCode 1.19.5» из списка установленных приложений (HKCU)
+[2026-10-31 15:20:08] pre-launch (from LaunchPortable.exe start): 0.36s before the program starts (slowest: service ports 0.09s, stale session 0.07s, profile setup 0.07s)
+[2026-10-31 15:20:08] start: "D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe" (cwd=D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App, elevated=True, job=no)
+[2026-10-31 15:20:08] browser login: browser profiles are connected to the real user profile (1 folder(s)); a login opens the installed browser
