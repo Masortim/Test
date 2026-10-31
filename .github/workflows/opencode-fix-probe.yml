@@ -1,0 +1,321 @@
+name: OpenCode fix diagnostic
+
+on:
+  push:
+    branches: ["arena/**"]
+    paths: [".github/workflows/opencode-fix-probe.yml"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build current Windows binaries
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          pyinstaller --noconfirm --clean portable_launcher.spec
+          Copy-Item -Force dist/PortableLauncher.exe portablizer/resources/portable_launcher.exe
+          pyinstaller --noconfirm --clean portable_launcher_onedir.spec
+          Remove-Item -Recurse -Force portablizer/resources/portable_launcher -ErrorAction SilentlyContinue
+          Copy-Item -Recurse -Force dist/PortableLauncher portablizer/resources/portable_launcher
+          pyinstaller --noconfirm --clean portablizer.spec
+          Copy-Item -Force dist/Portablizer.exe dist-windows/Portablizer.exe
+
+      - name: Probe ordinary OpenCode portable launch and login
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $report = [System.Collections.Generic.List[string]]::new()
+          $root = Join-Path $env:RUNNER_TEMP "OpenCode Browser And Startup Probe"
+          $portable = Join-Path $root "out/OpenCode_Portable"
+          $browserNames = @("msedge", "chrome", "browser", "yandex", "firefox", "brave")
+          try {
+            New-Item -ItemType Directory -Force -Path (Join-Path $root "out") | Out-Null
+            $installer = Join-Path $root "opencode-setup.exe"
+            Invoke-WebRequest -UseBasicParsing `
+              -Uri "https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-win-x64.exe" `
+              -OutFile $installer
+            $arguments = 'build "' + $installer + '" --out "' +
+              (Join-Path $root "out") + '" --name OpenCode --single-file --no-registry ' +
+              '--no-netstack --hard-timeout 180'
+            $builder = Start-Process -FilePath (Resolve-Path "dist-windows/Portablizer.exe").Path `
+              -ArgumentList $arguments -PassThru
+            if (-not $builder.WaitForExit(600000)) { $builder.Kill(); throw "Builder timed out" }
+            $report.Add("Builder exit: $($builder.ExitCode)")
+            if ($builder.ExitCode -ne 0) { throw "Builder failed" }
+            $configPath = Join-Path $portable "launcher_config.json"
+            $config = Get-Content $configPath -Raw | ConvertFrom-Json
+            $report.Add("Target: $($config.target_exe_rel)")
+            $report.Add("connect_host_profile=$($config.browser_login.connect_host_profile)")
+            $report.Add("clean_duplicates=$($config.browser_login.clean_duplicates)")
+            $edge = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+            Start-Process -FilePath $edge -ArgumentList "https://github.com/login"
+            Start-Sleep -Seconds 10
+            $report.Add("Existing Edge started before OpenCode")
+            $before = @(Get-Process -Name $browserNames -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.Id })
+            $report.Add("Browser processes before: $($before -join ',')")
+            $env:PORTABLE_LAUNCHER_NO_UI = "1"
+            $runLog = Join-Path $portable "PortableData/launcher-run.log"
+            $gui = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
+              -WorkingDirectory $portable -PassThru
+            Start-Sleep -Seconds 30
+
+            Add-Type -AssemblyName UIAutomationClient
+            Add-Type -AssemblyName UIAutomationTypes
+            Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class OpenCodeProbeInput { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y); [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e); }'
+            $automationRoot = [System.Windows.Automation.AutomationElement]::RootElement
+            $windowCondition = [System.Windows.Automation.PropertyCondition]::new(
+              [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+              [System.Windows.Automation.ControlType]::Window)
+            $windows = $automationRoot.FindAll(
+              [System.Windows.Automation.TreeScope]::Children, $windowCondition)
+            $appWindow = $null
+            foreach ($window in $windows) {
+              $report.Add("WINDOW: $($window.Current.Name)")
+              if ($window.Current.Name -match '(?i)opencode') { $appWindow = $window }
+            }
+            $report.Add("OpenCode window found: $([bool]$appWindow)")
+            if ($appWindow) {
+              [void][OpenCodeProbeInput]::SetForegroundWindow(
+                [IntPtr]$appWindow.Current.NativeWindowHandle)
+              $controls = $appWindow.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                [System.Windows.Automation.Condition]::TrueCondition)
+              $login = $null
+              $count = 0
+              foreach ($control in $controls) {
+                if ($count++ -ge 400) { break }
+                $name = [string]$control.Current.Name
+                $type = [string]$control.Current.ControlType.ProgrammaticName
+                if ($name) { $report.Add("CONTROL: $type :: $name") }
+                if (-not $login -and $name -match '(?i)log ?in|sign ?in|register|sign ?up') {
+                  $bounds = $control.Current.BoundingRectangle
+                  if ($bounds.Width -gt 0 -and $bounds.Height -gt 0) { $login = $control }
+                }
+              }
+              if ($login) {
+                $bounds = $login.Current.BoundingRectangle
+                [void][OpenCodeProbeInput]::SetCursorPos(
+                  [int]($bounds.X + $bounds.Width / 2),
+                  [int]($bounds.Y + $bounds.Height / 2))
+                [OpenCodeProbeInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [OpenCodeProbeInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+                $report.Add("Login control clicked: $($login.Current.Name)")
+                Start-Sleep -Seconds 25
+              }
+              else {
+                $report.Add("No visible login/register control was found")
+              }
+              Add-Type -AssemblyName System.Drawing
+              $windowBounds = $appWindow.Current.BoundingRectangle
+              if ($windowBounds.Width -gt 0 -and $windowBounds.Height -gt 0) {
+                $bitmap = [System.Drawing.Bitmap]::new(
+                  [int]$windowBounds.Width, [int]$windowBounds.Height)
+                $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                $graphics.CopyFromScreen(
+                  [int]$windowBounds.X, [int]$windowBounds.Y, 0, 0,
+                  [System.Drawing.Size]::new([int]$windowBounds.Width,
+                    [int]$windowBounds.Height))
+                $bitmap.Save((Join-Path $env:GITHUB_WORKSPACE "opencode-window.png"),
+                  [System.Drawing.Imaging.ImageFormat]::Png)
+                $graphics.Dispose()
+                $bitmap.Dispose()
+                $report.Add("Window screenshot captured")
+              }
+              if (-not $login) {
+                [void][OpenCodeProbeInput]::SetCursorPos(
+                  [int]$windowBounds.X + 40, [int]$windowBounds.Y + 22)
+                [OpenCodeProbeInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [OpenCodeProbeInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+                Start-Sleep -Seconds 3
+                $report.Add("Application menu clicked")
+                if ($windowBounds.Width -gt 0 -and $windowBounds.Height -gt 0) {
+                  $menuBitmap = [System.Drawing.Bitmap]::new(
+                    [int]$windowBounds.Width, [int]$windowBounds.Height)
+                  $menuGraphics = [System.Drawing.Graphics]::FromImage($menuBitmap)
+                  $menuGraphics.CopyFromScreen(
+                    [int]$windowBounds.X, [int]$windowBounds.Y, 0, 0,
+                    [System.Drawing.Size]::new([int]$windowBounds.Width,
+                      [int]$windowBounds.Height))
+                  $menuBitmap.Save((Join-Path $env:GITHUB_WORKSPACE "opencode-menu.png"),
+                    [System.Drawing.Imaging.ImageFormat]::Png)
+                  $menuGraphics.Dispose()
+                  $menuBitmap.Dispose()
+                }
+                [void][OpenCodeProbeInput]::SetCursorPos(
+                  [int]$windowBounds.X + 390, [int]$windowBounds.Y + 477)
+                [OpenCodeProbeInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [OpenCodeProbeInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+                Start-Sleep -Seconds 3
+                $report.Add("Provider selector clicked")
+                $providerBitmap = [System.Drawing.Bitmap]::new(
+                  [int]$windowBounds.Width, [int]$windowBounds.Height)
+                $providerGraphics = [System.Drawing.Graphics]::FromImage($providerBitmap)
+                $providerGraphics.CopyFromScreen(
+                  [int]$windowBounds.X, [int]$windowBounds.Y, 0, 0,
+                  [System.Drawing.Size]::new([int]$windowBounds.Width,
+                    [int]$windowBounds.Height))
+                $providerBitmap.Save((Join-Path $env:GITHUB_WORKSPACE "opencode-provider.png"),
+                  [System.Drawing.Imaging.ImageFormat]::Png)
+                $providerGraphics.Dispose()
+                $providerBitmap.Dispose()
+                [void][OpenCodeProbeInput]::SetCursorPos(
+                  [int]$windowBounds.X + 490, [int]$windowBounds.Y + 532)
+                [OpenCodeProbeInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [OpenCodeProbeInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+                $report.Add("OpenCode provider clicked")
+                Start-Sleep -Seconds 25
+                $loginBitmap = [System.Drawing.Bitmap]::new(
+                  [int]$windowBounds.Width, [int]$windowBounds.Height)
+                $loginGraphics = [System.Drawing.Graphics]::FromImage($loginBitmap)
+                $loginGraphics.CopyFromScreen(
+                  [int]$windowBounds.X, [int]$windowBounds.Y, 0, 0,
+                  [System.Drawing.Size]::new([int]$windowBounds.Width,
+                    [int]$windowBounds.Height))
+                $loginBitmap.Save((Join-Path $env:GITHUB_WORKSPACE "opencode-login.png"),
+                  [System.Drawing.Imaging.ImageFormat]::Png)
+                $loginGraphics.Dispose()
+                $loginBitmap.Dispose()
+                [void][OpenCodeProbeInput]::SetCursorPos(
+                  [int]$windowBounds.X + 430, [int]$windowBounds.Y + 326)
+                [OpenCodeProbeInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [OpenCodeProbeInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+                $report.Add("OpenCode Zen external link clicked")
+                $seenCommands = [System.Collections.Generic.HashSet[string]]::new()
+                for ($attempt = 0; $attempt -lt 150; $attempt++) {
+                  $samples = @(Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" `
+                    -ErrorAction SilentlyContinue)
+                  foreach ($sample in $samples) {
+                    if ($sample.CommandLine -and
+                        ($sample.CommandLine -match 'opencode\.ai/zen|single-argument')) {
+                      $key = "$($sample.ProcessId):$($sample.CommandLine)"
+                      if ($seenCommands.Add($key)) {
+                        $report.Add("TRANSIENT SAMPLE: pid=$($sample.ProcessId) parent=$($sample.ParentProcessId) command=$($sample.CommandLine)")
+                      }
+                    }
+                  }
+                  Start-Sleep -Milliseconds 100
+                }
+                $env:EDGE_USER_DATA = Join-Path $env:LOCALAPPDATA "Microsoft/Edge/User Data"
+                $historyLines = @(@'
+import os
+import pathlib
+import shutil
+import sqlite3
+import tempfile
+
+root = pathlib.Path(os.environ["EDGE_USER_DATA"])
+found = False
+for history in root.glob("*/History"):
+    try:
+        fd, copy = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        shutil.copy2(history, copy)
+        connection = sqlite3.connect(copy)
+        rows = connection.execute(
+            "select url, title from urls where url like ? order by last_visit_time desc limit 5",
+            ("%opencode.ai/zen%",),
+        ).fetchall()
+        connection.close()
+        os.unlink(copy)
+        for url, title in rows:
+            found = True
+            print(f"HISTORY {history.parent.name}: {url} :: {title}")
+    except Exception as exc:
+        print(f"HISTORY ERROR {history}: {exc}")
+if not found:
+    print("NO OPENCODE HISTORY")
+'@ | python -)
+                foreach ($line in $historyLines) { $report.Add([string]$line) }
+              }
+            }
+
+            $after = @(Get-Process -Name $browserNames -ErrorAction SilentlyContinue)
+            foreach ($process in $after) {
+              if ($before -contains $process.Id) { continue }
+              try {
+                $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)"
+                $command = $cim.CommandLine
+                $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($cim.ParentProcessId)" `
+                  -ErrorAction SilentlyContinue
+                $report.Add("NEW BROWSER pid=$($process.Id) name=$($process.ProcessName) parent=$($cim.ParentProcessId):$($parent.Name) command=$command")
+              }
+              catch {
+                $report.Add("NEW BROWSER pid=$($process.Id) name=$($process.ProcessName)")
+              }
+            }
+            $prefix = $portable.TrimEnd('\') + '\'
+            foreach ($candidate in @(Get-Process -ErrorAction SilentlyContinue)) {
+              try {
+                if ($candidate.Path -and $candidate.Path.StartsWith($prefix,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                  $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($candidate.Id)"
+                  $report.Add("PORTABLE PROCESS: $($candidate.Id) parent=$($cim.ParentProcessId) $($candidate.Path)")
+                }
+              }
+              catch { }
+            }
+            if (Test-Path $runLog) {
+              $text = Get-Content $runLog -Raw
+              $report.Add("Host reopen observed: $($text -match 'browser login: opened https://')")
+              $report.Add("Profile linked: $($text -match 'browser profiles are connected')")
+              $report.Add("--- launcher-run.log ---")
+              foreach ($line in @(Get-Content $runLog -Tail 120)) { $report.Add([string]$line) }
+            }
+            $errorLog = Join-Path $portable "PortableData/launcher-exe-error.log"
+            if (Test-Path $errorLog) {
+              $report.Add("--- launcher-exe-error.log ---")
+              foreach ($line in @(Get-Content $errorLog -Tail 80)) { $report.Add([string]$line) }
+            }
+          }
+          catch {
+            $report.Add("ERROR: $($_.Exception.Message)")
+            $buildLog = Join-Path $portable "portablizer.log"
+            if (Test-Path $buildLog) {
+              foreach ($line in @(Get-Content $buildLog -Tail 80)) { $report.Add([string]$line) }
+            }
+          }
+          finally {
+            $prefix = $portable.TrimEnd('\') + '\'
+            foreach ($candidate in @(Get-Process -ErrorAction SilentlyContinue)) {
+              try {
+                $image = $candidate.Path
+                if ($image -and $image.StartsWith($prefix,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                  Stop-Process -Id $candidate.Id -Force -ErrorAction SilentlyContinue
+                }
+              }
+              catch { }
+            }
+            $report | Set-Content -Encoding utf8 "opencode-browser-probe.txt"
+          }
+
+      - name: Publish report
+        shell: bash
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f opencode-browser-probe.txt
+          if test -f opencode-window.png; then git add -f opencode-window.png; fi
+          if test -f opencode-menu.png; then git add -f opencode-menu.png; fi
+          if test -f opencode-provider.png; then git add -f opencode-provider.png; fi
+          if test -f opencode-login.png; then git add -f opencode-login.png; fi
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "ci: update OpenCode browser diagnostic [skip ci]"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
