@@ -1,0 +1,165 @@
+name: Delta terms diagnostic
+
+on:
+  push:
+    branches: ["arena/**"]
+    paths: [".github/workflows/delta-terms-probe.yml"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Exercise Review Terms on real Delta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $report = [System.Collections.Generic.List[string]]::new()
+          $root = Join-Path $env:RUNNER_TEMP "Delta Terms Probe With A Long Path"
+          $portable = Join-Path $root "out/Delta_Portable"
+          try {
+            New-Item -ItemType Directory -Force -Path (Join-Path $root "out") | Out-Null
+            $installer = Join-Path $root "delta-setup.exe"
+            Invoke-WebRequest -UseBasicParsing `
+              -Uri "https://releases.delta.dev/releases/stable/0.23.0/delta-windows-x86_64-setup.exe" `
+              -OutFile $installer
+            $report.Add("Installer downloaded")
+            $arguments = 'build "' + $installer + '" --out "' +
+              (Join-Path $root "out") + '" --name Delta --single-file --no-registry ' +
+              '--no-netstack --hard-timeout 180'
+            $builder = Start-Process -FilePath (Resolve-Path "dist-windows/Portablizer.exe").Path `
+              -ArgumentList $arguments -PassThru
+            if (-not $builder.WaitForExit(600000)) {
+              $builder.Kill()
+              throw "Builder timed out"
+            }
+            $report.Add("Builder exit: $($builder.ExitCode)")
+            if ($builder.ExitCode -ne 0) { throw "Builder failed" }
+            $configPath = Join-Path $portable "launcher_config.json"
+            $config = Get-Content $configPath -Raw | ConvertFrom-Json
+            $config.browser_login.connect_host_profile = $false
+            $config.browser_login.clean_duplicates = $false
+            $config | ConvertTo-Json -Depth 20 |
+              Set-Content -Encoding utf8 $configPath
+            $env:PORTABLE_LAUNCHER_NO_UI = "1"
+            $runLog = Join-Path $portable "PortableData/launcher-run.log"
+            $gui = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
+              -WorkingDirectory $portable -PassThru
+            Start-Sleep -Seconds 15
+
+            Add-Type -AssemblyName UIAutomationClient
+            Add-Type -AssemblyName UIAutomationTypes
+            $automationRoot = [System.Windows.Automation.AutomationElement]::RootElement
+            $trueCondition = [System.Windows.Automation.Condition]::TrueCondition
+            $windowCondition = [System.Windows.Automation.PropertyCondition]::new(
+              [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+              [System.Windows.Automation.ControlType]::Window)
+            $windows = $automationRoot.FindAll(
+              [System.Windows.Automation.TreeScope]::Children, $windowCondition)
+            $termsElement = $null
+            $deltaPids = @(Get-Process -Name "delta-app" -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.Id })
+            foreach ($window in $windows) {
+              $name = $window.Current.Name
+              $pidValue = $window.Current.ProcessId
+              if ($name -notmatch '(?i)delta' -and $deltaPids -notcontains $pidValue) { continue }
+              $report.Add("WINDOW pid=$pidValue name=$name")
+              $elements = $window.FindAll(
+                [System.Windows.Automation.TreeScope]::Subtree, $trueCondition)
+              $count = 0
+              foreach ($element in $elements) {
+                $current = $element.Current
+                if ($current.Name -or $current.AutomationId) {
+                  $report.Add("UIA type=$($current.ControlType.ProgrammaticName) name=$($current.Name) id=$($current.AutomationId)")
+                }
+                if (-not $termsElement -and $current.Name -match '(?i)^\s*Review Terms\s*$') {
+                  $termsElement = $element
+                }
+                $count++
+                if ($count -ge 600) { break }
+              }
+            }
+            if (-not $termsElement) {
+              $report.Add("Review Terms element was not found")
+            }
+            else {
+              $report.Add("Review Terms element found; attempting invocation")
+              $invoked = $false
+              try {
+                $pattern = $termsElement.GetCurrentPattern(
+                  [System.Windows.Automation.InvokePattern]::Pattern)
+                $pattern.Invoke()
+                $invoked = $true
+                $report.Add("InvokePattern used")
+              }
+              catch {
+                $report.Add("InvokePattern unavailable: $($_.Exception.Message)")
+              }
+              if (-not $invoked) {
+                try {
+                  $legacy = $termsElement.GetCurrentPattern(
+                    [System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
+                  $legacy.DoDefaultAction()
+                  $invoked = $true
+                  $report.Add("LegacyIAccessiblePattern used")
+                }
+                catch {
+                  $report.Add("Legacy invocation unavailable: $($_.Exception.Message)")
+                }
+              }
+            }
+            $found = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              if (Test-Path $runLog) {
+                $text = Get-Content $runLog -Raw
+                if ($text -match 'browser login: opened https://dashboard\.zed\.dev/delta-beta') {
+                  $found = $true
+                  break
+                }
+              }
+              Start-Sleep -Seconds 1
+            }
+            $report.Add("Terms URL observed: $found")
+          }
+          catch {
+            $report.Add("ERROR: $($_.Exception.Message)")
+          }
+          finally {
+            $prefix = $portable.TrimEnd('\') + '\'
+            foreach ($candidate in @(Get-Process -ErrorAction SilentlyContinue)) {
+              try {
+                $image = $candidate.Path
+                if ($image -and $image.StartsWith($prefix,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                  Stop-Process -Id $candidate.Id -Force -ErrorAction SilentlyContinue
+                }
+              }
+              catch { }
+            }
+            Start-Sleep -Seconds 3
+            if (Test-Path $runLog) {
+              $report.Add("--- launcher-run.log ---")
+              foreach ($line in @(Get-Content $runLog -Tail 120)) {
+                $report.Add([string]$line)
+              }
+            }
+            $report | Set-Content -Encoding utf8 "delta-terms-probe.txt"
+          }
+
+      - name: Publish terms report
+        shell: bash
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f delta-terms-probe.txt
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "ci: update Delta terms diagnostic [skip ci]"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
