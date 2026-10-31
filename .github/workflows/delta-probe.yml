@@ -46,6 +46,11 @@ jobs:
             $configText = Get-Content $configPath -Raw
             $config = $configText | ConvertFrom-Json
             $report.Add("Target: $($config.target_exe_rel)")
+            $deltaCli = Get-ChildItem (Join-Path $portable "App") `
+              -Recurse -File -Filter "Delta.exe" | Select-Object -First 1
+            if (-not $deltaCli) { throw "Delta CLI was not found" }
+            $cliTarget = $deltaCli.FullName.Substring($portable.Length + 1).Replace('\', '/')
+            $report.Add("CLI target: $cliTarget")
             $authConfig = $configText | ConvertFrom-Json
             $authConfig.browser_login.connect_host_profile = $false
             $authConfig.browser_login.clean_duplicates = $false
@@ -55,7 +60,7 @@ jobs:
             $authOutput = Join-Path $root "auth.out"
             $authError = Join-Path $root "auth.err"
             $auth = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
-              -ArgumentList @("--target", "App/Delta.exe", "auth", "login") `
+              -ArgumentList @("--target", $cliTarget, "auth", "login") `
               -WorkingDirectory $portable -PassThru `
               -RedirectStandardOutput $authOutput -RedirectStandardError $authError
             $runLog = Join-Path $portable "PortableData/launcher-run.log"
