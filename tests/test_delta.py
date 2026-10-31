@@ -163,6 +163,8 @@ class DeltaIpcProfileTests(unittest.TestCase):
             original = {
                 "USERPROFILE": str(profile),
                 "APPDATA": str(root / "PortableData" / "AppData" / "Roaming"),
+                "HOMEDRIVE": "D:",
+                "HOMEPATH": "\\original\\profile",
             }
             alias_base = base
             if os.name == "nt":
@@ -187,6 +189,8 @@ class DeltaIpcProfileTests(unittest.TestCase):
                     Path(patched["USERPROFILE"])))
                 # BrowserLoginBridge can retain the original APPDATA roots.
                 self.assertEqual(patched["APPDATA"], original["APPDATA"])
+                self.assertEqual(patched["HOMEDRIVE"], "D:")
+                self.assertEqual(patched["HOMEPATH"], "\\original\\profile")
                 alias.cleanup()
                 self.assertFalse(alias.path.exists())
                 self.assertTrue(marker.is_file())

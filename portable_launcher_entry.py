@@ -2312,14 +2312,11 @@ def _windows_short_path(path: Path) -> Optional[Path]:
 
 def _delta_with_profile(env: Dict[str, str], profile: Path) -> Dict[str, str]:
     patched = dict(env)
-    text = str(profile)
-    patched["USERPROFILE"] = text
-    if len(text) >= 2 and text[1] == ":":
-        patched["HOMEDRIVE"] = text[:2]
-        patched["HOMEPATH"] = text[2:]
-    else:
-        patched["HOMEDRIVE"] = ""
-        patched["HOMEPATH"] = text
+    # Delta's IPC path is derived from USERPROFILE.  Keep HOMEDRIVE,
+    # HOMEPATH, APPDATA and every other setting exactly as the ordinary
+    # portable environment prepared them; changing the whole home identity
+    # makes Delta's own path initialization take a different failure branch.
+    patched["USERPROFILE"] = str(profile)
     return patched
 
 
