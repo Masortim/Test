@@ -191,6 +191,16 @@ class BridgePlanTests(unittest.TestCase):
         table = self.baseline + [(300, 1, "chrome.exe")]
         self.assertEqual(self._plan(table, {300: CHROME_LOGIN}), [])
 
+    def test_linked_profile_does_not_hide_browser_spawned_by_app_child(self):
+        # Реальный OpenCode: OpenCode.exe (потомок основного процесса)
+        # запускает msedge.exe --single-argument https://opencode.ai/zen.
+        # Раньше наличие junction полностью скрывало этот процесс от bridge.
+        self.bridge._bridged.add(("LOCALAPPDATA", "Google/Chrome"))
+        table = self.baseline + [(150, 100, "OpenCode.exe"),
+                                 (200, 150, "chrome.exe")]
+        planned = self._plan(table, {200: CHROME_LOGIN})
+        self.assertEqual([pid for pid, _url, _image in planned], [200])
+
     def test_brokered_launch_is_replaced_when_the_profile_is_not_linked(self):
         # Junction создать нельзя (exFAT, сетевая папка), а ShellExecute ушёл
         # в службу оболочки: родитель браузера — explorer/svchost, цепочки до
@@ -437,7 +447,7 @@ class HostProfileBridgeTests(unittest.TestCase):
             bridge._bridged = set(pairs)
             self.assertTrue(bridge._bridged_image("yandex.exe"))
 
-    def test_linked_browser_is_not_killed(self):
+    def test_linked_browser_started_by_app_is_still_reopened_in_host(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             host = root / "host"
@@ -458,9 +468,12 @@ class HostProfileBridgeTests(unittest.TestCase):
                     with mock.patch.object(entry, "_process_table",
                                            return_value=table):
                         bridge.poll()
-                # Вход идёт в настоящем профиле: снимать и переоткрывать нечего.
-                terminated.assert_not_called()
-                opened.assert_not_called()
+                # Junction предотвращает второй профиль, но не гарантирует
+                # повторное использование уже открытого браузера. Прямой
+                # browser-потомок приложения всё равно заменяется host URL.
+                terminated.assert_called_once_with([200])
+                opened.assert_called_once_with(
+                    "https://www.figma.com/login?redirect=%2Ffiles&state=abc")
 
     def test_nothing_is_linked_when_the_host_has_no_browser(self):
         with tempfile.TemporaryDirectory() as temp:
