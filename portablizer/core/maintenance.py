@@ -215,6 +215,33 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
     return report
 
 
+def _prefer_delta_gui_target(folder: str, cfg) -> bool:
+    """Переключить старый portable Delta с CLI на desktop application.
+
+    В paired-сборке ``Delta.exe`` — терминальный клиент, а
+    ``delta-app.exe`` — окно, которое обрабатывает sign-in и Review Terms.
+    Старые конфиги могли выбрать CLI по размеру/имени.  Меняем только
+    существующую стандартную цель; явные дополнительные target'ы остаются
+    доступными через меню.
+    """
+    current = str(getattr(cfg, "target_exe_rel", "") or "").replace("\\", "/")
+    if current.rsplit("/", 1)[-1].casefold() != "delta.exe":
+        return False
+    candidate = (current.rsplit("/", 1)[0] + "/delta-app.exe"
+                 if "/" in current else "delta-app.exe")
+    candidate_path = os.path.join(folder, *candidate.split("/"))
+    if not os.path.isfile(candidate_path):
+        return False
+    cfg.target_exe_rel = candidate
+    for item in getattr(cfg, "targets", []):
+        rel = str(item.rel_path).replace("\\", "/")
+        if rel.casefold() == current.casefold() and item.role == "main":
+            item.role = "auxiliary"
+        elif rel.casefold() == candidate.casefold():
+            item.role = "main"
+    return True
+
+
 def refresh(folder: str, log: Optional[Logger] = None,
             copy_exe=None, shared_saves: bool = True,
             language: str = "") -> MaintenanceReport:
@@ -259,6 +286,11 @@ def refresh(folder: str, log: Optional[Logger] = None,
         log.ok(f"Остановлено перед обновлением: {name}")
 
     cfg = launcher_mod.config_from_dict(data)
+    if _prefer_delta_gui_target(folder, cfg):
+        message = ("Delta: основной запуск переключён с CLI Delta.exe на "
+                   "delta-app.exe — desktop-версию с рабочим browser sign-in.")
+        log.info(message)
+        report.messages.append(message)
     log.info(f"Обновляю лончеры портатива «{cfg.app_name}»")
 
     # Портатив, собранный до 1.15.0, не имеет ни секции относительных путей,

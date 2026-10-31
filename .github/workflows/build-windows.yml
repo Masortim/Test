@@ -345,6 +345,9 @@ jobs:
           if (-not (Test-Path (Join-Path $portable $config.target_exe_rel))) {
             throw "Delta launcher target does not exist: $($config.target_exe_rel)"
           }
+          if ($config.target_exe_rel -notmatch '(?i)(^|/)delta-app\.exe$') {
+            throw "Delta Launch.bat must target the desktop delta-app.exe, not the CLI: $($config.target_exe_rel)"
+          }
           $buildLog = Join-Path $portable "portablizer.log"
           $buildLogText = Get-Content $buildLog -Raw
           if ($buildLogText -notmatch 'Сработал запасной сценарий: WiX Burn: /quiet /repair') {
