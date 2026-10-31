@@ -376,6 +376,35 @@ jobs:
           }
           Write-Host "Delta Launch.bat handoff: delta-app.exe exited with code 0"
 
+          # Launch.bat intentionally returns after the EXE handoff.  The
+          # target's exit line alone does not mean LaunchPortable.exe has
+          # finished registry/profile cleanup.  Do not start a second Delta
+          # session while the first one is still removing its IPC alias.
+          $portablePrefix = $portable.TrimEnd('\') + '\'
+          $firstSessionSettled = $false
+          for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            $remaining = @()
+            foreach ($candidate in @(Get-Process -ErrorAction SilentlyContinue)) {
+              try {
+                $image = $candidate.Path
+                if ($image -and $image.StartsWith($portablePrefix,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                  $remaining += $candidate
+                }
+              }
+              catch { }
+            }
+            if ($remaining.Count -eq 0) {
+              $firstSessionSettled = $true
+              break
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $firstSessionSettled) {
+            throw "The first Delta launcher did not finish cleanup before the auth probe"
+          }
+          Start-Sleep -Seconds 2
+
           # Browser/IPC regression: start the real desktop app through the
           # ordinary Launch.bat -> LaunchPortable.exe path, then ask the
           # running app for a non-blocking CLI sign-in handoff.  A standalone
