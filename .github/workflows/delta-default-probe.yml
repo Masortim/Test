@@ -39,6 +39,7 @@ jobs:
             if (-not $builder.WaitForExit(600000)) { $builder.Kill(); throw "Builder timed out" }
             $report.Add("Builder exit: $($builder.ExitCode)")
             if ($builder.ExitCode -ne 0) { throw "Builder failed" }
+            $report.Add("Expected Portablizer version: 1.43.5")
             $config = Get-Content (Join-Path $portable "launcher_config.json") -Raw | ConvertFrom-Json
             $report.Add("connect_host_profile=$($config.browser_login.connect_host_profile)")
             $report.Add("clean_duplicates=$($config.browser_login.clean_duplicates)")
