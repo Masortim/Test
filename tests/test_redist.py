@@ -6,6 +6,7 @@ MSVCR110.dll / d3dx9_39.dll / MSVCP100.dll / MSVCR100.dll». Такие ошиб
 должны возникать «изначально»: Portablizer обязан заранее выяснить, что нужно
 программе, принести это в портатив, а остаток честно назвать по имени пакета.
 """
+import hashlib
 import json
 import os
 import shutil
@@ -360,6 +361,50 @@ class RuntimeProvisionTests(unittest.TestCase):
                             if item.arch == "x86")
             self.assertEqual(sdk_copy.source, "Windows SDK (app-local redist)")
 
+    def test_embedded_d3dcompiler_closes_both_bitnesses_offline(self):
+        """Точный сценарий по умолчанию: без SDK, сети и установки пакетов."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            (app / "x86").mkdir()
+            (app / "x64").mkdir()
+            write_pe(app / "x86" / "game32.exe",
+                     imports=("d3dcompiler_47.dll",), machine=MACHINE_X86)
+            write_pe(app / "x64" / "game64.exe",
+                     imports=("d3dcompiler_47.dll",), machine=MACHINE_X64)
+            scan = redist.scan_app_runtime(str(app))
+            downloader = mock.Mock(return_value=False)
+
+            with mock.patch.object(redist, "windows_sdk_d3d_dirs_for",
+                                   return_value=[]):
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="",
+                    allow_download=False, allow_install=False,
+                    downloader=downloader,
+                ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertEqual(report.missing, [])
+            self.assertEqual(report.installed, [])
+            self.assertEqual(
+                {(item.dll, item.arch) for item in report.provided},
+                {("d3dcompiler_47.dll", "x86"),
+                 ("d3dcompiler_47.dll", "x64")})
+            official_hashes = {
+                "x86": "e3009e3738fab1f7cd685567c5aa1eb0a408ac51d0cda5da788841174d7625b1",
+                "x64": "fd3cc271308e1c1fd21821e0ecaf29498edd46839a4a2712b2fab7aa96b755e2",
+            }
+            for arch in ("x86", "x64"):
+                copied = app / arch / "d3dcompiler_47.dll"
+                self.assertTrue(copied.is_file())
+                self.assertEqual(
+                    redist.read_pe_imports(str(copied)).machine, arch)
+                self.assertEqual(
+                    hashlib.sha256(copied.read_bytes()).hexdigest(),
+                    official_hashes[arch])
+                item = next(item for item in report.provided
+                            if item.arch == arch)
+                self.assertIn("встроенный", item.source)
+            downloader.assert_not_called()
+
     def test_d3dcompiler_47_msu_is_extracted_without_windows_update(self):
         """Официальный KB — источник DLL, а не скрытая установка в систему."""
         with tempfile.TemporaryDirectory() as temp:
@@ -387,6 +432,8 @@ class RuntimeProvisionTests(unittest.TestCase):
             scan = redist.scan_app_runtime(str(app))
             with mock.patch.object(redist, "IS_WINDOWS", True), \
                     mock.patch.object(redist, "windows_sdk_d3d_dirs_for",
+                                      return_value=[]), \
+                    mock.patch.object(redist, "embedded_d3d_dirs_for",
                                       return_value=[]):
                 report = redist.RuntimeProvisioner(
                     self.log, system_dirs=[], sxs_dir="",
@@ -866,7 +913,9 @@ class FullKitProvisionTests(unittest.TestCase):
             # на Windows-раннере SDK законно принесёт запасной D3DCompiler и
             # сценарий «ничего не найдено» перестанет быть изолированным.
             with mock.patch.object(redist, "windows_sdk_d3d_dirs_for",
-                                   return_value=[]):
+                                   return_value=[]), \
+                    mock.patch.object(redist, "embedded_d3d_dirs_for",
+                                      return_value=[]):
                 report = redist.RuntimeProvisioner(
                     self.log, system_dirs=[], sxs_dir="",
                 ).provision(scan, str(app), str(portable), "Game", full_kit=True)

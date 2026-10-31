@@ -1167,6 +1167,26 @@ def windows_sdk_d3d_dirs_for(arch: str) -> List[str]:
     return result
 
 
+def embedded_d3d_dirs_for(arch: str) -> List[str]:
+    """Официальные D3DCompiler, встроенные в сам Portablizer.
+
+    Это автономная ступень для ПК без Windows SDK и без разрешения на сетевые
+    загрузки. В исходниках файлы лежат в ``portablizer/resources/redist``;
+    PyInstaller раскладывает их в ``_MEIPASS/resources/redist``. Неизвестная
+    архитектура намеренно не получает чужую DLL.
+    """
+    if arch not in ("x86", "x64"):
+        return []
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    if frozen_root:
+        base = os.path.join(frozen_root, "resources", "redist")
+    else:
+        package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        base = os.path.join(package_root, "resources", "redist")
+    candidate = os.path.join(base, arch)
+    return [candidate] if os.path.isdir(candidate) else []
+
+
 def winsxs_dir() -> str:
     if not IS_WINDOWS:
         return ""
@@ -3648,9 +3668,10 @@ class RuntimeProvisioner:
     1. файлы и пакеты, приложенные к установщику (``_CommonRedist`` и т. п.);
     2. системные папки этого ПК (с обязательной проверкой разрядности);
     3. Windows SDK ``Redist/D3D`` — официальные app-local D3DCompiler;
-    4. WinSxS — для VC++ 2005/2008, которые живут только там; рядом с
+    4. официальные D3DCompiler 47 x86/x64, встроенные в Portablizer;
+    5. WinSxS — для VC++ 2005/2008, которые живут только там; рядом с
        программой создаётся private-манифест сборки;
-    5. официальная загрузка с сайта Microsoft (только если разрешена).
+    6. официальная загрузка с сайта Microsoft (только если разрешена).
     """
 
     def __init__(self, log, *, source_dirs: Sequence[str] = (),
@@ -3889,6 +3910,20 @@ class RuntimeProvisioner:
             if os.path.isfile(candidate) \
                     and self._arch_matches(candidate, requirement.arch):
                 return candidate, "Windows SDK (app-local redist)"
+        return "", ""
+
+    def _from_embedded_d3d(self, requirement: RuntimeRequirement
+                           ) -> Tuple[str, str]:
+        """Автономная копия официального D3DCompiler из ресурсов программы."""
+        package = requirement.package
+        if package is None or package.key != "d3dcompiler_modern" \
+                or requirement.dll != "d3dcompiler_47.dll":
+            return "", ""
+        for directory in embedded_d3d_dirs_for(requirement.arch):
+            candidate = os.path.join(directory, requirement.dll)
+            if os.path.isfile(candidate) \
+                    and self._arch_matches(candidate, requirement.arch):
+                return candidate, "встроенный официальный redist Microsoft"
         return "", ""
 
     def _from_sxs(self, requirement: RuntimeRequirement) -> Tuple[str, str]:
@@ -4766,6 +4801,8 @@ class RuntimeProvisioner:
                 if not path:
                     path, source = self._from_windows_sdk(requirement)
                 if not path:
+                    path, source = self._from_embedded_d3d(requirement)
+                if not path:
                     path, source = self._from_sxs(requirement)
                 if not path:
                     path, source = self._from_package_payload(requirement, work_dir)
@@ -5206,14 +5243,16 @@ def render_report(report: ProvisionReport) -> str:
 
     if report.full_kit and (report.stock or report.stock_missing):
         lines += [
-            "Включён полный комплект: рядом с программой оказались все "
+            "Включён полный комплект: Portablizer пытается разложить все "
             "известные",
             "версии распространяемых библиотек, а не только найденные в "
             "таблицах",
             "импорта. Это страхует плагины, моды и библиотеки, которые "
             "грузятся",
-            "динамически (LoadLibrary по имени, собранному строкой), — окно",
-            "«отсутствует dll» в этом случае не возникает в принципе.",
+            "динамически (LoadLibrary по имени, собранному строкой). "
+            "Ненайденное",
+            "«про запас» перечислено ниже отдельно и не считается "
+            "обязательным.",
             "",
         ]
 

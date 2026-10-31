@@ -70,6 +70,24 @@ jobs:
       - name: Build EXE
         run: pyinstaller --noconfirm --clean portablizer.spec
 
+      - name: Verify embedded D3DCompiler 47 resources
+        shell: pwsh
+        run: |
+          @'
+          from PyInstaller.archive.readers import CArchiveReader
+
+          archive = CArchiveReader(r"dist/Portablizer.exe")
+          names = {name.replace("\\", "/") for name in archive.toc}
+          expected = {
+              "resources/redist/x86/d3dcompiler_47.dll",
+              "resources/redist/x64/d3dcompiler_47.dll",
+          }
+          missing = sorted(expected - names)
+          if missing:
+              raise RuntimeError(f"Resources missing from Portablizer.exe: {missing}")
+          print("Portablizer.exe contains both offline D3DCompiler 47 DLLs")
+          '@ | python -
+
       # Unit-test failures are reported after the Windows smoke checks and
       # artifact publication, so unrelated failures do not discard a valid build.
       - name: Run tests
@@ -225,8 +243,11 @@ jobs:
 
           $crashLog = Join-Path $root "portablizer-crash.log"
           $env:PORTABLIZER_CRASH_LOG = $crashLog
+          # Полный комплект остаётся включён, а --download-runtimes намеренно
+          # не передаётся: это точный сценарий жалобы. Обе разрядности
+          # D3DCompiler 47 должны прийти из ресурсов собранного EXE без сети.
           $arguments = 'build "' + $installer + '" --out "' + $out + '" ' +
-            '--name Delta --single-file --no-registry --no-runtimes ' +
+            '--name Delta --single-file --no-registry ' +
             '--no-netstack --hard-timeout 180'
           $process = Start-Process -FilePath (Resolve-Path "dist/Portablizer.exe").Path `
             -ArgumentList $arguments -PassThru
@@ -316,6 +337,25 @@ jobs:
             Get-Content $buildLog -Tail 160 | ForEach-Object { Write-Host $_ }
             throw "Delta did not recover the Present package through Burn repair"
           }
+          if ($buildLogText -match 'Не удалось найти файлы для:[^\r\n]*d3dcompiler_47\.dll') {
+            Get-Content $buildLog -Tail 160 | ForEach-Object { Write-Host $_ }
+            throw "D3DCompiler 47 is still reported as missing in the offline full-kit build"
+          }
+          $env:DELTA_APP_DIR = Join-Path $portable "App"
+          @'
+          import os
+          from pathlib import Path
+          from portablizer.core.redist import read_pe_imports
+
+          found = {}
+          for path in Path(os.environ["DELTA_APP_DIR"]).rglob("d3dcompiler_47.dll"):
+              machine = read_pe_imports(str(path)).machine
+              found.setdefault(machine, []).append(str(path))
+          missing = {"x86", "x64"} - set(found)
+          if missing:
+              raise RuntimeError(f"Delta portable lacks D3DCompiler 47 architectures: {sorted(missing)}; found={found}")
+          print(f"Delta offline full kit contains D3DCompiler 47: {found}")
+          '@ | python -
           $cacheDirs = @(Get-ChildItem $portable -Recurse -Directory `
             -Filter "Package Cache" -ErrorAction SilentlyContinue)
           $layoutPath = Join-Path $portable "_bundle_layout"

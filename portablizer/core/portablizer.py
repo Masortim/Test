@@ -8615,9 +8615,9 @@ class Portablizer:
         if report.stock:
             self.log.ok(
                 f"Полный комплект «про запас»: рядом с exe дополнительно "
-                f"разложено {len(report.stock)} библиотек — все версии "
-                "VC++ и DirectX, какие удалось найти. Плагинам и "
-                "динамическим загрузкам хватит всего.")
+                f"разложено {len(report.stock)} библиотек из найденных "
+                "версий VC++ и DirectX. Они закрывают динамические "
+                "загрузки, плагины и моды.")
         if report.stock_missing:
             self.log.info(
                 f"Полный комплект: ещё {len(report.stock_missing)} библиотек "

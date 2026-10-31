@@ -59,6 +59,14 @@ datas = [
     # результата. Сначала собирается portable_launcher.spec (см. build.bat/CI).
     (os.path.join("portablizer", "resources", "portable_launcher.exe"),
      os.path.join("resources")),
+    # Автономные app-local DLL: без них на ПК без SDK и с запрещённой сетевой
+    # загрузкой вторая разрядность D3DCompiler 47 снова останется недостающей.
+    (os.path.join("portablizer", "resources", "redist", "x86",
+                  "d3dcompiler_47.dll"),
+     os.path.join("resources", "redist", "x86")),
+    (os.path.join("portablizer", "resources", "redist", "x64",
+                  "d3dcompiler_47.dll"),
+     os.path.join("resources", "redist", "x64")),
 ]
 # Тот же лончер, собранный папкой: он запускается без распаковки во %TEMP%
 # (см. portable_launcher_onedir.spec). Папка есть только после сборки лончера;
