@@ -2258,6 +2258,219 @@ def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
     return env
 
 
+# Delta uses an AF_UNIX socket below USERPROFILE/AppData/Local/delta-ipc.
+# Even on Windows that socket has the small sockaddr_un.sun_path limit (108
+# bytes including the trailing NUL), rather than the usual Win32 path limit.
+# A portable folder with a descriptive name therefore breaks the app's IPC:
+# the window can be present, but Review Terms/auth cannot contact the app.
+_DELTA_IPC_SOCKET_NAME = "00000000000000000000000000000000.sock"
+_DELTA_IPC_SUN_LEN = 108
+
+
+def _is_delta_target(target: Path) -> bool:
+    return target.name.casefold() in {"delta.exe", "delta-app.exe"}
+
+
+def _delta_ipc_probe_path(profile: Path) -> Path:
+    return (profile / "AppData" / "Local" / "delta-ipc"
+            / _DELTA_IPC_SOCKET_NAME)
+
+
+def _delta_ipc_path_fits(profile: Path) -> bool:
+    try:
+        # Rust's Windows Unix-socket implementation consumes UTF-8 bytes.
+        # Keep one byte available for the terminating NUL.
+        return (len(str(_delta_ipc_probe_path(profile)).encode("utf-8"))
+                < _DELTA_IPC_SUN_LEN)
+    except (OSError, UnicodeError):
+        return False
+
+
+def _windows_short_path(path: Path) -> Optional[Path]:
+    """Return an existing 8.3 spelling, if the volume provides one."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        function = ctypes.windll.kernel32.GetShortPathNameW  # type: ignore[attr-defined]
+        function.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR,
+                             wintypes.DWORD]
+        function.restype = wintypes.DWORD
+        needed = int(function(str(path), None, 0))
+        if needed <= 0:
+            return None
+        buffer = ctypes.create_unicode_buffer(needed)
+        result = int(function(str(path), buffer, needed))
+        if result <= 0 or result >= needed:
+            return None
+        return Path(buffer.value)
+    except (OSError, AttributeError, TypeError, ValueError):
+        return None
+
+
+def _delta_with_profile(env: Dict[str, str], profile: Path) -> Dict[str, str]:
+    patched = dict(env)
+    # Delta's IPC path is derived from USERPROFILE.  Keep HOMEDRIVE,
+    # HOMEPATH, APPDATA and every other setting exactly as the ordinary
+    # portable environment prepared them; changing the whole home identity
+    # makes Delta's own path initialization take a different failure branch.
+    patched["USERPROFILE"] = str(profile)
+    return patched
+
+
+def _delta_alias_bases(root: Path) -> "list[Path]":
+    """Short, local locations for a temporary Delta profile junction.
+
+    The link lives on the host filesystem, never in the browser profile and
+    never in the registry.  Prefer the real host TEMP (also when a BAT
+    fallback saved it), then try the portable's parent as a local fallback.
+    """
+    values: "list[str]" = []
+    host_temp = os.environ.get("PORTABLE_HOST_TEMP", "")
+    host_local = (os.environ.get("PORTABLE_HOST_LOCALAPPDATA")
+                  or os.environ.get("LOCALAPPDATA", ""))
+    if host_temp:
+        values.append(host_temp)
+    if host_local:
+        local = Path(host_local)
+        values.append(str(local / "Temp"))
+        # The usual %LOCALAPPDATA%\\Temp is itself too long on many PCs:
+        # the socket suffix alone takes about 62 bytes.  AppData and the
+        # user root are still private, writable locations with more room.
+        values.append(str(local.parent))
+        values.append(str(local.parent.parent))
+    try:
+        values.append(tempfile.gettempdir())
+    except Exception:  # noqa: BLE001 - fallback to the portable parent
+        # tempfile can fail when the host temporary directory is unavailable;
+        # the portable parent below remains a usable candidate.
+        pass
+    # Same-volume links are preferable: some Windows socket/path code does
+    # not tolerate a cross-volume junction even though ordinary file I/O does.
+    # Ancestors of the portable are usually writable and often provide a much
+    # shorter spelling than the host profile TEMP.
+    values.extend(str(parent) for parent in list(root.parents)[:8])
+    result: "list[Path]" = []
+    seen: "set[str]" = set()
+    for value in values:
+        if not value:
+            continue
+        try:
+            path = Path(value)
+            if not path.is_absolute():
+                continue
+            key = os.path.normcase(os.path.normpath(str(path)))
+        except (OSError, ValueError):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    root_drive = root.drive.casefold()
+    return sorted(result, key=lambda item: (
+        item.drive.casefold() != root_drive,
+        item.parent == item,  # avoid the drive root unless it is necessary
+        len(str(item))))
+
+
+class DeltaProfileAlias:
+    """Ownership and safe removal of one temporary profile junction."""
+
+    def __init__(self, path: Path, log: Optional[Any] = None) -> None:
+        self.path = path
+        self.log = log or (lambda _message: None)
+        self._cleaned = False
+
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        try:
+            # Never recursively remove this path: it points at the real
+            # PortableData/User tree.  A non-link is left untouched as well.
+            if _is_junction(self.path) and _remove_junction(self.path):
+                self.log("Delta: removed the temporary IPC profile alias")
+        except (OSError, ValueError) as exc:
+            self.log(f"Delta: could not remove the IPC profile alias ({exc})")
+
+
+def _delta_profile_environment(
+        root: Path, target: Path, env: Dict[str, str],
+        log: Optional[Any] = None) -> "tuple[Dict[str, str], Optional[DeltaProfileAlias]]":
+    """Keep Delta's IPC socket below SUN_LEN without moving portable data.
+
+    Only the child Delta process receives the alias.  BrowserLoginBridge
+    keeps the original environment so its profile prevention and host-browser
+    fallback continue to refer to the real PortableData directories.
+    """
+    if not IS_WINDOWS or not _is_delta_target(target):
+        return env, None
+    logger = log or (lambda _message: None)
+    raw_profile = str(env.get("USERPROFILE") or "")
+    if not raw_profile:
+        return env, None
+    profile = Path(raw_profile)
+    try:
+        if not profile.is_absolute() or _delta_ipc_path_fits(profile):
+            return env, None
+        # Do not turn an explicitly host-owned custom profile into a link.
+        # The normal launcher profile is always below the portable root.
+        profile.relative_to(root)
+    except (OSError, ValueError):
+        return env, None
+
+    # 8.3 names need no lifecycle management and remain valid for a browser
+    # process which outlives this launcher.
+    short = _windows_short_path(profile)
+    if short is not None and _delta_ipc_path_fits(short):
+        logger("Delta: IPC profile: " + str(short))
+        logger("Delta: using the volume's short profile name for IPC")
+        return _delta_with_profile(env, short), None
+
+    # A junction on the host's local TEMP also works when the portable itself
+    # is on FAT/exFAT: no profile files are copied, only the directory entry
+    # is linked.  Include pid/time to avoid sharing cleanup between sessions.
+    digest = hashlib.sha1(
+        f"{profile}|{os.getpid()}|{time.time_ns()}".encode("utf-8")
+    ).hexdigest()[:12]
+    for base in _delta_alias_bases(root):
+        candidates = [base]
+        short_base = _windows_short_path(base)
+        if short_base is not None and str(short_base).casefold() != str(base).casefold():
+            candidates.insert(0, short_base)
+        for parent in candidates:
+            alias = parent / ("pd" + digest)
+            if not _delta_ipc_path_fits(alias):
+                continue
+            try:
+                if alias.exists() or alias.is_symlink() or _is_junction(alias):
+                    continue
+            except OSError:
+                continue
+            if not _junction_directory(alias, profile):
+                continue
+            try:
+                same = (os.path.normcase(os.path.realpath(str(alias)))
+                        == os.path.normcase(os.path.realpath(str(profile))))
+            except OSError:
+                same = False
+            if not same or not _delta_ipc_path_fits(alias):
+                # This is our newly-created candidate; remove only the link.
+                if _is_junction(alias):
+                    _remove_junction(alias)
+                continue
+            logger("Delta: IPC profile: " + str(alias))
+            logger("Delta: using a short temporary profile alias for IPC; "
+                   "the data remains in PortableData")
+            return _delta_with_profile(env, alias), DeltaProfileAlias(alias, logger)
+
+    logger("Delta: WARNING: the IPC profile path is too long and no short "
+           "alias could be created")
+    return env, None
+
+
 def _electron_environment(env: Dict[str, str], target: Path) -> Dict[str, str]:
     """Relax Chromium's sandbox when the target is an Electron host."""
     if not needs_electron_sandbox_off(target):
@@ -6613,6 +6826,14 @@ class BrowserLoginBridge:
 
     @property
     def connect_host_profile(self) -> bool:
+        # Delta's ShellExecute path starts a new Chromium process even after
+        # its profile directories are junctioned.  Treating that process as
+        # already bridged leaves Review Terms/sign-in inside the redirected
+        # environment and the user sees a no-op.  Always use the process/URL
+        # fallback for Delta so the launcher reopens the URL with the host
+        # environment and the current default browser/existing window.
+        if _is_delta_target(self.target):
+            return False
         return self.settings.get("connect_host_profile") is not False
 
     @property
@@ -13517,6 +13738,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     # Kill-on-close job: nothing started from the portable folder may outlive
     # this launcher, otherwise the user cannot delete the folder afterwards.
     job = _JobObject(enabled=should_use_job(target))
+    delta_profile_alias: "Optional[DeltaProfileAlias]" = None
     env = _electron_environment(env, target)
     env = apply_webview2_bridge(env, target)
     # Cursor/VS Code: профиль и данные расширений — внутри портатива, а
@@ -13598,9 +13820,16 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                 atexit.register(browser_login.teardown)
             except Exception as exc:  # noqa: BLE001 - слежка не срывает запуск
                 _run_log(root, f"browser login: preparation failed ({exc})")
+            # Keep BrowserLoginBridge on the original portable paths, but
+            # give Delta itself a short IPC profile when SUN_LEN requires it.
+            child_env, delta_profile_alias = _delta_profile_environment(
+                root, target, env,
+                log=lambda message: _run_log(root, message))
+            if delta_profile_alias is not None:
+                atexit.register(delta_profile_alias.cleanup)
             started_at = time.monotonic()
             try:
-                process = _spawn_target(command, str(target.parent), env, job)
+                process = _spawn_target(command, str(target.parent), child_env, job)
                 try:
                     browser_login.attach(process.pid)
                 except Exception:  # noqa: BLE001
@@ -13718,6 +13947,11 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             pass
         release_portable_folder(root, shutdown)
         job.close()
+        if delta_profile_alias is not None:
+            try:
+                delta_profile_alias.cleanup()
+            except Exception as exc:  # noqa: BLE001 - уже закрываемся
+                _run_log(root, f"Delta: alias cleanup failed ({exc})")
         # Теперь, когда из портатива уже ничего не выполняется и все файлы
         # закрыты, сохранения сводятся обратно: сделанное в этом сеансе
         # должно быть видно и при следующем прямом запуске exe.

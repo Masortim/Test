@@ -121,6 +121,20 @@ class DeltaRuntimeTargetTests(unittest.TestCase):
 
 
 class DeltaTermsBridgeTests(unittest.TestCase):
+    def test_delta_always_uses_host_browser_fallback(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = entry.BrowserLoginBridge(
+                Path(temp),
+                {"browser_login": {"connect_host_profile": True}},
+                Path(temp) / "App" / "delta-app.exe",
+                env={},
+            )
+            # Profile junctioning alone does not stop Delta from spawning a
+            # fresh Chromium process.  The host URL handoff must remain on.
+            self.assertFalse(bridge.connect_host_profile)
+
     def test_review_terms_url_is_forwarded_by_the_external_browser_bridge(self):
         import portable_launcher_entry as entry
 
@@ -147,3 +161,99 @@ class DeltaTermsBridgeTests(unittest.TestCase):
                     '"browser.exe" "' + url + '"')
 
             self.assertEqual(plan, [(20, url, "browser.exe")])
+
+
+class DeltaIpcProfileTests(unittest.TestCase):
+    def test_long_profile_uses_short_alias_without_copying_data(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / ("r" * 80)
+            profile = root / "PortableData" / "User"
+            profile.mkdir(parents=True)
+            marker = profile / "keep.txt"
+            marker.write_text("portable", encoding="utf-8")
+            original = {
+                "USERPROFILE": str(profile),
+                "APPDATA": str(root / "PortableData" / "AppData" / "Roaming"),
+                "HOMEDRIVE": "D:",
+                "HOMEPATH": "\\original\\profile",
+            }
+            alias_base = base
+            if os.name == "nt":
+                # Windows' default TEMP is deeper than the socket budget;
+                # use the same short user-level fallback as the launcher.
+                alias_base = base.parents[3]
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_windows_short_path", return_value=None), \
+                    mock.patch.object(entry, "_delta_alias_bases", return_value=[alias_base]):
+                patched, alias = entry._delta_profile_environment(
+                    root, root / "App" / "delta-app.exe", original)
+
+                self.assertIsNotNone(alias)
+                self.assertIsNot(patched, original)
+                self.assertEqual(original["USERPROFILE"], str(profile))
+                self.assertNotEqual(patched["USERPROFILE"], str(profile))
+                self.assertEqual(Path(patched["USERPROFILE"]).resolve(),
+                                 profile.resolve())
+                self.assertEqual((Path(patched["USERPROFILE"]) / "keep.txt").read_text(),
+                                 "portable")
+                self.assertTrue(entry._delta_ipc_path_fits(
+                    Path(patched["USERPROFILE"])))
+                # BrowserLoginBridge can retain the original APPDATA roots.
+                self.assertEqual(patched["APPDATA"], original["APPDATA"])
+                self.assertEqual(patched["HOMEDRIVE"], "D:")
+                self.assertEqual(patched["HOMEPATH"], "\\original\\profile")
+                alias.cleanup()
+                self.assertFalse(alias.path.exists())
+                self.assertTrue(marker.is_file())
+
+    def test_short_profile_does_not_need_an_alias(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            # Do not let the CI machine's deep TEMP make this "short" case
+            # accidentally exceed Delta's 108-byte socket budget on Windows.
+            root = Path(Path(temp).anchor) / "p"
+            profile = root / "PortableData" / "User"
+            env = {"USERPROFILE": str(profile)}
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_junction_directory") as junction:
+                patched, alias = entry._delta_profile_environment(
+                    root, root / "App" / "delta-app.exe", env)
+            self.assertIs(patched, env)
+            self.assertIsNone(alias)
+            junction.assert_not_called()
+
+    def test_other_targets_keep_their_environment(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / ("r" * 80)
+            profile = root / "PortableData" / "User"
+            env = {"USERPROFILE": str(profile)}
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_junction_directory") as junction:
+                patched, alias = entry._delta_profile_environment(
+                    root, root / "App" / "other.exe", env)
+            self.assertIs(patched, env)
+            self.assertIsNone(alias)
+            junction.assert_not_called()
+
+    def test_volume_short_name_is_used_without_a_temporary_link(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / ("r" * 80)
+            profile = root / "PortableData" / "User"
+            short = Path(Path(temp).anchor) / "p"
+            env = {"USERPROFILE": str(profile)}
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_windows_short_path", return_value=short), \
+                    mock.patch.object(entry, "_junction_directory") as junction:
+                patched, alias = entry._delta_profile_environment(
+                    root, root / "App" / "Delta.exe", env)
+            self.assertEqual(patched["USERPROFILE"], str(short))
+            self.assertIsNone(alias)
+            junction.assert_not_called()
