@@ -115,6 +115,27 @@ jobs:
                 $bitmap.Dispose()
                 $report.Add("Window screenshot captured")
               }
+              if (-not $login) {
+                [void][OpenCodeProbeInput]::SetCursorPos(
+                  [int]$windowBounds.X + 40, [int]$windowBounds.Y + 22)
+                [OpenCodeProbeInput]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [OpenCodeProbeInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+                Start-Sleep -Seconds 3
+                $report.Add("Application menu clicked")
+                if ($windowBounds.Width -gt 0 -and $windowBounds.Height -gt 0) {
+                  $menuBitmap = [System.Drawing.Bitmap]::new(
+                    [int]$windowBounds.Width, [int]$windowBounds.Height)
+                  $menuGraphics = [System.Drawing.Graphics]::FromImage($menuBitmap)
+                  $menuGraphics.CopyFromScreen(
+                    [int]$windowBounds.X, [int]$windowBounds.Y, 0, 0,
+                    [System.Drawing.Size]::new([int]$windowBounds.Width,
+                      [int]$windowBounds.Height))
+                  $menuBitmap.Save((Join-Path $env:GITHUB_WORKSPACE "opencode-menu.png"),
+                    [System.Drawing.Imaging.ImageFormat]::Png)
+                  $menuGraphics.Dispose()
+                  $menuBitmap.Dispose()
+                }
+              }
             }
 
             $after = @(Get-Process -Name $browserNames -ErrorAction SilentlyContinue)
@@ -181,6 +202,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f opencode-browser-probe.txt
           if test -f opencode-window.png; then git add -f opencode-window.png; fi
+          if test -f opencode-menu.png; then git add -f opencode-menu.png; fi
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "ci: update OpenCode browser diagnostic [skip ci]"
           git push origin HEAD:"${GITHUB_REF_NAME}"
