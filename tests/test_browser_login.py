@@ -372,6 +372,19 @@ class HostProfileBridgeTests(unittest.TestCase):
                 # Настоящий профиль не пострадал.
                 self.assertTrue((host_profile / "Bookmarks").is_file())
 
+    def test_partial_profile_bridge_keeps_fallback_monitoring(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bridge, _target = self._bridge(root)
+            pairs = entry._BROWSER_PROFILE_DIRS["yandex.exe"]
+            self.assertGreater(len(pairs), 1)
+            for count in range(len(pairs)):
+                bridge._bridged = set(pairs[:count])
+                self.assertFalse(bridge._bridged_image("yandex.exe"),
+                                 f"partial bridge must not disable fallback: {count}")
+            bridge._bridged = set(pairs)
+            self.assertTrue(bridge._bridged_image("yandex.exe"))
+
     def test_linked_browser_is_not_killed(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -6111,6 +6111,14 @@ _BROWSER_PROFILE_DIRS: Dict[str, tuple] = {
     # для него работает только наблюдение за процессами.
 }
 
+# Отсутствие optional updater-каталога не означает частичный профиль: на
+# многих машинах его просто нет.  А вот оба корня собственно профиля (например,
+# APPDATA и LOCALAPPDATA у Яндекса) обязательны для отключения fallback.
+_BROWSER_OPTIONAL_PROFILE_PAIRS = frozenset({
+    ("LOCALAPPDATA", "Google/Update"),
+    ("LOCALAPPDATA", "Google/GoogleUpdater"),
+})
+
 #: Кто запускает браузер, когда оболочка работает не сама, а через службу
 #: (AppInfo/DCOM): в этом случае цепочка родителей до программы не доходит.
 _SHELL_BROKERS = frozenset({
@@ -6798,7 +6806,13 @@ class BrowserLoginBridge:
         pairs = _BROWSER_PROFILE_DIRS.get(name, ())
         if not pairs and name in self._selected_default_images():
             pairs = tuple(self._selected_default_pairs())
-        return any(pair in self._bridged for pair in pairs)
+        # Частичного соединения недостаточно: например, у Яндекса APPDATA
+        # может быть junction, а LOCALAPPDATA — обычным перенаправленным
+        # каталогом.  В этом случае браузер всё ещё способен создать второй
+        # профиль, поэтому fallback-мониторинг отключать нельзя.
+        required = tuple(pair for pair in pairs
+                         if pair not in _BROWSER_OPTIONAL_PROFILE_PAIRS)
+        return bool(required) and all(pair in self._bridged for pair in required)
 
     def _existing_profiles(self) -> "set[str]":
         found: "set[str]" = set()

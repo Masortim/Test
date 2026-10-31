@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -117,3 +118,32 @@ class DeltaRuntimeTargetTests(unittest.TestCase):
             cfg = {"target_exe_rel": "App/Delta.exe"}
             self.assertEqual(entry._prefer_paired_gui_target(
                 root, cfg, "App/Delta.exe"), "App/Delta.exe")
+
+
+class DeltaTermsBridgeTests(unittest.TestCase):
+    def test_review_terms_url_is_forwarded_by_the_external_browser_bridge(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "App" / "delta-app.exe"
+            target.parent.mkdir()
+            target.write_bytes(b"MZ")
+            bridge = entry.BrowserLoginBridge(
+                root, {"browser_login": {}}, target, env={},
+                log=lambda _message: None)
+            url = "https://dashboard.zed.dev/delta-beta"
+            table = [(10, 0, "delta-app.exe"), (20, 10, "browser.exe")]
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_process_table", return_value=[]), \
+                    mock.patch.object(entry, "_default_browser_images",
+                                      return_value={"browser.exe"}), \
+                    mock.patch.object(entry, "_default_browser_profile_pairs",
+                                      return_value=set()):
+                bridge.attach(10)
+                plan = bridge.plan(
+                    table,
+                    command_line_of=lambda _pid:
+                    '"browser.exe" "' + url + '"')
+
+            self.assertEqual(plan, [(20, url, "browser.exe")])
