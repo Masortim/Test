@@ -121,7 +121,7 @@ class DeltaRuntimeTargetTests(unittest.TestCase):
 
 
 class DeltaTermsBridgeTests(unittest.TestCase):
-    def test_delta_always_uses_host_browser_fallback(self):
+    def test_delta_combines_profile_prevention_with_host_browser_fallback(self):
         import portable_launcher_entry as entry
 
         with tempfile.TemporaryDirectory() as temp:
@@ -131,9 +131,13 @@ class DeltaTermsBridgeTests(unittest.TestCase):
                 Path(temp) / "App" / "delta-app.exe",
                 env={},
             )
-            # Profile junctioning alone does not stop Delta from spawning a
-            # fresh Chromium process.  The host URL handoff must remain on.
-            self.assertFalse(bridge.connect_host_profile)
+            # Keep the real-profile junctions: they prevent a fresh Yandex
+            # profile and its first-run desktop shortcut.  Unlike other apps,
+            # however, a complete junction set must not disable Delta's
+            # process/URL fallback because it can still spawn a new browser.
+            self.assertTrue(bridge.connect_host_profile)
+            bridge._bridged = set(entry._BROWSER_PROFILE_DIRS["browser.exe"])
+            self.assertFalse(bridge._bridged_image("browser.exe"))
 
     def test_review_terms_url_is_forwarded_by_the_external_browser_bridge(self):
         import portable_launcher_entry as entry
@@ -161,6 +165,28 @@ class DeltaTermsBridgeTests(unittest.TestCase):
                     '"browser.exe" "' + url + '"')
 
             self.assertEqual(plan, [(20, url, "browser.exe")])
+
+    def test_every_repeated_review_terms_click_is_forwarded(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bridge = entry.BrowserLoginBridge(
+                root, {"browser_login": {}},
+                root / "App" / "delta-app.exe", env={},
+                log=lambda _message: None)
+            url = "https://dashboard.zed.dev/delta-beta"
+            bridge._bridged = set(entry._BROWSER_PROFILE_DIRS["browser.exe"])
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_default_browser_images",
+                                      return_value={"browser.exe"}):
+                bridge.attach(10)
+                for pid in (20, 21, 22):
+                    plan = bridge.plan(
+                        [(10, 0, "delta-app.exe"), (pid, 10, "browser.exe")],
+                        command_line_of=lambda _pid:
+                        '"browser.exe" "' + url + '"')
+                    self.assertEqual(plan, [(pid, url, "browser.exe")])
 
 
 class DeltaIpcProfileTests(unittest.TestCase):
