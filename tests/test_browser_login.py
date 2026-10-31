@@ -224,6 +224,15 @@ class BridgePlanTests(unittest.TestCase):
             self.assertEqual(self._plan(table, {pid: command}),
                              [(pid, DELTA_TERMS_URL, "browser.exe")])
 
+    def test_retired_pid_does_not_block_a_later_repeated_click(self):
+        command = 'browser.exe --single-argument "' + DELTA_TERMS_URL + '"'
+        table = self.baseline + [(200, 100, "browser.exe")]
+        self.assertEqual(len(self._plan(table, {200: command})), 1)
+        # Observe the process exit before Windows reuses its PID.
+        self.assertEqual(self._plan(self.baseline, {}), [])
+        self.assertEqual(self._plan(table, {200: command}),
+                         [(200, DELTA_TERMS_URL, "browser.exe")])
+
     def test_service_only_process_is_cleaned_without_opening_its_url(self):
         table = self.baseline + [(200, 100, "browser.exe")]
         self.assertEqual(self._plan(table, {200: YANDEX_CRASH}),
