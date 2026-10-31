@@ -88,7 +88,7 @@ jobs:
             $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
             $version = (Get-Item $file).VersionInfo.FileVersion
             $signature = Get-AuthenticodeSignature $file
-            Write-Host "$arch: version=$version hash=$hash embedded-signature=$($signature.Status)"
+            Write-Host "${arch}: version=$version hash=$hash embedded-signature=$($signature.Status)"
             if ($hash -ne $expected[$arch] -or $version -notlike "6.3.9600.18611*") {
               throw "Unexpected D3DCompiler payload in official KB4019990"
             }
