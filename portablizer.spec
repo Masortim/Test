@@ -67,6 +67,11 @@ datas = [
     (os.path.join("portablizer", "resources", "redist", "x64",
                   "d3dcompiler_47.dll"),
      os.path.join("resources", "redist", "x64")),
+    # Delta также имеет ARM64-импортёр: без этого файла x64 добавлялся, а
+    # одноимённая ARM64 DLL оставалась в missing на ПК без Windows SDK.
+    (os.path.join("portablizer", "resources", "redist", "arm64",
+                  "d3dcompiler_47.dll"),
+     os.path.join("resources", "redist", "arm64")),
 ]
 # Тот же лончер, собранный папкой: он запускается без распаковки во %TEMP%
 # (см. portable_launcher_onedir.spec). Папка есть только после сборки лончера;

@@ -81,11 +81,12 @@ jobs:
           expected = {
               "resources/redist/x86/d3dcompiler_47.dll",
               "resources/redist/x64/d3dcompiler_47.dll",
+              "resources/redist/arm64/d3dcompiler_47.dll",
           }
           missing = sorted(expected - names)
           if missing:
               raise RuntimeError(f"Resources missing from Portablizer.exe: {missing}")
-          print("Portablizer.exe contains both offline D3DCompiler 47 DLLs")
+          print("Portablizer.exe contains offline D3DCompiler 47 x86, x64 and ARM64")
           '@ | python -
 
       # Unit-test failures are reported after the Windows smoke checks and
@@ -244,8 +245,8 @@ jobs:
           $crashLog = Join-Path $root "portablizer-crash.log"
           $env:PORTABLIZER_CRASH_LOG = $crashLog
           # Полный комплект остаётся включён, а --download-runtimes намеренно
-          # не передаётся: это точный сценарий жалобы. Обе разрядности
-          # D3DCompiler 47 должны прийти из ресурсов собранного EXE без сети.
+          # не передаётся: это точный сценарий жалобы. Delta требует
+          # D3DCompiler 47 для x64 и ARM64 (не x86), обе DLL должны быть в App.
           $arguments = 'build "' + $installer + '" --out "' + $out + '" ' +
             '--name Delta --single-file --no-registry ' +
             '--no-netstack --hard-timeout 180'
@@ -351,7 +352,7 @@ jobs:
           for path in Path(os.environ["DELTA_APP_DIR"]).rglob("d3dcompiler_47.dll"):
               machine = read_pe_imports(str(path)).machine
               found.setdefault(machine, []).append(str(path))
-          missing = {"x86", "x64"} - set(found)
+          missing = {"x64", "arm64"} - set(found)
           if missing:
               raise RuntimeError(f"Delta portable lacks D3DCompiler 47 architectures: {sorted(missing)}; found={found}")
           print(f"Delta offline full kit contains D3DCompiler 47: {found}")

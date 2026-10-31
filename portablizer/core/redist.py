@@ -1175,7 +1175,7 @@ def embedded_d3d_dirs_for(arch: str) -> List[str]:
     PyInstaller раскладывает их в ``_MEIPASS/resources/redist``. Неизвестная
     архитектура намеренно не получает чужую DLL.
     """
-    if arch not in ("x86", "x64"):
+    if arch not in ("x86", "x64", "arm64"):
         return []
     frozen_root = getattr(sys, "_MEIPASS", None)
     if frozen_root:
@@ -3668,7 +3668,7 @@ class RuntimeProvisioner:
     1. файлы и пакеты, приложенные к установщику (``_CommonRedist`` и т. п.);
     2. системные папки этого ПК (с обязательной проверкой разрядности);
     3. Windows SDK ``Redist/D3D`` — официальные app-local D3DCompiler;
-    4. официальные D3DCompiler 47 x86/x64, встроенные в Portablizer;
+    4. официальные D3DCompiler 47 x86/x64/ARM64, встроенные в Portablizer;
     5. WinSxS — для VC++ 2005/2008, которые живут только там; рядом с
        программой создаётся private-манифест сборки;
     6. официальная загрузка с сайта Microsoft (только если разрешена).

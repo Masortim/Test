@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import batsim
 import portable_launcher_entry as exe_launcher
 from cabbuild import make_cabinet, make_self_extracting_exe
-from pebuild import MACHINE_X64, MACHINE_X86, write_pe, write_runtime_dll
+from pebuild import MACHINE_ARM64, MACHINE_X64, MACHINE_X86, write_pe, write_runtime_dll
 from portablizer.core import redist
 from portablizer.core.launcher import (
     LauncherConfig, ensure_ascii_bat, render_bat, render_config_json,
@@ -361,16 +361,18 @@ class RuntimeProvisionTests(unittest.TestCase):
                             if item.arch == "x86")
             self.assertEqual(sdk_copy.source, "Windows SDK (app-local redist)")
 
-    def test_embedded_d3dcompiler_closes_both_bitnesses_offline(self):
-        """Точный сценарий по умолчанию: без SDK, сети и установки пакетов."""
+    def test_embedded_d3dcompiler_closes_all_architectures_offline(self):
+        """Delta x64+ARM64 и другие приложения: без SDK, сети и установки."""
         with tempfile.TemporaryDirectory() as temp:
             portable, app = self._portable(temp)
-            (app / "x86").mkdir()
-            (app / "x64").mkdir()
+            for arch in ("x86", "x64", "arm64"):
+                (app / arch).mkdir()
             write_pe(app / "x86" / "game32.exe",
                      imports=("d3dcompiler_47.dll",), machine=MACHINE_X86)
             write_pe(app / "x64" / "game64.exe",
                      imports=("d3dcompiler_47.dll",), machine=MACHINE_X64)
+            write_pe(app / "arm64" / "game-arm64.exe",
+                     imports=("d3dcompiler_47.dll",), machine=MACHINE_ARM64)
             scan = redist.scan_app_runtime(str(app))
             downloader = mock.Mock(return_value=False)
 
@@ -387,12 +389,14 @@ class RuntimeProvisionTests(unittest.TestCase):
             self.assertEqual(
                 {(item.dll, item.arch) for item in report.provided},
                 {("d3dcompiler_47.dll", "x86"),
-                 ("d3dcompiler_47.dll", "x64")})
+                 ("d3dcompiler_47.dll", "x64"),
+                 ("d3dcompiler_47.dll", "arm64")})
             official_hashes = {
                 "x86": "e3009e3738fab1f7cd685567c5aa1eb0a408ac51d0cda5da788841174d7625b1",
                 "x64": "fd3cc271308e1c1fd21821e0ecaf29498edd46839a4a2712b2fab7aa96b755e2",
+                "arm64": "db2bd081879bc74478b3e80c194a67f7ea1b6fdf2b99ba9f1ada3f6c18b3e5cd",
             }
-            for arch in ("x86", "x64"):
+            for arch in ("x86", "x64", "arm64"):
                 copied = app / arch / "d3dcompiler_47.dll"
                 self.assertTrue(copied.is_file())
                 self.assertEqual(

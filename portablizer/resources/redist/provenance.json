@@ -16,6 +16,8 @@
   {
     "architecture": "arm64",
     "source": "Windows SDK 10 Redist/D3D/arm64",
+    "file_version": "10.0.26100.9457",
+    "signature": "Valid — Microsoft Windows Kits Publisher",
     "dll_sha256": "db2bd081879bc74478b3e80c194a67f7ea1b6fdf2b99ba9f1ada3f6c18b3e5cd",
     "dll_size": 8140760
   }
