@@ -46,7 +46,7 @@ import os
 import re
 import string
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .. import __version__
 from .redist import REDIST_DIR_NAME, SILENT_SCRIPT_NAME as REDIST_SCRIPT_NAME
@@ -189,6 +189,12 @@ class LauncherConfig:
     # запуска) или переносит программу на свободный порт через её же конфиг.
     # Пустой словарь - значит «взять профиль программы, если он есть».
     service_ports: Dict[str, object] = field(default_factory=dict)
+    # --- вход в аккаунт через браузер по умолчанию ---------------------------
+    # Блок ``browser_login`` из launcher_config.json: лончер не даёт
+    # перенаправленному профилю портатива создать второй профиль браузера.
+    # Пустой словарь означает «включено по умолчанию», поэтому обновлённый
+    # лончер лечит и портативы, собранные прежними версиями.
+    browser_login: Dict[str, object] = field(default_factory=dict)
     # Сетевые компоненты (драйвер TAP-Windows и службы), перенесённые в
     # папку NetStack/ портатива: {"manifest", "setup", "teardown",
     # "driver_services", "service_names", "stop_on_exit"}. Пусто — компонентов
@@ -1024,6 +1030,7 @@ rem the real Documents folder, the launcher writes inside the portable folder.
 rem Both have to end up in the same place, so the real path is captured here,
 rem while the variables below still point at this computer.
 set "PORTABLE_HOST_PROFILE=%USERPROFILE%"
+set "PORTABLE_HOST_APPDATA=%APPDATA%"
 set "PORTABLE_HOST_LOCALAPPDATA=%LOCALAPPDATA%"
 set "PORTABLE_HOST_DOCUMENTS=%USERPROFILE%\Documents"
 rem On modern Windows the Documents folder is often moved into OneDrive. The
@@ -1436,7 +1443,7 @@ rem %1 = pack   : absolute path  -> marker
 rem %1 = unpack : marker         -> absolute path
 set "PORTABLE_REG_MODE=%~1"
 set "PORTABLE_REG_TOKEN=%PORTABLE_REG_MARKER%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $p=[IO.File]::ReadAllBytes($env:PORTABLE_REG_SRC); $e=if($p.Length -ge 2 -and $p[0] -eq 255 -and $p[1] -eq 254){[Text.Encoding]::Unicode}else{[Text.Encoding]::UTF8}; $t=$e.GetString($p).TrimStart([char]0xFEFF); $r=$env:PORTABLE_ROOT.Replace('\','\\'); if($env:PORTABLE_REG_MODE -eq 'pack'){ $t=$t.Replace($r,$env:PORTABLE_REG_TOKEN); $t=$t.Replace($env:PORTABLE_ROOT,$env:PORTABLE_REG_TOKEN) } else { $t=$t.Replace($env:PORTABLE_REG_TOKEN,$r) }; $keep=@(); $skip=$false; $browserPrefixes=@('chromehtml','chromiumhtm','msedgehtm','firefoxurl','firefoxhtml','bravehtml','vivaldihtm','yandexhtml','duckduckgohtml','archtml','operastable','operagxstable','operairstable','operacryptostable'); foreach($line in ($t -split '\r?\n')){ $trim=$line.TrimStart(); if($trim.StartsWith('[')){ $skip=($trim -match '(?i)\\Explorer\\FileExts(?:\\|\])'); if(-not $skip -and $trim -match '(?i)\\Software(?:\\Wow6432Node)?\\Classes\\([A-Za-z0-9]+)'){ $handler=$matches[1].ToLowerInvariant(); $skip=($handler -in @('http','https')) -or (@($browserPrefixes | Where-Object {$handler.StartsWith($_)}).Count -gt 0) } }; if(-not $skip){$keep+=$line} }; $t=[string]::Join([Environment]::NewLine,$keep); if($t.Contains($env:PORTABLE_REG_TOKEN)){ exit 2 }; [IO.File]::WriteAllText($env:PORTABLE_REG_OUT,$t,[Text.Encoding]::Unicode) } catch { exit 1 }" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $p=[IO.File]::ReadAllBytes($env:PORTABLE_REG_SRC); $e=if($p.Length -ge 2 -and $p[0] -eq 255 -and $p[1] -eq 254){[Text.Encoding]::Unicode}else{[Text.Encoding]::UTF8}; $t=$e.GetString($p).TrimStart([char]0xFEFF); $r=$env:PORTABLE_ROOT.Replace('\','\\'); if($env:PORTABLE_REG_MODE -eq 'pack'){ $t=$t.Replace($r,$env:PORTABLE_REG_TOKEN); $t=$t.Replace($env:PORTABLE_ROOT,$env:PORTABLE_REG_TOKEN) } else { $t=$t.Replace($env:PORTABLE_REG_TOKEN,$r) }; $keep=@(); $skip=$false; $browserPrefixes=@('chromehtml','chromiumhtm','msedgehtm','firefoxurl','firefoxhtml','bravehtml','vivaldihtm','yandexhtml','yandexbrowser','duckduckgohtml','archtml','operastable','operagxstable','operairstable','operacryptostable'); foreach($line in ($t -split '\r?\n')){ $trim=$line.TrimStart(); if($trim.StartsWith('[')){ $skip=($trim -match '(?i)\\Explorer\\FileExts(?:\\|\])' -or $trim -match '(?i)\\Software(?:\\Wow6432Node)?\\(?:Clients\\StartMenuInternet|RegisteredApplications|Microsoft\\Windows\\Shell\\Associations\\UrlAssociations|Microsoft\\Windows\\CurrentVersion\\ApplicationAssociations)(?:\\|\])'); if(-not $skip -and $trim -match '(?i)\\Software(?:\\Wow6432Node)?\\Classes\\([A-Za-z0-9]+)'){ $handler=$matches[1].ToLowerInvariant(); $skip=($handler -in @('http','https','ftp','ftps','file','mailto','tel','callto','sms','news','nntp','feed','webcal','irc','ircs','magnet','microsoft-edge','ms-settings','search-ms')) -or (@($browserPrefixes | Where-Object {$handler.StartsWith($_)}).Count -gt 0) } }; if(-not $skip -and $trim -match '(?i)^\[-?(?:HKEY_CLASSES_ROOT|HKCR)\\([A-Za-z0-9]+)'){ $handler=$matches[1].ToLowerInvariant(); $skip=($handler -in @('http','https','ftp','ftps','file','mailto','tel','callto','sms','news','nntp','feed','webcal','irc','ircs','magnet','microsoft-edge','ms-settings','search-ms')) -or (@($browserPrefixes | Where-Object {$handler.StartsWith($_)}).Count -gt 0) }; if(-not $skip){$keep+=$line} }; $t=[string]::Join([Environment]::NewLine,$keep); if($t.Contains($env:PORTABLE_REG_TOKEN)){ exit 2 }; [IO.File]::WriteAllText($env:PORTABLE_REG_OUT,$t,[Text.Encoding]::Unicode) } catch { exit 1 }" >nul 2>&1
 goto :eof
 """
 
@@ -1986,6 +1993,8 @@ def config_from_dict(data: Dict[str, object]) -> LauncherConfig:
                 if isinstance(data.get("update"), dict) else {}),
         service_ports=(dict(data["service_ports"])
                        if isinstance(data.get("service_ports"), dict) else {}),
+        browser_login=(dict(data["browser_login"])
+                       if isinstance(data.get("browser_login"), dict) else {}),
         netstack=(dict(data["netstack"])
                   if isinstance(data.get("netstack"), dict) else {}),
         targets=targets,
@@ -2319,6 +2328,85 @@ def service_port_settings(cfg: "LauncherConfig") -> Dict[str, object]:
     return profile
 
 
+# --- Вход в аккаунт через внешний браузер -------------------------------------
+
+#: Параметры BrowserLoginBridge. Они записываются в каждый новый конфиг, а
+#: отсутствие блока в старом конфиге тоже означает включённую защиту.
+BROWSER_LOGIN_DEFAULTS: Dict[str, object] = {
+    "enabled": True,
+    "connect_host_profile": True,
+    "clean_duplicates": True,
+    "poll_seconds": 0.3,
+}
+
+#: Каталоги профилей и обновляторов браузеров: (переменная, путь от неё).
+#: Список дублируется в автономном portable_launcher_entry.py; тесты
+#: проверяют, что обе копии не разошлись. Это не выбор браузера: актуальный
+#: default определяется отдельно через UserChoice и команду его ProgID.
+BROWSER_PROFILE_DIRS: Tuple[Tuple[str, str], ...] = (
+    ("LOCALAPPDATA", "Google/Chrome"),
+    ("LOCALAPPDATA", "Microsoft/Edge"),
+    ("LOCALAPPDATA", "BraveSoftware"),
+    ("LOCALAPPDATA", "Vivaldi"),
+    ("LOCALAPPDATA", "Chromium"),
+    ("LOCALAPPDATA", "Thorium"),
+    ("APPDATA", "Opera Software"),
+    ("LOCALAPPDATA", "Opera Software"),
+    ("APPDATA", "Yandex"),
+    ("LOCALAPPDATA", "Yandex"),
+    ("APPDATA", "Mozilla"),
+    ("LOCALAPPDATA", "Mozilla"),
+    ("APPDATA", "zen"),
+    ("LOCALAPPDATA", "zen"),
+    ("LOCALAPPDATA", "Google/Update"),
+    ("LOCALAPPDATA", "Google/GoogleUpdater"),
+)
+
+_PROGRAM_SUFFIXES: Tuple[str, ...] = (".exe", ".dll")
+
+
+def browser_profile_pairs() -> Tuple[Tuple[str, str], ...]:
+    """Каталоги браузеров в порядке «профиль, затем обновлятор»."""
+    return BROWSER_PROFILE_DIRS
+
+
+def browser_dir_holds_program(path, max_depth: int = 3) -> bool:
+    """True, если каталог содержит exe/dll, а не только профиль браузера.
+
+    У per-user установок браузера профиль и программа могут делить один
+    каталог. Удалять такой каталог как «дубликат» нельзя: вместе с ним
+    исчезнет сам браузер или его обновлятор, и Windows начнёт запускать
+    установщик заново.
+    """
+    if not path:
+        return False
+    root = str(path).replace("\\", os.sep)
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    try:
+        for current, dirs, files in os.walk(root, followlinks=False):
+            depth = current.rstrip(os.sep).count(os.sep) - base_depth
+            if depth >= max_depth:
+                dirs[:] = []
+            for name in files:
+                if name.casefold().endswith(_PROGRAM_SUFFIXES):
+                    dirs[:] = []
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def browser_login_settings(cfg: "LauncherConfig") -> Dict[str, object]:
+    """Вернуть effective-настройки защиты входа для launcher_config.json."""
+    settings = dict(BROWSER_LOGIN_DEFAULTS)
+    explicit = cfg.browser_login or {}
+    if isinstance(explicit, dict):
+        settings.update(explicit)
+    if settings.get("enabled") is not False:
+        settings["enabled"] = True
+    return settings
+
+
 # --- Вспомогательные лаунчеры и меню ------------------------------------------
 
 def render_companion_bat(cfg: LauncherConfig, target: TargetInfo) -> str:
@@ -2473,7 +2561,7 @@ def _read_reg_text(path):
 _BROWSER_PROGID_PREFIXES = (
     "chromehtml", "chromiumhtm", "msedgehtm", "firefoxurl",
     "firefoxhtml", "bravehtml", "vivaldihtm", "yandexhtml",
-    "duckduckgohtml", "archtml", "operastable", "operagxstable",
+    "yandexbrowser", "duckduckgohtml", "archtml", "operastable", "operagxstable",
     "operairstable", "operacryptostable",
 )
 
@@ -2483,19 +2571,44 @@ def filter_external_browser_registry(text):
     kept = []
     skip = False
     dropped = False
+    roots = (
+        r"software\clients\startmenuinternet",
+        r"software\registeredapplications",
+        r"software\microsoft\windows\shell\associations\urlassociations",
+        r"software\microsoft\windows\currentversion\applicationassociations",
+    )
+    schemes = {
+        "http", "https", "ftp", "ftps", "file", "mailto", "tel",
+        "callto", "sms", "news", "nntp", "feed", "webcal", "irc",
+        "ircs", "magnet", "microsoft-edge", "ms-settings", "search-ms",
+    }
     for line in (text or "").splitlines():
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
+            header = stripped.strip("[]").lstrip("-")
+            parts = [part for part in header.split("\\") if part]
+            if parts and parts[0].upper() in (
+                    "HKCU", "HKEY_CURRENT_USER", "HKLM",
+                    "HKEY_LOCAL_MACHINE"):
+                parts = parts[1:]
+            elif parts and parts[0].upper() in ("HKU", "HKEY_USERS"):
+                parts = parts[2:]
+            elif parts and parts[0].upper() in ("HKCR", "HKEY_CLASSES_ROOT"):
+                parts = ["Software", "Classes"] + parts[1:]
+            path = "\\".join(parts).casefold()
+            if path.startswith("software\\wow6432node\\"):
+                path = "software\\" + path[len("software\\wow6432node\\"):]
+            skip = any(path == root or path.startswith(root + "\\")
+                       for root in roots)
             match = re.search(
-                r"(?i)\\Software(?:\\Wow6432Node)?\\Classes\\([A-Za-z0-9]+)",
-                stripped,
+                r"(?i)^software\\classes\\([a-z0-9][a-z0-9+.-]*)(?:\\|$)",
+                path,
             )
-            skip = False
             if match:
                 handler = match.group(1).lower()
-                skip = handler in ("http", "https") or handler.startswith(
+                skip = skip or handler in schemes or handler.startswith(
                     _BROWSER_PROGID_PREFIXES)
-                dropped = dropped or skip
+            dropped = dropped or skip
         if not skip:
             kept.append(line)
     if not dropped:
@@ -2984,4 +3097,7 @@ def render_config_json(cfg: LauncherConfig) -> str:
     ports = service_port_settings(cfg)
     if ports:
         payload["service_ports"] = ports
+    # Защита включена и для старых конфигов без этого блока; явные значения
+    # позволяют отключить её для конкретного портатива.
+    payload["browser_login"] = browser_login_settings(cfg)
     return json.dumps(payload, ensure_ascii=False, indent=2)

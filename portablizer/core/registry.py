@@ -122,6 +122,13 @@ _VOLATILE_PREFIXES: Tuple[str, ...] = (
     r"software\classes\activatableclasses",
     r"software\google\update",
     r"software\microsoft\edgeupdate",
+    # Регистрация внешнего браузера и выбор HTTP(S)-обработчика принадлежат
+    # текущему ПК. Их нельзя захватывать, восстанавливать или удалять как
+    # настройки портативного приложения.
+    r"software\clients\startmenuinternet",
+    r"software\registeredapplications",
+    r"software\microsoft\windows\shell\associations\urlassociations",
+    r"software\microsoft\windows\currentversion\applicationassociations",
 )
 
 # Ключи, которые нельзя ни переносить в портатив, ни откатывать по снимку.
@@ -141,6 +148,12 @@ _PROTECTED_PREFIXES: Tuple[str, ...] = (
     r"software\microsoft\edge",
     r"software\microsoft\edgewebview",
     r"software\microsoft\edgeupdate",
+    # Эти ветки принадлежат внешнему браузеру и выбору программы по
+    # умолчанию на текущем ПК, а не портативному приложению.
+    r"software\clients\startmenuinternet",
+    r"software\registeredapplications",
+    r"software\microsoft\windows\shell\associations\urlassociations",
+    r"software\microsoft\windows\currentversion\applicationassociations",
 )
 
 # Отдельные записи «Программы и компоненты» могут иметь случайный GUID вместо
@@ -313,6 +326,11 @@ def is_association_key(key_path: str) -> bool:
     if any(_matches(path, _ASSOCIATION_EXCLUDED_PREFIXES)
            for path in variants):
         return False
+    # Browser associations are excluded from the portable payload, but they
+    # MUST remain in this host-only snapshot: an installer that changed the
+    # default browser has to be rolled back too.
+    if is_external_browser_key(key_path):
+        return True
     if is_volatile(key_path) and not is_file_exts_key(key_path):
         return False
     if is_protected(key_path):
@@ -386,12 +404,26 @@ def _protocol_tail(key_path: str) -> Optional[str]:
 #: Это обработчики внешнего браузера, а не deep links портабилизируемого
 #: приложения. Их перенос подменял бы браузер, назначенный пользователем на
 #: текущем ПК, и мог запускать вторую/перенесённую копию при входе в аккаунт.
-_EXTERNAL_WEB_SCHEMES = frozenset({"http", "https"})
+_EXTERNAL_WEB_SCHEMES = frozenset({
+    "http", "https", "ftp", "ftps", "file", "mailto", "tel", "callto",
+    "sms", "news", "nntp", "feed", "webcal", "irc", "ircs", "magnet",
+    "microsoft-edge", "ms-settings", "search-ms",
+})
 _EXTERNAL_BROWSER_PROGID_PREFIXES = (
     "chromehtml", "chromiumhtm", "msedgehtm", "firefoxurl",
     "firefoxhtml", "bravehtml", "vivaldihtm", "yandexhtml",
-    "duckduckgohtml", "archtml", "operastable", "operagxstable",
+    "yandexbrowser", "duckduckgohtml", "archtml", "operastable", "operagxstable",
     "operairstable", "operacryptostable",
+)
+
+
+#: Shell-ветки внешнего браузера. Они не являются состоянием портатива
+#: даже если лежат в HKLM/HKCU вне ``Software\\Classes``.
+_EXTERNAL_BROWSER_REGISTRY_PREFIXES: Tuple[str, ...] = (
+    r"software\clients\startmenuinternet",
+    r"software\registeredapplications",
+    r"software\microsoft\windows\shell\associations\urlassociations",
+    r"software\microsoft\windows\currentversion\applicationassociations",
 )
 
 
@@ -406,6 +438,10 @@ def is_external_browser_key(key_path: str) -> bool:
     head, separator, tail = str(key_path).strip().partition("\\")
     if separator and head.upper() in ("HKCR", "HKEY_CLASSES_ROOT"):
         paths.append("software\\classes\\" + tail.casefold())
+    for path in paths:
+        if any(path == prefix or path.startswith(prefix + "\\")
+               for prefix in _EXTERNAL_BROWSER_REGISTRY_PREFIXES):
+            return True
     marker = "software\\classes\\"
     for path in paths:
         if not path.startswith(marker):
@@ -620,7 +656,7 @@ def retarget_protocol_paths(snapshot: Mapping[str, Mapping[str, object]],
 
 def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
           max_depth: int = 7, depth: int = 0,
-          skip_volatile: bool = True) -> None:
+          skip_volatile: bool = True, skip_protected: bool = True) -> None:
     """Рекурсивно обходит ветку и заполняет out[path] = {value: (type, repr)}."""
     if depth > max_depth:
         return
@@ -628,7 +664,8 @@ def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
     volatile = bool(depth and skip_volatile and is_volatile(full))
     explorer = r"software\microsoft\windows\currentversion\explorer"
     file_exts_gateway = volatile and _strip_hive(full) == explorer
-    if depth and ((volatile and not file_exts_gateway) or is_protected(full)):
+    if depth and ((volatile and not file_exts_gateway)
+                  or (skip_protected and is_protected(full))):
         # Не снимаем системное состояние, лицензии, Shell/Taskbar и компоненты
         # Microsoft: устаревший снимок не должен иметь возможность их стереть.
         # Для отдельного снимка ассоциаций volatile-фильтр отключается: там
@@ -661,7 +698,7 @@ def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
                 break
     finally:
         winreg.CloseKey(key)  # type: ignore
-    if is_protected(full, values):
+    if skip_protected and is_protected(full, values):
         # Некоторые Microsoft-компоненты используют GUID-подключи в Uninstall;
         # проверяем DisplayName после чтения ключа и не обходим его потомков.
         return
@@ -671,7 +708,7 @@ def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
         if file_exts_gateway and sk.casefold() != "fileexts":
             continue
         _walk(hive, f"{subkey}\\{sk}" if subkey else sk, prefix, out,
-              max_depth, depth + 1, skip_volatile)
+              max_depth, depth + 1, skip_volatile, skip_protected)
 
 
 def snapshot(include_user: bool = True) -> Snapshot:
@@ -717,6 +754,10 @@ _ASSOCIATION_ROOTS: Tuple[Tuple[str, str], ...] = (
     ("HKLM", r"Software\RegisteredApplications"),
     ("HKCU", r"Software\Clients"),
     ("HKLM", r"Software\Clients"),
+    ("HKCU", r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations"),
+    ("HKLM", r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations"),
+    ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\ApplicationAssociations"),
+    ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\ApplicationAssociations"),
     ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Shell Extensions"),
     ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\Shell Extensions"),
 )
@@ -740,7 +781,7 @@ def snapshot_associations(include_user: bool = True) -> Snapshot:
         if prefix == "HKCU" and not include_user:
             continue
         _walk(hives[prefix], base, prefix, snap, max_depth=12,
-              skip_volatile=False)
+              skip_volatile=False, skip_protected=False)
     return association_snapshot(snap)
 
 
@@ -2673,9 +2714,15 @@ def apply_language_to_portable_folder(
         before_empty, combined, app_dir, lang_code,
     )
     updated_inis = apply_language_to_ini_files(app_dir, lang_code)
+    # Старые REG-файлы могли уже содержать браузерную регистрацию. Языковая
+    # пересборка не должна вернуть её в portable.reg или в список ключей.
+    combined = {
+        key: values for key, values in combined.items()
+        if not is_external_browser_key(key)
+    }
 
-    if not combined:
-        return applied_regs, [], updated_inis
+    # Даже пустой после фильтра combined проходит через очистку session_files
+    # ниже: browser-only session.reg тоже должен исчезнуть.
 
     # Перестраиваем виртуализацию HKLM -> HKCU / VirtualStore с обновлёнными
     # языковыми значениями
@@ -2684,6 +2731,12 @@ def apply_language_to_portable_folder(
         combined, virtual_keys = virtualize_machine_snapshot(combined, machine_keys)
     else:
         virtual_keys = []
+    combined = {
+        key: values for key, values in combined.items()
+        if not is_external_browser_key(key)
+    }
+    virtual_keys = [key for key in virtual_keys
+                    if not is_external_browser_key(key)]
 
     # Дополнительно переписываем любые существующие ключи HKCU / VirtualStore
     _rewrite_snapshot_language_values(combined, list(combined.keys()), lang_code)
@@ -2709,8 +2762,15 @@ def apply_language_to_portable_folder(
     # Обновляем сохранённые файлы сессии PortableData\Registry\k*.reg, чтобы
     # они не перетёрли обновлённый portable.reg при следующем запуске
     for s_path in session_files:
-        s_snap = parse_reg_file(s_path)
+        s_snap = {
+            key: values for key, values in parse_reg_file(s_path).items()
+            if not is_external_browser_key(key)
+        }
         if not s_snap:
+            try:
+                os.remove(s_path)
+            except OSError:
+                pass
             continue
         for k in list(s_snap.keys()):
             match_k = _find_matching_key(combined, k)
