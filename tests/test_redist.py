@@ -361,6 +361,27 @@ class RuntimeProvisionTests(unittest.TestCase):
                             if item.arch == "x86")
             self.assertEqual(sdk_copy.source, "Windows SDK (app-local redist)")
 
+    def test_sdk_root_override_isolates_embedded_resource_from_host_sdk(self):
+        """CI может скрыть только SDK, не меняя ProgramFiles установщика."""
+        with tempfile.TemporaryDirectory() as temp:
+            host_root = Path(temp, "Host Program Files")
+            host_sdk = host_root / "Windows Kits/10/Redist/D3D/arm64"
+            host_sdk.mkdir(parents=True)
+            custom_root = Path(temp, "Custom SDK Root")
+            custom_sdk = custom_root / "Windows Kits/10/Redist/D3D/arm64"
+            custom_sdk.mkdir(parents=True)
+            environment = {
+                "ProgramFiles(x86)": str(host_root),
+                "ProgramW6432": str(host_root),
+                "ProgramFiles": str(host_root),
+                "PORTABLIZER_WINDOWS_SDK_ROOT": str(Path(temp, "No SDK")),
+            }
+            with mock.patch.dict(os.environ, environment):
+                self.assertEqual(redist.windows_sdk_d3d_dirs_for("arm64"), [])
+                os.environ["PORTABLIZER_WINDOWS_SDK_ROOT"] = str(custom_root)
+                self.assertEqual(redist.windows_sdk_d3d_dirs_for("arm64"),
+                                 [str(custom_sdk)])
+
     def test_embedded_d3dcompiler_closes_all_architectures_offline(self):
         """Delta x64+ARM64 и другие приложения: без SDK, сети и установки."""
         with tempfile.TemporaryDirectory() as temp:

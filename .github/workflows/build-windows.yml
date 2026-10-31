@@ -247,11 +247,24 @@ jobs:
           # Полный комплект остаётся включён, а --download-runtimes намеренно
           # не передаётся: это точный сценарий жалобы. Delta требует
           # D3DCompiler 47 для x64 и ARM64 (не x86), обе DLL должны быть в App.
+          # На windows-latest SDK уже установлен. Скрываем только его корни для
+          # процесса builder, иначе ARM64 снова придёт из SDK и smoke не
+          # докажет автономный ресурс. ProgramFiles и реестр не изменяются.
           $arguments = 'build "' + $installer + '" --out "' + $out + '" ' +
             '--name Delta --single-file --no-registry ' +
             '--no-netstack --hard-timeout 180'
-          $process = Start-Process -FilePath (Resolve-Path "dist/Portablizer.exe").Path `
-            -ArgumentList $arguments -PassThru
+          $sdkVariable = "PORTABLIZER_WINDOWS_SDK_ROOT"
+          $oldSdkRoot = [Environment]::GetEnvironmentVariable($sdkVariable)
+          [Environment]::SetEnvironmentVariable(
+            $sdkVariable, (Join-Path $root "No Windows SDK"))
+          try {
+            $process = Start-Process `
+              -FilePath (Resolve-Path "dist/Portablizer.exe").Path `
+              -ArgumentList $arguments -PassThru
+          }
+          finally {
+            [Environment]::SetEnvironmentVariable($sdkVariable, $oldSdkRoot)
+          }
           if (-not $process.WaitForExit(600000)) {
             $process.Kill()
             throw "Delta portable build did not exit within 600 s"
@@ -343,6 +356,7 @@ jobs:
             throw "D3DCompiler 47 is still reported as missing in the offline full-kit build"
           }
           $env:DELTA_APP_DIR = Join-Path $portable "App"
+          $env:DELTA_REPORT = Join-Path $portable "redistributables.txt"
           @'
           import os
           from pathlib import Path
@@ -355,7 +369,30 @@ jobs:
           missing = {"x64", "arm64"} - set(found)
           if missing:
               raise RuntimeError(f"Delta portable lacks D3DCompiler 47 architectures: {sorted(missing)}; found={found}")
-          print(f"Delta offline full kit contains D3DCompiler 47: {found}")
+
+          report = Path(os.environ["DELTA_REPORT"]).read_text(encoding="utf-8-sig")
+          headings = (
+              "Принесено в портатив (на целевом ПК ставить ничего не нужно)",
+              "Принесено про запас — полный комплект всех redistributables",
+              "Входит в состав программы (принёс сам установщик)",
+              "ТРЕБУЕТСЯ НА ЦЕЛЕВОМ ПК — файлы найти не удалось",
+              "Полный комплект: найти не удалось (программе, скорее всего, не нужно)",
+              "Не опознано (проверьте вручную, если программа не запускается)",
+          )
+          positions = sorted((report.index(title), title) for title in headings
+                             if title in report)
+          sections = {}
+          for index, (position, title) in enumerate(positions):
+              end = positions[index + 1][0] if index + 1 < len(positions) else len(report)
+              sections[title] = report[position:end]
+          for title in headings[3:5]:
+              if "d3dcompiler_47.dll" in sections.get(title, ""):
+                  raise RuntimeError(f"Delta still reports D3DCompiler 47 in: {title}")
+          embedded_arm64 = ("• d3dcompiler_47.dll [arm64] — "
+                            "встроенный официальный redist Microsoft")
+          if embedded_arm64 not in sections.get(headings[0], ""):
+              raise RuntimeError("Delta ARM64 DLL did not come from the embedded resource")
+          print(f"Delta offline full kit contains embedded ARM64 and x64 D3DCompiler 47: {found}")
           '@ | python -
           $cacheDirs = @(Get-ChildItem $portable -Recurse -Directory `
             -Filter "Package Cache" -ErrorAction SilentlyContinue)

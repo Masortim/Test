@@ -1144,15 +1144,26 @@ def windows_sdk_d3d_dirs_for(arch: str) -> List[str]:
     В отличие от System32/SysWOW64 здесь Microsoft специально кладёт обе
     разрядности для распространения рядом с desktop-приложением. Это важно,
     когда x64-файл в системе есть, а x86-импортёру взять нечего. На машине
-    без SDK функция просто возвращает пустой список.
+    без SDK функция просто возвращает пустой список. Переменная
+    ``PORTABLIZER_WINDOWS_SDK_ROOT`` заменяет корни ProgramFiles только для
+    этого поиска; несуществующий каталог воспроизводит ПК без SDK.
     """
     if arch not in ("x86", "x64", "arm64"):
         return []
     roots: List[str] = []
-    for variable in ("ProgramFiles(x86)", "ProgramW6432", "ProgramFiles"):
-        base = os.environ.get(variable)
-        if base and base not in roots:
-            roots.append(base)
+    # Явный корень нужен и для переносной/необычной установки SDK, и для
+    # воспроизводимой проверки автономного ресурса на runner, где SDK уже
+    # установлен. Пусть к каталогу обращается только resolver SDK: остальные
+    # ProgramFiles, системные папки и окружение установщика не изменяются.
+    override = os.environ.get("PORTABLIZER_WINDOWS_SDK_ROOT")
+    if override is not None:
+        if override:
+            roots.append(override)
+    else:
+        for variable in ("ProgramFiles(x86)", "ProgramW6432", "ProgramFiles"):
+            base = os.environ.get(variable)
+            if base and base not in roots:
+                roots.append(base)
     result: List[str] = []
     seen = set()
     for base in roots:
