@@ -212,35 +212,9 @@ jobs:
                   Start-Sleep -Milliseconds 100
                 }
                 $env:EDGE_USER_DATA = Join-Path $env:LOCALAPPDATA "Microsoft/Edge/User Data"
-                $historyLines = @(@'
-import os
-import pathlib
-import shutil
-import sqlite3
-import tempfile
-
-root = pathlib.Path(os.environ["EDGE_USER_DATA"])
-found = False
-for history in root.glob("*/History"):
-    try:
-        fd, copy = tempfile.mkstemp(suffix=".sqlite")
-        os.close(fd)
-        shutil.copy2(history, copy)
-        connection = sqlite3.connect(copy)
-        rows = connection.execute(
-            "select url, title from urls where url like ? order by last_visit_time desc limit 5",
-            ("%opencode.ai/zen%",),
-        ).fetchall()
-        connection.close()
-        os.unlink(copy)
-        for url, title in rows:
-            found = True
-            print(f"HISTORY {history.parent.name}: {url} :: {title}")
-    except Exception as exc:
-        print(f"HISTORY ERROR {history}: {exc}")
-if not found:
-    print("NO OPENCODE HISTORY")
-'@ | python -)
+                $pythonCode = [Text.Encoding]::UTF8.GetString(
+                  [Convert]::FromBase64String("aW1wb3J0IG9zCmltcG9ydCBwYXRobGliCmltcG9ydCBzaHV0aWwKaW1wb3J0IHNxbGl0ZTMKaW1wb3J0IHRlbXBmaWxlCgpyb290ID0gcGF0aGxpYi5QYXRoKG9zLmVudmlyb25bIkVER0VfVVNFUl9EQVRBIl0pCmZvdW5kID0gRmFsc2UKZm9yIGhpc3RvcnkgaW4gcm9vdC5nbG9iKCIqL0hpc3RvcnkiKToKICAgIHRyeToKICAgICAgICBmZCwgY29weSA9IHRlbXBmaWxlLm1rc3RlbXAoc3VmZml4PSIuc3FsaXRlIikKICAgICAgICBvcy5jbG9zZShmZCkKICAgICAgICBzaHV0aWwuY29weTIoaGlzdG9yeSwgY29weSkKICAgICAgICBjb25uZWN0aW9uID0gc3FsaXRlMy5jb25uZWN0KGNvcHkpCiAgICAgICAgcm93cyA9IGNvbm5lY3Rpb24uZXhlY3V0ZSgKICAgICAgICAgICAgInNlbGVjdCB1cmwsIHRpdGxlIGZyb20gdXJscyB3aGVyZSB1cmwgbGlrZSA/IG9yZGVyIGJ5IGxhc3RfdmlzaXRfdGltZSBkZXNjIGxpbWl0IDUiLAogICAgICAgICAgICAoIiVvcGVuY29kZS5haS96ZW4lIiwpLAogICAgICAgICkuZmV0Y2hhbGwoKQogICAgICAgIGNvbm5lY3Rpb24uY2xvc2UoKQogICAgICAgIG9zLnVubGluayhjb3B5KQogICAgICAgIGZvciB1cmwsIHRpdGxlIGluIHJvd3M6CiAgICAgICAgICAgIGZvdW5kID0gVHJ1ZQogICAgICAgICAgICBwcmludChmIkhJU1RPUlkge2hpc3RvcnkucGFyZW50Lm5hbWV9OiB7dXJsfSA6OiB7dGl0bGV9IikKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZXhjOgogICAgICAgIHByaW50KGYiSElTVE9SWSBFUlJPUiB7aGlzdG9yeX06IHtleGN9IikKaWYgbm90IGZvdW5kOgogICAgcHJpbnQoIk5PIE9QRU5DT0RFIEhJU1RPUlkiKQo="))
+                $historyLines = @($pythonCode | python -)
                 foreach ($line in $historyLines) { $report.Add([string]$line) }
               }
             }
