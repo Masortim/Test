@@ -79,15 +79,58 @@ jobs:
             $authConfig | ConvertTo-Json -Depth 20 |
               Set-Content -Encoding utf8 $configPath
             $env:PORTABLE_LAUNCHER_NO_UI = "1"
+            $runLog = Join-Path $portable "PortableData/launcher-run.log"
+            $guiOutput = Join-Path $root "gui.out"
+            $guiError = Join-Path $root "gui.err"
+            # Start the desktop application first.  delta auth login is an
+            # IPC client of this running application, not a standalone UI.
+            $gui = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
+              -WorkingDirectory $portable -PassThru `
+              -RedirectStandardOutput $guiOutput -RedirectStandardError $guiError
+            Start-Sleep -Seconds 12
+            $report.Add("GUI BAT exited: $($gui.HasExited)")
+            if (Test-Path $runLog) {
+              $guiText = Get-Content $runLog -Raw
+              $report.Add("GUI started through launcher: $($guiText -match 'start:.*delta-app\.exe')")
+            }
+
+            # Ask the running app for a browser sign-in handoff.  Use the
+            # same portable profile for this small CLI client, but do not
+            # start a second desktop application.
             $authOutput = Join-Path $root "auth.out"
             $authError = Join-Path $root "auth.err"
-            $auth = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
-              -ArgumentList @("--target", $cliTarget, "auth", "login") `
-              -WorkingDirectory $portable -PassThru `
-              -RedirectStandardOutput $authOutput -RedirectStandardError $authError
-            $runLog = Join-Path $portable "PortableData/launcher-run.log"
+            $data = Join-Path $portable "PortableData"
+            $childEnv = @{
+              APPDATA = Join-Path $data "AppData/Roaming"
+              LOCALAPPDATA = Join-Path $data "AppData/Local"
+              USERPROFILE = Join-Path $data "User"
+              TEMP = Join-Path $data "Temp"
+              TMP = Join-Path $data "Temp"
+            }
+            $oldEnv = @{}
+            foreach ($entry in $childEnv.GetEnumerator()) {
+              $oldEnv[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key)
+              [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value)
+            }
+            try {
+              $auth = Start-Process -FilePath $deltaCli.FullName `
+                -ArgumentList @("auth", "login", "--no-wait") -PassThru `
+                -RedirectStandardOutput $authOutput -RedirectStandardError $authError
+            }
+            finally {
+              foreach ($key in $oldEnv.Keys) {
+                [Environment]::SetEnvironmentVariable($key, $oldEnv[$key])
+              }
+            }
+            if (-not $auth.WaitForExit(30000)) {
+              $auth.Kill()
+              $report.Add("Auth handoff timed out")
+            }
+            else {
+              $report.Add("Auth handoff exit: $($auth.ExitCode)")
+            }
             $found = $false
-            for ($attempt = 0; $attempt -lt 45; $attempt++) {
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
               if (Test-Path $runLog) {
                 $runText = Get-Content $runLog -Raw
                 if ($runText -match 'dashboard\.zed\.dev/delta-beta') {
@@ -98,8 +141,6 @@ jobs:
               Start-Sleep -Seconds 1
             }
             $report.Add("Terms URL observed in launcher log: $found")
-            $report.Add("BAT process exited: $($auth.HasExited)")
-            if ($auth.HasExited) { $report.Add("BAT exit: $($auth.ExitCode)") }
             if (-not $found) { $report.Add("PROBE RESULT: URL WAS NOT FORWARDED") }
             else { $report.Add("PROBE RESULT: URL FORWARDED") }
           }
@@ -119,6 +160,8 @@ jobs:
               catch { }
             }
             foreach ($item in @(
+                @{Name = "gui.out"; Path = (Join-Path $root "gui.out")},
+                @{Name = "gui.err"; Path = (Join-Path $root "gui.err")},
                 @{Name = "auth.out"; Path = (Join-Path $root "auth.out")},
                 @{Name = "auth.err"; Path = (Join-Path $root "auth.err")},
                 @{Name = "launcher-run.log"; Path = (Join-Path $portable "PortableData/launcher-run.log")},
