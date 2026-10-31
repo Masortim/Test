@@ -1,17 +1,19 @@
 Installer downloaded
 Builder exit: 0
-WINDOW pid=7040 name=Delta
+WINDOW pid=7232 name=Delta
+WINDOW bounds=-8,-4,1040,728
+Window screenshot saved
 UIA type=ControlType.Window name=Delta id=
 Review Terms element was not found
 Terms URL observed: False
 --- launcher-run.log ---
-[2026-10-31 11:04:48] paths: replaced the portable marker in 2 file(s): Launch.bat, portability-report.txt
-[2026-10-31 11:04:48] paths: the portable marker is gone from 2 file(s)
-[2026-10-31 11:04:48] stale session: cleaned up after the previous session: очищена временная папка портатива (2)
-[2026-10-31 11:04:48] pre-launch (from LaunchPortable.exe start): 0.25s before the program starts (slowest: stale session 0.06s)
-[2026-10-31 11:04:49] start: "D:\a\_temp\Delta Terms Probe With A Long Path\out\Delta_Portable\App\delta-app.exe" (cwd=D:\a\_temp\Delta Terms Probe With A Long Path\out\Delta_Portable\App, elevated=True, job=yes)
-[2026-10-31 11:04:49] browser login: the file system cannot link the browser profile; watching the processes started by the program instead
-[2026-10-31 11:04:49] Delta: IPC profile: D:\a\pdf81e5d04374e
-[2026-10-31 11:04:49] Delta: using a short temporary profile alias for IPC; the data remains in PortableData
-[2026-10-31 11:04:49] installed programs: installed programs: не удалось удалить запись «Delta» ([WinError 5] Access is denied)
-[2026-10-31 11:04:49] installed programs: installed programs: удалена запись «Delta» из списка установленных приложений (HKLM)
+[2026-10-31 11:08:34] paths: replaced the portable marker in 2 file(s): Launch.bat, portability-report.txt
+[2026-10-31 11:08:34] paths: the portable marker is gone from 2 file(s)
+[2026-10-31 11:08:35] stale session: cleaned up after the previous session: очищена временная папка портатива (2)
+[2026-10-31 11:08:35] installed programs: installed programs: не удалось удалить запись «Delta» ([WinError 5] Access is denied)
+[2026-10-31 11:08:35] installed programs: installed programs: удалена запись «Delta» из списка установленных приложений (HKLM)
+[2026-10-31 11:08:35] pre-launch (from LaunchPortable.exe start): 0.31s before the program starts (slowest: saves 0.13s, stale session 0.07s)
+[2026-10-31 11:08:35] start: "D:\a\_temp\Delta Terms Probe With A Long Path\out\Delta_Portable\App\delta-app.exe" (cwd=D:\a\_temp\Delta Terms Probe With A Long Path\out\Delta_Portable\App, elevated=True, job=yes)
+[2026-10-31 11:08:35] browser login: the file system cannot link the browser profile; watching the processes started by the program instead
+[2026-10-31 11:08:35] Delta: IPC profile: D:\a\pda66f2f6447a4
+[2026-10-31 11:08:35] Delta: using a short temporary profile alias for IPC; the data remains in PortableData
