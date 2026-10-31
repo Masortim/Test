@@ -1,33 +1,33 @@
 Delta smoke failed; see the captured launcher state below.
 --- launcher-run.log ---
-[2026-10-31 10:22:21] paths: replaced the portable marker in 2 file(s): Launch.bat, portability-report.txt
-[2026-10-31 10:22:21] paths: the portable marker is gone from 2 file(s)
-[2026-10-31 10:22:21] stale session: cleaned up after the previous session: очищена временная папка портатива (3)
-[2026-10-31 10:22:21] pre-launch (from LaunchPortable.exe start): 0.10s before the program starts
-[2026-10-31 10:22:21] start: "D:\a\_temp\Delta Burn Smoke\out\Delta_Portable\App\delta-app.exe" --version (cwd=D:\a\_temp\Delta Burn Smoke\out\Delta_Portable\App, elevated=True, job=yes)
-[2026-10-31 10:22:21] browser login: browser profiles are connected to the real user profile (1 folder(s)); a login opens the installed browser
-[2026-10-31 10:22:21] Delta: IPC profile: D:\a\pdbeaa74fe9bde
-[2026-10-31 10:22:21] Delta: using a short temporary profile alias for IPC; the data remains in PortableData
-[2026-10-31 10:22:21] installed programs: installed programs: не удалось удалить запись «Delta» ([WinError 5] Access is denied)
-[2026-10-31 10:22:21] installed programs: installed programs: удалена запись «Delta» из списка установленных приложений (HKLM)
-[2026-10-31 10:22:21] delta-app.exe exited with code 0 after 0.0s
-[2026-10-31 10:22:27] browser login: unlinked D:\a\_temp\Delta Burn Smoke\out\Delta_Portable\PortableData\AppData\Local\Microsoft\Edge
-[2026-10-31 10:22:27] delta-app.exe closed within 0.0s and left nothing running
-[2026-10-31 10:22:28] pre-launch work: 0.29s of host cleanup, done in parallel with the program start
-[2026-10-31 10:22:29] Delta: removed the temporary IPC profile alias
-[2026-10-31 10:22:29] installed programs (after exit): не удалось удалить запись «Delta» ([WinError 5] Access is denied)
-[2026-10-31 10:22:30] WARNING: the folder is still locked by open files: cversions.2.db. Run StopPortable.cmd as administrator to force them closed.
-[2026-10-31 10:22:30] stale session cleanup skipped: the program is already running
-[2026-10-31 10:22:30] pre-launch (from LaunchPortable.exe start): 0.15s before the program starts (slowest: profile setup 0.07s)
-[2026-10-31 10:22:30] start: "D:\a\_temp\Delta Burn Smoke\out\Delta_Portable\App\delta-app.exe" (cwd=D:\a\_temp\Delta Burn Smoke\out\Delta_Portable\App, elevated=True, job=yes)
-[2026-10-31 10:22:30] browser login: the file system cannot link the browser profile; watching the processes started by the program instead
-[2026-10-31 10:22:30] Delta: IPC profile: D:\a\pd7d6e92e08994
-[2026-10-31 10:22:30] Delta: using a short temporary profile alias for IPC; the data remains in PortableData
-[2026-10-31 10:22:30] installed programs: installed programs: не удалось удалить запись «Delta» ([WinError 5] Access is denied)
+[2026-10-31 10:33:59] paths: replaced the portable marker in 2 file(s): Launch.bat, portability-report.txt
+[2026-10-31 10:33:59] paths: the portable marker is gone from 2 file(s)
+[2026-10-31 10:33:59] stale session: cleaned up after the previous session: очищена временная папка портатива (3)
+[2026-10-31 10:33:59] pre-launch (from LaunchPortable.exe start): 0.18s before the program starts
+[2026-10-31 10:33:59] start: "D:\a\_temp\Delta Burn Smoke\out\Delta_Portable\App\delta-app.exe" --version (cwd=D:\a\_temp\Delta Burn Smoke\out\Delta_Portable\App, elevated=True, job=yes)
+[2026-10-31 10:33:59] browser login: browser profiles are connected to the real user profile (1 folder(s)); a login opens the installed browser
+[2026-10-31 10:33:59] Delta: IPC profile: D:\a\pde792c3999931
+[2026-10-31 10:33:59] Delta: using a short temporary profile alias for IPC; the data remains in PortableData
+[2026-10-31 10:33:59] installed programs: installed programs: не удалось удалить запись «Delta» ([WinError 5] Access is denied)
+[2026-10-31 10:33:59] installed programs: installed programs: удалена запись «Delta» из списка установленных приложений (HKLM)
+[2026-10-31 10:33:59] delta-app.exe exited with code 0 after 0.1s
+[2026-10-31 10:34:05] browser login: unlinked D:\a\_temp\Delta Burn Smoke\out\Delta_Portable\PortableData\AppData\Local\Microsoft\Edge
+[2026-10-31 10:34:05] delta-app.exe closed within 0.1s and left nothing running
+[2026-10-31 10:34:06] pre-launch work: 0.55s of host cleanup, done in parallel with the program start
+[2026-10-31 10:34:07] Delta: removed the temporary IPC profile alias
+[2026-10-31 10:34:07] installed programs (after exit): не удалось удалить запись «Delta» ([WinError 5] Access is denied)
+[2026-10-31 10:34:08] WARNING: the folder is still locked by open files: cversions.2.db. Run StopPortable.cmd as administrator to force them closed.
+[2026-10-31 10:34:11] stale session cleanup skipped: the program is already running
+[2026-10-31 10:34:12] pre-launch (from LaunchPortable.exe start): 0.25s before the program starts (slowest: profile setup 0.10s, stale session 0.06s)
+[2026-10-31 10:34:12] start: "D:\a\_temp\Delta Burn Smoke\out\Delta_Portable\App\delta-app.exe" (cwd=D:\a\_temp\Delta Burn Smoke\out\Delta_Portable\App, elevated=True, job=yes)
+[2026-10-31 10:34:12] browser login: the file system cannot link the browser profile; watching the processes started by the program instead
+[2026-10-31 10:34:12] Delta: IPC profile: D:\a\pdb803ca172c96
+[2026-10-31 10:34:12] Delta: using a short temporary profile alias for IPC; the data remains in PortableData
+[2026-10-31 10:34:12] installed programs: installed programs: не удалось удалить запись «Delta» ([WinError 5] Access is denied)
 --- delta-auth.out ---
 --- delta-auth.err ---
 
-thread 'main' (3196) panicked at crates\delta_app\src\paths.rs:177:32:
+thread 'main' (1684) panicked at crates\delta_app\src\paths.rs:177:32:
 called `Option::unwrap()` on a `None` value
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 --- delta-gui.err ---
