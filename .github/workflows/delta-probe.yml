@@ -52,22 +52,23 @@ jobs:
             $cliTarget = $deltaCli.FullName.Substring($portable.Length + 1).Replace('\', '/')
             $report.Add("CLI target: $cliTarget")
             $env:DELTA_CLI_FOR_STRINGS = $deltaCli.FullName
+            $env:DELTA_APP_FOR_STRINGS = (Join-Path $portable "App/delta-app.exe")
             $env:PYTHONIOENCODING = "utf-8"
             $stringReport = @'
           import os, re
-          path = os.environ["DELTA_CLI_FOR_STRINGS"]
-          data = open(path, "rb").read()
-          pattern = re.compile(rb"[\x20-\x7e]{4,}")
-          need = re.compile(r"(?i)(delta[-_ ]?ipc|ipc[-_ ]?dir|config_dir|userprofile|localappdata|appdata|sun_len|socket|runtime_dir|DELTA_)")
-          found = set()
-          for match in pattern.finditer(data):
-              text = match.group().decode("ascii", "ignore")
-              if len(text) <= 240 and need.search(text):
-                  found.add(text)
-          for text in sorted(found):
-              print(text)
+          for label, key in (("CLI", "DELTA_CLI_FOR_STRINGS"), ("APP", "DELTA_APP_FOR_STRINGS")):
+              path = os.environ[key]
+              data = open(path, "rb").read()
+              print("BINARY", label, path)
+              tokens = sorted(set(re.findall(rb"DELTA_[A-Z0-9_]+", data)))
+              for token in tokens:
+                  print("ENV", token.decode("ascii", "ignore"))
+              for match in re.finditer(rb"delta-ipc", data, re.I):
+                  chunk = data[max(0, match.start() - 180):match.end() + 220]
+                  text = "".join(chr(c) if 32 <= c < 127 else "." for c in chunk)
+                  print("IPC_CONTEXT", text)
           '@ | python -
-            $report.Add("--- relevant CLI strings ---")
+            $report.Add("--- relevant binary strings ---")
             foreach ($line in @($stringReport)) { $report.Add([string]$line) }
             $helpOut = Join-Path $root "auth-help.out"
             $helpErr = Join-Path $root "auth-help.err"
