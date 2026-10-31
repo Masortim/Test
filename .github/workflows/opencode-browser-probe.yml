@@ -99,6 +99,22 @@ jobs:
               else {
                 $report.Add("No visible login/register control was found")
               }
+              Add-Type -AssemblyName System.Drawing
+              $windowBounds = $appWindow.Current.BoundingRectangle
+              if ($windowBounds.Width -gt 0 -and $windowBounds.Height -gt 0) {
+                $bitmap = [System.Drawing.Bitmap]::new(
+                  [int]$windowBounds.Width, [int]$windowBounds.Height)
+                $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                $graphics.CopyFromScreen(
+                  [int]$windowBounds.X, [int]$windowBounds.Y, 0, 0,
+                  [System.Drawing.Size]::new([int]$windowBounds.Width,
+                    [int]$windowBounds.Height))
+                $bitmap.Save((Join-Path $env:GITHUB_WORKSPACE "opencode-window.png"),
+                  [System.Drawing.Imaging.ImageFormat]::Png)
+                $graphics.Dispose()
+                $bitmap.Dispose()
+                $report.Add("Window screenshot captured")
+              }
             }
 
             $after = @(Get-Process -Name $browserNames -ErrorAction SilentlyContinue)
@@ -164,6 +180,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f opencode-browser-probe.txt
+          if test -f opencode-window.png; then git add -f opencode-window.png; fi
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "ci: update OpenCode browser diagnostic [skip ci]"
           git push origin HEAD:"${GITHUB_REF_NAME}"
