@@ -229,7 +229,17 @@ def _path_variants(key_path: str) -> List[str]:
 
 
 def is_volatile(key_path: str) -> bool:
-    """Ветка, которую постоянно меняет сама Windows (в расчёт не берём)."""
+    """Ветка, которую постоянно меняет сама Windows (в расчёт не берём).
+
+    ``FileExts`` — важное исключение из общего исключения Explorer. Внутри
+    ``UserChoice`` живёт явный выбор программы по умолчанию, а не кэш оболочки.
+    Его необходимо видеть в снимке, иначе установщик может изменить ассоциацию,
+    а сравнение «до/после» этого даже не заметит.
+    """
+    file_exts = r"software\microsoft\windows\currentversion\explorer\fileexts"
+    for path in _path_variants(key_path):
+        if _matches(path, (file_exts,)):
+            return False
     return any(_matches(path, _VOLATILE_PREFIXES)
                for path in _path_variants(key_path))
 
@@ -270,6 +280,54 @@ def categorize(key_path: str) -> str:
     if _matches(path, _TRACE_PREFIXES):
         return CATEGORY_TRACE
     return CATEGORY_APP
+
+
+#: Дополнительные ветки, где Windows запоминает выбор приложения по умолчанию.
+#: ``Software\Classes`` и остальные shell-ветки уже входят в integration.
+_ASSOCIATION_ONLY_PREFIXES: Tuple[str, ...] = (
+    r"software\microsoft\windows\currentversion\applicationassociationtoasts",
+)
+
+#: Ветки внутри Classes, которые не являются ассоциациями: состояние MSI и
+#: виртуализованные настройки приложений нельзя откатывать вместе с ProgID.
+_ASSOCIATION_EXCLUDED_PREFIXES: Tuple[str, ...] = (
+    r"software\classes\installer",
+    r"software\classes\virtualstore",
+)
+
+
+def is_file_exts_key(key_path: str) -> bool:
+    """Ключ ``Explorer\FileExts`` (в том числе защищённый ``UserChoice``)."""
+    prefix = r"software\microsoft\windows\currentversion\explorer\fileexts"
+    return any(_matches(path, (prefix,)) for path in _path_variants(key_path))
+
+
+def is_association_key(key_path: str) -> bool:
+    """Относится ли ключ к ассоциациям файлов/протоколов и выбору по умолчанию.
+
+    Это намеренно более узкий список, чем «весь реестр»: такой снимок можно
+    использовать для возврата shell-ассоциаций после установщика, не откатывая
+    активацию, обновления и обычные настройки других приложений.
+    """
+    variants = _path_variants(key_path)
+    if any(_matches(path, _ASSOCIATION_EXCLUDED_PREFIXES)
+           for path in variants):
+        return False
+    if is_volatile(key_path) and not is_file_exts_key(key_path):
+        return False
+    if is_protected(key_path):
+        return False
+    prefixes = _INTEGRATION_PREFIXES + _ASSOCIATION_ONLY_PREFIXES
+    return any(_matches(path, prefixes) for path in variants)
+
+
+def association_snapshot(snapshot: Mapping[str, Mapping[str, object]]) -> Snapshot:
+    """Оставляет в уже готовом снимке только shell-ассоциации."""
+    return {
+        key: {name: _as_entry(entry) for name, entry in values.items()}
+        for key, values in snapshot.items()
+        if is_association_key(key)
+    }
 
 
 def is_uninstall_entry(key_path: str) -> bool:
@@ -522,14 +580,20 @@ def retarget_protocol_paths(snapshot: Mapping[str, Mapping[str, object]],
 # --- снимок -------------------------------------------------------------------
 
 def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
-          max_depth: int = 7, depth: int = 0) -> None:
+          max_depth: int = 7, depth: int = 0,
+          skip_volatile: bool = True) -> None:
     """Рекурсивно обходит ветку и заполняет out[path] = {value: (type, repr)}."""
     if depth > max_depth:
         return
     full = f"{prefix}\\{subkey}" if subkey else prefix
-    if depth and (is_volatile(full) or is_protected(full)):
+    volatile = bool(depth and skip_volatile and is_volatile(full))
+    explorer = r"software\microsoft\windows\currentversion\explorer"
+    file_exts_gateway = volatile and _strip_hive(full) == explorer
+    if depth and ((volatile and not file_exts_gateway) or is_protected(full)):
         # Не снимаем системное состояние, лицензии, Shell/Taskbar и компоненты
         # Microsoft: устаревший снимок не должен иметь возможность их стереть.
+        # Для отдельного снимка ассоциаций volatile-фильтр отключается: там
+        # FileExts/ApplicationAssociationToasts являются предметом защиты.
         return
     try:
         key = winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ)  # type: ignore
@@ -562,10 +626,13 @@ def _walk(hive: int, subkey: str, prefix: str, out: Snapshot,
         # Некоторые Microsoft-компоненты используют GUID-подключи в Uninstall;
         # проверяем DisplayName после чтения ключа и не обходим его потомков.
         return
-    out[full] = values
+    if not volatile:
+        out[full] = values
     for sk in subkeys:
+        if file_exts_gateway and sk.casefold() != "fileexts":
+            continue
         _walk(hive, f"{subkey}\\{sk}" if subkey else sk, prefix, out,
-              max_depth, depth + 1)
+              max_depth, depth + 1, skip_volatile)
 
 
 def snapshot(include_user: bool = True) -> Snapshot:
@@ -590,6 +657,52 @@ def snapshot(include_user: bool = True) -> Snapshot:
             continue
         _walk(hives[prefix], base, prefix, snap)
     return snap
+
+
+#: Корни отдельного снимка ассоциаций. Нужен даже тогда, когда пользователь
+#: отключил перенос настроек реестра: это защита хоста, а не захват портатива.
+_ASSOCIATION_ROOTS: Tuple[Tuple[str, str], ...] = (
+    ("HKCU", r"Software\Classes"),
+    ("HKLM", r"Software\Classes"),
+    ("HKCU", r"Software\Wow6432Node\Classes"),
+    ("HKLM", r"Software\Wow6432Node\Classes"),
+    ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts"),
+    ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts"),
+    ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\ApplicationAssociationToasts"),
+    ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\ApplicationAssociationToasts"),
+    ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\App Paths"),
+    ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\App Paths"),
+    ("HKCU", r"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths"),
+    ("HKLM", r"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths"),
+    ("HKCU", r"Software\RegisteredApplications"),
+    ("HKLM", r"Software\RegisteredApplications"),
+    ("HKCU", r"Software\Clients"),
+    ("HKLM", r"Software\Clients"),
+    ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Shell Extensions"),
+    ("HKLM", r"Software\Microsoft\Windows\CurrentVersion\Shell Extensions"),
+)
+
+
+def snapshot_associations(include_user: bool = True) -> Snapshot:
+    """Снимок только ассоциаций для последующего точечного восстановления.
+
+    В отличие от переносимого снимка здесь нельзя выбрасывать ``FileExts`` и
+    ``ApplicationAssociationToasts`` как системный шум: именно их прежнее
+    состояние требуется гарантировать. Остальной реестр не обходится.
+    """
+    if not IS_WINDOWS:
+        return {}
+    snap: Snapshot = {}
+    hives = {
+        "HKCU": winreg.HKEY_CURRENT_USER,  # type: ignore
+        "HKLM": winreg.HKEY_LOCAL_MACHINE,  # type: ignore
+    }
+    for prefix, base in _ASSOCIATION_ROOTS:
+        if prefix == "HKCU" and not include_user:
+            continue
+        _walk(hives[prefix], base, prefix, snap, max_depth=12,
+              skip_volatile=False)
+    return association_snapshot(snap)
 
 
 # --- разница ------------------------------------------------------------------
@@ -938,6 +1051,109 @@ def render_keys(after: Mapping[str, Mapping[str, object]],
             lines.append(format_value(name, typ, _entry_value(entry), tokens))
         lines.append("")
     return _render(lines)
+
+
+def _root_new_keys(keys: Iterable[str]) -> List[str]:
+    """Минимальный набор новых ключей: удаление родителя покрывает потомков."""
+    ordered = sorted(set(keys), key=lambda key: (key.count("\\"), key.casefold()))
+    roots: List[str] = []
+    for key in ordered:
+        folded = key.casefold()
+        if any(folded.startswith(root.casefold() + "\\") for root in roots):
+            continue
+        roots.append(key)
+    return roots
+
+
+def render_association_restore(
+        before: Mapping[str, Mapping[str, object]],
+        after: Mapping[str, Mapping[str, object]]) -> str:
+    """REG-файл, возвращающий только изменённые ассоциации к виду ``before``.
+
+    Обрабатываются все четыре случая, которых не хватает обычному diff:
+
+    * добавленный ключ удаляется (одним корневым блоком вместе с потомками);
+    * удалённый ключ создаётся заново с прежними значениями;
+    * добавленное значение удаляется;
+    * изменённое или удалённое значение записывается со старым типом/данными.
+
+    Ключи вне :func:`is_association_key` игнорируются, даже если вызывающий код
+    случайно передал полный снимок ``HKCU/HKLM\Software``.
+    """
+    old = association_snapshot(before)
+    new = association_snapshot(after)
+    lines: List[str] = []
+
+    for key in _root_new_keys(key for key in new if key not in old):
+        hive = _hive_name(key)
+        if hive:
+            lines.append(f"[-{hive}\\{key.split(chr(92), 1)[1]}]")
+            lines.append("")
+
+    for key in sorted(set(old) & set(new)):
+        old_values = old[key]
+        new_values = new[key]
+        if dict(old_values) == dict(new_values):
+            continue
+        added = [name for name in new_values if name not in old_values]
+        restored = [
+            (name, entry) for name, entry in old_values.items()
+            if name not in new_values or new_values[name] != entry
+        ]
+        if not added and not restored:
+            continue
+        hive = _hive_name(key)
+        if not hive:
+            continue
+        lines.append(f"[{hive}\\{key.split(chr(92), 1)[1]}]")
+        for name in sorted(added):
+            quoted = "@" if name == "" else f'"{_escape_sz(name)}"'
+            lines.append(f"{quoted}=-")
+        for name, entry in sorted(restored):
+            typ, _raw = _as_entry(entry)
+            lines.append(format_value(name, typ, _entry_value(entry)))
+        lines.append("")
+
+    # Сначала родители, затем дети: reg import создаст промежуточные ключи, а
+    # каждая секция вернёт собственные значения удалённой ветки.
+    removed = sorted(
+        (key for key in old if key not in new),
+        key=lambda key: (key.count("\\"), key.casefold()),
+    )
+    for key in removed:
+        hive = _hive_name(key)
+        if not hive:
+            continue
+        lines.append(f"[{hive}\\{key.split(chr(92), 1)[1]}]")
+        for name, entry in sorted(old[key].items()):
+            typ, _raw = _as_entry(entry)
+            lines.append(format_value(name, typ, _entry_value(entry)))
+        lines.append("")
+    return _render(lines)
+
+
+def association_restore_mismatches(
+        before: Mapping[str, Mapping[str, object]],
+        after: Mapping[str, Mapping[str, object]],
+        current: Mapping[str, Mapping[str, object]]) -> List[str]:
+    """Ключи, которые после отката всё ещё отличаются от исходного состояния.
+
+    Сравниваются только ветки, изменившиеся между ``before`` и ``after``. Новый
+    параллельный шум в остальных ассоциациях не превращается в ложную ошибку.
+    Отсутствие ключа отличается от существующего пустого ключа.
+    """
+    old = association_snapshot(before)
+    new = association_snapshot(after)
+    now = association_snapshot(current)
+    missing = object()
+    touched = {
+        key for key in set(old) | set(new)
+        if old.get(key, missing) != new.get(key, missing)
+    }
+    return sorted(
+        key for key in touched
+        if old.get(key, missing) != now.get(key, missing)
+    )
 
 
 def render_launcher_undo(diff: RegistryDiff, keys: Iterable[str]) -> str:

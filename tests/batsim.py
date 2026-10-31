@@ -400,6 +400,7 @@ class BatchInterpreter:
 
     def _exec_single(self, command: str):
         command = command.strip()
+        raw_command = command
         # Срезаем хвостовые перенаправления (>nul, 2>nul, 2>&1 и их сочетания).
         command = re.sub(r"(?:\s*\d?>(?:&\d|[^\s\"]+))+\s*$", "", command).strip()
         low = command.lower()
@@ -454,6 +455,14 @@ class BatchInterpreter:
         if low.startswith("set "):
             self._exec_set(command[4:].strip())
             return None
+        if low.startswith("type nul"):
+            # Маркер ``type nul >file`` из registry guard: в отличие от echo
+            # здесь важен сам файл, а не вывод в консоль.
+            match = re.search(r">\s*(\"[^\"]+\"|[^\s]+)\s*$", raw_command)
+            if match:
+                self.fs.add_file(self.expand(match.group(1).strip('"')), "")
+            self.errorlevel = 0
+            return None
         if low.startswith("echo"):
             rest = command[4:]
             self.result.output.append(
@@ -507,9 +516,31 @@ class BatchInterpreter:
                            if part.strip()]
                 if any(part in expanded.lower() for part in missing):
                     self.errorlevel = 1
+            elif low.startswith("reg export"):
+                # backup/session — настоящие файлы: от наличия backup теперь
+                # зависит восстановление существовавшего на этом ПК ключа.
+                missing = [part.strip().lower()
+                           for part in self.env.get(
+                               "BATSIM_MISSING_REG", "").split(";")
+                           if part.strip()]
+                if any(part in expanded.lower() for part in missing):
+                    self.errorlevel = 1
+                else:
+                    tokens = self._tokens(expanded)
+                    if len(tokens) >= 4:
+                        self.fs.add_file(tokens[3].strip('"'), "registry backup")
             return None
         if low.startswith("powershell"):
             expanded = self.expand(command)
+            if "portable_reg_prune" in expanded.lower():
+                if self.env.get("BATSIM_NO_POWERSHELL") != "1":
+                    target = self.env.get("PORTABLE_REG_PRUNE", "")
+                    if target:
+                        self.fs.add_file(target, "deletion-only restore")
+                    self.errorlevel = 0 if target else 1
+                else:
+                    self.errorlevel = 1
+                return None
             if "portable_reg_out" in expanded.lower():
                 # Переписывание .reg: маркер -> путь (unpack) или обратно
                 # (pack). Без этой эмуляции тесты видели только ветку

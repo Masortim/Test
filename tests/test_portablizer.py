@@ -45,6 +45,25 @@ from portablizer.core.silentargs import (
 )
 
 
+_ASSOCIATION_SNAPSHOT_PATCH = None
+
+
+def setUpModule():
+    global _ASSOCIATION_SNAPSHOT_PATCH
+    # Здесь установщики — двойники, а тесты проверяют файлы и планы. На
+    # Windows полный обход Classes занимает десятки секунд на каждый run();
+    # настоящая защита HKCU/cmd/PowerShell проверяется в test_registry_safety.
+    _ASSOCIATION_SNAPSHOT_PATCH = mock.patch(
+        "portablizer.core.portablizer.reg_mod.snapshot_associations",
+        return_value={})
+    _ASSOCIATION_SNAPSHOT_PATCH.start()
+
+
+def tearDownModule():
+    if _ASSOCIATION_SNAPSHOT_PATCH is not None:
+        _ASSOCIATION_SNAPSHOT_PATCH.stop()
+
+
 def _labels(bat: str):
     return {line[1:].strip() for line in bat.splitlines()
             if line.startswith(":") and not line.startswith("::")}
@@ -1127,7 +1146,8 @@ class LaunchBatExecutionTests(unittest.TestCase):
         self.assertIn("RegistryHostBackup", joined)   # состояние чужого ПК
         self.assertIn("reg import", joined)           # настройки применены
         self.assertIn("PortableData\\Registry", joined)  # сохранены обратно
-        self.assertIn("reg delete", joined)           # ключ убран из системы
+        # Ключ существовал на этом ПК: восстановлен backup, не удаление.
+        self.assertNotIn("reg delete", joined)
         self.assertTrue(res.launched)
 
     def test_settings_with_the_marker_are_never_imported_verbatim(self):
@@ -1146,7 +1166,10 @@ class LaunchBatExecutionTests(unittest.TestCase):
         res = self._run(cfg, fs=self._fs(extra=["portable.reg"]),
                         env={"BATSIM_NO_POWERSHELL": "1"})
         joined = " | ".join(res.reg_commands).lower()
-        self.assertNotIn("reg import", joined,
+        portable_imports = [cmd for cmd in res.reg_commands
+                            if cmd.lower().startswith("reg import")
+                            and "registryhostbackup" not in cmd.lower()]
+        self.assertEqual(portable_imports, [],
                          "файл с маркером импортирован без подстановки корня")
         self.assertIn("skipped the import", res.text.lower())
         self.assertTrue(res.launched)
@@ -3721,7 +3744,10 @@ class GameLauncherHandoffTests(unittest.TestCase):
             app_name="Alice", target_exe_rel="App/alice.exe",
             registry_keys=[r"HKCU\Software\Alice"],
         )
-        self.assertNotIn("reg query", launcher_mod.render_bat(cfg))
+        bat = launcher_mod.render_bat(cfg)
+        self.assertNotIn('reg query "HKLM', bat)
+        # HKCU query после неудачного backup — не UAC-probe: он лишь отличает
+        # отсутствие ключа от ошибки экспорта и не вызывает повышение прав.
 
     def test_machine_file_without_hklm_section_needs_no_admin(self):
         with tempfile.TemporaryDirectory() as temp:

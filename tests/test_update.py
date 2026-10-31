@@ -39,6 +39,35 @@ OPENCODE_CFG = {
 }
 
 
+class _SyntheticAssociationGuard:
+    """Не даёт файловым update-тестам обходить настоящий HKLM/HKCU."""
+    def __init__(self, root: Path) -> None:
+        self.directory = root / "Updates" / "AssociationBackup"
+
+    def snapshot(self) -> bool:
+        return True
+
+    def restore(self):
+        return []
+
+
+_ASSOCIATION_GUARD_PATCH = None
+
+
+def setUpModule():
+    global _ASSOCIATION_GUARD_PATCH
+    # В этом модуле installer — двойник. Реальный HostAssociationGuard
+    # проверяется отдельно в test_registry_safety на настоящем HKCU.
+    _ASSOCIATION_GUARD_PATCH = mock.patch.object(
+        exe_launcher, "HostAssociationGuard", _SyntheticAssociationGuard)
+    _ASSOCIATION_GUARD_PATCH.start()
+
+
+def tearDownModule():
+    if _ASSOCIATION_GUARD_PATCH is not None:
+        _ASSOCIATION_GUARD_PATCH.stop()
+
+
 def _write(path: Path, text: str = "x") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
