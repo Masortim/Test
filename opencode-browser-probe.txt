@@ -1,0 +1,44 @@
+Builder exit: 0
+Target: App/OpenCode.exe
+connect_host_profile=True
+clean_duplicates=True
+Browser processes before: 
+WINDOW: OpenCode
+WINDOW: C:\ProgramData\GitHub\HostedComputeAgent\hosted-compute-agent
+OpenCode window found: True
+CONTROL: ControlType.Pane :: OpenCode
+CONTROL: ControlType.Button :: Minimize
+CONTROL: ControlType.Button :: Maximize
+CONTROL: ControlType.Button :: Close
+No visible login/register control was found
+Window screenshot captured
+Application menu clicked
+Provider selector clicked
+OpenCode provider clicked
+OpenCode Zen external link clicked
+NEW BROWSER pid=1208 name=msedge parent=8008:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=utility --utility-sub-type=network.mojom.NetworkService --lang=en-US --service-sandbox-type=none --startup-read-main-dll --metrics-shmem-handle=2332,i,2146942488551585287,2208508473916764348,524288 --field-trial-handle=2252,i,9069871347889799693,437917397586750385,262144 --variations-seed-version --pseudonymization-salt-handle=2256,i,6841715752560194868,15785684325775503929,4 --trace-process-track-uuid=3190708989122997041 --mojo-platform-channel-handle=2372 /prefetch:11
+NEW BROWSER pid=2028 name=msedge parent=8008:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=gpu-process --gpu-recent-crash-count=0 --gpu-preferences=WAAAAAAAAADgAAAEAAAAAAAAAAAAAGAAQAAAAAAAAAADAAAAAAAAADgAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAKAAAAAAAAAAoAAAAAAAAAAgAAAAAAAAAEAAAAAIAAAABAAAAAAAAAAgAAAAAAAAACAAAAAAAAAA= --startup-read-main-dll --metrics-shmem-handle=2036,i,16128509161750300701,1069205807523871282,262144 --field-trial-handle=2252,i,9069871347889799693,437917397586750385,262144 --variations-seed-version --pseudonymization-salt-handle=2256,i,6841715752560194868,15785684325775503929,4 --trace-process-track-uuid=3190708988185955192 --mojo-platform-channel-handle=2248 /prefetch:2
+NEW BROWSER pid=2088 name=msedge parent=8008:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=crashpad-handler "--user-data-dir=C:\Users\runneradmin\AppData\Local\Microsoft\Edge\User Data" /prefetch:4 --monitor-self-annotation=ptype=crashpad-handler --user-stream-region=756,65568 "--database=C:\Users\runneradmin\AppData\Local\Microsoft\Edge\User Data\Crashpad" --annotation=IsOfficialBuild=1 --annotation=channel= --annotation=chromium-version=156.0.8078.75 "--annotation=exe=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --annotation=plat=Win64 --annotation=prod=Edge --annotation=ver=156.0.4314.56 --initial-client-data=0x318,0x31c,0x320,0x314,0x23c,0x7fffad047470,0x7fffad047480,0x7fffad047490
+NEW BROWSER pid=3380 name=msedge parent=8008:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=renderer --pdf-upsell-enabled --video-capture-use-gpu-memory-buffer --lang=en-US --js-flags --device-scale-factor=1 --num-raster-threads=2 --enable-main-frame-before-activation --renderer-client-id=6 --ssd-no-pressure-read-main-dll --launch-time-ticks=491762796 --metrics-shmem-handle=3920,i,7168900238982148113,17970676790499356294,1048576 --field-trial-handle=2252,i,9069871347889799693,437917397586750385,262144 --variations-seed-version --pseudonymization-salt-handle=2256,i,6841715752560194868,15785684325775503929,4 --trace-process-track-uuid=3190708991934122588 --mojo-platform-channel-handle=3928 /prefetch:1
+NEW BROWSER pid=3672 name=msedge parent=8008:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=renderer --extension-process --renderer-sub-type=extension --pdf-upsell-enabled --disable-gpu-compositing --video-capture-use-gpu-memory-buffer --lang=en-US --js-flags --device-scale-factor=1 --num-raster-threads=2 --enable-main-frame-before-activation --renderer-client-id=14 --skip-read-main-dll --launch-time-ticks=494664879 --metrics-shmem-handle=5656,i,11951102627617726686,13253776785122472381,1048576 --field-trial-handle=2252,i,9069871347889799693,437917397586750385,262144 --variations-seed-version --pseudonymization-salt-handle=2256,i,6841715752560194868,15785684325775503929,4 --trace-process-track-uuid=3190708999430457380 --mojo-platform-channel-handle=5584 /prefetch:9
+NEW BROWSER pid=4108 name=msedge parent=8008:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=renderer --pdf-upsell-enabled --video-capture-use-gpu-memory-buffer --lang=en-US --js-flags --device-scale-factor=1 --num-raster-threads=2 --enable-main-frame-before-activation --renderer-client-id=5 --skip-read-main-dll --launch-time-ticks=491766104 --metrics-shmem-handle=3972,i,3448830041846537751,2210839141604463273,1048576 --field-trial-handle=2252,i,9069871347889799693,437917397586750385,262144 --variations-seed-version --pseudonymization-salt-handle=2256,i,6841715752560194868,15785684325775503929,4 --trace-process-track-uuid=3190708990997080739 --mojo-platform-channel-handle=3988 /prefetch:1
+NEW BROWSER pid=4284 name=msedge parent=8008:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=renderer --pdf-upsell-enabled --video-capture-use-gpu-memory-buffer --lang=en-US --js-flags --device-scale-factor=1 --num-raster-threads=2 --enable-main-frame-before-activation --renderer-client-id=7 --skip-read-main-dll --launch-time-ticks=491992735 --metrics-shmem-handle=3916,i,12310218705424554414,16979652713864082892,1048576 --field-trial-handle=2252,i,9069871347889799693,437917397586750385,262144 --variations-seed-version --pseudonymization-salt-handle=2256,i,6841715752560194868,15785684325775503929,4 --trace-process-track-uuid=3190708992871164437 --mojo-platform-channel-handle=4464 /prefetch:1
+NEW BROWSER pid=8008 name=msedge parent=2536:LaunchPortable.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --single-argument https://opencode.ai/zen
+NEW BROWSER pid=8708 name=msedge parent=8008:msedge.exe command="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --type=utility --utility-sub-type=storage.mojom.StorageService --lang=en-US --service-sandbox-type=service --startup-read-main-dll --metrics-shmem-handle=2828,i,15507783115587773847,11244090012427799399,524288 --field-trial-handle=2252,i,9069871347889799693,437917397586750385,262144 --variations-seed-version --pseudonymization-salt-handle=2256,i,6841715752560194868,15785684325775503929,4 --trace-process-track-uuid=3190708990060038890 --mojo-platform-channel-handle=2840 /prefetch:13
+PORTABLE PROCESS: 2536 parent=5956 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\LaunchPortable.exe
+PORTABLE PROCESS: 1260 parent=4688 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 4688 parent=2536 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 6880 parent=4688 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 8508 parent=4688 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 8584 parent=4688 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+PORTABLE PROCESS: 9052 parent=4688 D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe
+Host reopen observed: True
+Profile linked: True
+--- launcher-run.log ---
+[2026-10-31 16:02:36] paths: replaced the portable marker in 2 file(s): Launch.bat, portability-report.txt
+[2026-10-31 16:02:36] paths: the portable marker is gone from 2 file(s)
+[2026-10-31 16:02:36] installed programs: installed programs: удалена запись «OpenCode 1.19.5» из списка установленных приложений (HKCU)
+[2026-10-31 16:02:36] pre-launch (from LaunchPortable.exe start): 0.46s before the program starts (slowest: profile setup 0.16s, service ports 0.09s, stale session 0.06s)
+[2026-10-31 16:02:36] start: "D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App\OpenCode.exe" (cwd=D:\a\_temp\OpenCode Browser And Startup Probe\out\OpenCode_Portable\App, elevated=True, job=no)
+[2026-10-31 16:02:36] browser login: browser profiles are connected to the real user profile (1 folder(s)); a login opens the installed browser
+[2026-10-31 16:03:50] browser login: opened https://opencode.ai/zen in the default browser (the portable copy was stopped, so the real profile is used)
