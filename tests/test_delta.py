@@ -147,3 +147,88 @@ class DeltaTermsBridgeTests(unittest.TestCase):
                     '"browser.exe" "' + url + '"')
 
             self.assertEqual(plan, [(20, url, "browser.exe")])
+
+
+class DeltaIpcProfileTests(unittest.TestCase):
+    def test_long_profile_uses_short_alias_without_copying_data(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / ("r" * 80)
+            profile = root / "PortableData" / "User"
+            profile.mkdir(parents=True)
+            marker = profile / "keep.txt"
+            marker.write_text("portable", encoding="utf-8")
+            original = {
+                "USERPROFILE": str(profile),
+                "APPDATA": str(root / "PortableData" / "AppData" / "Roaming"),
+            }
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_windows_short_path", return_value=None), \
+                    mock.patch.object(entry, "_delta_alias_bases", return_value=[base]):
+                patched, alias = entry._delta_profile_environment(
+                    root, root / "App" / "delta-app.exe", original)
+
+                self.assertIsNotNone(alias)
+                self.assertIsNot(patched, original)
+                self.assertEqual(original["USERPROFILE"], str(profile))
+                self.assertNotEqual(patched["USERPROFILE"], str(profile))
+                self.assertEqual(Path(patched["USERPROFILE"]).resolve(),
+                                 profile.resolve())
+                self.assertEqual((Path(patched["USERPROFILE"]) / "keep.txt").read_text(),
+                                 "portable")
+                self.assertTrue(entry._delta_ipc_path_fits(
+                    Path(patched["USERPROFILE"])))
+                # BrowserLoginBridge can retain the original APPDATA roots.
+                self.assertEqual(patched["APPDATA"], original["APPDATA"])
+                alias.cleanup()
+                self.assertFalse(alias.path.exists())
+                self.assertTrue(marker.is_file())
+
+    def test_short_profile_does_not_need_an_alias(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profile = root / "PortableData" / "User"
+            env = {"USERPROFILE": str(profile)}
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_junction_directory") as junction:
+                patched, alias = entry._delta_profile_environment(
+                    root, root / "App" / "delta-app.exe", env)
+            self.assertIs(patched, env)
+            self.assertIsNone(alias)
+            junction.assert_not_called()
+
+    def test_other_targets_keep_their_environment(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / ("r" * 80)
+            profile = root / "PortableData" / "User"
+            env = {"USERPROFILE": str(profile)}
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_junction_directory") as junction:
+                patched, alias = entry._delta_profile_environment(
+                    root, root / "App" / "other.exe", env)
+            self.assertIs(patched, env)
+            self.assertIsNone(alias)
+            junction.assert_not_called()
+
+    def test_volume_short_name_is_used_without_a_temporary_link(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / ("r" * 80)
+            profile = root / "PortableData" / "User"
+            short = Path(temp) / "short"
+            env = {"USERPROFILE": str(profile)}
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_windows_short_path", return_value=short), \
+                    mock.patch.object(entry, "_junction_directory") as junction:
+                patched, alias = entry._delta_profile_environment(
+                    root, root / "App" / "Delta.exe", env)
+            self.assertEqual(patched["USERPROFILE"], str(short))
+            self.assertIsNone(alias)
+            junction.assert_not_called()

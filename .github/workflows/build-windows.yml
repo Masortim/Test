@@ -376,30 +376,96 @@ jobs:
           }
           Write-Host "Delta Launch.bat handoff: delta-app.exe exited with code 0"
 
-          # Browser sign-in regression: use the real Delta CLI, but start it
-          # through the ordinary Launch.bat -> LaunchPortable.exe path.  The
-          # profile junction is deliberately disabled for this probe so the
-          # process/URL fallback must prove that it saw the terms page.  No
-          # credentials are entered and the temporary process is stopped.
+          # Browser/IPC regression: start the real desktop app through the
+          # ordinary Launch.bat -> LaunchPortable.exe path, then ask the
+          # running app for a non-blocking CLI sign-in handoff.  A standalone
+          # "delta auth login" is not valid: it needs the desktop IPC server.
+          # This portable is intentionally in a long path.  Delta 0.23.0
+          # otherwise fails before the browser flow with SUN_LEN.
           $configText = Get-Content $configPath -Raw
           $authOutput = Join-Path $root "delta-auth.out"
           $authError = Join-Path $root "delta-auth.err"
+          $guiOutput = Join-Path $root "delta-gui.out"
+          $guiError = Join-Path $root "delta-gui.err"
           $authProcess = $null
           $authUrlFound = $false
           try {
+            $socketName = (('0' * 32) + '.sock')
+            $longIpcPath = Join-Path $portable (
+              'PortableData/User/AppData/Local/delta-ipc/' + $socketName)
+            if ($longIpcPath.Length -lt 108) {
+              throw "Delta regression path is not long enough to exercise SUN_LEN: $longIpcPath"
+            }
             $authConfig = $configText | ConvertFrom-Json
             $authConfig.browser_login.connect_host_profile = $false
             $authConfig.browser_login.clean_duplicates = $false
             $authConfig | ConvertTo-Json -Depth 20 |
               Set-Content -Encoding utf8 $configPath
-            $authProcess = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
-              -ArgumentList @("--target", "App/Delta.exe", "auth", "login") `
+            $runLog = Join-Path $portable "PortableData/launcher-run.log"
+            $gui = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
               -WorkingDirectory $portable -PassThru `
-              -RedirectStandardOutput $authOutput -RedirectStandardError $authError
+              -RedirectStandardOutput $guiOutput -RedirectStandardError $guiError
+
+            # The launcher logs the exact short profile used by the desktop.
+            # Use it for this external test CLI just as a real child process
+            # would inherit it from delta-app.exe.
+            $ipcProfile = $null
             for ($attempt = 0; $attempt -lt 45; $attempt++) {
               if (Test-Path $runLog) {
                 $runText = Get-Content $runLog -Raw
-                if ($runText -match 'browser login: opened https://dashboard\.zed\.dev/delta-beta') {
+                $ipcMatches = [regex]::Matches($runText,
+                  'Delta: IPC profile: ([^\r\n]+)')
+                if ($ipcMatches.Count -gt 0) {
+                  $ipcProfile = $ipcMatches[$ipcMatches.Count - 1].Groups[1].Value.Trim()
+                  break
+                }
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $ipcProfile) {
+              $details = if (Test-Path $runLog) { Get-Content $runLog -Tail 120 | Out-String } else { 'no launcher log' }
+              throw "Delta did not create a short IPC profile: $details"
+            }
+            Write-Host "Delta IPC profile: $ipcProfile"
+            $data = Join-Path $portable "PortableData"
+            $childEnv = @{
+              USERPROFILE = $ipcProfile
+              APPDATA = Join-Path $data "AppData/Roaming"
+              LOCALAPPDATA = Join-Path $data "AppData/Local"
+              TEMP = Join-Path $data "Temp"
+              TMP = Join-Path $data "Temp"
+            }
+            $oldEnv = @{}
+            foreach ($entry in $childEnv.GetEnumerator()) {
+              $oldEnv[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key)
+              [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value)
+            }
+            try {
+              $authProcess = Start-Process -FilePath $mainExe.FullName `
+                -ArgumentList @("auth", "login", "--no-wait") -PassThru `
+                -RedirectStandardOutput $authOutput -RedirectStandardError $authError
+            }
+            finally {
+              foreach ($key in $oldEnv.Keys) {
+                [Environment]::SetEnvironmentVariable($key, $oldEnv[$key])
+              }
+            }
+            if (-not $authProcess.WaitForExit(30000)) {
+              $authProcess.Kill()
+              throw "Delta auth handoff did not exit within 30 s"
+            }
+            if ($authProcess.ExitCode -ne 0) {
+              $details = @()
+              if (Test-Path $authOutput) { $details += Get-Content $authOutput -Tail 40 }
+              if (Test-Path $authError) { $details += Get-Content $authError -Tail 40 }
+              throw ("Delta auth handoff failed with exit $($authProcess.ExitCode). " +
+                ($details -join "`n"))
+            }
+            for ($attempt = 0; $attempt -lt 45; $attempt++) {
+              if (Test-Path $runLog) {
+                $runText = Get-Content $runLog -Raw
+                if ($runText -match 'browser login: opened https://zed\.dev/native_app_signin' -or
+                    $runText -match 'browser login: opened https://dashboard\.zed\.dev/delta-beta') {
                   $authUrlFound = $true
                   break
                 }
@@ -411,10 +477,10 @@ jobs:
               if (Test-Path $authOutput) { $details += Get-Content $authOutput -Tail 40 }
               if (Test-Path $authError) { $details += Get-Content $authError -Tail 40 }
               if (Test-Path $runLog) { $details += Get-Content $runLog -Tail 100 }
-              throw ("Delta auth login did not forward the terms URL through " +
-                "Launch.bat. " + ($details -join "`n"))
+              throw ("Delta IPC auth handoff did not reach the host browser. " +
+                ($details -join "`n"))
             }
-            Write-Host "Delta browser auth handoff: dashboard.zed.dev/delta-beta opened"
+            Write-Host "Delta long-path IPC and browser auth handoff: OK"
           }
           finally {
             # Only processes whose image is inside this temporary portable
