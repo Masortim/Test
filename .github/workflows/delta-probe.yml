@@ -23,7 +23,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $report = [System.Collections.Generic.List[string]]::new()
           $root = Join-Path $env:RUNNER_TEMP "d"
-          $portable = Join-Path $root "out/Delta_Portable"
+          $portable = Join-Path $root "out/x_Portable"
           try {
             New-Item -ItemType Directory -Force -Path (Join-Path $root "out") | Out-Null
             $installer = Join-Path $root "delta-setup.exe"
@@ -32,7 +32,7 @@ jobs:
               -OutFile $installer
             $report.Add("Installer downloaded")
             $arguments = 'build "' + $installer + '" --out "' +
-              (Join-Path $root "out") + '" --name Delta --single-file --no-registry ' +
+              (Join-Path $root "out") + '" --name x --single-file --no-registry ' +
               '--no-netstack --hard-timeout 180'
             $builder = Start-Process -FilePath (Resolve-Path "dist-windows/Portablizer.exe").Path `
               -ArgumentList $arguments -PassThru
