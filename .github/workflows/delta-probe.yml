@@ -22,8 +22,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $report = [System.Collections.Generic.List[string]]::new()
-          $root = Join-Path $env:RUNNER_TEMP "d"
-          $portable = Join-Path $root "out/x_Portable"
+          $root = Join-Path $env:RUNNER_TEMP "Delta Browser Probe"
+          $portable = Join-Path $root "out/Delta_Portable"
+          $alias = $null
           try {
             New-Item -ItemType Directory -Force -Path (Join-Path $root "out") | Out-Null
             $installer = Join-Path $root "delta-setup.exe"
@@ -32,7 +33,7 @@ jobs:
               -OutFile $installer
             $report.Add("Installer downloaded")
             $arguments = 'build "' + $installer + '" --out "' +
-              (Join-Path $root "out") + '" --name x --single-file --no-registry ' +
+              (Join-Path $root "out") + '" --name Delta --single-file --no-registry ' +
               '--no-netstack --hard-timeout 180'
             $builder = Start-Process -FilePath (Resolve-Path "dist-windows/Portablizer.exe").Path `
               -ArgumentList $arguments -PassThru
@@ -95,6 +96,16 @@ jobs:
             $authConfig = $configText | ConvertFrom-Json
             $authConfig.browser_login.connect_host_profile = $false
             $authConfig.browser_login.clean_duplicates = $false
+            $alias = Join-Path $env:RUNNER_TEMP "pd-alias"
+            if (Test-Path $alias) { cmd /c rmdir "$alias" | Out-Null }
+            New-Item -ItemType Junction -Path $alias `
+              -Target (Join-Path $portable "PortableData/User") | Out-Null
+            if (-not $authConfig.extra_env) {
+              $authConfig | Add-Member -MemberType NoteProperty `
+                -Name extra_env -Value ([pscustomobject]@{})
+            }
+            $authConfig.extra_env | Add-Member -Force -MemberType NoteProperty `
+              -Name USERPROFILE -Value $alias
             $authConfig | ConvertTo-Json -Depth 20 |
               Set-Content -Encoding utf8 $configPath
             $env:PORTABLE_LAUNCHER_NO_UI = "1"
@@ -120,9 +131,9 @@ jobs:
             $authError = Join-Path $root "auth.err"
             $data = Join-Path $portable "PortableData"
             $childEnv = @{
+              USERPROFILE = $alias
               APPDATA = Join-Path $data "AppData/Roaming"
               LOCALAPPDATA = Join-Path $data "AppData/Local"
-              USERPROFILE = Join-Path $data "User"
               TEMP = Join-Path $data "Temp"
               TMP = Join-Path $data "Temp"
             }
@@ -177,6 +188,9 @@ jobs:
                 }
               }
               catch { }
+            }
+            if ($alias -and (Test-Path $alias)) {
+              cmd /c rmdir "$alias" | Out-Null
             }
             foreach ($item in @(
                 @{Name = "gui.out"; Path = (Join-Path $root "gui.out")},
