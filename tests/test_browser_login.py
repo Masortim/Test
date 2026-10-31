@@ -52,6 +52,11 @@ EDGE_LOGIN = (r'"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" '
               "https://login.microsoftonline.com/common/oauth2/authorize?x=1")
 FIREFOX_LOGIN = ('"C:\\Program Files\\Mozilla Firefox\\firefox.exe" '
                  '-osint -url "https://accounts.example.com/sign-in"')
+YANDEX_CRASH_URL = "https://crash-reports.browser.yandex.net/submit"
+DELTA_TERMS_URL = "https://dashboard.zed.dev/delta-beta"
+YANDEX_CRASH = ('"C:\\Users\\user\\AppData\\Local\\Yandex\\YandexBrowser\\'
+                'Application\\browser.exe" --crash-reporter-url="' +
+                YANDEX_CRASH_URL + '"')
 
 
 def isolated_host():
@@ -102,6 +107,22 @@ class LoginUrlTests(unittest.TestCase):
         self.assertEqual(
             entry._browser_login_url('chrome.exe "https://example.com/x".'),
             "https://example.com/x")
+
+    def test_yandex_crash_report_is_not_a_login_url(self):
+        self.assertEqual(entry._browser_login_url(YANDEX_CRASH), "")
+        self.assertTrue(entry._has_only_browser_service_urls(YANDEX_CRASH))
+
+    def test_real_terms_url_after_yandex_crash_report_is_selected(self):
+        command_line = (YANDEX_CRASH + ' --single-argument "' +
+                        DELTA_TERMS_URL + '"')
+        self.assertEqual(entry._browser_login_url(command_line),
+                         DELTA_TERMS_URL)
+        self.assertFalse(entry._has_only_browser_service_urls(command_line))
+
+    def test_similar_yandex_domain_is_not_overfiltered(self):
+        url = "https://crash-reports.browser.yandex.net.example.com/login"
+        self.assertEqual(entry._browser_login_url('browser.exe "' + url + '"'),
+                         url)
 
     def test_browser_images_are_recognised_by_name(self):
         self.assertTrue(entry._is_known_browser(CHROME))
@@ -191,10 +212,32 @@ class BridgePlanTests(unittest.TestCase):
         planned = self._plan(table, {310: CHROME_LOGIN})
         self.assertEqual([pid for pid, _url, _image in planned], [310])
 
-    def test_the_same_url_is_handled_once(self):
+    def test_the_same_url_is_handled_once_per_live_process(self):
         table = self.baseline + [(200, 100, "chrome.exe")]
         self.assertEqual(len(self._plan(table, {200: CHROME_LOGIN})), 1)
         self.assertEqual(self._plan(table, {200: CHROME_LOGIN}), [])
+
+    def test_repeated_clicks_with_the_same_url_are_not_suppressed(self):
+        for pid in (200, 201, 202):
+            table = self.baseline + [(pid, 100, "browser.exe")]
+            command = 'browser.exe --single-argument "' + DELTA_TERMS_URL + '"'
+            self.assertEqual(self._plan(table, {pid: command}),
+                             [(pid, DELTA_TERMS_URL, "browser.exe")])
+
+    def test_service_only_process_is_cleaned_without_opening_its_url(self):
+        table = self.baseline + [(200, 100, "browser.exe")]
+        self.assertEqual(self._plan(table, {200: YANDEX_CRASH}),
+                         [(200, "", "browser.exe")])
+        self.assertEqual(self._plan(table, {200: YANDEX_CRASH}), [])
+
+    def test_crash_report_does_not_consume_the_real_terms_handoff(self):
+        table = self.baseline + [(200, 100, "browser.exe"),
+                                 (201, 100, "browser.exe")]
+        command = YANDEX_CRASH + ' --single-argument "' + DELTA_TERMS_URL + '"'
+        planned = self._plan(table, {200: YANDEX_CRASH, 201: command})
+        self.assertIn((200, "", "browser.exe"), planned)
+        self.assertIn((201, DELTA_TERMS_URL, "browser.exe"), planned)
+        self.assertNotIn(YANDEX_CRASH_URL, [url for _pid, url, _image in planned])
 
     def test_browser_without_url_is_ignored(self):
         table = self.baseline + [(200, 100, "chrome.exe")]
@@ -541,6 +584,29 @@ class BridgePollTests(unittest.TestCase):
             terminated.assert_called_once_with([200])
             opened.assert_called_once_with(
                 "https://www.figma.com/login?redirect=%2Ffiles&state=abc")
+
+    def test_poll_never_opens_yandex_crash_report_in_the_host_browser(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = make_portable(root)
+            bridge = make_bridge(root, target)
+            table = [(100, 0, "Figma.exe"), (200, 100, "browser.exe")]
+            with mock.patch.object(entry, "IS_WINDOWS", True), \
+                    mock.patch.object(entry, "_process_table",
+                                      return_value=[(100, 0, "Figma.exe")]), \
+                    isolated_host(), \
+                    mock.patch.object(entry, "_process_command_line",
+                                      return_value=YANDEX_CRASH), \
+                    mock.patch.object(entry, "_terminate_pids") as terminated, \
+                    mock.patch.object(entry, "open_in_host_browser") as opened:
+                bridge.prepare()
+                bridge.attach(100)
+                bridge._last_poll = 0.0
+                with mock.patch.object(entry, "_process_table",
+                                       return_value=table):
+                    bridge.poll()
+            terminated.assert_called_once_with([200])
+            opened.assert_not_called()
 
 
 class HostBrowserTests(unittest.TestCase):

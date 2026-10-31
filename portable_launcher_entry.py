@@ -6345,19 +6345,48 @@ _SHELL_BROKERS = frozenset({
 _LOGIN_URL_RE = re.compile(r"(?i)\bhttps?://[^\s\"'<>|]+")
 
 
+#: Служебные endpoint'ы браузера не являются страницей входа. В частности,
+#: Yandex Browser может поместить адрес crash reporter'а в командную строку
+#: перед настоящим URL, переданным через ShellExecute. Такой адрес нельзя
+#: открывать на машине пользователя: вместо Terms появляется ``method not
+#: allowed``. Сопоставление ведётся по целому hostname, без подстановки
+#: произвольного браузера или захвата обычных страниц входа.
+_BROWSER_SERVICE_HOSTS = frozenset({
+    "crash-reports.browser.yandex.net",
+})
+
+
 def _is_known_browser(image: str) -> bool:
     """True для исполняемого файла известного браузера."""
     return _image_name(image).casefold() in _BROWSER_IMAGES
 
 
-def _browser_login_url(command_line: str) -> str:
-    """Первый http(s)-адрес из командной строки браузера (или "")."""
+def _command_line_urls(command_line: str) -> "list[str]":
+    """Все HTTP(S)-аргументы в порядке их появления в командной строке."""
     if not command_line:
-        return ""
-    match = _LOGIN_URL_RE.search(str(command_line))
-    if not match:
-        return ""
-    return match.group(0).rstrip(".,;)")
+        return []
+    return [match.group(0).rstrip(".,;)")
+            for match in _LOGIN_URL_RE.finditer(str(command_line))]
+
+
+def _is_browser_service_url(url: str) -> bool:
+    """True только для известного служебного URL браузера, не для login."""
+    match = re.match(r"(?i)^https?://([^/:?#]+)", str(url or ""))
+    return bool(match and match.group(1).casefold() in _BROWSER_SERVICE_HOSTS)
+
+
+def _browser_login_url(command_line: str) -> str:
+    """Первый пользовательский URL; служебные browser endpoints пропускаются."""
+    for url in _command_line_urls(command_line):
+        if not _is_browser_service_url(url):
+            return url
+    return ""
+
+
+def _has_only_browser_service_urls(command_line: str) -> bool:
+    """Командная строка содержит лишь служебные URL и требует только cleanup."""
+    urls = _command_line_urls(command_line)
+    return bool(urls) and all(_is_browser_service_url(url) for url in urls)
 
 
 def _browser_profile_pairs() -> "tuple[tuple[str, str], ...]":
@@ -6780,7 +6809,10 @@ class BrowserLoginBridge:
         self._baseline: "set[int]" = set()
         self._profiles_before: "set[str]" = set()
         self._bridged: "set[tuple[str, str]]" = set()
-        self._handled: "set[str]" = set()
+        # Дедупликация нужна между polling'ами одного живого процесса, а не
+        # между разными кликами пользователя. Ключ включает PID: новый клик
+        # с тем же Terms URL обязан снова открыть страницу в основном браузере.
+        self._handled: "set[tuple[int, str]]" = set()
         self._last_poll = 0.0
         self._reported = False
         # Default browser вычисляется лениво и кэшируется только на этот
@@ -6826,14 +6858,6 @@ class BrowserLoginBridge:
 
     @property
     def connect_host_profile(self) -> bool:
-        # Delta's ShellExecute path starts a new Chromium process even after
-        # its profile directories are junctioned.  Treating that process as
-        # already bridged leaves Review Terms/sign-in inside the redirected
-        # environment and the user sees a no-op.  Always use the process/URL
-        # fallback for Delta so the launcher reopens the URL with the host
-        # environment and the current default browser/existing window.
-        if _is_delta_target(self.target):
-            return False
         return self.settings.get("connect_host_profile") is not False
 
     @property
@@ -6906,6 +6930,14 @@ class BrowserLoginBridge:
         for pid, url, image in self.plan(table):
             self._stop(pid)
             self.cleanup_duplicate_profile(image)
+            if not url:
+                # Crash-report/telemetry handoff: clean up the transient
+                # process, but never display its service endpoint as if it
+                # were the page requested by the application.
+                self.log("browser login: discarded a browser service URL; "
+                         "the transient browser process was stopped without "
+                         "opening that URL")
+                continue
             if open_in_host_browser(url):
                 self.log("browser login: opened " + url
                          + " in the default browser (the portable copy was "
@@ -6926,6 +6958,11 @@ class BrowserLoginBridge:
         if not self.enabled:
             return []
         reader = command_line_of or _process_command_line
+        live_pids = {int(pid) for pid, _ppid, _image in table}
+        # Не копим записи о завершившихся процессах и не блокируем будущий
+        # клик, если Windows повторно использовала их PID.
+        self._handled = {item for item in self._handled
+                         if item[0] in live_pids}
         parents = {int(pid): int(ppid) for pid, ppid, _image in table}
         images = {int(pid): str(image) for pid, _ppid, image in table}
         candidates = [
@@ -6938,6 +6975,7 @@ class BrowserLoginBridge:
         # кандидат: на флешке это самый дорогой шаг наблюдения.
         new_profiles = self._new_profiles()
         planned: "list[tuple[int, str, str]]" = []
+        planned_urls: "set[str]" = set()
         for pid, image in candidates:
             if self._bridged_image(image):
                 # Профиль уже настоящий: браузер открывает вход там, где надо.
@@ -6951,10 +6989,19 @@ class BrowserLoginBridge:
             except Exception:  # noqa: BLE001
                 command_line = ""
             url = _browser_login_url(command_line)
-            if not url or url in self._handled:
+            if not url and not _has_only_browser_service_urls(command_line):
                 continue
-            self._handled.add(url)
+            key = (pid, url)
+            if key in self._handled:
+                continue
+            self._handled.add(key)
+            if url and url in planned_urls:
+                # Несколько Chromium-процессов могут нести один и тот же URL.
+                # Все они запомнены, но страница открывается один раз за клик.
+                continue
             planned.append((pid, url, image))
+            if url:
+                planned_urls.add(url)
         return planned
 
     def _descends_from_target(self, parent: int,
@@ -6980,9 +7027,10 @@ class BrowserLoginBridge:
 
         ``ShellExecute`` может уйти в AppInfo/DCOM: тогда родитель браузера —
         ``svchost.exe``/``explorer.exe``, и цепочка до программы не доходит.
-        Вызывается только для браузеров, чей профиль соединить не удалось
-        (для соединённых ``plan`` выходит раньше): иначе окно пользователя
-        можно было бы закрыть без всякой причины.
+        Обычно вызывается только для браузеров, чей профиль соединить не
+        удалось (для соединённых ``plan`` выходит раньше). Delta — явное
+        исключение: у неё junction и process fallback работают одновременно,
+        потому что связанный профиль сам по себе не исключает новый процесс.
         """
         parent_image = images.get(int(parents.get(int(pid), 0)), "")
         return _image_name(parent_image).casefold() in _SHELL_BROKERS
@@ -7023,6 +7071,14 @@ class BrowserLoginBridge:
         return roots
 
     def _bridged_image(self, image: str) -> bool:
+        # Delta needs BOTH defences.  Junctions prevent a fresh browser
+        # profile/shortcut from appearing, but its ShellExecute path can still
+        # create a new browser process even when every profile is linked.
+        # Keep monitoring that process and reopen the real Terms/login URL
+        # through the host instead of treating the junction as proof that the
+        # handoff already succeeded.
+        if _is_delta_target(self.target):
+            return False
         name = _image_name(image).casefold()
         pairs = _BROWSER_PROFILE_DIRS.get(name, ())
         if not pairs and name in self._selected_default_images():
