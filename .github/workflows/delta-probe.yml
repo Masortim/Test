@@ -51,6 +51,28 @@ jobs:
             if (-not $deltaCli) { throw "Delta CLI was not found" }
             $cliTarget = $deltaCli.FullName.Substring($portable.Length + 1).Replace('\', '/')
             $report.Add("CLI target: $cliTarget")
+            $helpOut = Join-Path $root "auth-help.out"
+            $helpErr = Join-Path $root "auth-help.err"
+            $help = Start-Process -FilePath $deltaCli.FullName `
+              -ArgumentList @("auth", "login", "--help") -PassThru `
+              -RedirectStandardOutput $helpOut -RedirectStandardError $helpErr
+            if (-not $help.WaitForExit(30000)) {
+              $help.Kill()
+              $report.Add("Direct auth help timed out")
+            }
+            else {
+              $report.Add("Direct auth help exit: $($help.ExitCode)")
+            }
+            if (Test-Path $helpOut) {
+              foreach ($line in @(Get-Content $helpOut -Tail 40)) {
+                $report.Add("help out: $line")
+              }
+            }
+            if (Test-Path $helpErr) {
+              foreach ($line in @(Get-Content $helpErr -Tail 40)) {
+                $report.Add("help err: $line")
+              }
+            }
             $authConfig = $configText | ConvertFrom-Json
             $authConfig.browser_login.connect_host_profile = $false
             $authConfig.browser_login.clean_duplicates = $false
