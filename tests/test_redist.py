@@ -319,6 +319,163 @@ class RuntimeProvisionTests(unittest.TestCase):
             for name in ("msvcr110.dll", "msvcp110.dll", "xinput1_3.dll"):
                 self.assertTrue((app / name).is_file(), name)
 
+    def test_d3dcompiler_other_bitness_comes_from_windows_sdk(self):
+        """x64 уже есть в системе, а x86 не должен остаться недостающим."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            (app / "x86").mkdir()
+            (app / "x64").mkdir()
+            write_pe(app / "x86" / "game32.exe",
+                     imports=("d3dcompiler_47.dll",), machine=MACHINE_X86)
+            write_pe(app / "x64" / "game64.exe",
+                     imports=("d3dcompiler_47.dll",), machine=MACHINE_X64)
+
+            system = Path(temp, "FakeSystem")
+            system.mkdir()
+            write_runtime_dll(system / "d3dcompiler_47.dll",
+                              machine=MACHINE_X64)
+            sdk = Path(temp, "SDK")
+            sdk32 = sdk / "Windows Kits" / "10" / "Redist" / "D3D" / "x86"
+            sdk32.mkdir(parents=True)
+            write_runtime_dll(sdk32 / "d3dcompiler_47.dll",
+                              machine=MACHINE_X86)
+
+            scan = redist.scan_app_runtime(str(app))
+            with mock.patch.dict(
+                    os.environ, {"ProgramFiles(x86)": str(sdk)}):
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[str(system)], sxs_dir="",
+                ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertEqual(report.missing, [])
+            self.assertEqual(
+                {(item.dll, item.arch) for item in report.provided},
+                {("d3dcompiler_47.dll", "x86"),
+                 ("d3dcompiler_47.dll", "x64")})
+            self.assertEqual(redist.read_pe_imports(str(
+                app / "x86" / "d3dcompiler_47.dll")).machine, "x86")
+            self.assertEqual(redist.read_pe_imports(str(
+                app / "x64" / "d3dcompiler_47.dll")).machine, "x64")
+            sdk_copy = next(item for item in report.provided
+                            if item.arch == "x86")
+            self.assertEqual(sdk_copy.source, "Windows SDK (app-local redist)")
+
+    def test_d3dcompiler_47_msu_is_extracted_without_windows_update(self):
+        """Официальный KB — источник DLL, а не скрытая установка в систему."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("d3dcompiler_47.dll",))
+            payload_path = Path(temp, "payload.dll")
+            write_runtime_dll(payload_path)
+            inner = make_cabinet({
+                "x86_microsoft-windows-directx-d3dcompiler/"
+                "d3dcompiler_47.dll": payload_path.read_bytes(),
+            })
+            # MSU — внешний CAB с вложенным CAB. Хвост только поднимает
+            # размер выше общей проверки оборванной закачки.
+            msu = make_cabinet({
+                "Windows6.1-KB4019990-x86.cab": inner,
+            }) + b"\0" * (70 * 1024)
+            downloads = []
+            runner = mock.Mock(return_value=1)
+
+            def downloader(url, destination):
+                downloads.append(url)
+                Path(destination).write_bytes(msu)
+                return True
+
+            scan = redist.scan_app_runtime(str(app))
+            with mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "windows_sdk_d3d_dirs_for",
+                                      return_value=[]):
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="",
+                    allow_download=True, allow_install=True,
+                    downloader=downloader, runner=runner,
+                ).provision(scan, str(app), str(portable), "Game")
+
+            self.assertEqual(report.missing, [])
+            self.assertEqual([item.dll for item in report.provided],
+                             ["d3dcompiler_47.dll"])
+            self.assertTrue((app / "d3dcompiler_47.dll").is_file())
+            self.assertEqual(len(downloads), 1)
+            self.assertTrue(downloads[0].endswith(
+                "Windows6.1-KB4019990-x86.msu"))
+            runner.assert_not_called()
+            self.assertEqual(report.installed, [])
+
+    def test_d3dcompiler_46_does_not_download_the_47_only_update(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("d3dcompiler_46.dll",))
+            downloader = mock.Mock(return_value=False)
+            scan = redist.scan_app_runtime(str(app))
+            with mock.patch.object(redist, "windows_sdk_d3d_dirs_for",
+                                   return_value=[]):
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="",
+                    allow_download=True, downloader=downloader,
+                ).provision(scan, str(app), str(portable), "Game")
+            self.assertEqual([item.dll for item in report.missing],
+                             ["d3dcompiler_46.dll"])
+            downloader.assert_not_called()
+
+    def test_msu_extraction_never_executes_the_update_as_an_exe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive = Path(temp, "Windows6.1-KB4019990-x86.msu")
+            archive.write_bytes(b"MSCF")
+            commands = redist.extraction_commands(str(archive), temp)
+            self.assertTrue(commands)
+            self.assertTrue(all(
+                os.path.abspath(str(command[0])) != os.path.abspath(str(archive))
+                for command in commands))
+
+    def test_d3dcompiler_update_is_never_silently_installed_into_windows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app = self._portable(temp)
+            write_pe(app / "game.exe", imports=("d3dcompiler_47.dll",))
+            requirement = redist.scan_app_runtime(str(app)).requirements[0]
+            provisioner = redist.RuntimeProvisioner(
+                self.log, system_dirs=[], sxs_dir="",
+                allow_download=True, allow_install=True,
+            )
+            with mock.patch.object(redist, "IS_WINDOWS", True), \
+                    mock.patch.object(redist, "run_silent_install") as install:
+                result = provisioner._from_silent_install(
+                    requirement, str(portable))
+            self.assertEqual(result, ("", ""))
+            install.assert_not_called()
+
+    @unittest.skipUnless(
+        os.name == "nt" and os.environ.get("PORTABLIZER_LIVE_REDIST_TEST") == "1",
+        "real Microsoft download; enabled by the dedicated Windows CI step",
+    )
+    def test_official_d3dcompiler_47_packages_extract_on_windows(self):
+        """Настоящие KB4019990, не synthetic CAB: обе ссылки и обе разрядности."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable, _app = self._portable(temp)
+            package = redist.find_package("d3dcompiler_47.dll")
+            self.assertIsNotNone(package)
+            provisioner = redist.RuntimeProvisioner(
+                self.log, system_dirs=[], sxs_dir="",
+                allow_download=True, allow_install=False,
+            )
+            expected = {"x86": {"x86"}, "x64": {"x86", "x64"}}
+            for arch, required_machines in expected.items():
+                with self.subTest(arch=arch):
+                    archive = provisioner._download_archive(
+                        package, arch, str(portable))
+                    self.assertTrue(archive, f"KB4019990 {arch} was not downloaded")
+                    destination = Path(temp, f"payload-{arch}")
+                    self.assertTrue(provisioner._extract_installer(
+                        archive, str(destination)))
+                    machines = {
+                        redist.read_pe_imports(str(path)).machine
+                        for path in destination.rglob("d3dcompiler_47.dll")
+                    }
+                    self.assertTrue(required_machines <= machines, machines)
+                    self.assertEqual(provisioner.installs, [])
+
     def test_wrong_architecture_is_never_copied(self):
         with tempfile.TemporaryDirectory() as temp:
             portable, app = self._portable(temp)
@@ -705,9 +862,14 @@ class FullKitProvisionTests(unittest.TestCase):
             portable, app = self._portable(temp)
             write_pe(app / "game.exe", imports=("KERNEL32.dll",))
             scan = redist.scan_app_runtime(str(app))
-            report = redist.RuntimeProvisioner(
-                self.log, system_dirs=[], sxs_dir="",
-            ).provision(scan, str(app), str(portable), "Game", full_kit=True)
+            # Тест намеренно моделирует ПК без источников. Иначе установленный
+            # на Windows-раннере SDK законно принесёт запасной D3DCompiler и
+            # сценарий «ничего не найдено» перестанет быть изолированным.
+            with mock.patch.object(redist, "windows_sdk_d3d_dirs_for",
+                                   return_value=[]):
+                report = redist.RuntimeProvisioner(
+                    self.log, system_dirs=[], sxs_dir="",
+                ).provision(scan, str(app), str(portable), "Game", full_kit=True)
 
             self.assertEqual(report.missing, [])
             self.assertEqual(report.provided, [])

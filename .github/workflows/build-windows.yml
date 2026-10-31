@@ -112,6 +112,18 @@ jobs:
           }
           exit $testStatus
 
+      - name: Test official D3DCompiler 47 packages
+        shell: pwsh
+        timeout-minutes: 5
+        env:
+          PYTHONIOENCODING: utf-8
+          PORTABLIZER_LIVE_REDIST_TEST: "1"
+        # Настоящие MSU с download.microsoft.com, а не только synthetic CAB:
+        # x86-пакет обязан дать x86 DLL, x64-пакет — обе разрядности. Тест
+        # использует только распаковку и никогда не запускает WUSA.
+        run: |
+          python -m unittest -v tests.test_redist.RuntimeProvisionTests.test_official_d3dcompiler_47_packages_extract_on_windows
+
       # Регрессия 1.20.0: собранный exe не запускался вовсе — на импорте
       # вызывался inspect.getsource, а исходников в PyInstaller-сборке нет
       # ("OSError: could not get source code"). Юнит-тесты этого не видели:
