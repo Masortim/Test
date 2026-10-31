@@ -1,0 +1,94 @@
+name: Fetch official D3DCompiler redist
+
+# Временный служебный прогон: получает эталонные app-local DLL прямо из
+# Microsoft KB4019990 и публикует их как короткоживущий артефакт для ресурсов.
+on:
+  push:
+    branches: ["arena/782f6c71-test"]
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Extract official DLLs
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          @'
+          import hashlib
+          import json
+          import os
+          import shutil
+          from pathlib import Path
+
+          from portablizer.core import redist
+          from portablizer.core.logutil import Logger
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "d3dcompiler47-official"
+          output = root / "out"
+          portable = root / "portable"
+          output.mkdir(parents=True, exist_ok=True)
+          portable.mkdir(parents=True, exist_ok=True)
+          package = redist.find_package("d3dcompiler_47.dll")
+          provisioner = redist.RuntimeProvisioner(
+              Logger(), system_dirs=[], sxs_dir="",
+              allow_download=True, allow_install=False,
+          )
+          provenance = []
+          for arch in ("x86", "x64"):
+              archive = provisioner._download_archive(package, arch, str(portable))
+              if not archive:
+                  raise RuntimeError(f"KB4019990 {arch} was not downloaded")
+              extracted = root / f"extracted-{arch}"
+              if not provisioner._extract_installer(archive, str(extracted)):
+                  raise RuntimeError(f"KB4019990 {arch} was not extracted")
+              candidates = []
+              for path in extracted.rglob("d3dcompiler_47.dll"):
+                  if redist.read_pe_imports(str(path)).machine == arch:
+                      candidates.append(path)
+              if not candidates:
+                  raise RuntimeError(f"No {arch} D3DCompiler payload in KB4019990")
+              source = sorted(candidates, key=lambda p: (len(str(p)), str(p)))[0]
+              target_dir = output / arch
+              target_dir.mkdir(parents=True, exist_ok=True)
+              target = target_dir / "d3dcompiler_47.dll"
+              shutil.copy2(source, target)
+              archive_hash = hashlib.sha256(Path(archive).read_bytes()).hexdigest()
+              dll_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+              print(f"{arch}: {target} SHA256={dll_hash}")
+              provenance.append({
+                  "architecture": arch,
+                  "package_url": package.urls(arch)[0],
+                  "package_sha256": archive_hash,
+                  "dll_sha256": dll_hash,
+                  "dll_size": target.stat().st_size,
+              })
+          (output / "provenance.json").write_text(
+              json.dumps(provenance, indent=2), encoding="utf-8")
+          '@ | python -X utf8 -
+      - name: Verify Microsoft signatures and versions
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "d3dcompiler47-official/out"
+          Get-ChildItem $root -Recurse -Filter d3dcompiler_47.dll | ForEach-Object {
+            $signature = Get-AuthenticodeSignature $_.FullName
+            $version = $_.VersionInfo.FileVersion
+            Write-Host "$($_.FullName): version=$version signature=$($signature.Status) signer=$($signature.SignerCertificate.Subject)"
+            if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "Microsoft") {
+              throw "The extracted D3DCompiler does not have a valid Microsoft signature"
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d3dcompiler47-official-redist
+          path: ${{ runner.temp }}/d3dcompiler47-official/out
+          retention-days: 1
