@@ -164,9 +164,14 @@ class DeltaIpcProfileTests(unittest.TestCase):
                 "USERPROFILE": str(profile),
                 "APPDATA": str(root / "PortableData" / "AppData" / "Roaming"),
             }
+            alias_base = base
+            if os.name == "nt":
+                # Windows' default TEMP is deeper than the socket budget;
+                # use the same short user-level fallback as the launcher.
+                alias_base = base.parents[3]
             with mock.patch.object(entry, "IS_WINDOWS", True), \
                     mock.patch.object(entry, "_windows_short_path", return_value=None), \
-                    mock.patch.object(entry, "_delta_alias_bases", return_value=[base]):
+                    mock.patch.object(entry, "_delta_alias_bases", return_value=[alias_base]):
                 patched, alias = entry._delta_profile_environment(
                     root, root / "App" / "delta-app.exe", original)
 
@@ -222,7 +227,7 @@ class DeltaIpcProfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / ("r" * 80)
             profile = root / "PortableData" / "User"
-            short = Path(temp) / "short"
+            short = Path(Path(temp).anchor) / "p"
             env = {"USERPROFILE": str(profile)}
             with mock.patch.object(entry, "IS_WINDOWS", True), \
                     mock.patch.object(entry, "_windows_short_path", return_value=short), \

@@ -2336,8 +2336,14 @@ def _delta_alias_bases(root: Path) -> "list[Path]":
                   or os.environ.get("LOCALAPPDATA", ""))
     if host_temp:
         values.append(host_temp)
-    elif host_local:
-        values.append(str(Path(host_local) / "Temp"))
+    if host_local:
+        local = Path(host_local)
+        values.append(str(local / "Temp"))
+        # The usual %LOCALAPPDATA%\\Temp is itself too long on many PCs:
+        # the socket suffix alone takes about 62 bytes.  AppData and the
+        # user root are still private, writable locations with more room.
+        values.append(str(local.parent))
+        values.append(str(local.parent.parent))
     try:
         values.append(tempfile.gettempdir())
     except Exception:  # noqa: BLE001 - fallback to the portable parent
