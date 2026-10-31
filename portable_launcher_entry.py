@@ -6826,6 +6826,14 @@ class BrowserLoginBridge:
 
     @property
     def connect_host_profile(self) -> bool:
+        # Delta's ShellExecute path starts a new Chromium process even after
+        # its profile directories are junctioned.  Treating that process as
+        # already bridged leaves Review Terms/sign-in inside the redirected
+        # environment and the user sees a no-op.  Always use the process/URL
+        # fallback for Delta so the launcher reopens the URL with the host
+        # environment and the current default browser/existing window.
+        if _is_delta_target(self.target):
+            return False
         return self.settings.get("connect_host_profile") is not False
 
     @property

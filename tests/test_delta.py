@@ -121,6 +121,20 @@ class DeltaRuntimeTargetTests(unittest.TestCase):
 
 
 class DeltaTermsBridgeTests(unittest.TestCase):
+    def test_delta_always_uses_host_browser_fallback(self):
+        import portable_launcher_entry as entry
+
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = entry.BrowserLoginBridge(
+                Path(temp),
+                {"browser_login": {"connect_host_profile": True}},
+                Path(temp) / "App" / "delta-app.exe",
+                env={},
+            )
+            # Profile junctioning alone does not stop Delta from spawning a
+            # fresh Chromium process.  The host URL handoff must remain on.
+            self.assertFalse(bridge.connect_host_profile)
+
     def test_review_terms_url_is_forwarded_by_the_external_browser_bridge(self):
         import portable_launcher_entry as entry
 

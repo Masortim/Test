@@ -374,11 +374,9 @@ jobs:
             if ($longIpcPath.Length -lt 108) {
               throw "Delta regression path is not long enough to exercise SUN_LEN: $longIpcPath"
             }
-            $authConfig = $configText | ConvertFrom-Json
-            $authConfig.browser_login.connect_host_profile = $false
-            $authConfig.browser_login.clean_duplicates = $false
-            $authConfig | ConvertTo-Json -Depth 20 |
-              Set-Content -Encoding utf8 $configPath
+            # Keep the generated default browser_login configuration.  Delta
+            # must force the host-browser fallback itself rather than relying
+            # on a test-only connect_host_profile override.
             $runLog = Join-Path $portable "PortableData/launcher-run.log"
             $gui = Start-Process -FilePath (Join-Path $portable "Launch.bat") `
               -WorkingDirectory $portable -PassThru `
