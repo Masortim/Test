@@ -75,17 +75,25 @@ jobs:
           (output / "provenance.json").write_text(
               json.dumps(provenance, indent=2), encoding="utf-8")
           '@ | python -X utf8 -
-      - name: Verify Microsoft signatures and versions
+      - name: Verify official payload hashes and versions
         shell: pwsh
         run: |
           $root = Join-Path $env:RUNNER_TEMP "d3dcompiler47-official/out"
-          Get-ChildItem $root -Recurse -Filter d3dcompiler_47.dll | ForEach-Object {
-            $signature = Get-AuthenticodeSignature $_.FullName
-            $version = $_.VersionInfo.FileVersion
-            Write-Host "$($_.FullName): version=$version signature=$($signature.Status) signer=$($signature.SignerCertificate.Subject)"
-            if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "Microsoft") {
-              throw "The extracted D3DCompiler does not have a valid Microsoft signature"
+          $expected = @{
+            x86 = "e3009e3738fab1f7cd685567c5aa1eb0a408ac51d0cda5da788841174d7625b1"
+            x64 = "fd3cc271308e1c1fd21821e0ecaf29498edd46839a4a2712b2fab7aa96b755e2"
+          }
+          foreach ($arch in @("x86", "x64")) {
+            $file = Join-Path $root "$arch/d3dcompiler_47.dll"
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $version = (Get-Item $file).VersionInfo.FileVersion
+            $signature = Get-AuthenticodeSignature $file
+            Write-Host "$arch: version=$version hash=$hash embedded-signature=$($signature.Status)"
+            if ($hash -ne $expected[$arch] -or $version -notlike "6.3.9600.18611*") {
+              throw "Unexpected D3DCompiler payload in official KB4019990"
             }
+            # Payload Windows Update подписывается каталогом пакета, поэтому у
+            # отдельной DLL встроенной Authenticode-подписи может не быть.
           }
       - uses: actions/upload-artifact@v4
         with:
