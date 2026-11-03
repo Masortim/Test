@@ -457,20 +457,55 @@ def netstack_missing(root: Path, cfg: Dict[str, Any]
     жалоба (см. :func:`_device_hwid_present`).
     """
     section = _netstack_section(cfg)
-    names: "list[str]" = []
-    for key in ("driver_services", "service_names"):
-        raw = section.get(key)
-        if isinstance(raw, list):
-            names.extend(str(n) for n in raw if str(n).strip())
     devices: "list[str]" = []
     raw_devices = section.get("driver_devices")
     if isinstance(raw_devices, list):
         devices = [str(n) for n in raw_devices if str(n).strip()]
-    missing = [name for name in dict.fromkeys(names)
-               if not _service_key_present(name)]
-    missing += ["адаптер " + hwid for hwid in dict.fromkeys(devices)
-                if not _device_hwid_present(hwid)]
-    return missing
+    # Служба драйвера проверяется по паре «служба — устройство»: имя службы
+    # известно лишь из INF на компьютере-сборщике, а INF на другом ПК вправе
+    # зарегистрировать другое имя (tap0902 и т. п.). Работающий АДАПТЕР —
+    # доказательство, что драйвер установлен; требовать конкретный ключ
+    # Services\tap0901 значило показывать предупреждение «нет tap0901» на
+    # машине, где адаптер уже есть и работает (status.txt: adapter OK).
+    pairs: "list[tuple[str, str]]" = []
+    raw_pairs = section.get("driver_pairs")
+    if isinstance(raw_pairs, list):
+        for entry in raw_pairs:
+            if not isinstance(entry, dict):
+                continue
+            pairs.append((str(entry.get("service", "")).strip(),
+                          str(entry.get("device", "")).strip()))
+    if not pairs:
+        # Старый конфиг без пар: сопоставляем по порядку, как их пишет сборка.
+        services = [str(n) for n in (section.get("driver_services") or [])
+                    if str(n).strip()]
+        pairs = [(name, devices[index] if index < len(devices) else "")
+                 for index, name in enumerate(services)]
+    # Устройства из пар проверяются так же, как из driver_devices.
+    for _service, device in pairs:
+        if device and device not in devices:
+            devices.append(device)
+    present_devices = {hwid for hwid in dict.fromkeys(devices)
+                       if _device_hwid_present(hwid)}
+
+    missing: "list[str]" = []
+    for service, device in pairs:
+        if not service:
+            continue
+        if _service_key_present(service):
+            continue
+        if device and device in present_devices:
+            # Драйвер установлен, просто его служба называется иначе.
+            continue
+        missing.append(service)
+    for name in (section.get("service_names") or []):
+        name = str(name).strip()
+        if name and not _service_key_present(name):
+            missing.append(name)
+    for hwid in dict.fromkeys(devices):
+        if hwid and hwid not in present_devices:
+            missing.append("адаптер " + hwid)
+    return list(dict.fromkeys(missing))
 
 
 def _netstack_warning_is_new(root: Path, cfg: Dict[str, Any],
