@@ -1154,9 +1154,11 @@ def render_setup_cmd(report: NetStackReport) -> str:
 
     Режимы:
 
-    * ``--check`` — только проверка наличия (права не нужны, ничего не
-      меняется); код ``0`` — всё на месте, ``2``/``3``/``4`` — чего-то не
-      хватает или не поставилось;
+    * ``--check`` — только проверка (права не нужны, ничего не меняется):
+      есть ли пакет, устройство адаптера, служба, указывает ли её ``ImagePath``
+      внутрь ЭТОЙ папки и запущена ли она. Код ``0`` — всё в порядке,
+      ``2`` — нет пакета драйвера, ``3`` — нет адаптера, ``4`` — службы нет
+      или она устарела/остановлена;
     * по умолчанию (и ``--elevated``) — установить недостающие пакеты
       драйверов и зарегистрировать/запустить службы.
     """
@@ -1312,17 +1314,19 @@ def render_setup_cmd(report: NetStackReport) -> str:
         'if /i "%NETSTACK_MODE%" == "--check" set "PS_MODE=check"',
         f"powershell -NoProfile -ExecutionPolicy Bypass -File "
         f"{services_script} -Mode %PS_MODE%",
-        "rem 4 = companion service missing, 3 = adapter device missing.",
-        "rem 'if errorlevel N' also matches greater codes, so 4 is tested",
-        "rem first and 3 - only when the .ps1 really returned 3.",
-        "if errorlevel 4 (set \"NETSTACK_RC=4\") else if errorlevel 3 "
+        "rem 6 = a service exists but did not start, 4 = service missing or",
+        "rem its ImagePath points into another folder, 3 = adapter missing.",
+        "rem 'if errorlevel N' also matches greater codes, so 6 is tested",
+        "rem before 4, and 4 before 3 - only real returns set the code.",
+        "if errorlevel 6 (set \"NETSTACK_RC=6\") else if errorlevel 4 "
+        "(set \"NETSTACK_RC=4\") else if errorlevel 3 "
         "set \"NETSTACK_RC=3\"",
         "rem Re-verify honestly: services that still do not exist keep the",
         "rem exit code at 4, the launcher asks UAC only when it really helps.",
         'if /i not "%NETSTACK_MODE%" == "--check" (',
         f"  powershell -NoProfile -ExecutionPolicy Bypass -File "
         f"{services_script} -Mode check >nul 2>&1",
-        "  if errorlevel 4 set \"NETSTACK_RC=4\"",
+        '  if not "%NETSTACK_RC%" == "6" if errorlevel 4 set "NETSTACK_RC=4"',
         ")",
         "",
         'if /i not "%NETSTACK_MODE%" == "--check" echo   NetStack ready.',
@@ -1628,6 +1632,116 @@ function Remove-RememberedDevices {
      }
      Remove-Item -LiteralPath $devicesPath -Force -ErrorAction SilentlyContinue
 }
+# --- companion services: the registry must point into THIS copy ------------
+# A service registered by the vendor installer (or by an earlier copy of this
+# portable) stores an ABSOLUTE ImagePath. After the folder is copied to another
+# PC or moved to another drive that path leads nowhere: the service "exists",
+# never starts, and the VPN client reports "Не удалось подключиться ни по
+# одному из протоколов" although everything looks installed. So the ImagePath
+# is compared with the one this copy needs, and a stale registration is
+# replaced - but a live installation outside the portable is never touched.
+function Get-ServiceExePath([string]$image) {
+     if (-not $image) { return '' }
+     $text = [Environment]::ExpandEnvironmentVariables($image.Trim())
+     $text = $text.Replace('\??\', '')
+     if ($text.StartsWith('"')) {
+          $end = $text.IndexOf('"', 1)
+          if ($end -gt 1) { return $text.Substring(1, $end - 1) }
+          return $text.Trim('"')
+     }
+     $cut = $text.ToLower().IndexOf('.exe')
+     if ($cut -gt 0) { return $text.Substring(0, $cut + 4) }
+     return ($text -split '\s+')[0]
+}
+function Get-ServiceImagePath([string]$name) {
+     if (-not $name) { return '' }
+     $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\' + $name
+     return [string]((Get-ItemProperty -LiteralPath $key -Name ImagePath `
+               -ErrorAction SilentlyContinue).ImagePath)
+}
+function Test-SamePath([string]$left, [string]$right) {
+     if (-not $left -or -not $right) { return $false }
+     return [string]::Equals($left.TrimEnd('\'), $right.TrimEnd('\'),
+          [StringComparison]::OrdinalIgnoreCase)
+}
+function Test-ForeignService([string]$image) {
+     # A service whose binary exists OUTSIDE a portable folder belongs to a
+     # real installation on this PC: leave it alone (and never claim it).
+     # A portable copy always has "PortableData" next to the folder its binary
+     # lives in, so even a copy in another folder is recognised as ours.
+     $exe = Get-ServiceExePath $image
+     if (-not $exe) { return $false }
+     if (-not (Test-Path -LiteralPath $exe)) { return $false }
+     $dir = Split-Path -Parent $exe
+     if ($dir -and (Test-Path -LiteralPath (Join-Path $dir 'PortableData'))) {
+          return $false
+     }
+     $parent = Split-Path -Parent $dir
+     if ($parent -and
+          (Test-Path -LiteralPath (Join-Path $parent 'PortableData'))) {
+          return $false
+     }
+     return $true
+}
+# --- adapters: present is not the same as usable ---------------------------
+# A device can be present and DISABLED (or fail to start): the client sees the
+# adapter, so it no longer says "not found", but every protocol fails. The
+# elevated pass therefore enables the device instead of only creating it.
+function Enable-HwidDevices([string]$hwid) {
+     $changed = $false
+     foreach ($dev in @(Find-HwidDevices $hwid)) {
+          if (-not $dev.InstanceId) { continue }
+          $status = ''
+          try {
+               $status = [string](Get-PnpDevice -InstanceId $dev.InstanceId `
+                    -ErrorAction Stop).Status
+          } catch { }
+          if ($status -eq 'OK') { continue }
+          try {
+               Enable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false `
+                    -ErrorAction Stop
+               $changed = $true
+               continue
+          } catch { }
+          & pnputil /enable-device $dev.InstanceId 2>&1 | Out-Null
+          if ($LASTEXITCODE -eq 0) { $changed = $true }
+     }
+     if ($changed) { Start-Sleep -Milliseconds 700 }
+     return $changed
+}
+function Write-NetStackStatus([bool]$healthy) {
+     $lines = @()
+     $lines += ('root: ' + $root)
+     $lines += ('time: ' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
+     $lines += ('healthy: ' + $healthy)
+     foreach ($d in @($cfg.drivers)) {
+          if (-not $d.needs_install) { continue }
+          $hwid = [string]$d.device_id
+          if (-not $hwid) { continue }
+          $devices = @(Find-HwidDevices $hwid)
+          $state = 'missing'
+          if ($devices.Count -gt 0) {
+               $state = 'present'
+               $first = $devices[0].InstanceId
+               try {
+                    $pnp = Get-PnpDevice -InstanceId $first -ErrorAction Stop
+                    $state = [string]$pnp.Status
+               } catch { }
+          }
+          $lines += ('adapter ' + $hwid + ': ' + $state)
+     }
+     foreach ($s in @($cfg.services)) {
+          $name = [string]$s.name
+          if (-not $name) { continue }
+          $state = 'absent'
+          $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+          if ($null -ne $svc) { $state = [string]$svc.Status }
+          $lines += ('service ' + $name + ': ' + $state + ' | ' +
+               (Get-ServiceImagePath $name))
+     }
+     Set-Content -LiteralPath (Join-Path $stateDir 'status.txt') -Value $lines `
+          -Encoding UTF8 -ErrorAction SilentlyContinue
+}
 function Ensure-NetAdapters {
      $failed = $false
      $scanned = $false
@@ -1635,7 +1749,10 @@ function Ensure-NetAdapters {
           if (-not $d.needs_install) { continue }
           $hwid = [string]$d.device_id
           if (-not $hwid) { continue }
-          if (@(Find-HwidDevices $hwid).Count -gt 0) { continue }
+          if (@(Find-HwidDevices $hwid).Count -gt 0) {
+               Enable-HwidDevices $hwid | Out-Null
+               continue
+          }
           if (-not $d.inf) { $failed = $true; continue }
           $inf = Join-Path $root ([string]$d.inf -replace '/', '\')
           $tool = ''
@@ -1648,6 +1765,7 @@ function Ensure-NetAdapters {
                & pnputil /scan-devices 2>&1 | Out-Null
                $scanned = $true
           }
+          Enable-HwidDevices $hwid | Out-Null
           $instances = @(Find-HwidDevices $hwid)
           if ($instances.Count -eq 0) { $failed = $true }
           if ($created) {
@@ -1747,8 +1865,23 @@ if ($Mode -eq 'check') {
           $hwid = [string]$d.device_id
           if ($hwid -and (@(Find-HwidDevices $hwid).Count -eq 0)) { exit 3 }
      }
+     # A service is only useful when it exists, points to THIS copy and is
+     # running: a stopped or stale service is exactly the "no protocol works"
+     # state for a VPN client, and starting it needs no new installation.
      foreach ($s in $services) {
-          if (-not (Get-Service -Name $s.name)) { exit 4 }
+          $name = [string]$s.name
+          if (-not $name) { continue }
+          $current = Get-ServiceImagePath $name
+          if (-not $current) { exit 4 }
+          if (Test-ForeignService $current) { continue }
+          $exe = ([string]$s.image).Replace($token, $root)
+          if (-not (Test-SamePath (Get-ServiceExePath $current) $exe)) { exit 4 }
+          if (-not (Test-Path -LiteralPath $exe)) { exit 4 }
+          $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+          if ($null -eq $svc) { exit 4 }
+          if (@('Running', 'StartPending') -notcontains [string]$svc.Status) {
+               exit 4
+          }
      }
      exit 0
 }
@@ -1772,39 +1905,96 @@ if ($Mode -eq 'teardown') {
 # Adapters first: the VPN client cannot do anything without one, and its own
 # driver installation needs the rights this elevated pass already has.
 if (-not (Ensure-NetAdapters)) { exit 3 }
-if ($services.Count -eq 0) { exit 0 }
+if ($services.Count -eq 0) {
+     # Драйвер-адаптер сам по себе: состояние всё равно фиксируется, иначе
+     # после сеанса нечем объяснить, что именно было на машине.
+     Write-NetStackStatus $true
+     exit 0
+}
 $created = @()
 if (Test-Path -LiteralPath $createdPath) {
      $created = @(Get-Content -LiteralPath $createdPath |
                   ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
+$serviceFailed = $false
 foreach ($s in $services) {
-     $svc = Get-Service -Name $s.name
-     if ($null -ne $svc) {
-          if ($svc.Status -ne 'Running') { Start-Service -Name $s.name }
-          continue
-     }
-     $image = $s.image.Replace($token, $root)
+     $name = [string]$s.name
+     if (-not $name) { continue }
+     $exe = ([string]$s.image).Replace($token, $root)
+     $image = $exe
      if ($s.args) { $image = $image + ' ' + $s.args }
      $type = if ($s.start -eq 'auto') { 'Automatic' } else { 'Manual' }
+     $startArg = if ($s.start -eq 'auto') { 'auto' } else { 'demand' }
+     $current = Get-ServiceImagePath $name
+     $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+     if ($null -ne $svc) {
+          $ours = (Test-SamePath (Get-ServiceExePath $current) $exe) -and
+               (Test-Path -LiteralPath $exe)
+          if (-not $ours -and (Test-ForeignService $current)) {
+               Write-Output ("netstack: service '" + $name +
+                    "' belongs to another installation (" + $current +
+                    ") - left untouched")
+               continue
+          }
+          if (-not $ours) {
+               # Stale registration: the path points into the previous folder
+               # (the portable was copied or moved). Replace it, and remember
+               # the service as ours so the session end removes it again.
+               Write-Output ("netstack: service '" + $name + "' pointed to " +
+                    $current + " - re-registering it for this folder")
+               Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+               sc.exe delete $name | Out-Null
+               Start-Sleep -Milliseconds 400
+               if ($created -notcontains $name) { $created += $name }
+               $svc = $null
+               $current = ''
+          }
+     }
+     if ($null -ne $svc) {
+          if ($svc.Status -ne 'Running') {
+               Start-Service -Name $name -ErrorAction SilentlyContinue
+               Start-Sleep -Milliseconds 600
+               $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+          }
+          if (($null -eq $svc) -or ($svc.Status -ne 'Running')) {
+               Write-Output ("netstack: service '" + $name +
+                    "' did not start")
+               $serviceFailed = $true
+          }
+          continue
+     }
      try {
-          New-Service -Name $s.name -BinaryPathName $image `
+          New-Service -Name $name -BinaryPathName ('"' + $image + '"') `
                 -DisplayName $s.display -StartupType $type -ErrorAction Stop |
             Out-Null
-          $created += $s.name
+          $created += $name
      } catch {
           # PS 5.1 на Win10 ругается на StartupType у уже существующих
           # служб; сюда приходим только когда New-Service реально отказал.
-          sc.exe create $s.name binPath= "`"$image`"" start= demand DisplayName= "$($s.display)" obj= LocalSystem | Out-Null
-          if ($LASTEXITCODE -eq 0) { $created += $s.name }
-          continue
+          sc.exe create $name binPath= "`"$image`"" start= $startArg DisplayName= "$($s.display)" obj= LocalSystem | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+               $created += $name
+          } else {
+               Write-Output ("netstack: service '" + $name +
+                    "' could not be created (sc exit " + $LASTEXITCODE + ")")
+               $serviceFailed = $true
+               continue
+          }
      }
-     Start-Service -Name $s.name
+     Start-Service -Name $name -ErrorAction SilentlyContinue
+     Start-Sleep -Milliseconds 600
+     $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+     if (($null -eq $svc) -or ($svc.Status -ne 'Running')) {
+          Write-Output ("netstack: service '" + $name + "' did not start")
+          $serviceFailed = $true
+     }
 }
 $created = @($created | Select-Object -Unique)
 if ($created.Count -gt 0) {
      Set-Content -LiteralPath $createdPath -Value $created -Encoding UTF8
 }
+Write-NetStackStatus (-not $serviceFailed)
+if ($serviceFailed) { exit 6 }
 exit 0
 '''
 
@@ -1813,8 +2003,9 @@ def render_services_ps1() -> str:
     """``NetStack\\NetStackServices.ps1`` — ensure | check | teardown |
     ownership | rollback.
 
-    Коды выхода: 0 — всё в порядке; 4 — чего-то не хватает (режим check);
-    5 — PowerShell слишком стар (нет ConvertFrom-Json), трогать ничего не
-    стали.
+    Коды выхода: 0 — всё в порядке; 4 — службы нет, её ``ImagePath`` ведёт в
+    прежнюю папку или она остановлена (режим check); 6 — службу не удалось
+    ни зарегистрировать, ни запустить (режим ensure); 5 — PowerShell слишком
+    стар (нет ConvertFrom-Json), трогать ничего не стали.
     """
     return _PS1_BODY

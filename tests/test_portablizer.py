@@ -4735,8 +4735,22 @@ class BuildFolderVerdictTests(unittest.TestCase):
         self.assertEqual(result.registered_services, ["GameGuard"])
         self.assertEqual(result.removed_services, [])
         self.assertIn("GameGuard", self.engine.log.text)
-        self.assertIn("не останавливает и не удаляет", self.engine.log.text)
+        self.assertIn("не пересоздаёт", self.engine.log.text)
         stop.assert_not_called()
+
+    def test_service_already_in_netstack_is_not_called_manual_work(self):
+        """Служба, уехавшая в NetStack, — не повод «проверять вручную»."""
+        result = self._result()
+        result.netstack_services = ["PlanetVPNService"]
+        with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                mock.patch.object(procutil, "services_in",
+                                  return_value=["PlanetVPNService"]):
+            self.engine._report_portable_services(r"C:\P", result)
+
+        text = self.engine.log.text
+        self.assertIn("регистрируются портативом", text)
+        self.assertIn("права администратора", text)
+        self.assertNotIn("проверьте такие службы вручную", text.lower())
 
 
 class LauncherFolderVerdictTests(unittest.TestCase):

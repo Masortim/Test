@@ -129,6 +129,20 @@ _VOLATILE_PREFIXES: Tuple[str, ...] = (
     r"software\registeredapplications",
     r"software\microsoft\windows\shell\associations\urlassociations",
     r"software\microsoft\windows\currentversion\applicationassociations",
+    # Состояние ОКНА проводника, а не выбор программы по умолчанию. ``Bags``
+    # (``Bags\\1\\Desktop``, ``Bags\\1\\Shell``) и ``BagMRU`` хранят положение
+    # значков и режим просмотра каждой папки, и оболочка переписывает их
+    # постоянно. Раньше они попадали в снимок ассоциаций, и сборка получала
+    # ложную тревогу «не удалось подтвердить восстановление всех ассоциаций
+    # (HKCU\\...\\Shell\\Bags\\1\\Desktop)».
+    r"software\microsoft\windows\shell\bags",
+    r"software\microsoft\windows\shell\bagmru",
+    r"software\microsoft\windows\shell\streams",
+    r"software\microsoft\windows\shell\typedpaths",
+    r"software\microsoft\windows\shell\verbselection",
+    r"software\microsoft\windows\shellnoRoam\bags",
+    r"software\microsoft\windows\shellnoRoam\bagmru",
+    r"software\microsoft\windows\shellnoRoam\muicache",
 )
 
 # Ключи, которые нельзя ни переносить в портатив, ни откатывать по снимку.
@@ -306,6 +320,16 @@ _ASSOCIATION_ONLY_PREFIXES: Tuple[str, ...] = (
 _ASSOCIATION_EXCLUDED_PREFIXES: Tuple[str, ...] = (
     r"software\classes\installer",
     r"software\classes\virtualstore",
+    # Состояние представления папок (значки, сортировка, размер окна) — это
+    # не ассоциация: его нельзя ни восстанавливать по снимку, ни проверять.
+    r"software\microsoft\windows\shell\bags",
+    r"software\microsoft\windows\shell\bagmru",
+    r"software\microsoft\windows\shell\streams",
+    r"software\microsoft\windows\shell\typedpaths",
+    r"software\microsoft\windows\shell\verbselection",
+    r"software\microsoft\windows\shellnoRoam\bags",
+    r"software\microsoft\windows\shellnoRoam\bagmru",
+    r"software\microsoft\windows\shellnoRoam\muicache",
 )
 
 
