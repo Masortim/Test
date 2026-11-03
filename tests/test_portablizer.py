@@ -4362,6 +4362,330 @@ class FolderLockDiagnosticsTests(unittest.TestCase):
         stop.assert_not_called()
 
 
+class ServiceEnumerationTests(unittest.TestCase):
+    """Перечисление служб: имя, путь и честная проверка «удалена ли»."""
+
+    ROOT = r"C:\Games\Type_Portable"
+
+    @staticmethod
+    def _fake_winreg(entries):
+        """Минимальная подделка ``winreg`` для проверки разбора ImagePath."""
+        import types
+
+        class _Key:
+            def __init__(self, names=None, image=""):
+                self.names = names or []
+                self.image = image
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        module = types.SimpleNamespace(HKEY_LOCAL_MACHINE=object())
+
+        def open_key(_root, path, *_args):
+            if str(path).casefold().rstrip("\\").endswith("services"):
+                return _Key([name for name, _image in entries])
+            leaf = str(path).split("\\")[-1]
+            for name, image in entries:
+                if name == leaf:
+                    return _Key(image=image)
+            raise OSError(2, "service not found")
+
+        def enum_key(key, index):
+            if index >= len(key.names):
+                raise OSError(259, "no more data")
+            return key.names[index]
+
+        def query_value(key, name):
+            if name != "ImagePath":
+                raise OSError(2, "no value")
+            return key.image, 1
+
+        module.OpenKey = open_key
+        module.EnumKey = enum_key
+        module.QueryValueEx = query_value
+        return module
+
+    def test_detail_names_the_binary_of_every_service_inside_the_folder(self):
+        entries = [
+            ("PlanetVPNService",
+             r'"C:\Games\Type_Portable\App\PlanetVPNService.exe" -service'),
+            ("Spooler", r"C:\Windows\System32\spoolsv.exe"),
+            ("Neighbor", r"C:\Games\Type_Portable2\App\guard.exe"),
+        ]
+        module = self._fake_winreg(entries)
+        with mock.patch.object(procutil, "IS_WINDOWS", True), \
+                mock.patch.dict(sys.modules, {"winreg": module}):
+            refs = procutil.services_in_detail(self.ROOT)
+            names = procutil.services_in(self.ROOT)
+
+        self.assertEqual([ref.name for ref in refs], ["PlanetVPNService"])
+        self.assertEqual(
+            refs[0].image,
+            r"C:\Games\Type_Portable\App\PlanetVPNService.exe")
+        # Соседняя папка с похожим префиксом — не наша служба.
+        self.assertEqual(names, ["PlanetVPNService"])
+
+    def test_service_present_tells_1060_apart_from_a_live_service(self):
+        gone = subprocess.CompletedProcess([], 1060, b"", b"")
+        alive = subprocess.CompletedProcess([], 0, b"STATE: RUNNING", b"")
+        with mock.patch.object(procutil, "IS_WINDOWS", True), \
+                mock.patch.object(procutil.subprocess, "run", return_value=gone):
+            self.assertFalse(procutil.service_present("PlanetVPNService"))
+        with mock.patch.object(procutil, "IS_WINDOWS", True), \
+                mock.patch.object(procutil.subprocess, "run", return_value=alive):
+            self.assertTrue(procutil.service_present("PlanetVPNService"))
+
+    def test_remove_services_returns_the_ones_that_survived(self):
+        refs = [procutil.ServiceRef("Gone", r"C:\P\App\gone.exe"),
+                procutil.ServiceRef("Stuck", r"C:\P\App\stuck.exe")]
+        with mock.patch.object(procutil, "IS_WINDOWS", True), \
+                mock.patch.object(procutil, "stop_service",
+                                  return_value=True) as stop, \
+                mock.patch.object(procutil, "service_present",
+                                  side_effect=lambda name: name == "Stuck"), \
+                mock.patch("time.sleep"):
+            left = procutil.remove_services(refs, wait=0.01)
+
+        self.assertEqual(left, ["Stuck"])
+        self.assertEqual(stop.call_count, 2)
+        self.assertTrue(all(call.kwargs.get("remove") for call in stop.mock_calls
+                            if call.args))
+
+
+class LeftoverServiceTakeoverTests(unittest.TestCase):
+    """Повторная сборка в папку, где прошлая сборка оставила службу.
+
+    Жалоба: «В указанной папке уже зарегистрированы службы Windows
+    (PlanetVPNService)» — и сборка обрывалась советом выбрать другую папку,
+    хотя службу зарегистрировала предыдущая сборка этого же портатива.
+    """
+
+    def setUp(self):
+        self.engine = Portablizer(Logger())
+
+    @staticmethod
+    def _folder(temp):
+        portable = Path(temp, "planetvpn_Portable")
+        app = portable / "App"
+        data = portable / "PortableData"
+        app.mkdir(parents=True)
+        data.mkdir()
+        (app / "Old.exe").write_bytes(b"old")
+        return portable, app, data
+
+    def test_service_of_this_folder_is_removed_and_rebuild_continues(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app, data = self._folder(temp)
+            ref = procutil.ServiceRef(
+                "PlanetVPNService", str(app / "PlanetVPNService.exe"))
+            result = PortableResult(success=True)
+            with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                    mock.patch.object(procutil, "services_in_detail",
+                                      return_value=[ref]), \
+                    mock.patch.object(procutil, "remove_services",
+                                      return_value=[]) as remove, \
+                    mock.patch.object(procutil, "release_folder",
+                                      return_value=[]):
+                self.engine._prepare_output(str(portable), str(app), str(data),
+                                            result=result)
+
+            remove.assert_called_once()
+            self.assertEqual(result.removed_services, ["PlanetVPNService"])
+            # Старый App заменён пустым: сборка действительно продолжилась.
+            self.assertEqual(list(app.iterdir()), [])
+            self.assertIn("службы прошлой сборки", self.engine.log.text)
+            self.assertIn("PlanetVPNService", self.engine.log.text)
+            self.assertIn("снята с регистрации", self.engine.log.text)
+
+    def test_service_outside_our_folders_is_never_removed(self):
+        """Бинарник в другом месте папки — не след нашей сборки."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app, data = self._folder(temp)
+            ref = procutil.ServiceRef(
+                "GameGuard", str(portable / "GameGuard.exe"))
+            with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                    mock.patch.object(procutil, "services_in_detail",
+                                      return_value=[ref]), \
+                    mock.patch.object(procutil, "remove_services",
+                                      side_effect=AssertionError("must not remove")), \
+                    mock.patch.object(procutil, "release_folder",
+                                      return_value=[]):
+                with self.assertRaises(RuntimeError) as caught:
+                    self.engine._prepare_output(str(portable), str(app),
+                                                str(data))
+
+            self.assertIn("не в App или PortableData", str(caught.exception))
+            self.assertTrue((app / "Old.exe").exists())
+
+    def test_one_foreign_service_blocks_the_whole_takeover(self):
+        """Частичного снятия не бывает: сначала разбираемся, потом трогаем."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app, data = self._folder(temp)
+            own = procutil.ServiceRef(
+                "PlanetVPNService", str(app / "PlanetVPNService.exe"))
+            foreign = procutil.ServiceRef(
+                "GameGuard", str(portable / "GameGuard.exe"))
+            with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                    mock.patch.object(procutil, "services_in_detail",
+                                      return_value=[own, foreign]), \
+                    mock.patch.object(procutil, "remove_services",
+                                      side_effect=AssertionError("must not remove")), \
+                    mock.patch.object(procutil, "release_folder",
+                                      return_value=[]):
+                with self.assertRaises(RuntimeError) as caught:
+                    self.engine._prepare_output(str(portable), str(app),
+                                                str(data))
+
+            message = str(caught.exception)
+            self.assertIn("GameGuard", message)
+            self.assertNotIn("PlanetVPNService (", message)
+
+    def test_leftover_service_is_removed_without_mocks_in_between(self):
+        """Сквозная проверка: реестр → sc stop → sc delete → sc query."""
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app, data = self._folder(temp)
+            image = str(app / "PlanetVPNService.exe")
+            state = {"PlanetVPNService"}
+
+            def fake_sc(args, **_kwargs):
+                # Команды приходят как ["sc", "stop", <имя>].
+                action, name = args[1], args[2]
+                if action == "stop":
+                    return subprocess.CompletedProcess(args, 0, b"STOP_PENDING", b"")
+                if action == "delete":
+                    state.discard(name)
+                    return subprocess.CompletedProcess(args, 0, b"", b"")
+                if action == "query":
+                    if name in state:
+                        return subprocess.CompletedProcess(
+                            args, 0, b"STATE : 4  STOPPED", b"")
+                    return subprocess.CompletedProcess(args, 1060, b"", b"")
+                return subprocess.CompletedProcess(args, 0, b"", b"")
+
+            winreg = ServiceEnumerationTests._fake_winreg(
+                [("PlanetVPNService", image)])
+            with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                    mock.patch.object(procutil, "IS_WINDOWS", True), \
+                    mock.patch.dict(sys.modules, {"winreg": winreg}), \
+                    mock.patch.object(procutil.subprocess, "run",
+                                      side_effect=fake_sc), \
+                    mock.patch.object(procutil, "release_folder",
+                                      return_value=[]):
+                self.engine._prepare_output(str(portable), str(app), str(data))
+
+            self.assertEqual(state, set())
+            self.assertIn("снята с регистрации", self.engine.log.text)
+            self.assertIn(image, self.engine.log.text)
+
+    def test_service_inside_portable_data_is_also_ours(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app, data = self._folder(temp)
+            ref = procutil.ServiceRef(
+                "PlanetVPNHelper", str(data / "NetStack" / "PlanetVPNHelper.exe"))
+            with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                    mock.patch.object(procutil, "services_in_detail",
+                                      return_value=[ref]), \
+                    mock.patch.object(procutil, "remove_services",
+                                      return_value=[]) as remove, \
+                    mock.patch.object(procutil, "release_folder",
+                                      return_value=[]):
+                self.engine._prepare_output(str(portable), str(app), str(data))
+
+            remove.assert_called_once()
+
+    def test_stuck_service_is_reported_with_an_exact_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            portable, app, data = self._folder(temp)
+            ref = procutil.ServiceRef(
+                "PlanetVPNService", str(app / "PlanetVPNService.exe"))
+            with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+                    mock.patch.object(procutil, "services_in_detail",
+                                      return_value=[ref]), \
+                    mock.patch.object(procutil, "remove_services",
+                                      return_value=["PlanetVPNService"]), \
+                    mock.patch.object(self.engine, "_elevated_remove_services",
+                                      return_value=["PlanetVPNService"]), \
+                    mock.patch.object(procutil, "release_folder",
+                                      return_value=[]):
+                with self.assertRaises(RuntimeError) as caught:
+                    self.engine._prepare_output(str(portable), str(app),
+                                                str(data))
+
+            message = str(caught.exception)
+            self.assertIn("правами администратора", message)
+            self.assertIn('sc delete "PlanetVPNService"', message)
+            self.assertTrue((app / "Old.exe").exists())
+
+    def test_uac_is_asked_once_for_all_services_and_result_is_verified(self):
+        calls = []
+
+        def fake_runas(program, arguments, directory=""):
+            script = Path(arguments[-1]).read_text(encoding="ascii")
+            calls.append((program, list(arguments), script))
+            return 42  # повышение подтверждено
+
+        with mock.patch.object(elevate_mod, "_shell_execute_runas",
+                               side_effect=fake_runas), \
+                mock.patch.object(procutil, "service_present",
+                                  return_value=False) as present:
+            left = self.engine._elevated_remove_services(
+                ["PlanetVPNService", "PlanetVPNHelper"])
+
+        self.assertEqual(left, [])
+        self.assertEqual(len(calls), 1)
+        program, arguments, script = calls[0]
+        self.assertTrue(program.casefold().endswith("cmd.exe"))
+        self.assertEqual(arguments[0], "/c")
+        for name in ("PlanetVPNService", "PlanetVPNHelper"):
+            self.assertIn(f'sc stop "{name}"', script)
+            self.assertIn(f'sc delete "{name}"', script)
+        self.assertTrue(present.called)
+        # Временный командный файл убран, кавычки экранировать не пришлось.
+        self.assertFalse(Path(arguments[-1]).exists())
+
+    def test_unsafe_service_name_never_reaches_the_uac_script(self):
+        """Имя с кавычкой или ``&`` в ``cmd`` не пишется — только вручную."""
+        scripts = []
+
+        def fake_runas(_program, arguments, directory=""):
+            scripts.append(Path(arguments[-1]).read_text(encoding="ascii"))
+            return 42
+
+        with mock.patch.object(elevate_mod, "_shell_execute_runas",
+                               side_effect=fake_runas):
+            left = self.engine._elevated_remove_services(
+                ['Bad"Name & calc', "PlanetVPNService"])
+
+        self.assertEqual(left, ['Bad"Name & calc'])
+        self.assertEqual(len(scripts), 1)
+        self.assertIn("PlanetVPNService", scripts[0])
+        self.assertNotIn("Bad", scripts[0])
+
+    def test_refused_uac_keeps_the_services_and_says_so(self):
+        with mock.patch.object(elevate_mod, "_shell_execute_runas",
+                               return_value=5), \
+                mock.patch("time.sleep"):
+            left = self.engine._elevated_remove_services(["PlanetVPNService"])
+
+        self.assertEqual(left, ["PlanetVPNService"])
+        self.assertIn("Повышение прав отклонено", self.engine.log.text)
+
+    def test_uac_cleanup_waits_until_the_service_is_really_gone(self):
+        answers = iter([True, True, False])
+        with mock.patch.object(elevate_mod, "_shell_execute_runas",
+                               return_value=42), \
+                mock.patch.object(procutil, "service_present",
+                                  side_effect=lambda _name: next(answers)), \
+                mock.patch("time.sleep"):
+            left = self.engine._elevated_remove_services(["PlanetVPNService"])
+
+        self.assertEqual(left, [])
+
+
 class BuildFolderVerdictTests(unittest.TestCase):
     """Сборка обязана доказать, что папку можно удалить."""
 
