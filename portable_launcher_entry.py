@@ -457,55 +457,20 @@ def netstack_missing(root: Path, cfg: Dict[str, Any]
     жалоба (см. :func:`_device_hwid_present`).
     """
     section = _netstack_section(cfg)
+    names: "list[str]" = []
+    for key in ("driver_services", "service_names"):
+        raw = section.get(key)
+        if isinstance(raw, list):
+            names.extend(str(n) for n in raw if str(n).strip())
     devices: "list[str]" = []
     raw_devices = section.get("driver_devices")
     if isinstance(raw_devices, list):
         devices = [str(n) for n in raw_devices if str(n).strip()]
-    # Служба драйвера проверяется по паре «служба — устройство»: имя службы
-    # известно лишь из INF на компьютере-сборщике, а INF на другом ПК вправе
-    # зарегистрировать другое имя (tap0902 и т. п.). Работающий АДАПТЕР —
-    # доказательство, что драйвер установлен; требовать конкретный ключ
-    # Services\tap0901 значило показывать предупреждение «нет tap0901» на
-    # машине, где адаптер уже есть и работает (status.txt: adapter OK).
-    pairs: "list[tuple[str, str]]" = []
-    raw_pairs = section.get("driver_pairs")
-    if isinstance(raw_pairs, list):
-        for entry in raw_pairs:
-            if not isinstance(entry, dict):
-                continue
-            pairs.append((str(entry.get("service", "")).strip(),
-                          str(entry.get("device", "")).strip()))
-    if not pairs:
-        # Старый конфиг без пар: сопоставляем по порядку, как их пишет сборка.
-        services = [str(n) for n in (section.get("driver_services") or [])
-                    if str(n).strip()]
-        pairs = [(name, devices[index] if index < len(devices) else "")
-                 for index, name in enumerate(services)]
-    # Устройства из пар проверяются так же, как из driver_devices.
-    for _service, device in pairs:
-        if device and device not in devices:
-            devices.append(device)
-    present_devices = {hwid for hwid in dict.fromkeys(devices)
-                       if _device_hwid_present(hwid)}
-
-    missing: "list[str]" = []
-    for service, device in pairs:
-        if not service:
-            continue
-        if _service_key_present(service):
-            continue
-        if device and device in present_devices:
-            # Драйвер установлен, просто его служба называется иначе.
-            continue
-        missing.append(service)
-    for name in (section.get("service_names") or []):
-        name = str(name).strip()
-        if name and not _service_key_present(name):
-            missing.append(name)
-    for hwid in dict.fromkeys(devices):
-        if hwid and hwid not in present_devices:
-            missing.append("адаптер " + hwid)
-    return list(dict.fromkeys(missing))
+    missing = [name for name in dict.fromkeys(names)
+               if not _service_key_present(name)]
+    missing += ["адаптер " + hwid for hwid in dict.fromkeys(devices)
+                if not _device_hwid_present(hwid)]
+    return missing
 
 
 def _netstack_warning_is_new(root: Path, cfg: Dict[str, Any],
@@ -528,54 +493,8 @@ def _netstack_warning_is_new(root: Path, cfg: Dict[str, Any],
     return True
 
 
-def _netstack_state_dir(root: Path) -> Path:
-    """``PortableData\\NetStack`` — общая папка состояния для .cmd и .ps1."""
-    return root / "PortableData" / "NetStack"
-
-
-def _append_run_log(path: "Path", text: str) -> None:
-    """Дописать в журнал, никогда не падая из-за самого журнала."""
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8", errors="replace") as handle:
-            handle.write(text if text.endswith("\n") else text + "\n")
-    except Exception:  # noqa: BLE001 - журнал не должен ломать запуск
-        return
-
-
-def _log_tail(path: "Path", limit: int = 12) -> "list[str]":
-    """Последние непустые строки файла — для журнала запуска.
-
-    Отдельное имя от ``_tail_lines`` ниже: там считаются все строки и файл
-    читается без фильтра, а здесь нужны именно содержательные строки лога.
-    """
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-    return lines[-limit:]
-
-
-def _netstack_tail(root: Path, limit: int = 10) -> "list[str]":
-    """Хвост журналов NetStack: по нему видно, на каком шаге всё встало.
-
-    Клиент присылает ``launcher-run.log``, а не внутренние файлы папки
-    NetStack. Поэтому самое важное из ``setup.log`` (шаги .cmd) и ``ps.log``
-    (шаги .ps1) переносится сюда — иначе от неудачной установки драйвера
-    остаётся один код возврата.
-    """
-    state = _netstack_state_dir(root)
-    tail: "list[str]" = []
-    for name in ("setup.log", "ps.log"):
-        lines = _log_tail(state / name, limit=limit)
-        for line in lines:
-            tail.append(name + ": " + line)
-    return tail[-2 * limit:]
-
-
-def _run_hidden(arguments: Sequence[str], timeout: float = 300.0,
-                log_path: "Optional[Path]" = None) -> "Optional[int]":
+def _run_hidden(arguments: Sequence[str],
+                timeout: float = 300.0) -> "Optional[int]":
     """Run a command without a console window; return its exit code.
 
     ``None`` means "no result": the command could not be started or did not
@@ -589,57 +508,33 @@ def _run_hidden(arguments: Sequence[str], timeout: float = 300.0,
     в журнал строкой «netstack: ensure failed»). Клиент VPN в итоге видел
     машину без адаптера и писал «Не удалось подключиться ни по одному из
     протоколов».
-
-    ``log_path`` включается тогда, когда вывод команды больше некуда деть:
-    UAC-окно закрывается, консоль скрыта, и без файла от неудачной установки
-    драйвера не остаётся ни строчки — только код возврата.
     """
     if not IS_WINDOWS:
         return None
-    command = [str(item) for item in arguments]
-    started = time.time()
     try:
         completed = subprocess.run(
-            command,
+            [str(item) for item in arguments],
             creationflags=NO_WINDOW,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=timeout,
         )
-    except Exception as exc:  # noqa: BLE001 - нет команды/таймаут: результата нет
-        if log_path is not None:
-            _append_run_log(log_path, "$ " + " ".join(command)
-                            + "\n  not started: " + str(exc))
+    except Exception:  # noqa: BLE001 - нет команды/таймаут: результата нет
         return None
-    if log_path is not None:
-        lines = ["$ " + " ".join(command),
-                 "  exit " + str(completed.returncode)
-                 + ", " + f"{time.time() - started:.1f}s"]
-        for stream, name in ((completed.stdout, "out"), (completed.stderr, "err")):
-            text = stream or ""
-            if isinstance(text, bytes):
-                text = text.decode("utf-8", "replace")
-            text = text.rstrip()
-            if text:
-                for line in text.splitlines()[-40:]:
-                    lines.append("  " + name + ": " + line)
-        _append_run_log(log_path, "\n".join(lines))
     return int(completed.returncode)
 
 
 def _run_hidden_elevated(program: str, arguments: Sequence[str],
-                         timeout: float = 900.0,
-                         log_path: "Optional[Path]" = None) -> "Optional[int]":
+                         timeout: float = 900.0) -> "Optional[int]":
     """Run a command that needs administrator rights, without its own window.
 
     The NetStack ``.cmd`` scripts elevate THEMSELVES (``Start-Process -Verb
-    RunAs -Wait -PassThru``) and pass the elevated copy's exit code back, so a
+    RunAs -Wait``) and the result is verified afterwards with ``--check``, so a
     plain hidden run is enough and predictable: one UAC prompt comes from the
-    script, and a declined prompt shows up as code ``7`` instead of a fake
-    success.  ``None`` — the command could not be started/finished.
+    script, and a declined prompt shows up as a failed verification instead of
+    a fake success.  ``None`` — the command could not be started/finished.
     """
-    return _run_hidden([program, *arguments], timeout=timeout,
-                       log_path=log_path)
+    return _run_hidden([program, *arguments], timeout=timeout)
 
 
 def _run_netstack_script(root: Path, relative: str, argument: str = ""
@@ -649,8 +544,7 @@ def _run_netstack_script(root: Path, relative: str, argument: str = ""
     The scripts themselves re-launch through UAC when nobody granted rights
     yet, so a plain ``cmd /c`` is enough here: when the launcher already runs
     elevated (HKLM registry import path) the script sees admin and does no
-    second prompt.  Everything the script prints goes to
-    ``PortableData\\NetStack\\launcher-netstack.log``.
+    second prompt.
     """
     relative = str(relative or "").replace("/", os.sep)
     if not relative:
@@ -662,30 +556,21 @@ def _run_netstack_script(root: Path, relative: str, argument: str = ""
             return None
         path = path2
     args = ["/c", str(path)] + ([argument] if argument else [])
-    log_path = _netstack_state_dir(root) / "launcher-netstack.log"
     if _is_elevated():
-        return _run_hidden(["cmd.exe", *args], log_path=log_path)
-    return _run_hidden_elevated("cmd.exe", args, log_path=log_path)
-
+        return _run_hidden(["cmd.exe", *args])
+    return _run_hidden_elevated("cmd.exe", args)
 
 
 #: Что означает код возврата NetStack-скриптов — в журнале запуска, а не
 #: только цифрой: по нему видно, чего именно не хватает на этом ПК.
 _NETSTACK_CODE_NOTES = {
-    2: "the driver service is missing: the package was not published",
+    2: "driver package is missing",
     3: "the network adapter was not created",
     4: "a companion service is missing, points into the previous folder or is "
        "not running",
     5: "PowerShell is too old (no ConvertFrom-Json)",
     6: "a companion service is registered but did not start",
-    7: "administrator rights were not granted: nothing was installed",
 }
-
-#: Коды, которые действительно означают состояние компонентов. Всё остальное
-#: (255, 9009 от cmd, 1 от упавшего PowerShell) — «проверка не выполнилась», и
-#: выдавать это за «компонентов нет» нельзя: ложная тревога отправляла бы
-#: пользователя искать несуществующую проблему.
-_NETSTACK_KNOWN_CODES = frozenset({0, 2, 3, 4, 5, 6, 7})
 
 
 def _netstack_code_note(code: "Optional[int]") -> str:
@@ -720,15 +605,11 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
         return []
     # Дешёвая проверка без повышения: коды Setup.cmd --check честнее, чем
     # один реестр (он видит и корневое устройство), но и без неё решаем.
-    run_log = _netstack_state_dir(root) / "launcher-netstack.log"
     if not missing:
-        code = _run_hidden(["cmd.exe", "/c", str(script), "--check"],
-                           log_path=run_log)
+        code = _run_hidden(["cmd.exe", "/c", str(script), "--check"])
         if code in (0, None):
             return []
-        notes.append("Setup.cmd --check reported missing components"
-                     + (f" ({_netstack_code_note(code)})"
-                        if _netstack_code_note(code) else ""))
+        notes.append("Setup.cmd --check reported missing components")
     code = _run_netstack_script(root, setup)
     if code is None:
         notes.append("UAC prompt was declined or unavailable - the driver "
@@ -738,10 +619,7 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
         notes.append(f"NetStack setup exit code {code}"
                      + (f" ({detail})" if detail else ""))
     still = netstack_missing(root, cfg)
-    # Повтор имеет смысл только когда установка действительно шла: после
-    # отказанного UAC (7) второй проход — это второе окно с тем же отказом,
-    # а после «нет прав» оно ещё и ждёт пользователя.
-    if still and code not in (None, 0, 7):
+    if still and code not in (None, 0):
         # Второй проход: пакет уже опубликован в DriverStore, и теперь
         # создаётся само устройство адаптера (tapinstall/SetupAPI). Иногда
         # PnP успевает привязать драйвер только к этому моменту.
@@ -758,54 +636,31 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
     # «Не удалось подключиться ни по одному из протоколов».
     verify: "Optional[int]" = None
     try:
-        verify = _run_hidden(["cmd.exe", "/c", str(script), "--check"],
-                             log_path=run_log)
+        verify = _run_hidden(["cmd.exe", "/c", str(script), "--check"])
     except Exception:  # noqa: BLE001 - проверка не мешает запуску
         verify = None
-    if verify == 0:
-        notes.append("NetStack verify: adapter, services and their paths are "
-                     "consistent with this folder")
-    elif verify is not None and verify not in _NETSTACK_KNOWN_CODES:
-        # Проверка не выполнилась (упавший PowerShell, старый cmd) — это не
-        # «компонентов нет»: состояние решают пробы ниже, а факт остаётся в
-        # журнале, чтобы не выдавать сбой проверки за сбой установки.
-        notes.append(f"NetStack verify could not run (exit code {verify}); "
-                     "see launcher-netstack.log")
-    elif verify:
+    if verify not in (0, None):
         reason = _netstack_code_note(verify) or "components are not ready"
         notes.append(f"NetStack verify exit code {verify} ({reason})")
         still = still or [reason]
+    elif verify == 0:
+        notes.append("NetStack verify: adapter, services and their paths are "
+                     "consistent with this folder")
 
     if still:
         notes.append("still missing: " + ", ".join(still))
-        notes.extend(_netstack_tail(root))
         if _netstack_warning_is_new(root, cfg, still):
-            state = _netstack_state_dir(root)
-            header = ("Программе нужны системные сетевые компоненты, которых "
-                      "нет на этом компьютере:\n\n  " + "\n  ".join(still)
-                      + "\n\n")
-            if code == 7:
-                # Самая частая причина: окно контроля учётных записей
-                # закрыли или нажали «Нет». Говорим прямо, что делать.
-                advice = ("Установка не началась: права администратора не "
-                          "были выданы.\nПри следующем запуске нажмите «Да» "
-                          "в окне «Контроль учётных записей» (UAC) — или "
-                          "запустите NetStack\\Setup.cmd от имени "
-                          "администратора (правый клик → «Запуск от имени "
-                          "администратора»).\n")
-            else:
-                advice = ("Портатив ставит их сам из папки NetStack — для "
-                          "этого нужен один запрос прав администратора "
-                          "(пакет драйвера + сетевой адаптер + служба "
-                          "клиента).\nЕсли окно UAC было отклонено, запустите "
-                          "NetStack\\Setup.cmd от имени администратора и "
-                          "повторите запуск.\n")
             _show_warning(
-                header + advice
-                + "Что именно произошло, записано в:\n  "
-                + str(state / "setup.log") + "\n  "
-                + str(state / "status.txt") + "\n  "
-                + str(state / "launcher-netstack.log"))
+                "Программе нужны системные сетевые компоненты, которых нет на "
+                "этом компьютере:\n\n  " + "\n  ".join(still)
+                + "\n\nПортатив ставит их сам из папки NetStack (один запрос "
+                "прав администратора: пакет драйвера + сетевой адаптер + "
+                "служба клиента).\n"
+                "Если окно UAC было отклонено, запустите "
+                "NetStack\\Setup.cmd вручную и повторите запуск. "
+                "Состояние компонентов — в "
+                + str(root / str(cfg.get("data_dir_name", "PortableData"))
+                      / "NetStack" / "status.txt") + ".")
     else:
         notes.append("all required components are present")
     return notes

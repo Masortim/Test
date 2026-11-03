@@ -1734,34 +1734,6 @@ class SilentInstallTests(unittest.TestCase):
         for line in wrapper_lines:
             self.assertNotIn("/norestart", line)
 
-    def test_install_script_reports_the_elevated_exit_code(self):
-        """Отказ от UAC не должен выглядеть как «всё установлено»."""
-        text = redist.render_silent_install_script([{
-            "file": "Redist/vcredist_x64.exe", "title": "VC++ x64",
-            "kind": "exe", "args": "/q"}])
-        self.assertIn("-PassThru", text)
-        self.assertIn("exit $p.ExitCode", text)
-        self.assertIn("catch { exit 7 }", text)
-        # `net session` падает и у администратора при выключенной службе
-        # «Сервер»: тогда скрипт повышал права бесконечно.
-        self.assertNotIn('") >nul 2>&1 net session', text)
-        command_lines = [line for line in text.splitlines()
-                         if "net session" in line
-                         and not line.strip().lower().startswith("rem")]
-        self.assertEqual(command_lines, [])
-        self.assertIn("fltmc >nul 2>&1", text)
-
-    def test_install_script_never_elevates_twice(self):
-        text = redist.render_silent_install_script([{
-            "file": "Redist/vcredist_x64.exe", "title": "VC++ x64",
-            "kind": "exe", "args": "/q"}])
-        lines = [line.strip() for line in text.splitlines()]
-        elevated = next(i for i, line in enumerate(lines)
-                        if '"--elevated" goto' in line)
-        asking = next(i for i, line in enumerate(lines)
-                      if "Start-Process -Verb RunAs" in line)
-        self.assertLess(elevated, asking)
-
     def test_exit_codes_are_read_the_way_microsoft_means_them(self):
         self.assertEqual(redist.classify_exit_code(0), "installed")
         self.assertEqual(redist.classify_exit_code(1638), "already")

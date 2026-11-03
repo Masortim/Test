@@ -3423,23 +3423,12 @@ def render_silent_install_script(entries: Sequence[Dict[str, str]]) -> str:
         "",
         "rem One UAC prompt for the whole batch - installing runtimes needs",
         "rem administrator rights, everything after that is silent.",
-        "rem fltmc/openfiles instead of `net session`: the latter fails even",
-        "rem for an administrator when the Server service is disabled, and",
-        "rem the script then re-elevated itself forever.",
-        'set "REDIST_ADMIN=0"',
-        "fltmc >nul 2>&1 && set \"REDIST_ADMIN=1\"",
-        'if "%REDIST_ADMIN%" == "1" goto redist_pass',
-        "openfiles.exe /query >nul 2>&1 && set \"REDIST_ADMIN=1\"",
-        'if "%REDIST_ADMIN%" == "1" goto redist_pass',
-        'for %%A in (%*) do if /i "%%~A" == "--elevated" goto redist_pass',
-        "rem -PassThru: the elevated copy's exit code is the real result. It",
-        "rem used to be dropped, so a failed install looked like success.",
-        'powershell -NoProfile -ExecutionPolicy Bypass -Command '
-        '"try { $p = Start-Process -Verb RunAs -Wait -PassThru '
-        '-FilePath \'%~f0\' -ArgumentList \'--elevated\'; '
-        'exit $p.ExitCode } catch { exit 7 }"',
-        "exit /b %ERRORLEVEL%",
-        ":redist_pass",
+        ">nul 2>&1 net session || (",
+        '  powershell -NoProfile -ExecutionPolicy Bypass -Command '
+        '"Start-Process -Verb RunAs -Wait -WindowStyle Hidden '
+        '-FilePath \'%~f0\' -ArgumentList \'--elevated\'" >nul 2>&1',
+        "  exit /b 0",
+        ")",
         "",
         'set "REDIST_RC=0"',
     ]

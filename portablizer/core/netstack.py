@@ -635,91 +635,6 @@ def is_complete_driver_package(package: NetDriverPackage) -> bool:
             and any(name.endswith(".cat") for name in names))
 
 
-def inf_payload_names(inf_text: str) -> Tuple[List[str], List[str]]:
-    """Что сам ``.inf`` ждёт рядом с собой: каталог и файлы пакета.
-
-    Возвращает ``(каталоги, файлы)``: ``CatalogFile``/``CatalogFile.NTamd64``
-    из ``[Version]`` и имена из всех ``[SourceDisksFiles*]``. ``pnputil
-    /add-driver`` отвечает «Не удается найти указанный файл» ровно тогда,
-    когда чего-то из этого списка в папке пакета нет.
-    """
-    catalogs: List[str] = []
-    files: List[str] = []
-    section = ""
-    for raw in inf_text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith((";", "#")):
-            continue
-        matched = _INF_SECTION_RE.match(line)
-        if matched:
-            section = matched.group(1).strip().lower()
-            continue
-        assign = _INF_ASSIGN_RE.match(line)
-        if not assign:
-            continue
-        key = assign.group(1).strip()
-        value = assign.group(2).strip().strip('"')
-        if section == "version":
-            if key.lower().startswith("catalogfile") and value:
-                catalogs.append(value)
-        elif section.startswith("sourcedisksfiles"):
-            files.append(key)
-    return catalogs, files
-
-
-def heal_package_files(dest_dir: str, inf_name: str) -> List[str]:
-    """Проверяет полноту пакета и по возможности его чинит.
-
-    Две реальные причины, по которым ``pnputil /add-driver`` отказывается
-    ставить пакет, скопированный из ``DriverStore``:
-
-    * каталог ``.cat`` лежит под другим именем, чем записано в
-      ``CatalogFile=`` (имя каталога не входит в его подпись, поэтому копия
-      под нужным именем валидна) — копируется здесь;
-    * файлов из ``[SourceDisksFiles]`` физически нет — это называется по
-      именам, чтобы сборка не выпускала заведомо неработающий пакет.
-
-    Возвращает список файлов, которых всё равно не хватает (пусто — пакет
-    полный).
-    """
-    inf_path = os.path.join(dest_dir, inf_name)
-    try:
-        with open(inf_path, "r", encoding="utf-8", errors="replace") as handle:
-            text = handle.read(_MAX_INF_BYTES)
-    except OSError:
-        return []
-    catalogs, files = inf_payload_names(text)
-    try:
-        present = {name.lower(): name
-                   for name in os.listdir(dest_dir)
-                   if os.path.isfile(os.path.join(dest_dir, name))}
-    except OSError:
-        return []
-    cats = [name for name in present if name.endswith(".cat")]
-    for catalog in catalogs:
-        low = catalog.lower()
-        if low in present:
-            continue
-        if len(cats) == 1:
-            # Единственный каталог — это он и есть, просто с другим именем.
-            try:
-                shutil.copy2(os.path.join(dest_dir, present[cats[0]]),
-                             os.path.join(dest_dir, catalog))
-            except OSError:
-                continue
-            present[low] = catalog
-    missing: List[str] = []
-    for name in files:
-        leaf = os.path.basename(name.replace("\\", os.sep))
-        if leaf.lower().endswith(".cat"):
-            # Каталог проверен выше по ``CatalogFile``: его имя в
-            # ``[SourceDisksFiles]`` бывает устаревшим и не мешает установке.
-            continue
-        if leaf.lower() not in present:
-            missing.append(leaf)
-    return sorted(set(missing))
-
-
 def merge_driver_packages(app_packages: Sequence[NetDriverPackage],
                           system_packages: Sequence[NetDriverPackage]
                           ) -> List[NetDriverPackage]:
@@ -1020,18 +935,6 @@ class NetStackReport:
                 entry.get("device_id", "") for entry in self.drivers
                 if entry.get("needs_install") == "1" and entry.get("device_id")
             ],
-            # Пара «служба драйвера — устройство». Нужна лончеру, чтобы не
-            # требовать ключ Services\<служба> там, где АДАПТЕР уже работает:
-            # имя службы берётся из INF на компьютере-сборщике, а INF вправе
-            # зарегистрировать другое имя (например, tap0902, если tap0901
-            # занят). Устройство с нужным Hardware ID доказывает, что драйвер
-            # установлен, независимо от имени его службы.
-            "driver_pairs": [
-                {"service": entry.get("service", ""),
-                 "device": entry.get("device_id", "")}
-                for entry in self.drivers
-                if entry.get("needs_install") == "1"
-            ],
             "service_names": [entry.get("name", "")
                               for entry in self.services if entry.get("name")],
             # Портатив снимает «свои» службы по завершении сеанса: чистый
@@ -1117,18 +1020,6 @@ def provision_netstack(portable_dir: str, app_dir: str,
                 if os.path.isfile(src):
                     shutil.copy2(src,
                                  os.path.join(dest_dir, os.path.basename(src)))
-            if package_copied and entry.get("needs_install") == "1":
-                # Пакет уезжает на другой ПК, где pnputil проверит каждую
-                # ссылку INF. Лучше узнать о пропаже здесь, чем показать
-                # пользователю «Не удается найти указанный файл».
-                absent = heal_package_files(dest_dir,
-                                            os.path.basename(source_inf))
-                if absent:
-                    report.notes.append(
-                        f"пакет {package.kind}: в пакете нет файлов "
-                        + ", ".join(absent)
-                        + " — pnputil его не поставит, адаптер создаётся "
-                          "напрямую из INF (SetupAPI)")
         except OSError as exc:
             report.notes.append(
                 f"пакет {package.kind}: часть файлов не скопирована ({exc})")
@@ -1264,29 +1155,20 @@ def render_setup_cmd(report: NetStackReport) -> str:
     Режимы:
 
     * ``--check`` — только проверка (права не нужны, ничего не меняется):
-      есть ли адаптер, служба, указывает ли её ``ImagePath`` внутрь ЭТОЙ
-      папки и запущена ли она. Код ``0`` — всё в порядке, ``3`` — нет
-      адаптера, ``4`` — службы нет или она устарела/остановлена,
-      ``2`` — нет ключа службы драйвера;
-    * по умолчанию — установить недостающее: один запрос прав администратора
-      на весь пакет;
-    * ``--elevated`` — внутренний режим уже повышенной копии. Если прав всё
-      равно нет, он НЕ пытается повышаться снова (это давало бесконечный
-      ряд окон UAC и «код 0» при полностью нетронутой машине), а выходит
-      с кодом ``7``.
-
-    Каждый шаг пишется в ``PortableData\\NetStack\\setup.log``: раньше
-    единственным следом сломанной установки был код возврата, а он терялся
-    при передаче управления повышенной копии.
+      есть ли пакет, устройство адаптера, служба, указывает ли её ``ImagePath``
+      внутрь ЭТОЙ папки и запущена ли она. Код ``0`` — всё в порядке,
+      ``2`` — нет пакета драйвера, ``3`` — нет адаптера, ``4`` — службы нет
+      или она устарела/остановлена;
+    * по умолчанию (и ``--elevated``) — установить недостающие пакеты
+      драйверов и зарегистрировать/запустить службы.
     """
     lines = [
         "@echo off",
         "setlocal EnableExtensions",
         "rem NetStack setup: bundled network drivers (TAP-Windows and friends)",
         "rem plus the companion services, generated by Portablizer.",
-        "rem   --check     verify only (no admin rights needed, no changes)",
-        "rem   --elevated  internal: the copy that already has admin rights",
-        "rem   (default)   install what is missing; asks UAC once for the batch",
+        "rem   --check    verify only (no admin rights needed, no changes)",
+        "rem   (default)  install what is missing; services go through the .ps1",
         'set "NETSTACK_MODE=%~1"',
         'set "NETSTACK_ROOT=%~dp0"',
         'set "PORTABLE_ROOT=%NETSTACK_ROOT%.."',
@@ -1294,64 +1176,25 @@ def render_setup_cmd(report: NetStackReport) -> str:
         'set "NETSTACK_STATE=%PORTABLE_ROOT%\\PortableData\\'
         + STATE_DIR_NAME + '"',
         'if not exist "%NETSTACK_STATE%" mkdir "%NETSTACK_STATE%" >nul 2>&1',
-        'set "NETSTACK_LOG=%NETSTACK_STATE%\\setup.log"',
         'set "NETSTACK_RC=0"',
-        "call :netstack_trace start",
         "",
-        "rem --- administrator rights: ONE prompt for the whole batch --------",
-        'set "NETSTACK_ADMIN=0"',
-        "fltmc >nul 2>&1 && set \"NETSTACK_ADMIN=1\"",
-        'if "%NETSTACK_ADMIN%" == "1" goto netstack_pass',
-        "rem net session and openfiles both refuse without rights, but net",
-        "rem session fails on machines with the Server service disabled -",
-        "rem that is why openfiles is the fallback here.",
-        "openfiles.exe /query >nul 2>&1 || goto netstack_not_admin",
-        'set "NETSTACK_ADMIN=1"',
-        "goto netstack_pass",
-        "",
-        ":netstack_not_admin",
-        "call :netstack_trace not-elevated",
+        "rem --check needs no elevation at all. The ensure pass asks UAC once",
+        "rem for the whole batch, so nobody has to click through the device",
+        'rem "install the software for this device" dialog by hand.',
         'if /i "%NETSTACK_MODE%" == "--check" goto netstack_pass',
-        'if /i "%NETSTACK_MODE%" == "--elevated" goto netstack_no_rights',
-        "call :netstack_trace asking-uac",
-        "rem -PassThru + exit: the elevated copy runs the same file with",
-        "rem --elevated, and ITS exit code is what the caller must see. The",
-        "rem previous version returned 0 here no matter what happened, so a",
-        "rem failed or declined installation looked like a success.",
-        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-        "\"try { $p = Start-Process -Verb RunAs -Wait -PassThru "
-        "-FilePath '%~f0' -ArgumentList '--elevated'; exit $p.ExitCode } "
-        "catch { exit 7 }\"",
-        'set "NETSTACK_RC=%ERRORLEVEL%"',
-        "call :netstack_trace elevated-returned %NETSTACK_RC%",
-        'if "%NETSTACK_RC%" == "7" goto netstack_no_rights',
-        'if "%NETSTACK_RC%" == "0" echo   NetStack ready.',
-        "goto netstack_done",
-        "",
-        ":netstack_no_rights",
-        "call :netstack_trace no-administrator-rights",
-        'echo   [warn] administrator rights were NOT granted: nothing was installed',
-        "rem 7 = the UAC prompt was declined or could not be shown. Distinct",
-        "rem from 3 (adapter missing after a real attempt), so the launcher",
-        "rem can tell the user to press Yes instead of guessing.",
-        'set "NETSTACK_RC=7"',
-        "goto netstack_done",
+        ">nul 2>&1 net session || (",
+        "  powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        "\"Start-Process -Verb RunAs -Wait -WindowStyle Hidden "
+        "-FilePath '%~f0' -ArgumentList '--elevated'\" >nul 2>&1",
+        "  goto netstack_done",
+        ")",
         "",
         ":netstack_pass",
-        "call :netstack_trace pass admin=%NETSTACK_ADMIN%",
         'set "PNPMODERN=0"',
         'if exist "%SystemRoot%\\System32\\pnputil.exe" (',
         '  pnputil /? 2>nul | findstr /i /c:"/add-driver" >nul 2>&1 '
         '&& set "PNPMODERN=1"',
         ")",
-        "rem The package itself is checked first: an INF that points at a",
-        'rem missing file (usually its .cat) makes pnputil answer "the',
-        'rem system cannot find the file specified", and the adapter never',
-        "rem appears. Repair-DriverPackage also renames a stray catalog.",
-        'if /i "%NETSTACK_MODE%" == "--check" goto netstack_package_done',
-        "powershell -NoProfile -ExecutionPolicy Bypass -File "
-        f'"%NETSTACK_ROOT%{SERVICES_SCRIPT_NAME}" -Mode package',
-        ":netstack_package_done",
     ]
 
     isolated = report.isolation == "session"
@@ -1365,10 +1208,10 @@ def render_setup_cmd(report: NetStackReport) -> str:
             "rem isolation: snapshot the driver store before publishing, so",
             "rem Teardown can remove exactly the packages this portable added.",
             'if /i not "%NETSTACK_MODE%" == "--check" (',
-            '  dir /b "%SystemRoot%\\INF\\oem*.inf" '
+            '  dir /b "%SystemRoot%\INF\oem*.inf" ',
             '> "%NETSTACK_STATE\\' + SNAPSHOT_PRE_FILE + '" 2>nul',
             '  del "%NETSTACK_STATE\\' + SNAPSHOT_IDS_FILE + '" >nul 2>&1',
-            ")",
+            ')',
         ]
 
     for index, driver in enumerate(report.drivers, start=1):
@@ -1399,14 +1242,11 @@ def render_setup_cmd(report: NetStackReport) -> str:
             f'reg query "HKLM\\SYSTEM\\CurrentControlSet\\Services\\{service}" '
             ">nul 2>&1",
             "if not errorlevel 1 goto netstack_after_driver_" + str(index),
-            f"echo   [info] driver service {service} is not registered on this PC",
-            "call :netstack_trace driver-not-registered " + service,
-            # В --check решение принимает .ps1 по УСТРОЙСТВУ: имя службы
-            # известно только из INF с компьютера-сборщика, а INF вправе
-            # зарегистрировать другое имя. Раньше отсутствие ключа давало код
-            # 2 и ложное «нет tap0901» на машине с работающим адаптером.
-            'if /i "%NETSTACK_MODE%" == "--check" goto netstack_after_driver_'
-            + str(index),
+            f"echo   [setup] driver service {service} is missing on this PC",
+            'if /i "%NETSTACK_MODE%" == "--check" (',
+            '  set "NETSTACK_RC=2"',
+            "  goto netstack_after_driver_" + str(index),
+            ")",
             *([f'echo {device}>> "%NETSTACK_STATE\\'
                f'{SNAPSHOT_IDS_FILE}"']
               if (isolated and device) else []),
@@ -1424,7 +1264,6 @@ def render_setup_cmd(report: NetStackReport) -> str:
                 ">nul 2>&1",
                 f"if errorlevel 1 if exist {inst_path} (",
                 "  echo   [setup] running the bundled package installer",
-                "  call :netstack_trace bundled-installer " + service,
                 f'  start "" /wait {inst_path} /S /NCRC',
                 ")",
             ]
@@ -1445,12 +1284,9 @@ def render_setup_cmd(report: NetStackReport) -> str:
             f'reg query "HKLM\\SYSTEM\\CurrentControlSet\\Services\\{service}" '
             ">nul 2>&1",
             "if errorlevel 1 (",
-            f"  echo   [warn] driver package {service} is still not registered",
-            "  call :netstack_trace driver-package-unregistered " + service,
-            "  rem The adapter is what matters: NetStackServices.ps1 creates",
-            "  rem it from this INF even when the package cannot be staged",
-            "  rem (no catalog, blocked by policy) and exits non-zero only",
-            "  rem when the device really is absent.",
+            f"  echo   [warn] driver service {service} still missing after "
+            "all attempts",
+            '  set "NETSTACK_RC=3"',
             ")",
             f":netstack_after_driver_{index}",
         ]
@@ -1478,34 +1314,24 @@ def render_setup_cmd(report: NetStackReport) -> str:
         'if /i "%NETSTACK_MODE%" == "--check" set "PS_MODE=check"',
         f"powershell -NoProfile -ExecutionPolicy Bypass -File "
         f"{services_script} -Mode %PS_MODE%",
-        "rem The code is captured immediately: `call` below resets ERRORLEVEL.",
-        'set "NETSTACK_PS=%ERRORLEVEL%"',
-        "call :netstack_trace ps1-%PS_MODE%-exit-%NETSTACK_PS%",
-        'if "%NETSTACK_RC%" == "0" set "NETSTACK_RC=%NETSTACK_PS%"',
-        'if "%NETSTACK_RC%" == "0" goto netstack_summary',
-        'if "%NETSTACK_RC%" == "3" echo   [warn] the network adapter was not created',
-        'if "%NETSTACK_RC%" == "4" echo   [warn] a companion service is missing, '
-        "stale or stopped",
-        'if "%NETSTACK_RC%" == "6" echo   [warn] a companion service did not start',
-        'if "%NETSTACK_RC%" == "5" echo   [warn] PowerShell is too old for NetStack',
-        'if "%NETSTACK_RC%" == "7" echo   [warn] administrator rights were NOT granted',
-        'if not "%NETSTACK_RC%" == "0" echo   Details: %NETSTACK_LOG%',
-        ":netstack_summary",
-        'if /i "%NETSTACK_MODE%" == "--check" goto netstack_done',
-        'if "%NETSTACK_RC%" == "0" echo   NetStack ready.',
-        "rem Fallback: when the .ps1 never ran (old PowerShell, blocked",
-        "rem script) the user still needs a file that says so.",
-        'if exist "%NETSTACK_STATE%\\status.txt" goto netstack_done',
-        'echo NetStack: the state was not recorded, see setup.log>> '
-        '"%NETSTACK_STATE%\\status.txt"',
-        ":netstack_done",
-        "call :netstack_trace exit-%NETSTACK_RC%",
-        "endlocal & exit /b %NETSTACK_RC%",
+        "rem 6 = a service exists but did not start, 4 = service missing or",
+        "rem its ImagePath points into another folder, 3 = adapter missing.",
+        "rem 'if errorlevel N' also matches greater codes, so 6 is tested",
+        "rem before 4, and 4 before 3 - only real returns set the code.",
+        "if errorlevel 6 (set \"NETSTACK_RC=6\") else if errorlevel 4 "
+        "(set \"NETSTACK_RC=4\") else if errorlevel 3 "
+        "set \"NETSTACK_RC=3\"",
+        "rem Re-verify honestly: services that still do not exist keep the",
+        "rem exit code at 4, the launcher asks UAC only when it really helps.",
+        'if /i not "%NETSTACK_MODE%" == "--check" (',
+        f"  powershell -NoProfile -ExecutionPolicy Bypass -File "
+        f"{services_script} -Mode check >nul 2>&1",
+        '  if not "%NETSTACK_RC%" == "6" if errorlevel 4 set "NETSTACK_RC=4"',
+        ")",
         "",
-        "rem --- helpers ------------------------------------------------------",
-        ":netstack_trace",
-        '>>"%NETSTACK_LOG%" echo [%DATE% %TIME%] %~1 %~2',
-        "exit /b 0",
+        'if /i not "%NETSTACK_MODE%" == "--check" echo   NetStack ready.',
+        ":netstack_done",
+        "endlocal & exit /b %NETSTACK_RC%",
         "",
     ]
     return "\r\n".join(lines)
@@ -1560,24 +1386,12 @@ def render_teardown_cmd(report: NetStackReport) -> str:
          'set "TEARDOWN_MODE=--keep-driver"' if isolated else
          'for %%A in (%*) do if /i "%%~A" == "--remove-device" '
          'set "TEARDOWN_MODE=--remove-device"'),
-        "rem Same rights check as Setup.cmd: `net session` fails even for",
-        "rem an administrator when the Server service is disabled, and then",
-        "rem every level re-elevated itself (an endless row of UAC windows).",
-        'set "TEARDOWN_ADMIN=0"',
-        "fltmc >nul 2>&1 && set \"TEARDOWN_ADMIN=1\"",
-        'if "%TEARDOWN_ADMIN%" == "1" goto netstack_teardown_pass',
-        "openfiles.exe /query >nul 2>&1 && set \"TEARDOWN_ADMIN=1\"",
-        'if "%TEARDOWN_ADMIN%" == "1" goto netstack_teardown_pass',
-        "for %%A in (%*) do if /i \"%%~A\" == \"--elevated\" "
-        "goto netstack_teardown_pass",
-        "rem The elevated copy reports its own exit code: hiding it made a",
-        "rem teardown that did nothing indistinguishable from a clean exit.",
-        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-        "\"try { $p = Start-Process -Verb RunAs -Wait -PassThru "
-        "-FilePath '%~f0' -ArgumentList '--elevated %TEARDOWN_MODE%'; "
-        "exit $p.ExitCode } catch { exit 7 }\"",
-        "exit /b %ERRORLEVEL%",
-        ":netstack_teardown_pass",
+        ">nul 2>&1 net session || (",
+        "  powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        "\"Start-Process -Verb RunAs -Wait -WindowStyle Hidden "
+        "-FilePath '%~f0' -ArgumentList '--elevated %TEARDOWN_MODE%'\" >nul 2>&1",
+        "  exit /b 0",
+        ")",
         "",
         "rem Companion services first: the .ps1 knows exactly what Setup",
         "rem created on THIS machine and removes nothing else.",
@@ -1637,31 +1451,6 @@ if (-not (Test-Path -LiteralPath $stateDir)) {
 $createdPath = Join-Path $stateDir 'created-services.txt'
 $packagesPath = Join-Path $stateDir 'driver-packages.txt'
 $devicesPath = Join-Path $stateDir 'created-devices.txt'
-# --- trace: a file first, actions second -----------------------------------
-# Without this the launcher could only report an exit code. A copy that never
-# reaches its last line (parse error, missing function, no rights) used to
-# leave NOTHING behind: no status.txt, no log, and the user saw "exit code 0".
-$script:traceFile = Join-Path $stateDir 'ps.log'
-function Add-NetStackTrace([string]$message) {
-     try {
-          $line = '[' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '] ' + $message
-          Add-Content -LiteralPath $script:traceFile -Value $line -Encoding UTF8
-     } catch { }
-}
-trap {
-     Add-NetStackTrace ('ERROR in mode ' + $Mode + ': ' + $_.Exception.Message)
-     try { if (Get-Command Write-NetStackStatus -ErrorAction SilentlyContinue) {
-          Write-NetStackStatus $false } } catch { }
-     exit 1
-}
-$script:isAdmin = $false
-try {
-     $principal = New-Object Security.Principal.WindowsPrincipal(
-          [Security.Principal.WindowsIdentity]::GetCurrent())
-     $script:isAdmin = $principal.IsInRole(
-          [Security.Principal.WindowsBuiltInRole]::Administrator)
-} catch { }
-Add-NetStackTrace ('mode=' + $Mode + ' admin=' + $script:isAdmin + ' root=' + $root)
 # --- adapters: a driver service is not an adapter ---------------------------
 # A VPN client does not ask Windows "is service tap0901 registered?" - it
 # enumerates NETWORK ADAPTERS. So publishing the package is only half the job:
@@ -1802,21 +1591,12 @@ namespace PortablizerNetStack {
 '@
           Add-Type -TypeDefinition $source -ErrorAction SilentlyContinue
      }
-     if (-not ('PortablizerNetStack.RootDevice' -as [type])) {
-          # Add-Type is blocked by policy on some machines: without this line
-          # the only trace was "adapter still missing", with no reason.
-          Add-NetStackTrace ('SetupAPI installer could not be compiled: ' +
-               'Add-Type is unavailable')
-          return $false
+     if ('PortablizerNetStack.RootDevice' -as [type]) {
+          try {
+               [PortablizerNetStack.RootDevice]::Install($infPath, $hwid) |
+                    Out-Null
+          } catch { }
      }
-     $installed = $false
-     try {
-          $installed = [bool][PortablizerNetStack.RootDevice]::Install(
-               $infPath, $hwid)
-     } catch {
-          Add-NetStackTrace ('SetupAPI install failed: ' + $_.Exception.Message)
-     }
-     Add-NetStackTrace ('SetupAPI install returned ' + $installed + ' for ' + $hwid)
      Start-Sleep -Milliseconds 600
      return (@(Find-HwidDevices $hwid).Count -gt 0)
 }
@@ -1929,81 +1709,6 @@ function Enable-HwidDevices([string]$hwid) {
      if ($changed) { Start-Sleep -Milliseconds 700 }
      return $changed
 }
-function Get-DeviceServiceName([string]$instanceId) {
-     if (-not $instanceId) { return '' }
-     $path = 'HKLM:\SYSTEM\CurrentControlSet\Enum\' + $instanceId
-     $name = [string](Get-ItemProperty -LiteralPath $path -Name Service `
-          -ErrorAction SilentlyContinue).Service
-     return $name
-}
-# --- the driver package itself: what pnputil will look for ----------------
-# "Не удалось добавить пакет драйвера: Не удается найти указанный файл" means
-# the INF points at a file that did not travel with it - usually the catalog
-# (its name is written in [Version] as CatalogFile=...) or one of
-# [SourceDisksFiles]. The name of the .cat is not part of its signature, so a
-# renamed catalog is repaired here instead of failing every launch.
-function Repair-DriverPackage([string]$infPath) {
-     if (-not $infPath -or -not (Test-Path -LiteralPath $infPath)) {
-          Add-NetStackTrace ('package: inf is absent: ' + $infPath)
-          return $false
-     }
-     $dir = Split-Path -Parent $infPath
-     $expected = @()
-     $catalogs = @()
-     $section = ''
-     foreach ($raw in @(Get-Content -LiteralPath $infPath -ErrorAction SilentlyContinue)) {
-          $line = $raw.Trim()
-          if (-not $line -or $line.StartsWith(';')) { continue }
-          if ($line -match '^\[(.+)\]$') {
-               $section = $Matches[1].ToLower()
-               continue
-          }
-          if ($section -eq 'version') {
-               if ($line -match '^(?i)catalogfile(\.[^=]*)?\s*=\s*(.+)$') {
-                    $catalogs += $Matches[2].Trim()
-               }
-               continue
-          }
-          if ($section.StartsWith('sourcedisksfiles')) {
-               if ($line -match '^([^=]+?)\s*=') {
-                    $expected += $Matches[1].Trim()
-               }
-          }
-     }
-     $present = @{}
-     foreach ($file in @(Get-ChildItem -LiteralPath $dir -File `
-               -ErrorAction SilentlyContinue)) {
-          $present[$file.Name.ToLower()] = $file.FullName
-     }
-     $allCats = @($present.Keys | Where-Object { $_.EndsWith('.cat') })
-     foreach ($cat in $catalogs) {
-          if ($present.ContainsKey($cat.ToLower())) { continue }
-          if ($allCats.Count -eq 1) {
-               $source = $present[$allCats[0]]
-               $target = Join-Path $dir $cat
-               Copy-Item -LiteralPath $source -Destination $target -Force `
-                    -ErrorAction SilentlyContinue
-               Add-NetStackTrace ('package: catalog renamed ' +
-                    (Split-Path -Leaf $source) + ' -> ' + $cat)
-               $present[$cat.ToLower()] = $target
-               continue
-          }
-          Add-NetStackTrace ('package: catalog is absent: ' + $cat)
-     }
-     $missing = @()
-     foreach ($name in $expected) {
-          $flat = $name -replace '\\', '\'
-          $leaf = Split-Path -Leaf $flat
-          if ($present.ContainsKey($leaf.ToLower())) { continue }
-          $missing += $leaf
-     }
-     if ($missing.Count -gt 0) {
-          Add-NetStackTrace ('package ' + (Split-Path -Leaf $infPath) +
-               ': files are absent: ' + (@($missing | Select-Object -Unique) -join ', '))
-          return $false
-     }
-     return $true
-}
 function Write-NetStackStatus([bool]$healthy) {
      $lines = @()
      $lines += ('root: ' + $root)
@@ -2023,12 +1728,7 @@ function Write-NetStackStatus([bool]$healthy) {
                     $state = [string]$pnp.Status
                } catch { }
           }
-          $driver = ''
-          if ($devices.Count -gt 0) {
-               $driver = Get-DeviceServiceName $devices[0].InstanceId
-          }
-          $lines += ('adapter ' + $hwid + ': ' + $state +
-               ' (driver service: ' + $driver + ')')
+          $lines += ('adapter ' + $hwid + ': ' + $state)
      }
      foreach ($s in @($cfg.services)) {
           $name = [string]$s.name
@@ -2053,23 +1753,13 @@ function Ensure-NetAdapters {
                Enable-HwidDevices $hwid | Out-Null
                continue
           }
-          if (-not $d.inf) {
-               Add-NetStackTrace ('adapter ' + $hwid + ': the manifest has no inf')
-               $failed = $true
-               continue
-          }
+          if (-not $d.inf) { $failed = $true; continue }
           $inf = Join-Path $root ([string]$d.inf -replace '/', '\')
           $tool = ''
           if ($d.tool) {
                $tool = Join-Path $root ([string]$d.tool -replace '/', '\')
           }
-          if (-not (Test-Path -LiteralPath $inf)) {
-               Add-NetStackTrace ('adapter ' + $hwid + ': inf is absent: ' + $inf)
-               $failed = $true
-               continue
-          }
-          Add-NetStackTrace ('adapter ' + $hwid + ': installing from ' + $inf)
-          Repair-DriverPackage $inf | Out-Null
+          if (-not (Test-Path -LiteralPath $inf)) { $failed = $true; continue }
           $created = Install-RootDevice $inf $hwid $tool
           if (-not $scanned) {
                & pnputil /scan-devices 2>&1 | Out-Null
@@ -2167,82 +1857,33 @@ if ($Mode -eq 'rollback') {
      exit 0
 }
 $services = @($cfg.services)
-if ($Mode -eq 'package') {
-     # Проверка самого пакета драйвера ДО pnputil: "Не удается найти
-     # указанный файл" означает, что INF ссылается на файл, который не
-     # доехал (обычно каталог .cat из [Version]). Переименованный каталог
-     # починим молча, отсутствующие файлы назовём по именам.
-     $complete = $true
-     foreach ($d in @($cfg.drivers)) {
-          if (-not $d.needs_install) { continue }
-          if (-not $d.inf) { continue }
-          $inf = Join-Path $root ([string]$d.inf -replace '/', '\\')
-          if (-not (Repair-DriverPackage $inf)) { $complete = $false }
-          Add-NetStackTrace ('package ' + $inf + ': complete=' + $complete)
-     }
-     exit 0
-}
 if ($Mode -eq 'check') {
-     # One exit point: the state file is written even when the answer is
-     # "something is missing", so the user always has a file to send.
-     $code = 0
      # The adapter is checked as well: a registered service without a device
      # is exactly the vendor app's "adapter not found" state.
      foreach ($d in @($cfg.drivers)) {
           if (-not $d.needs_install) { continue }
           $hwid = [string]$d.device_id
-          if ($hwid -and (@(Find-HwidDevices $hwid).Count -eq 0)) {
-               Add-NetStackTrace ('adapter ' + $hwid + ': missing')
-               $code = 3
-               break
-          }
+          if ($hwid -and (@(Find-HwidDevices $hwid).Count -eq 0)) { exit 3 }
      }
      # A service is only useful when it exists, points to THIS copy and is
      # running: a stopped or stale service is exactly the "no protocol works"
      # state for a VPN client, and starting it needs no new installation.
-     if ($code -eq 0) {
-          foreach ($s in $services) {
-               $name = [string]$s.name
-               if (-not $name) { continue }
-               $current = Get-ServiceImagePath $name
-               if (-not $current) {
-                    Add-NetStackTrace ('service ' + $name + ': not registered')
-                    $code = 4
-                    break
-               }
-               if (Test-ForeignService $current) {
-                    Add-NetStackTrace ('service ' + $name + ': belongs to another ' +
-                         'installation, left alone')
-                    continue
-               }
-               $exe = ([string]$s.image).Replace($token, $root)
-               if (-not (Test-SamePath (Get-ServiceExePath $current) $exe)) {
-                    Add-NetStackTrace ('service ' + $name + ': ImagePath is ' +
-                         $current + ', expected ' + $exe)
-                    $code = 4
-                    break
-               }
-               if (-not (Test-Path -LiteralPath $exe)) {
-                    Add-NetStackTrace ('service ' + $name + ': binary is absent: ' + $exe)
-                    $code = 4
-                    break
-               }
-               $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
-               if ($null -eq $svc) {
-                    Add-NetStackTrace ('service ' + $name + ': registry key without a service')
-                    $code = 4
-                    break
-               }
-               if (@('Running', 'StartPending') -notcontains [string]$svc.Status) {
-                    Add-NetStackTrace ('service ' + $name + ': ' + $svc.Status)
-                    $code = 4
-                    break
-               }
+     foreach ($s in $services) {
+          $name = [string]$s.name
+          if (-not $name) { continue }
+          $current = Get-ServiceImagePath $name
+          if (-not $current) { exit 4 }
+          if (Test-ForeignService $current) { continue }
+          $exe = ([string]$s.image).Replace($token, $root)
+          if (-not (Test-SamePath (Get-ServiceExePath $current) $exe)) { exit 4 }
+          if (-not (Test-Path -LiteralPath $exe)) { exit 4 }
+          $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+          if ($null -eq $svc) { exit 4 }
+          if (@('Running', 'StartPending') -notcontains [string]$svc.Status) {
+               exit 4
           }
      }
-     Add-NetStackTrace ('check result ' + $code)
-     Write-NetStackStatus ($code -eq 0)
-     exit $code
+     exit 0
 }
 if ($Mode -eq 'detach') {
      # Shared mode (--remove-device): detach only our adapters, keep packages.
@@ -2263,14 +1904,7 @@ if ($Mode -eq 'teardown') {
 # ensure: create only what is absent, remember only what we created.
 # Adapters first: the VPN client cannot do anything without one, and its own
 # driver installation needs the rights this elevated pass already has.
-$adapterOk = Ensure-NetAdapters
-Add-NetStackTrace ('adapters ready=' + $adapterOk)
-if (-not $adapterOk) {
-     # The state file is written on the way out even when the adapter could
-     # not be created: "nothing happened" is not a diagnosis.
-     Write-NetStackStatus $false
-     exit 3
-}
+if (-not (Ensure-NetAdapters)) { exit 3 }
 if ($services.Count -eq 0) {
      # Драйвер-адаптер сам по себе: состояние всё равно фиксируется, иначе
      # после сеанса нечем объяснить, что именно было на машине.
@@ -2325,7 +1959,6 @@ foreach ($s in $services) {
           if (($null -eq $svc) -or ($svc.Status -ne 'Running')) {
                Write-Output ("netstack: service '" + $name +
                     "' did not start")
-               Add-NetStackTrace ('service ' + $name + ': did not start')
                $serviceFailed = $true
           }
           continue
@@ -2344,8 +1977,6 @@ foreach ($s in $services) {
           } else {
                Write-Output ("netstack: service '" + $name +
                     "' could not be created (sc exit " + $LASTEXITCODE + ")")
-               Add-NetStackTrace ('service ' + $name + ': sc create failed, ' +
-                    'exit ' + $LASTEXITCODE)
                $serviceFailed = $true
                continue
           }
@@ -2355,12 +1986,9 @@ foreach ($s in $services) {
      $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
      if (($null -eq $svc) -or ($svc.Status -ne 'Running')) {
           Write-Output ("netstack: service '" + $name + "' did not start")
-          Add-NetStackTrace ('service ' + $name + ': did not start')
           $serviceFailed = $true
      }
 }
-Add-NetStackTrace ('services done, failed=' + $serviceFailed + ', created=' +
-     (@($created) -join ','))
 $created = @($created | Select-Object -Unique)
 if ($created.Count -gt 0) {
      Set-Content -LiteralPath $createdPath -Value $created -Encoding UTF8
