@@ -386,19 +386,91 @@ def _service_key_present(name: str) -> bool:
         return False
 
 
+def _device_hwid_present(hwid: str) -> bool:
+    """Есть ли на этом ПК устройство с таким Hardware ID.
+
+    Ключ ``Services\\tap0901`` означает лишь, что пакет драйвера
+    зарегистрирован. Вендорский VPN-клиент ищет **сетевой адаптер**, а его
+    может не быть: именно это состояние он и показывает окном «Приложению не
+    удалось обнаружить TAP-Windows Provider V9 Network adapter для
+    подключения к VPN. Установить сейчас?». Поэтому проверяются оба признака.
+
+    Реестр ``HKLM\\SYSTEM\\CurrentControlSet\\Enum`` открыт на чтение всем,
+    права администратора не нужны. Сначала смотрится ``ROOT`` (TAP-адаптер —
+    корневое устройство), затем остальные шины: так поиск дешёвый, но не
+    пропускает адаптер, установленный иначе.
+    """
+    if not IS_WINDOWS or not hwid:
+        return True
+    try:
+        import winreg  # type: ignore
+
+        needle = str(hwid).lower()
+        enum_path = "SYSTEM\\CurrentControlSet\\Enum"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, enum_path) as enum:
+            buses: "list[str]" = []
+            index = 0
+            while True:
+                try:
+                    bus = winreg.EnumKey(enum, index)
+                except OSError:
+                    break
+                index += 1
+                buses.append(bus)
+        ordered = ["ROOT"] + [bus for bus in buses if bus.upper() != "ROOT"]
+        for bus in ordered:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    enum_path + "\\" + bus) as bus_key:
+                    count = winreg.QueryInfoKey(bus_key)[0]
+                    for position in range(count):
+                        try:
+                            instance = winreg.EnumKey(bus_key, position)
+                        except OSError:
+                            break
+                        try:
+                            with winreg.OpenKey(
+                                    winreg.HKEY_LOCAL_MACHINE,
+                                    enum_path + "\\" + bus + "\\"
+                                    + instance) as device:
+                                raw = winreg.QueryValueEx(
+                                    device, "HardwareID")[0]
+                        except OSError:
+                            continue
+                        values = raw if isinstance(raw, (list, tuple)) else [raw]
+                        for value in values:
+                            if needle in str(value).lower():
+                                return True
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001 — проверка не должна мешать запуску
+        return True
+    return False
+
+
 def netstack_missing(root: Path, cfg: Dict[str, Any]
                      ) -> "list[str]":
-    """Имена недостающих системных компонентов из секции ``netstack``."""
+    """Имена недостающих системных компонентов из секции ``netstack``.
+
+    Возвращает и службы, и отсутствующие АДАПТЕРЫ (строкой ``адаптер tap0901``):
+    пакет драйвера без устройства — это ровно та ошибка, с которой начинается
+    жалоба (см. :func:`_device_hwid_present`).
+    """
     section = _netstack_section(cfg)
     names: "list[str]" = []
     for key in ("driver_services", "service_names"):
         raw = section.get(key)
         if isinstance(raw, list):
             names.extend(str(n) for n in raw if str(n).strip())
-    if not names:
-        return []
-    return [name for name in dict.fromkeys(names)
-            if not _service_key_present(name)]
+    devices: "list[str]" = []
+    raw_devices = section.get("driver_devices")
+    if isinstance(raw_devices, list):
+        devices = [str(n) for n in raw_devices if str(n).strip()]
+    missing = [name for name in dict.fromkeys(names)
+               if not _service_key_present(name)]
+    missing += ["адаптер " + hwid for hwid in dict.fromkeys(devices)
+                if not _device_hwid_present(hwid)]
+    return missing
 
 
 def _netstack_warning_is_new(root: Path, cfg: Dict[str, Any],
@@ -480,15 +552,25 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
     else:
         notes.append(f"NetStack setup exit code {code}")
     still = netstack_missing(root, cfg)
+    if still and code not in (None, 0):
+        # Второй проход: пакет уже опубликован в DriverStore, и теперь
+        # создаётся само устройство адаптера (tapinstall/SetupAPI). Иногда
+        # PnP успевает привязать драйвер только к этому моменту.
+        time.sleep(1.0)
+        second = _run_netstack_script(root, setup)
+        notes.append(f"NetStack setup retry exit code {second}")
+        still = netstack_missing(root, cfg)
     if still:
         notes.append("still missing: " + ", ".join(still))
         if _netstack_warning_is_new(root, cfg, still):
             _show_warning(
                 "Программе нужны системные сетевые компоненты, которых нет на "
                 "этом компьютере:\n\n  " + "\n  ".join(still)
-                + "\n\nПортатив пытается поставить их сам из папки NetStack "
-                "(один запрос прав администратора). Если окно UAC было "
-                "отклонено - запустите NetStack\\Setup.cmd вручную.")
+                + "\n\nПортатив ставит их сам из папки NetStack (один запрос "
+                "прав администратора: пакет драйвера + сетевой адаптер).\n"
+                "Если окно UAC было отклонено, запустите "
+                "NetStack\\Setup.cmd вручную и повторите запуск. "
+                "Подробности: " + str(root / "portablizer.log") + ".")
     else:
         notes.append("all required components are present")
     return notes
@@ -512,8 +594,9 @@ def stop_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
         return []
     state = (root / str(cfg.get("data_dir_name", "PortableData"))
              / "NetStack")
-    claimed = (state / "created-services.txt").is_file() or (
-        state / "driver-packages.txt").is_file()
+    claimed = ((state / "created-services.txt").is_file()
+               or (state / "driver-packages.txt").is_file()
+               or (state / "created-devices.txt").is_file())
     if not claimed:
         return []
     code = _run_netstack_script(root, teardown)

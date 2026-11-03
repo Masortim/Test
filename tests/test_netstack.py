@@ -32,6 +32,18 @@ from portablizer.core.launcher import (
 )
 from portablizer.core import redist as redist_mod
 
+def _command_lines_with(text: str, needle: str):
+    """Строки скрипта, где needle — команда, а не пояснение в rem."""
+    found = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("rem"):
+            continue
+        if needle in stripped:
+            found.append(stripped)
+    return found
+
+
 TAP_INF = """; TAP-Windows driver setup file (c) 2002-2019 OpenVPN Technologies
 [Version]
 Signature   = "$Chicago$"
@@ -265,8 +277,13 @@ class ProvisionTests(unittest.TestCase):
                       '\\tap0901"', setup)
         self.assertIn("pnputil /add-driver", setup)
         self.assertIn("/install", setup)
-        # tapinstall — запас, когда pnputil не создал корневое устройство.
-        self.assertIn("tapinstall.exe", setup)
+        # pnputil НЕ умеет создавать устройства: команды /add-device у него
+        # нет. Пакет публикуется им, а адаптер создаёт .ps1 (tapinstall или
+        # встроенный установщик на SetupAPI) — именно этого не хватало,
+        # чтобы портатив Planeta VPN видел адаптер.
+        self.assertFalse(_command_lines_with(setup, "/add-device"))
+        self.assertIn("/scan-devices", setup)
+        self.assertIn("NetStackServices.ps1", setup)
         # Службы создаёт PowerShell по манифесту (пути с кириллицей живут в
         # json, а .cmd остаётся ASCII).
         self.assertIn("NetStackServices.ps1", setup)
@@ -292,7 +309,12 @@ class ProvisionTests(unittest.TestCase):
             .decode("utf-8-sig")
         for needle in ("if ($Mode -eq 'ownership')", "if ($Mode -eq 'rollback')",
                        "/delete-driver", "/uninstall /force", "pending-driver.txt",
-                       "driver-packages.txt", "/remove-device", "tapinstall"):
+                       "driver-packages.txt", "/remove-device",
+                       "Find-HwidDevices", "Ensure-NetAdapters",
+                       "PortablizerNetStack.RootDevice",
+                       "UpdateDriverForPlugAndPlayDevices", "tapinstall",
+                       "created-devices.txt", "Remember-Device",
+                       "Remove-RememberedDevices"):
             self.assertIn(needle.replace("tapinstall", "remove"), ps1, needle)
         self.assertTrue(report.to_config()["stop_on_exit"])
         self.assertEqual(report.to_config()["isolation"], "session")
@@ -390,8 +412,9 @@ class LauncherWiringTests(unittest.TestCase):
         self.assertIn("NetStack\\Setup.cmd", bat)
         self.assertIn("--check", bat)
         self.assertIn("created-services.txt", bat)
-        # гейт teardown в bat учитывает оба маркера изолированного сеанса
+        # гейт teardown в bat учитывает все маркеры изолированного сеанса
         self.assertIn("driver-packages.txt", bat)
+        self.assertIn("created-devices.txt", bat)
 
     def test_bat_without_netstack_is_a_noop(self):
         bat = render_bat(self._cfg(netstack_section={}))
@@ -439,6 +462,23 @@ class NetstackEntryRuntimeTests(unittest.TestCase):
                 notes = exe_launcher.stop_netstack(root, cfg)
                 self.assertEqual(fake.call_count, 1)
                 self.assertTrue(notes)
+
+    def test_created_adapter_marker_alone_triggers_teardown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "PortableData" / "NetStack"
+            state.mkdir(parents=True)
+            (state / "created-devices.txt").write_text(
+                "tap0901 ROOT\\NET\\0003", encoding="utf-8")
+            cfg = {"netstack": {"teardown": "NetStack/Teardown.cmd",
+                                "stop_on_exit": True,
+                                "isolation": "session"}}
+            fake = mock.Mock(return_value=0)
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_run_netstack_script",
+                                      fake):
+                exe_launcher.stop_netstack(root, cfg)
+            self.assertEqual(fake.call_count, 1)
 
     def test_driver_marker_alone_triggers_isolation_teardown(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -576,6 +616,371 @@ class FailureHintTests(unittest.TestCase):
         hints = " ".join(engine._failure_hints(det, 2, opts, "/p"))
         self.assertIn("Безопасность Windows", hints)
         self.assertIn("NetStack", hints)
+
+
+#: Настоящий TAP-Windows кладёт рядом с .inf ещё и .sys/.cat: без них
+#: pnputil пакет не примет, а Windows не подпишет установку драйвера.
+class SystemCaptureTests(unittest.TestCase):
+    """Драйвер, установленный установщиком В СИСТЕМУ, а не в папку App.
+
+    Именно этого не хватало: Planeta VPN (как и почти все клиенты на
+    OpenVPN) ставит TAP-Windows в DriverStore, поэтому сканирование одного
+    App ничего не находило, портатив уезжал без драйвера, и на чужом ПК
+    клиент показывал «не удалось обнаружить TAP-Windows Provider V9 Network
+    adapter» и «Ошибка установки драйвера адаптера».
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.store = self.base / "DriverStore" / "FileRepository"
+        self.store.mkdir(parents=True)
+
+    def _driverstore_package(self, name, inf_text=TAP_INF, arch="amd64"):
+        directory = self.store / f"oemvista.inf_{arch}_9f1c2e4a"
+        directory.mkdir()
+        (directory / "OemVista.inf").write_text(inf_text, encoding="utf-8")
+        (directory / "tap0901.sys").write_bytes(b"MZ")
+        (directory / "tap-windows6.cat").write_bytes(b"MZ")
+        return directory
+
+    def test_driverstore_package_is_found_with_absolute_paths(self):
+        directory = self._driverstore_package("tap")
+        packages = netstack.scan_driverstore_packages(str(self.store),
+                                                      arch="amd64")
+        self.assertEqual(len(packages), 1)
+        package = packages[0]
+        self.assertEqual(package.kind, netstack.KIND_TAP_WINDOWS)
+        self.assertEqual(package.check_service, "tap0901")
+        self.assertEqual(package.origin, "driverstore")
+        self.assertEqual(Path(package.inf_path), directory / "OemVista.inf")
+        names = {Path(path).name for path in package.file_paths}
+        self.assertIn("tap0901.sys", names)
+        self.assertIn("tap-windows6.cat", names)
+
+    def test_foreign_drivers_are_not_captured(self):
+        directory = self.store / "intelwifi.inf_amd64_1234"
+        directory.mkdir()
+        (directory / "intelwifi.inf").write_text(FOREIGN_INF, encoding="utf-8")
+        self.assertEqual(netstack.scan_driverstore_packages(str(self.store)),
+                         [])
+
+    def test_prefers_package_of_the_os_architecture(self):
+        x86 = self.store / "oemvista.inf_x86_aaaa"
+        x86.mkdir()
+        (x86 / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+        (x86 / "tap0901.sys").write_bytes(b"MZ")
+        (x86 / "tap-windows6.cat").write_bytes(b"MZ")
+        arm = self.store / "oemvista.inf_arm64_bbbb"
+        arm.mkdir()
+        (arm / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+        (arm / "tap0901.sys").write_bytes(b"MZ")
+        (arm / "tap-windows6.cat").write_bytes(b"MZ")
+        packages = netstack.scan_driverstore_packages(str(self.store),
+                                                      arch="arm64")
+        self.assertEqual(Path(packages[0].inf_path).parent, arm)
+
+    def test_program_files_package_and_tapinstall_are_found(self):
+        programs = self.base / "Program Files"
+        driver = programs / "TAP-Windows" / "driver"
+        driver.mkdir(parents=True)
+        (driver / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+        (driver / "tap0901.sys").write_bytes(b"MZ")
+        (driver / "tap-windows6.cat").write_bytes(b"MZ")
+        binary = programs / "TAP-Windows" / "bin"
+        binary.mkdir(parents=True)
+        (binary / "tapinstall.exe").write_bytes(b"MZ")
+        packages = netstack.scan_program_files_packages([str(programs)])
+        self.assertEqual(len(packages), 1)
+        self.assertEqual(packages[0].origin, "program-files")
+        tools = netstack.find_netstack_tools([str(programs)])
+        self.assertEqual(Path(tools[0]).name, "tapinstall.exe")
+
+    def test_system_scan_merges_both_sources(self):
+        self._driverstore_package("tap")
+        programs = self.base / "PF"
+        driver = programs / "TAP-Windows" / "driver"
+        driver.mkdir(parents=True)
+        (driver / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+        (driver / "tap0901.sys").write_bytes(b"MZ")
+        (driver / "tap-windows6.cat").write_bytes(b"MZ")
+        packages = netstack.scan_system_driver_packages(
+            store_dir=str(self.store), program_files=[str(programs)])
+        self.assertEqual(len(packages), 1)
+        self.assertEqual(packages[0].origin, "driverstore")
+
+    def test_incomplete_app_package_is_replaced_by_full_system_one(self):
+        app = self.base / "App"
+        app.mkdir()
+        (app / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+        app_packages = netstack.scan_net_driver_packages(str(app))
+        self.assertEqual(len(app_packages), 1)
+        self.assertFalse(netstack.is_complete_driver_package(app_packages[0]))
+        system = [netstack.NetDriverPackage(
+            kind=netstack.KIND_TAP_WINDOWS, service="tap0901",
+            device_id="tap0901", inf_path=str(self.base / "x.inf"),
+            file_paths=[str(self.base / "tap0901.sys"),
+                        str(self.base / "tap.cat")],
+            origin="driverstore")]
+        merged = netstack.merge_driver_packages(app_packages, system)
+        self.assertIs(merged[0], system[0])
+        self.assertEqual(merged[0].origin, "driverstore")
+
+    def test_complete_app_package_wins_and_gets_the_tool(self):
+        app = self.base / "App2"
+        app.mkdir()
+        (app / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+        (app / "tap0901.sys").write_bytes(b"MZ")
+        (app / "tap-windows6.cat").write_bytes(b"MZ")
+        packages = netstack.scan_net_driver_packages(str(app))
+        self.assertTrue(netstack.is_complete_driver_package(packages[0]))
+        tool = self.base / "tapinstall.exe"
+        tool.write_bytes(b"MZ")
+        packages = netstack.attach_netstack_tools(packages, [str(tool)])
+        self.assertEqual(packages[0].origin, "app")
+        self.assertEqual(Path(packages[0].tool_path), tool)
+
+    def test_vpn_hint(self):
+        self.assertTrue(netstack.looks_like_vpn("Planeta VPN"))
+        self.assertTrue(netstack.looks_like_vpn("", "planetvpn-setup.exe"))
+        self.assertTrue(netstack.looks_like_vpn("WireGuard"))
+        self.assertFalse(netstack.looks_like_vpn("Notepad++", "setup.exe"))
+
+
+class SystemPackageProvisionTests(unittest.TestCase):
+    """Пакет из системы должен доехать до NetStack целиком."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.root = self.base / "PlanetaVPN_Portable"
+        self.app = self.root / "App"
+        self.app.mkdir(parents=True)
+        self.store = self.base / "store"
+        package_dir = self.store / "oemvista.inf_amd64_1"
+        package_dir.mkdir(parents=True)
+        (package_dir / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+        (package_dir / "tap0901.sys").write_bytes(b"MZ")
+        (package_dir / "tap-windows6.cat").write_bytes(b"MZ")
+        self.packages = netstack.scan_driverstore_packages(str(self.store))
+
+    def provision(self):
+        report = netstack.provision_netstack(str(self.root), str(self.app),
+                                             self.packages, [])
+        self.assertIsNotNone(report)
+        return report
+
+    def test_system_package_is_copied_with_driver_and_catalog(self):
+        report = self.provision()
+        drivers = self.root / "NetStack" / "Drivers" / "tap-windows"
+        self.assertTrue((drivers / "OemVista.inf").is_file())
+        self.assertEqual((drivers / "tap0901.sys").read_bytes(), b"MZ")
+        self.assertTrue((drivers / "tap-windows6.cat").is_file())
+        manifest = json.loads((self.root / "NetStack" / "netstack.json")
+                              .read_text(encoding="utf-8"))
+        self.assertEqual(manifest["drivers"][0]["device_id"], "tap0901")
+        self.assertTrue(manifest["drivers"][0]["inf"].startswith(
+            "NetStack/Drivers/"))
+        config = report.to_config()
+        self.assertEqual(config["driver_services"], ["tap0901"])
+        # Служба без устройства — не «готово»: лончер проверяет и адаптер.
+        self.assertEqual(config["driver_devices"], ["tap0901"])
+
+    def test_tool_from_the_system_is_copied_to_bin(self):
+        tool = self.base / "tapinstall.exe"
+        tool.write_bytes(b"MZ")
+        self.packages = netstack.attach_netstack_tools(self.packages,
+                                                       [str(tool)])
+        report = self.provision()
+        self.assertTrue((self.root / "NetStack" / "bin"
+                         / "tapinstall.exe").is_file())
+        manifest = json.loads((self.root / "NetStack" / "netstack.json")
+                              .read_text(encoding="utf-8"))
+        self.assertEqual(manifest["drivers"][0]["tool"],
+                         "NetStack/bin/tapinstall.exe")
+        setup = (self.root / "NetStack" / "Setup.cmd").read_text(
+            encoding="ascii")
+        self.assertIn("SetupAPI", setup)
+
+    def test_setup_script_does_not_pretend_pnputil_can_add_devices(self):
+        self.provision()
+        setup = (self.root / "NetStack" / "Setup.cmd").read_text(
+            encoding="ascii")
+        self.assertFalse(_command_lines_with(setup, "/add-device"))
+        self.assertIn("/scan-devices", setup)
+        ps1 = (self.root / "NetStack" / "NetStackServices.ps1").read_text(
+            encoding="utf-8-sig")
+        self.assertIn("Find-HwidDevices", ps1)
+        self.assertIn("RootDevice", ps1)
+        # Проверка адаптера — отдельно от проверки службы.
+        self.assertIn("exit 3", ps1)
+
+
+class BuildIntegrationTests(unittest.TestCase):
+    """Сборка портатива: драйвер с ПК-сборщика попадает в NetStack."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.root = self.base / "PlanetaVPN_Portable"
+        self.app = self.root / "App"
+        self.app.mkdir(parents=True)
+        store = self.base / "store" / "tap0901.inf_amd64_1"
+        store.mkdir(parents=True)
+        (store / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+        (store / "tap0901.sys").write_bytes(b"MZ")
+        (store / "tap-windows6.cat").write_bytes(b"MZ")
+        tool = self.base / "tapinstall.exe"
+        tool.write_bytes(b"MZ")
+        self.store = self.base / "store"
+        self.tool = tool
+
+    def test_build_takes_the_driver_from_the_build_pc(self):
+        from portablizer.core import portablizer as engine_mod
+        from portablizer.core.logutil import Logger
+        from portablizer.core.portablizer import (PortableOptions,
+                                                  PortableResult)
+        engine = engine_mod.Portablizer(Logger())
+        opts = PortableOptions(installer_path=str(self.base / "planetvpn.exe"),
+                               output_dir=str(self.base))
+        result = PortableResult(success=True)
+        scanned = netstack.scan_driverstore_packages(str(self.store))
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                mock.patch.object(netstack, "scan_system_driver_packages",
+                                  return_value=scanned), \
+                mock.patch.object(netstack, "find_netstack_tools",
+                                  return_value=[str(self.tool)]), \
+                mock.patch.object(engine_mod.procutil, "services_in",
+                                  return_value=[]):
+            report = engine._provision_netstack(
+                str(self.root), str(self.app), opts, result,
+                vpn_hint=True)
+        self.assertIsNotNone(report)
+        self.assertTrue((self.root / "NetStack" / "Drivers" / "tap-windows"
+                         / "tap0901.sys").is_file())
+        self.assertTrue((self.root / "NetStack" / "bin"
+                         / "tapinstall.exe").is_file())
+        self.assertEqual(result.netstack_drivers, ["tap0901"])
+        config = report.to_config()
+        self.assertEqual(config["driver_services"], ["tap0901"])
+        self.assertEqual(config["driver_devices"], ["tap0901"])
+        # Изолированный сеанс снимает созданный адаптер при выходе, даже
+        # когда служб-компаньонов нет.
+        self.assertTrue(config["stop_on_exit"])
+        self.assertEqual(config["isolation"], "session")
+        # Драйвер взят не из App: об этом должна быть строка в отчёте.
+        self.assertTrue(any("driverstore" in note for note in report.notes))
+
+    def test_build_without_a_driver_still_succeeds_for_regular_apps(self):
+        from portablizer.core import portablizer as engine_mod
+        from portablizer.core.logutil import Logger
+        from portablizer.core.portablizer import (PortableOptions,
+                                                  PortableResult)
+        engine = engine_mod.Portablizer(Logger())
+        opts = PortableOptions(installer_path=str(self.base / "setup.exe"),
+                               output_dir=str(self.base))
+        result = PortableResult(success=True)
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                mock.patch.object(netstack, "scan_system_driver_packages",
+                                  return_value=[]), \
+                mock.patch.object(netstack, "find_netstack_tools",
+                                  return_value=[]), \
+                mock.patch.object(engine_mod.procutil, "services_in",
+                                  return_value=[]):
+            report = engine._provision_netstack(
+                str(self.root), str(self.app), opts, result, vpn_hint=False)
+        self.assertIsNone(report)
+
+
+class PowerShellSyntaxGuardTests(unittest.TestCase):
+    """Сгенерированные .ps1/.cmd должны хотя бы разбираться Windows.
+
+    Тест выполняется только там, где есть powershell (то есть на Windows-
+    раннере): на Linux он честно пропускается. Без него синтаксическая
+    ошибка в C#-вставке Add-Type всплывала бы уже на компьютере пользователя.
+    """
+
+    def _powershell(self):
+        import shutil
+        return shutil.which("powershell") or shutil.which("pwsh")
+
+    def test_generated_ps1_parses(self):
+        import subprocess
+        shell = self._powershell()
+        if not shell:
+            self.skipTest("PowerShell недоступен")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "NetStackServices.ps1"
+            path.write_text(netstack.render_services_ps1(),
+                            encoding="utf-8-sig")
+            probe = ("$ErrorActionPreference='Stop'; "
+                     "$null = [scriptblock]::Create("
+                     "(Get-Content -Raw -LiteralPath '" + str(path) + "')); "
+                     "exit 0")
+            result = subprocess.run([shell, "-NoProfile", "-Command", probe],
+                                    capture_output=True, text=True, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_generated_ps1_runs_check_and_ensure_without_drivers(self):
+        """Пустой манифест: скрипт обязан дойти до конца обоих режимов.
+
+        Это ловит не только синтаксис, но и ошибки выполнения в новых
+        функциях (Find-HwidDevices, Ensure-NetAdapters) — на Linux-машине
+        без PowerShell тест честно пропускается.
+        """
+        import subprocess
+        shell = self._powershell()
+        if not shell:
+            self.skipTest("PowerShell недоступен")
+        with tempfile.TemporaryDirectory() as tmp:
+            portable = Path(tmp) / "Планета VPN Portable"
+            netstack_dir = portable / "NetStack"
+            netstack_dir.mkdir(parents=True)
+            (portable / "PortableData" / "NetStack").mkdir(parents=True)
+            (netstack_dir / "NetStackServices.ps1").write_text(
+                netstack.render_services_ps1(), encoding="utf-8-sig")
+            manifest = {"schema": 1, "isolation": "session",
+                        "root_token": "@@PORTABLE_ROOT@@",
+                        "drivers": [], "services": [],
+                        "state_dir": "PortableData/NetStack",
+                        "created_services_file": "created-services.txt"}
+            (netstack_dir / "netstack.json").write_text(
+                json.dumps(manifest), encoding="utf-8")
+            for mode in ("check", "ensure"):
+                result = subprocess.run(
+                    [shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                     "-File", str(netstack_dir / "NetStackServices.ps1"),
+                     "-Mode", mode],
+                    capture_output=True, text=True, timeout=180)
+                self.assertEqual(result.returncode, 0,
+                                 mode + ": " + result.stderr)
+
+    def test_embedded_csharp_compiles(self):
+        """Add-Type-вставка должна компилироваться (иначе адаптер не создать)."""
+        import re
+        import subprocess
+        shell = self._powershell()
+        if not shell:
+            self.skipTest("PowerShell недоступен")
+        text = netstack.render_services_ps1()
+        found = re.search(r"\$source = @'\r?\n(.*?)\r?\n'@", text, re.S)
+        self.assertIsNotNone(found, "C#-вставка не найдена в .ps1")
+        assert found is not None
+        source = found.group(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            cs = Path(tmp) / "RootDevice.cs"
+            cs.write_text(source, encoding="utf-8")
+            probe = ("$ErrorActionPreference='Stop'; "
+                     "Add-Type -TypeDefinition (Get-Content -Raw -LiteralPath '"
+                     + str(cs) + "') -ErrorAction Stop; "
+                     "if (-not ('PortablizerNetStack.RootDevice' -as [type])) "
+                     "{ exit 2 }; exit 0")
+            result = subprocess.run([shell, "-NoProfile", "-Command", probe],
+                                    capture_output=True, text=True, timeout=180)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

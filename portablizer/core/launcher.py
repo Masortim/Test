@@ -50,7 +50,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .. import __version__
 from .redist import REDIST_DIR_NAME, SILENT_SCRIPT_NAME as REDIST_SCRIPT_NAME
-from .netstack import (NETSTACK_DIR_NAME, SETUP_SCRIPT_NAME,
+from .netstack import (CREATED_DEVICES_FILE, NETSTACK_DIR_NAME,
+                       SETUP_SCRIPT_NAME,
                       TEARDOWN_SCRIPT_NAME, STATE_DIR_NAME,
                       CREATED_SERVICES_FILE, DRIVER_PACKAGES_FILE)
 
@@ -419,6 +420,10 @@ def _netstack_impls(cfg: LauncherConfig) -> Tuple[str, str]:
         'set "NETSTACK_TD=0"',
         f'if exist "{teardown_state}" set "NETSTACK_TD=1"',
         f'if exist "%NETSTACK_STATE%\\{DRIVER_PACKAGES_FILE}" '
+        'set "NETSTACK_TD=1"',
+        # Адаптер мог быть создан на ПК, где пакет драйвера уже стоял: тогда
+        # driver-packages.txt пуст, но своё устройство снять всё равно надо.
+        f'if exist "%NETSTACK_STATE%\\{CREATED_DEVICES_FILE}" '
         'set "NETSTACK_TD=1"',
         'if "%NETSTACK_TD%" == "0" goto :eof',
         "echo   Removing the services and drivers this portable created"

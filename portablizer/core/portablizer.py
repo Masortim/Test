@@ -2690,7 +2690,9 @@ class Portablizer:
             self._check_cancel()
             self.progress(91, "Сетевые компоненты (драйверы TAP, службы)")
             netstack_report = self._provision_netstack(
-                portable_dir, runtime_app_dir, opts, result)
+                portable_dir, runtime_app_dir, opts, result,
+                vpn_hint=netstack_mod.looks_like_vpn(
+                    name, opts.app_name, opts.installer_path))
 
             # 8. Генерация лончера и вспомогательных скриптов
             self._check_cancel()
@@ -9117,7 +9119,8 @@ class Portablizer:
 
     def _provision_netstack(self, portable_dir: str, app_dir: str,
                             opts: PortableOptions,
-                            result: PortableResult
+                            result: PortableResult,
+                            vpn_hint: bool = False
                             ) -> Optional["netstack_mod.NetStackReport"]:
         """Переносит системные сетевые компоненты программы в ``NetStack/``.
 
@@ -9141,6 +9144,28 @@ class Portablizer:
             return None
         try:
             packages = netstack_mod.scan_net_driver_packages(app_dir)
+            # Установщик VPN-клиента обычно ставит драйвер НЕ в свою папку, а
+            # в систему: пакет уходит в DriverStore, файлы — в
+            # System32\drivers. Без этого шага портатив из Planeta VPN
+            # уезжал без драйвера, и на чужом ПК клиент писал «не удалось
+            # обнаружить TAP-Windows Provider V9 Network adapter» и «Ошибка
+            # установки драйвера адаптера» (см. скриншоты в README).
+            if IS_WINDOWS:
+                try:
+                    system_packages = netstack_mod.scan_system_driver_packages()
+                except Exception as exc:  # noqa: BLE001
+                    self.log.debug(
+                        f"Поиск драйверов на этом ПК не удался: {exc}")
+                    system_packages = []
+                if system_packages:
+                    packages = netstack_mod.merge_driver_packages(
+                        packages, system_packages)
+                try:
+                    tools = netstack_mod.find_netstack_tools()
+                except Exception as exc:  # noqa: BLE001
+                    self.log.debug(f"Поиск tapinstall не удался: {exc}")
+                    tools = []
+                packages = netstack_mod.attach_netstack_tools(packages, tools)
             service_names: List[str] = []
             if IS_WINDOWS:
                 try:
@@ -9156,12 +9181,20 @@ class Portablizer:
             self.log.warn(f"Сетевые компоненты не перенесены: {exc}")
             return None
         if report is None:
-            self.log.debug(
-                "Сетевых компонентов (TAP-Windows/wintun/ovpn-dco) в App не "
-                "найдено — NetStack не создаётся.")
+            if vpn_hint:
+                self.log.warn(
+                    "Это VPN-клиент, но пакет драйвера TAP-Windows не найден "
+                    "ни в App, ни на этом ПК — портатив без него не "
+                    "подключится. Установите клиент на этом компьютере один "
+                    "раз (вместе с ним ставится драйвер), затем соберите "
+                    "портатив снова: пакет будет взят из DriverStore.")
+            else:
+                self.log.debug(
+                    "Сетевых компонентов (TAP-Windows/wintun/ovpn-dco) не "
+                    "найдено — NetStack не создаётся.")
             return None
         for note in report.notes:
-            self.log.debug(f"  • {note}")
+            self.log.info(f"  • {note}")
         result.netstack_drivers = sorted({
             entry.get("service") or entry.get("kind", "")
             for entry in report.drivers})
