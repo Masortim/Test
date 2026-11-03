@@ -1208,19 +1208,30 @@ def service_image_path(raw: str) -> str:
     return candidate.split(" ")[0]
 
 
-def services_in(root: str) -> List[str]:
-    """Имена служб Windows, чей исполняемый файл лежит внутри папки.
+class ServiceRef(NamedTuple):
+    """Служба, чей исполняемый файл лежит внутри папки."""
 
-    Игровая защита, «обновлятор» и подобное регистрируются службой. Убивать
-    такой процесс бесполезно: диспетчер служб немедленно поднимет его снова,
-    и папка останется занятой навсегда.
+    name: str
+    image: str
+
+
+def services_in_detail(root: str) -> List[ServiceRef]:
+    """Службы Windows внутри папки: имя и путь к бинарнику.
+
+    Игровая защита, «обновлятор», VPN-клиент и подобное регистрируются
+    службой. Убивать такой процесс бесполезно: диспетчер служб немедленно
+    поднимет его снова, и папка останется занятой навсегда.
+
+    Путь нужен вызывающему: по нему видно, ЧЬЯ это служба. Для решения
+    «остановить и удалить или не трогать» одного совпадения пути мало —
+    важно, что бинарник лежит в папке, которую мы пересобираем.
     """
     if not IS_WINDOWS:
         return []
     try:
         import winreg  # type: ignore
 
-        names: List[str] = []
+        found: List[ServiceRef] = []
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
                             r"SYSTEM\CurrentControlSet\Services") as services:
             index = 0
@@ -1235,11 +1246,57 @@ def services_in(root: str) -> List[str]:
                         path, _type = winreg.QueryValueEx(key, "ImagePath")
                 except OSError:
                     continue
-                if is_inside(service_image_path(str(path)), root):
-                    names.append(name)
-        return names
+                image = service_image_path(str(path))
+                if image and is_inside(image, root):
+                    found.append(ServiceRef(name, image))
+        return found
     except Exception:  # noqa: BLE001
         return []
+
+
+def services_in(root: str) -> List[str]:
+    """Имена служб Windows, чей исполняемый файл лежит внутри папки."""
+    return [ref.name for ref in services_in_detail(root)]
+
+
+def service_present(name: str, timeout: float = 15.0) -> bool:
+    """Зарегистрирована ли служба прямо сейчас (``sc query``).
+
+    Нужна для проверки результата: ``sc delete`` может отметить службу
+    удалённой не сразу, и «команда не вернула ошибку» ещё не значит
+    «службы больше нет».
+    """
+    if not IS_WINDOWS or not name:
+        return False
+    no_window = 0x08000000
+    try:
+        probe = subprocess.run(["sc", "query", str(name)],
+                               creationflags=no_window, capture_output=True,
+                               timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
+    # 1060 = ERROR_SERVICE_DOES_NOT_EXIST.
+    return probe.returncode != 1060
+
+
+def remove_services(refs: Iterable[ServiceRef], wait: float = 8.0) -> List[str]:
+    """Останавливает и снимает с регистрации службы из папки.
+
+    Возвращает имена тех, что остались зарегистрированными: без прав
+    администратора ``sc delete`` отказывает, и об этом нужно сказать честно,
+    а не «сборка продолжилась».
+    """
+    if not IS_WINDOWS:
+        return []
+    left: List[str] = []
+    for ref in refs:
+        stop_service(ref.name, remove=True)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and service_present(ref.name):
+            time.sleep(0.25)
+        if service_present(ref.name):
+            left.append(ref.name)
+    return left
 
 
 def stop_service(name: str, remove: bool = False, timeout: float = 15.0

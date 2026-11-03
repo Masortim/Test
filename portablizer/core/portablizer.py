@@ -987,10 +987,13 @@ class PortableResult:
     #: Отчёт о переносимости (``portability-report.txt``): какие абсолютные
     #: пути остались внутри портатива и что лончер сделает при переносе.
     portability_report_rel: str = ""
-    #: Найденные службы, указывающие внутрь портатива. Они только сообщаются;
-    #: Portablizer не останавливает и не удаляет системные службы автоматически.
+    #: Найденные службы, указывающие внутрь портатива (этой сборки). Здесь они
+    #: только сообщаются: останавливать их нельзя, программе они нужны.
+    #: Службы ПРОШЛОЙ сборки снимаются заранее — см. ``removed_services``.
     registered_services: List[str] = field(default_factory=list)
-    #: Устаревшее поле: службы больше не снимаются с регистрации сборщиком.
+    #: Службы прошлой сборки этой же папки, снятые с регистрации, чтобы
+    #: пересборка не упиралась в «выберите другую папку» (см.
+    #: ``Portablizer._adopt_leftover_services``). Чужие службы не трогаются.
     removed_services: List[str] = field(default_factory=list)
     #: Режим сквозных сохранений: ``inplace`` | ``mirror`` | ``off``.
     saves_mode: str = "off"
@@ -1643,8 +1646,162 @@ class Portablizer:
         if last is not None:
             raise last
 
+    def _owns_service_image(self, image: str, app_dir: str,
+                            data_dir: str) -> bool:
+        """Наш ли бинарник службы.
+
+        Portablizer считает своими только ``App`` (его пересборка всё равно
+        очищает) и ``PortableData`` (её он создаёт сам). Служба с бинарником
+        где-то ещё внутри папки — не след нашей сборки, и трогать её нельзя.
+        """
+        return (procutil.is_inside(image, app_dir)
+                or procutil.is_inside(image, data_dir))
+
+    #: Имена служб, которые безопасно попадают в командный файл для UAC:
+    #: никаких кавычек, процентов, амперсандов и переводов строк. Остальные
+    #: (практически несуществующие) удаляются вручную по подсказке.
+    _CMD_SAFE_NAME = re.compile(r"[A-Za-z0-9 ._$#@()\-]{1,120}")
+
+    def _elevated_remove_services(self, names: Sequence[str]) -> List[str]:
+        """Просит UAC снять службы с регистрации и ждёт результат.
+
+        Один запрос повышения на все службы. Команды пишутся во временный
+        ``.cmd``: собирать строку ``sc stop "…" & sc delete "…"`` в аргументах
+        нельзя — Windows экранирует кавычки способом, который ``cmd.exe``
+        не понимает, и служба с пробелом в имени не удалилась бы.
+
+        Возвращает имена служб, которые остались зарегистрированными
+        (пользователь отказал в UAC, прав всё равно нет, служба занята).
+        """
+        names = [str(name) for name in names if name]
+        if not names:
+            return []
+        safe = [name for name in names if self._CMD_SAFE_NAME.fullmatch(name)]
+        unsafe = [name for name in names if name not in safe]
+        if not safe:
+            return list(names)
+
+        comspec = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                               "System32", "cmd.exe")
+        script_lines = ["@echo off"]
+        for name in safe:
+            script_lines.append(f'sc stop "{name}"')
+            script_lines.append(f'sc delete "{name}"')
+        script_path = ""
+        try:
+            handle, script_path = tempfile.mkstemp(prefix="portablizer-services-",
+                                                   suffix=".cmd")
+            with os.fdopen(handle, "wb") as stream:
+                stream.write(("\r\n".join(script_lines) + "\r\n")
+                             .encode("ascii"))
+            self.log.warn(
+                "Удаление служб требует прав администратора — запрашиваю "
+                "повышение через UAC (подтвердите запрос Windows).")
+            code = elevate_mod._shell_execute_runas(comspec, ["/c", script_path])
+            if code <= 32:
+                self.log.warn(
+                    "Повышение прав отклонено (или недоступно). Службы "
+                    "прошлой сборки остались зарегистрированными.")
+                return list(names)
+
+            # Повышенный ``cmd`` мог ещё не открыть файл: удаляем его только
+            # после того, как убедились в результате.
+            deadline = time.monotonic() + 60.0
+            while True:
+                left = [name for name in safe
+                        if procutil.service_present(name)]
+                if not left or time.monotonic() >= deadline:
+                    return left + unsafe
+                time.sleep(0.5)
+        except Exception as exc:  # noqa: BLE001 - нет UAC: сообщим ниже
+            self.log.debug(f"Запрос повышения не удался: {exc}")
+            return list(names)
+        finally:
+            if script_path:
+                try:
+                    os.remove(script_path)
+                except OSError:
+                    pass
+
+    def _adopt_leftover_services(self, portable_dir: str, app_dir: str,
+                                 data_dir: str,
+                                 result: Optional["PortableResult"] = None
+                                 ) -> None:
+        """Снимает службы, оставшиеся от прошлой сборки этой же папки.
+
+        Раньше любая служба, чей ``ImagePath`` указывает внутрь папки
+        результата, обрывала сборку советом «выберите другую папку». Но в
+        реальности это обычный след прошлой сборки: установщик (или сам
+        портатив при первом запуске) зарегистрировал службу с бинарником в
+        ``App\\…`` — то есть ровно в той папке, которую пересборка всё равно
+        перезапишет. Отказаться здесь значит навсегда заблокировать повторную
+        сборку на этом ПК.
+
+        Поэтому службы-«свои» останавливаются и снимаются с регистрации:
+
+        * только для служб, чей бинарник лежит в ``App`` или
+          ``PortableData`` — этих папок Portablizer и касается при пересборке;
+          служба с бинарником в другом месте папки по-прежнему не трогается
+          и останавливает сборку прежним сообщением;
+        * сначала без повышения, затем одним запросом UAC;
+        * если снять не удалось — сборка останавливается с точной причиной
+          и командой для ручного удаления, а не с общим «выберите другую
+          папку».
+        """
+        try:
+            refs = procutil.services_in_detail(portable_dir)
+        except Exception as exc:  # noqa: BLE001 - перечисление не критично
+            self.log.debug(f"Не удалось перечислить службы папки: {exc}")
+            return
+        if not refs:
+            return
+        ours = [ref for ref in refs
+                if self._owns_service_image(ref.image, app_dir, data_dir)]
+        foreign = [ref for ref in refs if ref not in ours]
+        if foreign:
+            raise RuntimeError(
+                "В указанной папке зарегистрированы службы Windows, чьи файлы "
+                "лежат не в App или PortableData этой папки: "
+                + ", ".join(f"{ref.name} ({ref.image})" for ref in foreign)
+                + ". Portablizer не будет останавливать их или удалять файлы "
+                  "под ними; выберите другую папку либо проверьте службы "
+                  "вручную.")
+        refs = ours
+        names = [ref.name for ref in refs]
+
+        self.log.warn(
+            "В папке остались службы прошлой сборки: "
+            + ", ".join(f"{ref.name} ({ref.image})" for ref in refs) + ". "
+            "Останавливаю и снимаю их с регистрации, иначе Windows не даст "
+            "пересобрать App под ними.")
+        try:
+            left = procutil.remove_services(refs)
+        except Exception as exc:  # noqa: BLE001 - попробуем через UAC
+            self.log.debug(f"Снятие служб без повышения не удалось: {exc}")
+            left = list(names)
+        if left:
+            left = self._elevated_remove_services(left)
+        if left:
+            commands = "; ".join(
+                f'sc stop "{name}" && sc delete "{name}"' for name in left)
+            raise RuntimeError(
+                "Не удалось снять с регистрации службы прошлой сборки ("
+                + ", ".join(left) + "). Windows разрешает это только с "
+                "правами администратора. Запустите Portablizer от имени "
+                "администратора (правый клик по Portablizer.exe → «Запуск "
+                "от имени администратора») либо выполните в командной строке "
+                "администратора: " + commands
+                + " — и повторите сборку.")
+        for ref in refs:
+            self.log.info(
+                f"Служба прошлой сборки снята с регистрации: {ref.name} "
+                f"({ref.image}).")
+        if result is not None:
+            result.removed_services = list(names)
+
     def _prepare_output(self, portable_dir: str, app_dir: str,
-                        data_dir: str, installer_path: str = "") -> None:
+                        data_dir: str, installer_path: str = "",
+                        result: Optional["PortableResult"] = None) -> None:
         """Готовит чистый App и удаляет лончер от незавершённого запуска.
 
         ``PortableData`` намеренно сохраняется: пользователь мог повторно
@@ -1654,16 +1811,8 @@ class Portablizer:
         """
         os.makedirs(portable_dir, exist_ok=True)
         if IS_WINDOWS:
-            try:
-                existing_services = procutil.services_in(portable_dir)
-            except Exception:  # noqa: BLE001 - ниже безопасное поведение по умолчанию
-                existing_services = []
-            if existing_services:
-                raise RuntimeError(
-                    "В указанной папке уже зарегистрированы службы Windows "
-                    "(" + ", ".join(existing_services) + "). Portablizer "
-                    "не будет останавливать их или удалять файлы под ними; "
-                    "выберите другую папку либо проверьте службы вручную.")
+            self._adopt_leftover_services(portable_dir, app_dir, data_dir,
+                                          result)
 
         # Пересборка поверх работающего портатива — самая частая причина
         # «не удалось очистить старый файл результата»: прошлый запуск
@@ -2248,7 +2397,7 @@ class Portablizer:
             # анализ повреждённого/неподдерживаемого установщика не должен
             # удалять уже имеющийся App и запускатели.
             self._prepare_output(portable_dir, app_dir, data_dir,
-                                 opts.installer_path)
+                                 opts.installer_path, result=result)
 
             if IS_WINDOWS:
                 self.log.warn(
@@ -3813,8 +3962,10 @@ class Portablizer:
         self.log.warn(
             "Обнаружены зарегистрированные службы, указывающие внутрь "
             "портатива: " + ", ".join(services) + ". Portablizer их не "
-            "останавливает и не удаляет. Такая сборка может быть не полностью "
-            "переносимой; проверьте службы вручную, не удаляя незнакомые.")
+            "останавливает и не удаляет: это службы текущей сборки, программе "
+            "они нужны. При следующей пересборке в эту же папку такие службы "
+            "снимаются автоматически. Если сборка оказалась не полностью "
+            "переносимой, проверьте службы вручную, не удаляя незнакомые.")
 
     @staticmethod
     def _reg_import(path: str) -> int:
