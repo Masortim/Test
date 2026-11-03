@@ -635,6 +635,91 @@ def is_complete_driver_package(package: NetDriverPackage) -> bool:
             and any(name.endswith(".cat") for name in names))
 
 
+def inf_payload_names(inf_text: str) -> Tuple[List[str], List[str]]:
+    """Что сам ``.inf`` ждёт рядом с собой: каталог и файлы пакета.
+
+    Возвращает ``(каталоги, файлы)``: ``CatalogFile``/``CatalogFile.NTamd64``
+    из ``[Version]`` и имена из всех ``[SourceDisksFiles*]``. ``pnputil
+    /add-driver`` отвечает «Не удается найти указанный файл» ровно тогда,
+    когда чего-то из этого списка в папке пакета нет.
+    """
+    catalogs: List[str] = []
+    files: List[str] = []
+    section = ""
+    for raw in inf_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith((";", "#")):
+            continue
+        matched = _INF_SECTION_RE.match(line)
+        if matched:
+            section = matched.group(1).strip().lower()
+            continue
+        assign = _INF_ASSIGN_RE.match(line)
+        if not assign:
+            continue
+        key = assign.group(1).strip()
+        value = assign.group(2).strip().strip('"')
+        if section == "version":
+            if key.lower().startswith("catalogfile") and value:
+                catalogs.append(value)
+        elif section.startswith("sourcedisksfiles"):
+            files.append(key)
+    return catalogs, files
+
+
+def heal_package_files(dest_dir: str, inf_name: str) -> List[str]:
+    """Проверяет полноту пакета и по возможности его чинит.
+
+    Две реальные причины, по которым ``pnputil /add-driver`` отказывается
+    ставить пакет, скопированный из ``DriverStore``:
+
+    * каталог ``.cat`` лежит под другим именем, чем записано в
+      ``CatalogFile=`` (имя каталога не входит в его подпись, поэтому копия
+      под нужным именем валидна) — копируется здесь;
+    * файлов из ``[SourceDisksFiles]`` физически нет — это называется по
+      именам, чтобы сборка не выпускала заведомо неработающий пакет.
+
+    Возвращает список файлов, которых всё равно не хватает (пусто — пакет
+    полный).
+    """
+    inf_path = os.path.join(dest_dir, inf_name)
+    try:
+        with open(inf_path, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(_MAX_INF_BYTES)
+    except OSError:
+        return []
+    catalogs, files = inf_payload_names(text)
+    try:
+        present = {name.lower(): name
+                   for name in os.listdir(dest_dir)
+                   if os.path.isfile(os.path.join(dest_dir, name))}
+    except OSError:
+        return []
+    cats = [name for name in present if name.endswith(".cat")]
+    for catalog in catalogs:
+        low = catalog.lower()
+        if low in present:
+            continue
+        if len(cats) == 1:
+            # Единственный каталог — это он и есть, просто с другим именем.
+            try:
+                shutil.copy2(os.path.join(dest_dir, present[cats[0]]),
+                             os.path.join(dest_dir, catalog))
+            except OSError:
+                continue
+            present[low] = catalog
+    missing: List[str] = []
+    for name in files:
+        leaf = os.path.basename(name.replace("\\", os.sep))
+        if leaf.lower().endswith(".cat"):
+            # Каталог проверен выше по ``CatalogFile``: его имя в
+            # ``[SourceDisksFiles]`` бывает устаревшим и не мешает установке.
+            continue
+        if leaf.lower() not in present:
+            missing.append(leaf)
+    return sorted(set(missing))
+
+
 def merge_driver_packages(app_packages: Sequence[NetDriverPackage],
                           system_packages: Sequence[NetDriverPackage]
                           ) -> List[NetDriverPackage]:
@@ -935,6 +1020,18 @@ class NetStackReport:
                 entry.get("device_id", "") for entry in self.drivers
                 if entry.get("needs_install") == "1" and entry.get("device_id")
             ],
+            # Пара «служба драйвера — устройство». Нужна лончеру, чтобы не
+            # требовать ключ Services\<служба> там, где АДАПТЕР уже работает:
+            # имя службы берётся из INF на компьютере-сборщике, а INF вправе
+            # зарегистрировать другое имя (например, tap0902, если tap0901
+            # занят). Устройство с нужным Hardware ID доказывает, что драйвер
+            # установлен, независимо от имени его службы.
+            "driver_pairs": [
+                {"service": entry.get("service", ""),
+                 "device": entry.get("device_id", "")}
+                for entry in self.drivers
+                if entry.get("needs_install") == "1"
+            ],
             "service_names": [entry.get("name", "")
                               for entry in self.services if entry.get("name")],
             # Портатив снимает «свои» службы по завершении сеанса: чистый
@@ -1020,6 +1117,18 @@ def provision_netstack(portable_dir: str, app_dir: str,
                 if os.path.isfile(src):
                     shutil.copy2(src,
                                  os.path.join(dest_dir, os.path.basename(src)))
+            if package_copied and entry.get("needs_install") == "1":
+                # Пакет уезжает на другой ПК, где pnputil проверит каждую
+                # ссылку INF. Лучше узнать о пропаже здесь, чем показать
+                # пользователю «Не удается найти указанный файл».
+                absent = heal_package_files(dest_dir,
+                                            os.path.basename(source_inf))
+                if absent:
+                    report.notes.append(
+                        f"пакет {package.kind}: в пакете нет файлов "
+                        + ", ".join(absent)
+                        + " — pnputil его не поставит, адаптер создаётся "
+                          "напрямую из INF (SetupAPI)")
         except OSError as exc:
             report.notes.append(
                 f"пакет {package.kind}: часть файлов не скопирована ({exc})")
@@ -1235,6 +1344,14 @@ def render_setup_cmd(report: NetStackReport) -> str:
         '  pnputil /? 2>nul | findstr /i /c:"/add-driver" >nul 2>&1 '
         '&& set "PNPMODERN=1"',
         ")",
+        "rem The package itself is checked first: an INF that points at a",
+        'rem missing file (usually its .cat) makes pnputil answer "the',
+        'rem system cannot find the file specified", and the adapter never',
+        "rem appears. Repair-DriverPackage also renames a stray catalog.",
+        'if /i "%NETSTACK_MODE%" == "--check" goto netstack_package_done',
+        "powershell -NoProfile -ExecutionPolicy Bypass -File "
+        f'"%NETSTACK_ROOT%{SERVICES_SCRIPT_NAME}" -Mode package',
+        ":netstack_package_done",
     ]
 
     isolated = report.isolation == "session"
@@ -1282,12 +1399,14 @@ def render_setup_cmd(report: NetStackReport) -> str:
             f'reg query "HKLM\\SYSTEM\\CurrentControlSet\\Services\\{service}" '
             ">nul 2>&1",
             "if not errorlevel 1 goto netstack_after_driver_" + str(index),
-            f"echo   [setup] driver service {service} is missing on this PC",
-            "call :netstack_trace driver-missing " + service,
-            'if /i "%NETSTACK_MODE%" == "--check" (',
-            '  set "NETSTACK_RC=2"',
-            "  goto netstack_after_driver_" + str(index),
-            ")",
+            f"echo   [info] driver service {service} is not registered on this PC",
+            "call :netstack_trace driver-not-registered " + service,
+            # В --check решение принимает .ps1 по УСТРОЙСТВУ: имя службы
+            # известно только из INF с компьютера-сборщика, а INF вправе
+            # зарегистрировать другое имя. Раньше отсутствие ключа давало код
+            # 2 и ложное «нет tap0901» на машине с работающим адаптером.
+            'if /i "%NETSTACK_MODE%" == "--check" goto netstack_after_driver_'
+            + str(index),
             *([f'echo {device}>> "%NETSTACK_STATE\\'
                f'{SNAPSHOT_IDS_FILE}"']
               if (isolated and device) else []),
@@ -1326,10 +1445,12 @@ def render_setup_cmd(report: NetStackReport) -> str:
             f'reg query "HKLM\\SYSTEM\\CurrentControlSet\\Services\\{service}" '
             ">nul 2>&1",
             "if errorlevel 1 (",
-            f"  echo   [warn] driver service {service} still missing after "
-            "all attempts",
-            "  call :netstack_trace driver-still-missing " + service,
-            '  if "%NETSTACK_RC%" == "0" set "NETSTACK_RC=3"',
+            f"  echo   [warn] driver package {service} is still not registered",
+            "  call :netstack_trace driver-package-unregistered " + service,
+            "  rem The adapter is what matters: NetStackServices.ps1 creates",
+            "  rem it from this INF even when the package cannot be staged",
+            "  rem (no catalog, blocked by policy) and exits non-zero only",
+            "  rem when the device really is absent.",
             ")",
             f":netstack_after_driver_{index}",
         ]
@@ -1808,6 +1929,81 @@ function Enable-HwidDevices([string]$hwid) {
      if ($changed) { Start-Sleep -Milliseconds 700 }
      return $changed
 }
+function Get-DeviceServiceName([string]$instanceId) {
+     if (-not $instanceId) { return '' }
+     $path = 'HKLM:\SYSTEM\CurrentControlSet\Enum\' + $instanceId
+     $name = [string](Get-ItemProperty -LiteralPath $path -Name Service `
+          -ErrorAction SilentlyContinue).Service
+     return $name
+}
+# --- the driver package itself: what pnputil will look for ----------------
+# "Не удалось добавить пакет драйвера: Не удается найти указанный файл" means
+# the INF points at a file that did not travel with it - usually the catalog
+# (its name is written in [Version] as CatalogFile=...) or one of
+# [SourceDisksFiles]. The name of the .cat is not part of its signature, so a
+# renamed catalog is repaired here instead of failing every launch.
+function Repair-DriverPackage([string]$infPath) {
+     if (-not $infPath -or -not (Test-Path -LiteralPath $infPath)) {
+          Add-NetStackTrace ('package: inf is absent: ' + $infPath)
+          return $false
+     }
+     $dir = Split-Path -Parent $infPath
+     $expected = @()
+     $catalogs = @()
+     $section = ''
+     foreach ($raw in @(Get-Content -LiteralPath $infPath -ErrorAction SilentlyContinue)) {
+          $line = $raw.Trim()
+          if (-not $line -or $line.StartsWith(';')) { continue }
+          if ($line -match '^\[(.+)\]$') {
+               $section = $Matches[1].ToLower()
+               continue
+          }
+          if ($section -eq 'version') {
+               if ($line -match '^(?i)catalogfile(\.[^=]*)?\s*=\s*(.+)$') {
+                    $catalogs += $Matches[2].Trim()
+               }
+               continue
+          }
+          if ($section.StartsWith('sourcedisksfiles')) {
+               if ($line -match '^([^=]+?)\s*=') {
+                    $expected += $Matches[1].Trim()
+               }
+          }
+     }
+     $present = @{}
+     foreach ($file in @(Get-ChildItem -LiteralPath $dir -File `
+               -ErrorAction SilentlyContinue)) {
+          $present[$file.Name.ToLower()] = $file.FullName
+     }
+     $allCats = @($present.Keys | Where-Object { $_.EndsWith('.cat') })
+     foreach ($cat in $catalogs) {
+          if ($present.ContainsKey($cat.ToLower())) { continue }
+          if ($allCats.Count -eq 1) {
+               $source = $present[$allCats[0]]
+               $target = Join-Path $dir $cat
+               Copy-Item -LiteralPath $source -Destination $target -Force `
+                    -ErrorAction SilentlyContinue
+               Add-NetStackTrace ('package: catalog renamed ' +
+                    (Split-Path -Leaf $source) + ' -> ' + $cat)
+               $present[$cat.ToLower()] = $target
+               continue
+          }
+          Add-NetStackTrace ('package: catalog is absent: ' + $cat)
+     }
+     $missing = @()
+     foreach ($name in $expected) {
+          $flat = $name -replace '\\', '\'
+          $leaf = Split-Path -Leaf $flat
+          if ($present.ContainsKey($leaf.ToLower())) { continue }
+          $missing += $leaf
+     }
+     if ($missing.Count -gt 0) {
+          Add-NetStackTrace ('package ' + (Split-Path -Leaf $infPath) +
+               ': files are absent: ' + (@($missing | Select-Object -Unique) -join ', '))
+          return $false
+     }
+     return $true
+}
 function Write-NetStackStatus([bool]$healthy) {
      $lines = @()
      $lines += ('root: ' + $root)
@@ -1827,7 +2023,12 @@ function Write-NetStackStatus([bool]$healthy) {
                     $state = [string]$pnp.Status
                } catch { }
           }
-          $lines += ('adapter ' + $hwid + ': ' + $state)
+          $driver = ''
+          if ($devices.Count -gt 0) {
+               $driver = Get-DeviceServiceName $devices[0].InstanceId
+          }
+          $lines += ('adapter ' + $hwid + ': ' + $state +
+               ' (driver service: ' + $driver + ')')
      }
      foreach ($s in @($cfg.services)) {
           $name = [string]$s.name
@@ -1868,6 +2069,7 @@ function Ensure-NetAdapters {
                continue
           }
           Add-NetStackTrace ('adapter ' + $hwid + ': installing from ' + $inf)
+          Repair-DriverPackage $inf | Out-Null
           $created = Install-RootDevice $inf $hwid $tool
           if (-not $scanned) {
                & pnputil /scan-devices 2>&1 | Out-Null
@@ -1965,6 +2167,21 @@ if ($Mode -eq 'rollback') {
      exit 0
 }
 $services = @($cfg.services)
+if ($Mode -eq 'package') {
+     # Проверка самого пакета драйвера ДО pnputil: "Не удается найти
+     # указанный файл" означает, что INF ссылается на файл, который не
+     # доехал (обычно каталог .cat из [Version]). Переименованный каталог
+     # починим молча, отсутствующие файлы назовём по именам.
+     $complete = $true
+     foreach ($d in @($cfg.drivers)) {
+          if (-not $d.needs_install) { continue }
+          if (-not $d.inf) { continue }
+          $inf = Join-Path $root ([string]$d.inf -replace '/', '\\')
+          if (-not (Repair-DriverPackage $inf)) { $complete = $false }
+          Add-NetStackTrace ('package ' + $inf + ': complete=' + $complete)
+     }
+     exit 0
+}
 if ($Mode -eq 'check') {
      # One exit point: the state file is written even when the answer is
      # "something is missing", so the user always has a file to send.

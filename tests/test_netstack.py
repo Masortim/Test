@@ -431,6 +431,43 @@ class NetstackEntryRuntimeTests(unittest.TestCase):
             missing = exe_launcher.netstack_missing(Path("/p"), cfg)
         self.assertEqual(missing, ["tap0901", "PlanetaVPNSvc"])
 
+    def test_working_adapter_satisfies_the_driver_service(self):
+        """Ключ Services\tap0901 — не приговор: адаптер важнее.
+
+        На компьютере пользователя status.txt показывал «adapter tap0901:
+        OK» и работающую службу клиента, а лончер всё равно требовал ключ
+        tap0901 и показывал предупреждение.
+        """
+        cfg = {"netstack": {"driver_services": ["tap0901"],
+                            "driver_devices": ["tap0901"],
+                            "service_names": ["PlanetVPNService"]}}
+        with mock.patch.object(exe_launcher, "_service_key_present",
+                               lambda name: name == "PlanetVPNService"), \
+                mock.patch.object(exe_launcher, "_device_hwid_present",
+                                  lambda hwid: True):
+            self.assertEqual(exe_launcher.netstack_missing(Path("/p"), cfg), [])
+
+    def test_adapter_absence_is_still_reported(self):
+        cfg = {"netstack": {"driver_services": ["tap0901"],
+                            "driver_devices": ["tap0901"]}}
+        with mock.patch.object(exe_launcher, "_service_key_present",
+                               lambda name: True), \
+                mock.patch.object(exe_launcher, "_device_hwid_present",
+                                  lambda hwid: False):
+            self.assertEqual(exe_launcher.netstack_missing(Path("/p"), cfg),
+                             ["адаптер tap0901"])
+
+    def test_driver_pairs_are_used_when_present(self):
+        cfg = {"netstack": {"driver_pairs": [
+                    {"service": "tap0901", "device": "tap0901"},
+                    {"service": "ovpn-dco", "device": "ovpn-dco"}]}}
+        with mock.patch.object(exe_launcher, "_service_key_present",
+                               lambda name: False), \
+                mock.patch.object(exe_launcher, "_device_hwid_present",
+                                  lambda hwid: hwid == "tap0901"):
+            self.assertEqual(exe_launcher.netstack_missing(Path("/p"), cfg),
+                             ["ovpn-dco", "адаптер ovpn-dco"])
+
     def test_empty_section_short_circuits(self):
         self.assertEqual(exe_launcher.netstack_missing(Path("/p"), {}), [])
         self.assertEqual(exe_launcher.netstack_missing(
@@ -818,6 +855,92 @@ class SystemPackageProvisionTests(unittest.TestCase):
         self.assertIn("exit 3", ps1)
 
 
+class PackageCompletenessTests(unittest.TestCase):
+    """Пакет драйвера проверяется до pnputil — на сборке и на целевом ПК.
+
+    «Не удалось добавить пакет драйвера: Не удается найти указанный файл»
+    на компьютере пользователя означало: INF ссылается на файл, которого нет
+    рядом (каталог назывался иначе).
+    """
+
+    INF = ("[Version]\r\n"
+           "Signature=\"$Windows NT$\"\r\n"
+           "Class=Net\r\n"
+           "CatalogFile=tap-windows6.cat\r\n"
+           "Provider=%Provider%\r\n"
+           "[Manufacturer]\r\n"
+           "%Provider%=TAP,NTamd64\r\n"
+           "[SourceDisksNames]\r\n"
+           "1 = %Disk%\r\n"
+           "[SourceDisksFiles]\r\n"
+           "tap0901.sys = 1,,,\r\n"
+           "[TAP.NTamd64]\r\n"
+           "%DeviceDesc%=TAP0901.ndi, root\\tap0901\r\n"
+           "[Strings]\r\n"
+           "Provider=\"TAP-Windows\"\r\n"
+           "Disk=\"TAP-Windows disk\"\r\n"
+           "DeviceDesc=\"TAP-Windows Adapter V9\"\r\n")
+
+    def _package(self, tmp: str, **files):
+        root = Path(tmp) / "Drivers" / "tap-windows"
+        root.mkdir(parents=True)
+        (root / "OemVista.inf").write_text(self.INF, encoding="utf-8")
+        for name in files:
+            (root / name).write_bytes(b"MZ")
+        return root
+
+    def test_renamed_catalog_is_repaired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._package(tmp, **{"tap0901.sys": 1,
+                                         "tap0901.cat": 1})
+            absent = netstack.heal_package_files(str(root), "OemVista.inf")
+            self.assertEqual(absent, [])
+            self.assertTrue((root / "tap-windows6.cat").is_file())
+            self.assertEqual((root / "tap-windows6.cat").read_bytes(), b"MZ")
+
+    def test_missing_driver_file_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._package(tmp, **{"tap-windows6.cat": 1})
+            absent = netstack.heal_package_files(str(root), "OemVista.inf")
+            self.assertEqual(absent, ["tap0901.sys"])
+
+    def test_inf_parser_reads_catalog_and_payload(self):
+        catalogs, files = netstack.inf_payload_names(self.INF)
+        self.assertEqual(catalogs, ["tap-windows6.cat"])
+        self.assertEqual(files, ["tap0901.sys"])
+
+    def test_build_reports_an_incomplete_package(self):
+        from portablizer.core import portablizer as engine_mod
+        from portablizer.core.logutil import Logger
+        from portablizer.core.portablizer import PortableOptions, PortableResult
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            app = base / "P" / "App"
+            app.mkdir(parents=True)
+            store = base / "store" / "tap0901.inf_amd64_1"
+            store.mkdir(parents=True)
+            (store / "OemVista.inf").write_text(self.INF, encoding="utf-8")
+            (store / "tap-windows6.cat").write_bytes(b"MZ")
+            # .sys отсутствует: пакет неполный
+            engine = engine_mod.Portablizer(Logger())
+            opts = PortableOptions(installer_path=str(base / "planetvpn.exe"),
+                                   output_dir=str(base))
+            result = PortableResult(success=True)
+            scanned = netstack.scan_driverstore_packages(str(base / "store"))
+            with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                    mock.patch.object(netstack, "scan_system_driver_packages",
+                                      return_value=scanned), \
+                    mock.patch.object(netstack, "find_netstack_tools",
+                                      return_value=[]), \
+                    mock.patch.object(engine_mod.procutil, "services_in",
+                                      return_value=[]):
+                report = engine._provision_netstack(
+                    str(base / "P"), str(app), opts, result, vpn_hint=True)
+            self.assertIsNotNone(report)
+            self.assertTrue(any("нет файлов" in note for note in report.notes),
+                            report.notes)
+
+
 class BuildIntegrationTests(unittest.TestCase):
     """Сборка портатива: драйвер с ПК-сборщика попадает в NetStack."""
 
@@ -936,6 +1059,20 @@ class ServiceRepairScriptTests(unittest.TestCase):
         # «Наша» копия узнаётся по PortableData рядом с папкой бинарника.
         self.assertIn("'PortableData'", ps1)
 
+    def test_package_problems_are_named_before_pnputil_complains(self):
+        ps1 = netstack.render_services_ps1()
+        self.assertIn("function Repair-DriverPackage", ps1)
+        self.assertIn("function Get-DeviceServiceName", ps1)
+        self.assertIn("if ($Mode -eq 'package')", ps1)
+        # Каталог с другим именем копируется под ожидаемым.
+        self.assertIn("package: catalog renamed", ps1)
+        # Отсутствующие файлы перечисляются по именам.
+        self.assertIn("files are absent", ps1)
+
+    def test_status_shows_the_real_driver_service(self):
+        ps1 = netstack.render_services_ps1()
+        self.assertIn("(driver service: ", ps1)
+
     def test_present_but_disabled_adapter_is_enabled(self):
         ps1 = netstack.render_services_ps1()
         self.assertIn("function Enable-HwidDevices", ps1)
@@ -989,6 +1126,36 @@ class ServiceRepairScriptTests(unittest.TestCase):
         self.assertFalse(_command_lines_with(setup, "net session"),
                          "проверка прав всё ещё через net session")
         self.assertFalse(_command_lines_with(setup, "net session ||"))
+
+    def test_check_does_not_fail_on_the_driver_service_key(self):
+        """Отсутствие ключа Services\tap0901 больше не даёт код 2.
+
+        Имя службы драйвера известно только из INF на компьютере-сборщике;
+        на другом ПК драйвер может зарегистрироваться под другим именем.
+        Приговор выносит .ps1 по УСТРОЙСТВУ (адаптеру).
+        """
+        setup = netstack.render_setup_cmd(_report_with_service())
+        self.assertIn("call :netstack_trace driver-not-registered tap0901",
+                      setup)
+        lines = [line.strip() for line in setup.splitlines()]
+        idx = next(i for i, line in enumerate(lines)
+                   if "driver-not-registered" in line)
+        tail = "\n".join(lines[idx:idx + 4])
+        self.assertNotIn('set "NETSTACK_RC=2"', tail)
+        # Итоговая проверка ключа тоже не ставит код.
+        self.assertNotIn("driver-still-missing", setup)
+
+    def test_package_is_verified_before_pnputil(self):
+        setup = netstack.render_setup_cmd(_report_with_service())
+        self.assertIn("-Mode package", setup)
+        order = setup.index("-Mode package")
+        pnputil = setup.index("pnputil /add-driver")
+        self.assertLess(order, pnputil, "проверка пакета должна быть раньше")
+
+    def test_driver_pairs_reach_the_launcher_config(self):
+        config = _report_with_service().to_config()
+        self.assertEqual(config["driver_pairs"],
+                         [{"service": "tap0901", "device": "tap0901"}])
 
     def test_state_file_is_named_in_the_script(self):
         self.assertIn("status.txt", netstack.render_services_ps1())
