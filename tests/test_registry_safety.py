@@ -46,6 +46,10 @@ def sz(value: str):
     return reg.REG_SZ, repr(value)
 
 
+def dword(value: int):
+    return reg.REG_DWORD, repr(int(value))
+
+
 def snapshots():
     before = {
         EXT: {"": sz("Before.ProgID"), "Keep": sz("same")},
@@ -112,6 +116,37 @@ class AssociationRestoreRenderTests(unittest.TestCase):
         self.assertIn(CHOICE, out)
         self.assertNotIn("HKCU\\" + start_page, out)
         self.assertNotIn("HKCU\\" + explorer, out)
+
+    def test_folder_view_state_is_not_an_association(self):
+        """``Shell\\Bags`` — значки и вид папок, а не выбор программы.
+
+        Из-за него сборка показывала ложное предупреждение «не удалось
+        подтвердить восстановление всех ассоциаций (HKCU\\...\\Shell\\
+        Bags\\1\\Desktop)»: оболочка переписывает эти ключи постоянно, и
+        сверка снимков не может их гарантировать.
+        """
+        bags = (r"HKCU\Software\Microsoft\Windows\Shell\Bags\1\Desktop")
+        bagmru = r"HKCU\Software\Microsoft\Windows\Shell\BagMRU\0\1"
+        streams = r"HKCU\Software\Microsoft\Windows\Shell\Streams"
+        for key in (bags, bagmru, streams):
+            self.assertFalse(reg.is_association_key(key), key)
+            self.assertTrue(reg.is_volatile(key), key)
+        # Настоящие ассоциации при этом остаются в снимке.
+        self.assertTrue(reg.is_association_key(CHOICE))
+
+    def test_folder_view_state_never_becomes_a_false_mismatch(self):
+        bags = r"HKCU\Software\Microsoft\Windows\Shell\Bags\1\Desktop"
+        before = {bags: {"Mode": dword(4), "Sort": dword(0)},
+                  CHOICE: {"": sz("A")}}
+        after = {bags: {"Mode": dword(6), "Sort": dword(2),
+                        "XPos": dword(120)},
+                 CHOICE: {"": sz("A")}}
+        current = {bags: {"Mode": dword(5)}, CHOICE: {"": sz("A")}}
+
+        self.assertEqual(
+            reg.association_restore_mismatches(before, after, current), [])
+        self.assertFalse(reg.has_entries(
+            reg.render_association_restore(before, after)))
 
     def test_restore_covers_changed_added_and_deleted_keys_and_values(self):
         before, after = snapshots()

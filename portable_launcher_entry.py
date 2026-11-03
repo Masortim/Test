@@ -22,7 +22,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
 IS_WINDOWS = sys.platform.startswith("win")
@@ -493,6 +493,50 @@ def _netstack_warning_is_new(root: Path, cfg: Dict[str, Any],
     return True
 
 
+def _run_hidden(arguments: Sequence[str],
+                timeout: float = 300.0) -> "Optional[int]":
+    """Run a command without a console window; return its exit code.
+
+    ``None`` means "no result": the command could not be started or did not
+    finish inside ``timeout``. Callers treat that as "the repair did not
+    happen" and verify the real state afterwards, so a silent zero is never
+    mistaken for success.
+
+    Существование этой функции — не мелочь: на неё опираются проверка и
+    починка NetStack, и её отсутствие раньше обрывало ВСЮ починку драйвера
+    адаптера на целевом ПК (``NameError`` ловился общим ``except`` и попадал
+    в журнал строкой «netstack: ensure failed»). Клиент VPN в итоге видел
+    машину без адаптера и писал «Не удалось подключиться ни по одному из
+    протоколов».
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        completed = subprocess.run(
+            [str(item) for item in arguments],
+            creationflags=NO_WINDOW,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except Exception:  # noqa: BLE001 - нет команды/таймаут: результата нет
+        return None
+    return int(completed.returncode)
+
+
+def _run_hidden_elevated(program: str, arguments: Sequence[str],
+                         timeout: float = 900.0) -> "Optional[int]":
+    """Run a command that needs administrator rights, without its own window.
+
+    The NetStack ``.cmd`` scripts elevate THEMSELVES (``Start-Process -Verb
+    RunAs -Wait``) and the result is verified afterwards with ``--check``, so a
+    plain hidden run is enough and predictable: one UAC prompt comes from the
+    script, and a declined prompt shows up as a failed verification instead of
+    a fake success.  ``None`` — the command could not be started/finished.
+    """
+    return _run_hidden([program, *arguments], timeout=timeout)
+
+
 def _run_netstack_script(root: Path, relative: str, argument: str = ""
                         ) -> "Optional[int]":
     """Run one NetStack script; elevate only when the session is not elevated.
@@ -515,6 +559,27 @@ def _run_netstack_script(root: Path, relative: str, argument: str = ""
     if _is_elevated():
         return _run_hidden(["cmd.exe", *args])
     return _run_hidden_elevated("cmd.exe", args)
+
+
+#: Что означает код возврата NetStack-скриптов — в журнале запуска, а не
+#: только цифрой: по нему видно, чего именно не хватает на этом ПК.
+_NETSTACK_CODE_NOTES = {
+    2: "driver package is missing",
+    3: "the network adapter was not created",
+    4: "a companion service is missing, points into the previous folder or is "
+       "not running",
+    5: "PowerShell is too old (no ConvertFrom-Json)",
+    6: "a companion service is registered but did not start",
+}
+
+
+def _netstack_code_note(code: "Optional[int]") -> str:
+    if code is None:
+        return ""
+    try:
+        return _NETSTACK_CODE_NOTES.get(int(code), "")
+    except (TypeError, ValueError):
+        return ""
 
 
 def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
@@ -550,7 +615,9 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
         notes.append("UAC prompt was declined or unavailable - the driver "
                      "and services were NOT installed")
     else:
-        notes.append(f"NetStack setup exit code {code}")
+        detail = _netstack_code_note(code)
+        notes.append(f"NetStack setup exit code {code}"
+                     + (f" ({detail})" if detail else ""))
     still = netstack_missing(root, cfg)
     if still and code not in (None, 0):
         # Второй проход: пакет уже опубликован в DriverStore, и теперь
@@ -558,8 +625,28 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
         # PnP успевает привязать драйвер только к этому моменту.
         time.sleep(1.0)
         second = _run_netstack_script(root, setup)
-        notes.append(f"NetStack setup retry exit code {second}")
+        detail = _netstack_code_note(second)
+        notes.append(f"NetStack setup retry exit code {second}"
+                     + (f" ({detail})" if detail else ""))
         still = netstack_missing(root, cfg)
+
+    # Проверка результата ДЕЛОМ, а не по наличию ключей: служба может быть
+    # зарегистрирована и указывать в прежнюю папку или просто стоять. Клиент
+    # VPN в таком состоянии видит «всё установлено», а подключаться не может:
+    # «Не удалось подключиться ни по одному из протоколов».
+    verify: "Optional[int]" = None
+    try:
+        verify = _run_hidden(["cmd.exe", "/c", str(script), "--check"])
+    except Exception:  # noqa: BLE001 - проверка не мешает запуску
+        verify = None
+    if verify not in (0, None):
+        reason = _netstack_code_note(verify) or "components are not ready"
+        notes.append(f"NetStack verify exit code {verify} ({reason})")
+        still = still or [reason]
+    elif verify == 0:
+        notes.append("NetStack verify: adapter, services and their paths are "
+                     "consistent with this folder")
+
     if still:
         notes.append("still missing: " + ", ".join(still))
         if _netstack_warning_is_new(root, cfg, still):
@@ -567,10 +654,13 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
                 "Программе нужны системные сетевые компоненты, которых нет на "
                 "этом компьютере:\n\n  " + "\n  ".join(still)
                 + "\n\nПортатив ставит их сам из папки NetStack (один запрос "
-                "прав администратора: пакет драйвера + сетевой адаптер).\n"
+                "прав администратора: пакет драйвера + сетевой адаптер + "
+                "служба клиента).\n"
                 "Если окно UAC было отклонено, запустите "
                 "NetStack\\Setup.cmd вручную и повторите запуск. "
-                "Подробности: " + str(root / "portablizer.log") + ".")
+                "Состояние компонентов — в "
+                + str(root / str(cfg.get("data_dir_name", "PortableData"))
+                      / "NetStack" / "status.txt") + ".")
     else:
         notes.append("all required components are present")
     return notes
@@ -11607,7 +11697,7 @@ def clean_installed_programs(root: Path,
     lines, needs_admin = remove_portable_install_records(root, cfg)
     if (needs_admin and allow_elevation and not _is_elevated()
             and getattr(sys, "frozen", False)
-            and not elevation_refused_recently(root)):
+            and not elevation_recently_refused(root)):
         code = _run_elevated(["--clean-installed-entry"])
         if code is None:
             mark_elevation_refused(root, "no result from the UAC prompt")

@@ -1325,6 +1325,8 @@ class Portablizer:
         self._run_started: Optional[float] = None
         #: Сколько вариантов команды установки реально выполнено.
         self._attempts_made = 0
+        #: NetStack собран в режиме общего компонента (службы остаются на ПК).
+        self._netstack_shared = False
         #: Сколько раз за сборку был закрыт диалог Windows Security
         #: «Установить ПО для данного устройства?» (установка драйвера TAP).
         #: Нужен для честных подсказок, когда установка всё же не удалась.
@@ -1798,6 +1800,58 @@ class Portablizer:
                 f"({ref.image}).")
         if result is not None:
             result.removed_services = list(names)
+
+    def _retire_captured_services(
+            self, portable_dir: str,
+            report: "netstack_mod.NetStackReport") -> None:
+        """Снимает со сборочного ПК службы, которые уехали в ``NetStack``.
+
+        Клиент VPN работает не сам по себе: он поднимает адаптер и маршруты
+        через свою службу. Портатив теперь регистрирует её сам при запуске
+        (``NetStack\\Setup.cmd``) — с путём, вычисленным от СВОЕЙ папки, — и
+        снимает по завершении сеанса. Оставлять такую службу зарегистрированной
+        на машине сборки нельзя:
+
+        * её ``ImagePath`` — абсолютный путь этой машины, после копирования
+          папки на другой ПК или диск он ведёт в никуда. Служба «есть», но не
+          стартует, а клиент сообщает ровно то, что видел пользователь:
+          «Не удалось подключиться ни по одному из протоколов»;
+        * это и есть то самое предупреждение «обнаружены зарегистрированные
+          службы, указывающие внутрь портатива» — после снятия его нет.
+
+        Снимаются только службы из манифеста ``NetStack`` (то есть с
+        бинарником внутри ``App`` этой папки): чужие службы не трогаются.
+        """
+        names = {str(entry.get("name", "")) for entry in report.services}
+        names.discard("")
+        if not names:
+            return
+        try:
+            refs = [ref for ref in procutil.services_in_detail(portable_dir)
+                    if ref.name in names]
+        except Exception as exc:  # noqa: BLE001 - уборка не срывает сборку
+            self.log.debug(f"Не удалось перечислить службы портатива: {exc}")
+            return
+        if not refs:
+            return
+        try:
+            left = procutil.remove_services(refs)
+        except Exception as exc:  # noqa: BLE001 - уборка не срывает сборку
+            self.log.debug(f"Снятие служб портатива не удалось: {exc}")
+            left = [ref.name for ref in refs]
+        removed = [ref.name for ref in refs if ref.name not in left]
+        if removed:
+            self.log.ok(
+                "Службы перенесены в NetStack и сняты с этого ПК: "
+                + ", ".join(removed)
+                + ". Портатив зарегистрирует их заново при запуске — уже с "
+                  "путём внутри своей папки.")
+        if left:
+            self.log.warn(
+                "Снять со сборочного ПК не удалось: " + ", ".join(left)
+                + " (нужны права администратора). Служба уже перенесена в "
+                  "NetStack и на каждом ПК регистрируется заново; при "
+                  "следующей сборке в эту папку она будет снята автоматически.")
 
     def _prepare_output(self, portable_dir: str, app_dir: str,
                         data_dir: str, installer_path: str = "",
@@ -3544,7 +3598,15 @@ class Portablizer:
         verified_after = reg_mod.snapshot_associations(include_user=include_user)
         mismatches = reg_mod.association_restore_mismatches(
             before, current_after, verified_after)
-        if rc == 0 and not mismatches:
+        if not mismatches:
+            # Код возврата ``reg import`` — не приговор: частично он бывает
+            # ненулевым из-за ключей, которых уже нет, а проверка снимком
+            # показывает, что состояние ассоциаций правильное. Верим проверке
+            # и не пугаем пользователя ложным предупреждением.
+            if rc != 0:
+                self.log.debug(
+                    f"reg import вернул код {rc}, но сверка снимков показала: "
+                    "все изменённые ассоциации восстановлены.")
             result.association_changes_restored += len(changed)
             self.log.ok(
                 "Ассоциации файлов и программы по умолчанию восстановлены "
@@ -3959,13 +4021,31 @@ class Portablizer:
         if not services:
             return
         result.registered_services = list(services)
-        self.log.warn(
-            "Обнаружены зарегистрированные службы, указывающие внутрь "
-            "портатива: " + ", ".join(services) + ". Portablizer их не "
-            "останавливает и не удаляет: это службы текущей сборки, программе "
-            "они нужны. При следующей пересборке в эту же папку такие службы "
-            "снимаются автоматически. Если сборка оказалась не полностью "
-            "переносимой, проверьте службы вручную, не удаляя незнакомые.")
+        portable_ones = [name for name in services
+                         if name in set(result.netstack_services)]
+        if portable_ones:
+            # Служба уже лежит в NetStack и регистрируется портативом на
+            # каждом ПК, поэтому «проверять её вручную» пользователю не нужно.
+            if getattr(self, "_netstack_shared", False):
+                self.log.info(
+                    "Службы перенесены в NetStack и оставлены на этом ПК "
+                    "намеренно (режим общего компонента): "
+                    + ", ".join(portable_ones) + ".")
+            else:
+                self.log.warn(
+                    "Службы уже перенесены в NetStack и регистрируются "
+                    "портативом при запуске, но снять их с этого ПК не "
+                    "удалось: " + ", ".join(portable_ones)
+                    + ". Нужны права администратора; на работу портатива на "
+                      "другом компьютере это не влияет.")
+        rest = [name for name in services if name not in set(portable_ones)]
+        if rest:
+            self.log.warn(
+                "Обнаружены зарегистрированные службы, указывающие внутрь "
+                "портатива: " + ", ".join(rest) + ". В NetStack они не "
+                "попали (нет бинарника в App этой папки), поэтому портатив их "
+                "не пересоздаёт. Проверьте такие службы вручную, не удаляя "
+                "незнакомые.")
 
     @staticmethod
     def _reg_import(path: str) -> int:
@@ -9352,6 +9432,10 @@ class Portablizer:
         result.netstack_services = sorted({
             entry.get("name", "") for entry in report.services
             if entry.get("name")})
+        # Режим, в котором собран NetStack: в общем («shared») службы
+        # остаются на сборочном ПК намеренно, и предупреждать о «не удалось
+        # снять» там нечестно.
+        self._netstack_shared = report.isolation == "shared"
         parts = []
         if result.netstack_drivers:
             parts.append("драйверы: " + ", ".join(result.netstack_drivers))
@@ -9361,6 +9445,9 @@ class Portablizer:
             self.log.ok("Сетевые компоненты перенесены в NetStack — "
                         + "; ".join(parts)
                         + ". Лончер проверит и досоздаст их на любом ПК.")
+        if report.isolation == "session":
+            # Изолированный режим: на сборочном ПК ничего не остаётся.
+            self._retire_captured_services(portable_dir, report)
         return report
 
     def _write_launcher(self, portable_dir: str, name: str, main_exe_rel: str,

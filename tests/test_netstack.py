@@ -895,6 +895,263 @@ class BuildIntegrationTests(unittest.TestCase):
         self.assertIsNone(report)
 
 
+class ServiceRepairScriptTests(unittest.TestCase):
+    """Служба-компаньон должна работать, а не просто существовать.
+
+    Жалоба: клиент писал «Не удалось подключиться ни по одному из протоколов»
+    при том, что служба была зарегистрирована. Причина — путь в реестре вёл в
+    прежнюю папку (или служба стояла), а проверки смотрели только на факт
+    существования ключа.
+    """
+
+    def test_script_repairs_a_service_pointing_into_the_old_folder(self):
+        ps1 = netstack.render_services_ps1()
+        for needle in ("function Get-ServiceExePath",
+                       "function Get-ServiceImagePath",
+                       "function Test-SamePath",
+                       "function Test-ForeignService",
+                       "re-registering it for this folder",
+                       "did not start",
+                       "Write-NetStackStatus"):
+            self.assertIn(needle, ps1)
+        # Проверка больше не ограничивается наличием ключа службы.
+        self.assertIn("Test-SamePath (Get-ServiceExePath $current) $exe", ps1)
+        self.assertIn("StartPending", ps1)
+
+    def test_foreign_installation_is_never_hijacked(self):
+        ps1 = netstack.render_services_ps1()
+        self.assertIn("belongs to another installation", ps1)
+        # «Наша» копия узнаётся по PortableData рядом с папкой бинарника.
+        self.assertIn("'PortableData'", ps1)
+
+    def test_present_but_disabled_adapter_is_enabled(self):
+        ps1 = netstack.render_services_ps1()
+        self.assertIn("function Enable-HwidDevices", ps1)
+        self.assertIn("Enable-PnpDevice", ps1)
+        self.assertIn("/enable-device", ps1)
+
+    def test_ensure_reports_a_service_that_did_not_start(self):
+        report = netstack.NetStackReport(
+            services=[{"name": "PlanetVPNService", "image": "x", "args": "",
+                       "display": "PlanetVPN", "start": "demand"}])
+        setup = netstack.render_setup_cmd(report)
+        lines = _command_lines_with(setup, "errorlevel 6")
+        self.assertTrue(lines, "NetStack RC=6 не доходит до лончера")
+        self.assertIn('set "NETSTACK_RC=6"', setup)
+        # 6 не перетирается повторной проверкой (она ставит только 4).
+        self.assertIn('if not "%NETSTACK_RC%" == "6" if errorlevel 4', setup)
+
+    def test_state_file_is_named_in_the_script(self):
+        self.assertIn("status.txt", netstack.render_services_ps1())
+
+
+class LauncherHelperAuditTests(unittest.TestCase):
+    """В лончере не должно быть вызовов несуществующих функций.
+
+    Именно такая опечатка (`_run_hidden`) отключала ВСЮ починку NetStack:
+    ``NameError`` ловился общим ``except``, Setup.cmd не запускался, и клиент
+    VPN оставался без адаптера и службы.
+    """
+
+    SOURCE_FILES = ("portable_launcher_entry.py",)
+
+    @staticmethod
+    def _undefined_names(source: str):
+        import ast
+        import builtins
+
+        tree = ast.parse(source)
+        defined = set(dir(builtins))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                defined.add(node.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    defined.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, ast.arg):
+                defined.add(node.arg)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+        return sorted({(node.lineno, node.id) for node in ast.walk(tree)
+                       if isinstance(node, ast.Name)
+                       and isinstance(node.ctx, ast.Load)
+                       and node.id not in defined and node.id != "__file__"})
+
+    def test_no_call_goes_to_a_name_the_launcher_does_not_have(self):
+        for name in self.SOURCE_FILES:
+            path = Path(__file__).resolve().parent.parent / name
+            missing = self._undefined_names(path.read_text(encoding="utf-8"))
+            self.assertEqual(missing, [], f"{name}: неизвестные имена {missing}")
+
+    def test_hidden_runner_exists_and_returns_exit_codes(self):
+        self.assertTrue(callable(exe_launcher._run_hidden))
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", False):
+            self.assertIsNone(exe_launcher._run_hidden(["cmd.exe", "/c", "x"]))
+        completed = mock.Mock(returncode=6)
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher.subprocess, "run",
+                                  return_value=completed) as run:
+            code = exe_launcher._run_hidden(["cmd.exe", "/c", "x"])
+        self.assertEqual(code, 6)
+        self.assertEqual(run.call_args.args[0], ["cmd.exe", "/c", "x"])
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+
+    def test_hidden_runner_survives_a_missing_command(self):
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher.subprocess, "run",
+                                  side_effect=OSError("no cmd")):
+            self.assertIsNone(exe_launcher._run_hidden(["cmd.exe"]))
+
+    def test_elevated_runner_delegates_to_the_scripts_own_elevation(self):
+        with mock.patch.object(exe_launcher, "_run_hidden",
+                               return_value=0) as hidden:
+            code = exe_launcher._run_hidden_elevated(
+                "cmd.exe", ["/c", "Setup.cmd"], timeout=30)
+        self.assertEqual(code, 0)
+        self.assertEqual(hidden.call_args.args[0], ["cmd.exe", "/c", "Setup.cmd"])
+
+    def test_every_netstack_exit_code_is_explained(self):
+        expected = {3: "adapter", 4: "service", 6: "did not start"}
+        for code, needle in expected.items():
+            self.assertIn(needle, exe_launcher._netstack_code_note(code).lower())
+        self.assertEqual(exe_launcher._netstack_code_note(None), "")
+        self.assertEqual(exe_launcher._netstack_code_note(0), "")
+
+
+class NetstackVerifyRuntimeTests(unittest.TestCase):
+    """Лончер обязан проверить результат, а не поверить коду возврата."""
+
+    def _root(self, tmp: str) -> Path:
+        root = Path(tmp)
+        (root / "NetStack").mkdir(parents=True)
+        (root / "NetStack" / "Setup.cmd").write_text("@echo off",
+                                                     encoding="ascii")
+        return root
+
+    def test_verify_failure_is_reported_in_the_run_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            cfg = {"netstack": {"setup": "NetStack/Setup.cmd"}}
+            codes = []
+
+            def fake_hidden(arguments, **_kwargs):
+                codes.append(arguments[-1])
+                # --check до починки: служба остановлена; после: всё хорошо.
+                return 4 if len(codes) == 1 else 0
+
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_run_hidden",
+                                      side_effect=fake_hidden), \
+                    mock.patch.object(exe_launcher, "_run_netstack_script",
+                                      return_value=6) as setup, \
+                    mock.patch.object(exe_launcher, "netstack_missing",
+                                      return_value=[]):
+                notes = exe_launcher.ensure_netstack(root, cfg)
+
+            self.assertTrue(setup.called)
+            self.assertEqual(codes.count("--check") >= 1, True)
+            text = "\n".join(notes)
+            self.assertIn("exit code 6", text)
+            self.assertIn("did not start", text)
+            self.assertTrue(any("verify" in line.lower() for line in notes))
+
+    def test_a_ready_machine_does_not_ask_for_rights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            cfg = {"netstack": {"setup": "NetStack/Setup.cmd"}}
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_run_hidden",
+                                      return_value=0), \
+                    mock.patch.object(exe_launcher, "_run_netstack_script",
+                                      side_effect=AssertionError("must not run")), \
+                    mock.patch.object(exe_launcher, "netstack_missing",
+                                      return_value=[]):
+                notes = exe_launcher.ensure_netstack(root, cfg)
+            self.assertEqual(notes, [])
+
+
+class CapturedServiceRetirementTests(unittest.TestCase):
+    """Служба, уехавшая в NetStack, снимается со сборочного ПК."""
+
+    def _engine(self):
+        from portablizer.core.logutil import Logger
+        from portablizer.core.portablizer import Portablizer
+        return Portablizer(Logger())
+
+    def _report(self, isolation: str = "session"):
+        return netstack.NetStackReport(
+            services=[{"name": "PlanetVPNService"}],
+            isolation=isolation)
+
+    def test_service_from_the_manifest_is_removed_and_explained(self):
+        from portablizer.core import portablizer as engine_mod
+        engine = self._engine()
+        ref = engine_mod.procutil.ServiceRef(
+            "PlanetVPNService", r"E:\P\App\PlanetVPNService.exe")
+        with mock.patch.object(engine_mod.procutil, "services_in_detail",
+                               return_value=[ref]), \
+                mock.patch.object(engine_mod.procutil, "remove_services",
+                                  return_value=[]) as remove:
+            engine._retire_captured_services(r"E:\P", self._report())
+
+        remove.assert_called_once()
+        text = engine.log.text
+        self.assertIn("сняты с этого ПК", text)
+        self.assertIn("PlanetVPNService", text)
+
+    def test_stuck_service_is_not_hidden_from_the_user(self):
+        from portablizer.core import portablizer as engine_mod
+        engine = self._engine()
+        ref = engine_mod.procutil.ServiceRef(
+            "PlanetVPNService", r"E:\P\App\PlanetVPNService.exe")
+        with mock.patch.object(engine_mod.procutil, "services_in_detail",
+                               return_value=[ref]), \
+                mock.patch.object(engine_mod.procutil, "remove_services",
+                                  return_value=["PlanetVPNService"]):
+            engine._retire_captured_services(r"E:\P", self._report())
+
+        self.assertIn("права администратора", engine.log.text)
+
+    def test_service_outside_the_manifest_is_not_touched(self):
+        from portablizer.core import portablizer as engine_mod
+        engine = self._engine()
+        ref = engine_mod.procutil.ServiceRef(
+            "SomebodyElse", r"E:\P\App\other.exe")
+        with mock.patch.object(engine_mod.procutil, "services_in_detail",
+                               return_value=[ref]), \
+                mock.patch.object(engine_mod.procutil, "remove_services",
+                                  side_effect=AssertionError("must not remove")):
+            engine._retire_captured_services(r"E:\P", self._report())
+
+    def test_shared_mode_is_not_reported_as_a_failure(self):
+        """В общем режиме служба остаётся намеренно — и так и говорится."""
+        from portablizer.core import portablizer as engine_mod
+        from portablizer.core.logutil import Logger
+        from portablizer.core.portablizer import PortableResult
+        engine = engine_mod.Portablizer(Logger())
+        engine._netstack_shared = True
+        result = PortableResult(success=True)
+        result.netstack_services = ["PlanetVPNService"]
+        with mock.patch.object(engine_mod, "IS_WINDOWS", True), \
+                mock.patch.object(engine_mod.procutil, "services_in",
+                                  return_value=["PlanetVPNService"]):
+            engine._report_portable_services(r"E:\P", result)
+
+        text = engine.log.text
+        self.assertIn("намеренно", text)
+        self.assertNotIn("не удалось", text)
+
+    def test_shared_mode_keeps_the_service_for_other_programs(self):
+        from portablizer.core import portablizer as engine_mod
+        engine = self._engine()
+        with mock.patch.object(engine_mod.procutil, "services_in_detail",
+                               side_effect=AssertionError("must not look")):
+            engine._retire_captured_services(r"E:\P", self._report("shared"))
+
+
 class PowerShellSyntaxGuardTests(unittest.TestCase):
     """Сгенерированные .ps1/.cmd должны хотя бы разбираться Windows.
 
