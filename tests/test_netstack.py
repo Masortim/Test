@@ -895,6 +895,18 @@ class BuildIntegrationTests(unittest.TestCase):
         self.assertIsNone(report)
 
 
+def _report_with_service(isolation: str = "session"):
+    """Отчёт NetStack с одним драйвером и одной службой (TAP + клиент)."""
+    return netstack.NetStackReport(
+        drivers=[{"inf": "NetStack/Drivers/tap-windows/OemVista.inf",
+                  "device_id": "tap0901", "needs_install": "1",
+                  "service": "tap0901", "kind": "net"}],
+        services=[{"name": "PlanetVPNService",
+                   "image": "@@PORTABLE_ROOT@@/App/PlanetVPNService.exe",
+                   "args": "", "display": "PlanetVPN", "start": "demand"}],
+        isolation=isolation)
+
+
 class ServiceRepairScriptTests(unittest.TestCase):
     """Служба-компаньон должна работать, а не просто существовать.
 
@@ -935,14 +947,77 @@ class ServiceRepairScriptTests(unittest.TestCase):
             services=[{"name": "PlanetVPNService", "image": "x", "args": "",
                        "display": "PlanetVPN", "start": "demand"}])
         setup = netstack.render_setup_cmd(report)
-        lines = _command_lines_with(setup, "errorlevel 6")
-        self.assertTrue(lines, "NetStack RC=6 не доходит до лончера")
-        self.assertIn('set "NETSTACK_RC=6"', setup)
-        # 6 не перетирается повторной проверкой (она ставит только 4).
-        self.assertIn('if not "%NETSTACK_RC%" == "6" if errorlevel 4', setup)
+        # Код .ps1 снимается сразу: следующий `call` сбрасывает ERRORLEVEL.
+        self.assertIn('set "NETSTACK_PS=%ERRORLEVEL%"', setup)
+        self.assertIn('if "%NETSTACK_RC%" == "0" set "NETSTACK_RC=%NETSTACK_PS%"',
+                      setup)
+
+    def test_elevated_copy_exit_code_reaches_the_launcher(self):
+        """""Код 0 при полностью нетронутой машине" — это был баг именно здесь."""
+        setup = netstack.render_setup_cmd(_report_with_service())
+        self.assertIn("-PassThru", setup)
+        self.assertIn("exit $p.ExitCode", setup)
+        # Отказ от UAC — отдельный код 7, а не «всё готово».
+        self.assertIn("catch { exit 7 }", setup)
+        self.assertIn('set "NETSTACK_RC=7"', setup)
+
+    def test_elevated_copy_never_asks_for_rights_again(self):
+        setup = netstack.render_setup_cmd(_report_with_service())
+        lines = [line.strip() for line in setup.splitlines()]
+        elevated = next(i for i, line in enumerate(lines)
+                        if line.startswith("if /i") and '"--elevated"' in line)
+        asking = next(i for i, line in enumerate(lines)
+                      if "Start-Process -Verb RunAs" in line)
+        # Сначала «уже повышенная копия без прав → код 7», и только потом UAC.
+        self.assertLess(elevated, asking)
+        self.assertIn("goto netstack_no_rights", lines[elevated])
+
+    def test_setup_log_records_every_step(self):
+        setup = netstack.render_setup_cmd(_report_with_service())
+        self.assertIn('set "NETSTACK_LOG=%NETSTACK_STATE%\\setup.log"', setup)
+        for step in ("start", "ps1-%PS_MODE%-exit-%NETSTACK_PS%",
+                     "exit-%NETSTACK_RC%"):
+            self.assertIn("call :netstack_trace " + step, setup)
+        self.assertIn(':netstack_trace', setup)
+
+    def test_elevation_is_detected_without_the_server_service(self):
+        # `net session` падает и у администратора, если служба Server выключена:
+        # тогда скрипт бесконечно повышал права и возвращал 0.
+        setup = netstack.render_setup_cmd(_report_with_service())
+        self.assertIn("fltmc >nul 2>&1", setup)
+        self.assertIn("openfiles.exe /query", setup)
+        self.assertFalse(_command_lines_with(setup, "net session"),
+                         "проверка прав всё ещё через net session")
+        self.assertFalse(_command_lines_with(setup, "net session ||"))
 
     def test_state_file_is_named_in_the_script(self):
         self.assertIn("status.txt", netstack.render_services_ps1())
+
+
+class TeardownScriptTests(unittest.TestCase):
+    """Teardown тоже не должен молча «ничего не делать»."""
+
+    def _text(self, isolation="session"):
+        report = netstack.NetStackReport(isolation=isolation)
+        return netstack.render_teardown_cmd(report)
+
+    def test_teardown_does_not_use_net_session(self):
+        text = self._text()
+        self.assertFalse(_command_lines_with(text, "net session"))
+        self.assertIn("fltmc >nul 2>&1", text)
+        self.assertIn("openfiles.exe /query", text)
+
+    def test_elevated_copy_does_not_elevate_again(self):
+        text = self._text()
+        self.assertIn('for %%A in (%*) do if /i "%%~A" == "--elevated"',
+                      text)
+        self.assertIn(":netstack_teardown_pass", text)
+
+    def test_exit_code_of_the_elevated_copy_is_returned(self):
+        text = self._text()
+        self.assertIn("-PassThru", text)
+        self.assertIn("exit $p.ExitCode", text)
+        self.assertIn("catch { exit 7 }", text)
 
 
 class LauncherHelperAuditTests(unittest.TestCase):
@@ -1071,6 +1146,130 @@ class NetstackVerifyRuntimeTests(unittest.TestCase):
                                       return_value=[]):
                 notes = exe_launcher.ensure_netstack(root, cfg)
             self.assertEqual(notes, [])
+
+
+class NetstackDiagnosticsRuntimeTests(unittest.TestCase):
+    """Отказ UAC и непонятный код не должны молчать.
+
+    Снимок экрана пользователя: «Портатив ставит их сам…», в журнале
+    «setup exit code 0», на машине — ни адаптера, ни службы, ни status.txt.
+    Код возврата терялся при передаче управления повышенной копии, а сам
+    запуск ничего не записывал.
+    """
+
+    def _root(self, tmp: str) -> Path:
+        root = Path(tmp)
+        (root / "NetStack").mkdir(parents=True)
+        (root / "NetStack" / "Setup.cmd").write_text("@echo off",
+                                                     encoding="ascii")
+        (root / "PortableData" / "NetStack").mkdir(parents=True)
+        return root
+
+    def test_uac_refusal_stops_the_retry_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            cfg = {"netstack": {"setup": "NetStack/Setup.cmd"}}
+            setup = mock.Mock(return_value=7)
+            shown = []
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_run_hidden",
+                                      return_value=7), \
+                    mock.patch.object(exe_launcher, "_run_netstack_script",
+                                      setup), \
+                    mock.patch.object(exe_launcher, "netstack_missing",
+                                      return_value=["tap0901"]), \
+                    mock.patch.object(exe_launcher, "_show_warning",
+                                      shown.append):
+                notes = exe_launcher.ensure_netstack(root, cfg)
+
+            self.assertEqual(setup.call_count, 1, "второй запрос UAC не нужен")
+            text = "\n".join(notes)
+            self.assertIn("administrator rights were not granted", text)
+            self.assertIn("still missing: tap0901", text)
+            self.assertTrue(shown, "пользователь должен увидеть предупреждение")
+            self.assertIn("Да", shown[0])
+            self.assertIn("setup.log", shown[0])
+
+    def test_unknown_verify_code_is_not_missing_components(self):
+        """255 от сломанной проверки — не повод говорить «компонентов нет»."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            cfg = {"netstack": {"setup": "NetStack/Setup.cmd"}}
+            shown = []
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_run_hidden",
+                                      return_value=255), \
+                    mock.patch.object(exe_launcher, "netstack_missing",
+                                      return_value=[]), \
+                    mock.patch.object(exe_launcher, "_show_warning",
+                                      shown.append):
+                notes = exe_launcher.ensure_netstack(root, cfg)
+
+            text = "\n".join(notes)
+            self.assertIn("could not run", text)
+            self.assertNotIn("components are not ready", text)
+            self.assertEqual(shown, [])
+
+    def test_known_verify_code_means_a_real_problem(self):
+        """Служба «есть», но её путь устарел: пробы молчат, проверка — нет."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            cfg = {"netstack": {"setup": "NetStack/Setup.cmd"}}
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_run_hidden",
+                                      side_effect=[4, 0]), \
+                    mock.patch.object(exe_launcher, "_run_netstack_script",
+                                      return_value=0), \
+                    mock.patch.object(exe_launcher, "netstack_missing",
+                                      return_value=["PlanetVPNService"]), \
+                    mock.patch.object(exe_launcher, "_show_warning",
+                                      lambda *a, **k: None):
+                notes = exe_launcher.ensure_netstack(root, cfg)
+            text = "\n".join(notes)
+            self.assertIn("verify exit code 4", text)
+            self.assertIn("not running", text)
+
+    def test_run_log_keeps_the_output_of_the_script(self):
+        completed = mock.Mock(returncode=4)
+        completed.stdout = "netstack: service 'X' did not start\n"
+        completed.stderr = ""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "NetStack" / "launcher-netstack.log"
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher.subprocess, "run",
+                                      return_value=completed):
+                code = exe_launcher._run_hidden(["cmd.exe", "/c", "Setup.cmd"],
+                                                log_path=log)
+            self.assertEqual(code, 4)
+            text = log.read_text(encoding="utf-8")
+            self.assertIn("$ cmd.exe /c Setup.cmd", text)
+            self.assertIn("exit 4", text)
+            self.assertIn("out: netstack: service 'X' did not start", text)
+
+    def test_tail_of_netstack_logs_reaches_the_run_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            state = root / "PortableData" / "NetStack"
+            (state / "setup.log").write_text(
+                "[1] start\n[2] elevated-returned 3\n", encoding="utf-8")
+            (state / "ps.log").write_text(
+                "[1] mode=ensure admin=True\n[2] adapters ready=False\n",
+                encoding="utf-8")
+            cfg = {"netstack": {"setup": "NetStack/Setup.cmd"}}
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(exe_launcher, "_run_hidden",
+                                      return_value=0), \
+                    mock.patch.object(exe_launcher, "_run_netstack_script",
+                                      return_value=3), \
+                    mock.patch.object(exe_launcher, "netstack_missing",
+                                      return_value=["адаптер tap0901"]), \
+                    mock.patch.object(exe_launcher, "_show_warning",
+                                      lambda *a, **k: None):
+                notes = exe_launcher.ensure_netstack(root, cfg)
+
+            text = "\n".join(notes)
+            self.assertIn("setup.log: [2] elevated-returned 3", text)
+            self.assertIn("ps.log: [2] adapters ready=False", text)
 
 
 class CapturedServiceRetirementTests(unittest.TestCase):
