@@ -166,6 +166,10 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("folder", help="корень портатива (папка с Launch.bat)")
     rn.add_argument("--log-file", default="",
                     help="куда писать журнал (по умолчанию рядом с портативом)")
+    rn.add_argument(
+        "--from-installer", default="",
+        help="добрать недостающие .sys/.cat из этого установщика, не "
+             "пересобирая портатив (установщик только читается, не запускается)")
     return parser
 
 
@@ -343,6 +347,23 @@ def cmd_repair_netstack(ns: argparse.Namespace) -> int:
         os.path.dirname(folder), "portablizer-netstack.log")
     log = Logger(logfile=log_file)
     log.add_sink(lambda level, message: print(f"{level:<5} {message}"))
+    installer = str(getattr(ns, "from_installer", "") or "")
+    if installer:
+        if not os.path.isfile(installer):
+            log.error(f"установщик не найден: {installer}")
+            return 2
+        try:
+            added = netstack_mod.refill_netstack_from_installer(
+                folder, installer)
+        except (OSError, ValueError) as exc:
+            log.error(f"драйверы из установщика не извлечены: {exc}")
+            return 1
+        if added:
+            for rel in added:
+                log.ok(f"добавлен {rel}")
+        else:
+            log.warn("в установщике не нашлось полного пакета драйвера либо "
+                     "все нужные файлы уже на месте")
     try:
         updated = netstack_mod.refresh_netstack_scripts(folder)
     except (OSError, ValueError) as exc:

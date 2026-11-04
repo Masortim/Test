@@ -275,6 +275,72 @@ class CabinetHarvestTests(unittest.TestCase):
         self.assertFalse(report.found)
 
 
+class RefillExistingPortableTests(unittest.TestCase):
+    """Починка УЖЕ собранного портатива: жалоба «нужны компоненты: tap0901».
+
+    Портатив, собранный до 1.45.0, уехал с одним INF. Пересобирать его
+    незачем: недостающие .sys/.cat берутся из того же установщика.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.root = self.tmp / "portable"
+        self.driver = self.root / "NetStack" / "Drivers" / "tap-windows"
+        self.driver.mkdir(parents=True)
+        (self.driver / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+        (self.root / "NetStack" / "netstack.json").write_text(json.dumps({
+            "isolation": "session",
+            "drivers": [{
+                "kind": "tap-windows", "service": "tap0901",
+                "device_id": "tap0901", "needs_install": "1",
+                "inf": "NetStack/Drivers/tap-windows/OemVista.inf",
+                "required_files": "tap0901.sys;tap0901.cat",
+                "complete": "0", "missing_files": "tap0901.sys;tap0901.cat",
+            }],
+            "services": [],
+        }), encoding="utf-8")
+        payload = self.tmp / "payload"
+        _write_package(payload)
+        self.installer = _zip_of(payload, self.tmp / "planetvpn_setup.exe")
+
+    def _refill(self):
+        with mock.patch.object(driverpayload.unpacker, "find_extractors",
+                               return_value=_fake_extractors()), \
+                mock.patch.object(unpacker, "_default_runner",
+                                  side_effect=_zip_runner):
+            return netstack.refill_netstack_from_installer(
+                str(self.root), str(self.installer), arch="amd64")
+
+    def test_missing_files_are_added_and_the_package_becomes_complete(self):
+        added = self._refill()
+        self.assertEqual(sorted(os.path.basename(p) for p in added),
+                         ["tap0901.cat", "tap0901.sys"])
+        netstack.refresh_netstack_scripts(str(self.root))
+        manifest = json.loads(
+            (self.root / "NetStack" / "netstack.json").read_text(
+                encoding="utf-8"))
+        entry = manifest["drivers"][0]
+        self.assertEqual(entry["complete"], "1")
+        self.assertEqual(entry["missing_files"], "")
+
+    def test_existing_files_are_never_overwritten(self):
+        """Вендорский файл из App может быть новее, чем в установщике."""
+        (self.driver / "tap0901.sys").write_bytes(b"VENDOR-NEWER")
+        self._refill()
+        self.assertEqual((self.driver / "tap0901.sys").read_bytes(),
+                         b"VENDOR-NEWER")
+
+    def test_staging_directory_is_removed(self):
+        self._refill()
+        self.assertFalse((self.root / "NetStack" / ".refill").exists())
+
+    def test_portable_without_manifest_is_left_alone(self):
+        (self.root / "NetStack" / "netstack.json").unlink()
+        self.assertEqual(self._refill(), [])
+
+
 class BuildIntegrationTests(unittest.TestCase):
     """Сборка обязана дать рабочий NetStack, а не предупреждение."""
 

@@ -503,6 +503,123 @@ def netstack_missing(root: Path, cfg: Dict[str, Any]
     return missing
 
 
+def _netstack_diagnose(root: Path, cfg: Dict[str, Any],
+                       missing: Sequence[str],
+                       code: "Optional[int]" = None) -> str:
+    """Почему компонентов нет — словами, а не именем службы.
+
+    Прежнее окно говорило только «нужны сетевые компоненты: tap0901» и
+    предлагало «запустите Setup.cmd вручную». Но у отказа четыре разные
+    причины, и лечатся они по-разному: неполный пакет в самом портативе
+    (тогда никакой Setup.cmd не поможет — файлов просто нет), отклонённый
+    UAC, отсутствующий адаптер при установленному пакете и слишком старый
+    PowerShell. Точный ответ уже лежит в ``netstack.json``,
+    ``PortableData\\NetStack\\status.txt`` и ``setup.log`` — здесь он
+    поднимается в окно, чтобы не приходилось угадывать.
+    """
+    lines: "list[str]" = []
+    state = (root / str(cfg.get("data_dir_name", "PortableData")) / "NetStack")
+    section = _netstack_section(cfg)
+
+    # 1. Неполный пакет — самая частая причина, и единственная, где
+    #    повторный запуск Setup.cmd бесполезен.
+    incomplete: "list[str]" = []
+    manifest_rel = str(section.get("manifest") or "NetStack/netstack.json")
+    try:
+        manifest = json.loads(
+            (root / manifest_rel.replace("/", os.sep)).read_text(
+                encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        manifest = {}
+    for entry in manifest.get("drivers", []) if isinstance(
+            manifest, dict) else []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("needs_install") != "1":
+            continue
+        name = str(entry.get("service") or entry.get("kind") or "драйвер")
+        if entry.get("complete") == "0":
+            files = str(entry.get("missing_files") or "").strip()
+            incomplete.append(name + (f" (нет файлов: {files})" if files else ""))
+            continue
+        # Манифест мог остаться от старой сборки: проверяем файлы на диске.
+        inf_rel = str(entry.get("inf") or "")
+        if not inf_rel:
+            continue
+        directory = (root / inf_rel.replace("/", os.sep)).parent
+        required = [part for part in
+                    str(entry.get("required_files") or "").split(";") if part]
+        absent = [rel for rel in required
+                  if not (directory / rel.replace("/", os.sep)).is_file()]
+        if absent:
+            incomplete.append(f"{name} (нет файлов: {', '.join(absent)})")
+    if incomplete:
+        lines.append(
+            "Причина: в папке NetStack лежит НЕПОЛНЫЙ пакет драйвера — "
+            + "; ".join(incomplete) + ".\n"
+            "Запуск Setup.cmd здесь не поможет: устанавливать нечего. "
+            "Пересоберите портатив программой Portablizer 1.45.0 или новее "
+            "(она достаёт полный пакет из самого установщика), либо положите "
+            "недостающие файлы рядом с .inf в NetStack\\Drivers\\... и "
+            "выполните: Portablizer.exe repair-netstack <папка портатива>.")
+        return "\n".join(lines)
+
+    # 2. Явный код возврата от Setup.cmd.
+    if code == 1223:
+        lines.append(
+            "Причина: запрос прав администратора (UAC) был отклонён. "
+            "Без него драйвер установить нельзя. Запустите портатив снова и "
+            "подтвердите запрос, либо один раз выполните "
+            "NetStack\\Setup.cmd от имени администратора.")
+    elif code == 5:
+        lines.append(
+            "Причина: на этом ПК слишком старый или отключённый PowerShell — "
+            "скрипты NetStack не могут выполниться. Нужен PowerShell 3.0 "
+            "или новее (встроен в Windows 8 и новее).")
+    elif code == 3:
+        lines.append(
+            "Причина: пакет драйвера установлен, но сетевой адаптер создать "
+            "не удалось. Обычно это политика установки устройств или "
+            "ожидание перезагрузки после прежней установки TAP.")
+    elif code == 2:
+        lines.append(
+            "Причина: служба драйвера не зарегистрирована — пакет драйвера "
+            "не был установлен до конца.")
+
+    # 3. Что видит сама Windows: строка «package ... incomplete» из
+    #    status.txt важнее наших предположений.
+    try:
+        status = (state / "status.txt").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        status = ""
+    detail = [line.strip() for line in status.splitlines()
+              if line.strip().startswith(("package ", "driver ", "adapter "))]
+    if detail:
+        lines.append("Состояние на этом ПК:\n  " + "\n  ".join(detail[:6]))
+    tail = _netstack_log_tail(state / "setup.log")
+    if tail:
+        lines.append("Последние строки журнала установки:\n  " + tail)
+    if not lines:
+        lines.append(
+            "Портатив ставит компоненты сам из папки NetStack (один запрос "
+            "прав администратора). Если окно UAC было отклонено, запустите "
+            "NetStack\\Setup.cmd вручную и повторите запуск.")
+    lines.append("Подробности: " + str(state / "status.txt")
+                 + " и " + str(state / "setup.log") + ".")
+    return "\n".join(lines)
+
+
+def _netstack_log_tail(path: Path, limit: int = 4) -> str:
+    """Последние осмысленные строки setup.log (для окна предупреждения)."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    rows = [line.strip() for line in raw.splitlines() if line.strip()]
+    return "\n  ".join(rows[-limit:])
+
+
 def _netstack_warning_is_new(root: Path, cfg: Dict[str, Any],
                              missing: Sequence[str]) -> bool:
     """Одно предупреждение на состав недостающего (как для runtime-пакетов)."""
@@ -677,7 +794,9 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
     if verify != 0:
         reason = _netstack_code_note(verify) or "components are not ready"
         notes.append(f"NetStack verify exit code {verify} ({reason})")
-        still = still or [reason]
+        # В журнал — английский код-пояснение, в окно — русский текст:
+        # причину словами добавит _netstack_diagnose по этому же коду.
+        still = still or ["сетевые компоненты (причина ниже)"]
     elif verify == 0:
         notes.append("NetStack verify: adapter, services and their paths are "
                      "consistent with this folder")
@@ -685,17 +804,14 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
     if still:
         notes.append("still missing: " + ", ".join(still))
         if _netstack_warning_is_new(root, cfg, still):
+            # Код, объясняющий отказ: сначала от самой установки, затем от
+            # проверки результата — именно он отличает отклонённый UAC от
+            # неполного пакета.
             _show_warning(
                 "Программе нужны системные сетевые компоненты, которых нет на "
-                "этом компьютере:\n\n  " + "\n  ".join(still)
-                + "\n\nПортатив ставит их сам из папки NetStack (один запрос "
-                "прав администратора: пакет драйвера + сетевой адаптер + "
-                "служба клиента).\n"
-                "Если окно UAC было отклонено, запустите "
-                "NetStack\\Setup.cmd вручную и повторите запуск. "
-                "Состояние компонентов — в "
-                + str(root / str(cfg.get("data_dir_name", "PortableData"))
-                      / "NetStack" / "status.txt") + ".")
+                "этом компьютере:\n\n  " + "\n  ".join(still) + "\n\n"
+                + _netstack_diagnose(root, cfg, still,
+                                     verify if verify is not None else code))
     else:
         notes.append("all required components are present")
     return notes
