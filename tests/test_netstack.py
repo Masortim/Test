@@ -1250,7 +1250,9 @@ class Tap0901RegressionTests(unittest.TestCase):
         self.assertIn("NetStack/Setup.cmd", updated)
         manifest = json.loads((netstack_dir / "netstack.json").read_text())
         self.assertEqual(manifest["drivers"][0]["complete"], "0")
-        self.assertEqual(manifest["drivers"][0]["hardware_id"], "root\\tap0901")
+        # The INF declares both spellings; the bare ``tap0901`` is the one
+        # Windows searches for and tapinstall uses (see setupapi.dev.log).
+        self.assertEqual(manifest["drivers"][0]["hardware_id"], "tap0901")
         setup = (netstack_dir / "Setup.cmd").read_text(encoding="ascii")
         self.assertIn("-Mode preflight", setup)
 
@@ -1434,6 +1436,88 @@ class PowerShellSyntaxGuardTests(unittest.TestCase):
             result = subprocess.run([shell, "-NoProfile", "-Command", probe],
                                     capture_output=True, text=True, timeout=180)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class HardwareIdFromInfTests(unittest.TestCase):
+    """Первопричина «Ошибка установки драйвера адаптера».
+
+    Штатный OemVista.inf объявляет устройство как ``tap0901`` (без
+    ``root\``). Прежний код выдумывал ``root\tap0901``: устройство
+    создавалось, но драйвер к нему не привязывался, потому что такой модели
+    в INF нет. В журнале Windows это видно как
+    ``Searching for hardware ID(s): tap0901``.
+    """
+
+    STOCK = """[Version]
+Signature = "$Windows NT$"
+Class = Net
+ClassGuid = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider = %Provider%
+CatalogFile = tap0901.cat
+DriverVer = 04/21/2016,9.00.00.21
+[Manufacturer]
+%Provider% = tap0901, NTamd64
+[tap0901.NTamd64]
+%DeviceDescription% = tap0901.ndi, tap0901
+[tap0901.ndi]
+AddReg = tap0901.reg
+[SourceDisksFiles]
+tap0901.sys = 1
+[Strings]
+Provider = "TAP-Windows Provider V9"
+DeviceDescription = "TAP-Windows Adapter V9"
+"""
+
+    def test_stock_openvpn_inf_yields_bare_tap0901(self):
+        self.assertEqual(netstack.inf_hardware_ids(self.STOCK, "amd64"),
+                         ["tap0901"])
+        meta = netstack.parse_net_inf(self.STOCK, "amd64")
+        self.assertEqual(meta.device_id, "tap0901")
+        self.assertEqual(meta.hardware_id, "tap0901",
+                         "ID обязан быть тем, что объявлен в INF")
+
+    def test_repackaged_vendor_inf_keeps_its_root_prefix(self):
+        text = self.STOCK.replace("tap0901.ndi, tap0901",
+                                 "tap0901.ndi, root\\tap0901")
+        self.assertEqual(netstack.parse_net_inf(text, "amd64").hardware_id,
+                         "root\\tap0901")
+
+    def test_undecorated_models_section_is_read_too(self):
+        text = self.STOCK.replace("%Provider% = tap0901, NTamd64",
+                                 "%Provider% = tap0901")
+        self.assertEqual(netstack.parse_net_inf(text).hardware_id, "tap0901")
+
+    def test_unknown_inf_falls_back_to_the_old_guess(self):
+        text = self.STOCK.replace("[tap0901.NTamd64]", "[other.NTamd64]")
+        self.assertEqual(netstack.parse_net_inf(text, "amd64").hardware_id,
+                         "root\\tap0901")
+
+    def test_generated_setup_tries_both_id_shapes(self):
+        """Манифесты старых сборок несут выдуманный ID — скрипт чинит и их."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "portable"
+            app = root / "App"
+            app.mkdir(parents=True)
+            driver = app / "driver"
+            driver.mkdir()
+            (driver / "OemVista.inf").write_text(self.STOCK, encoding="utf-8")
+            (driver / "tap0901.sys").write_bytes(b"MZ")
+            (driver / "tap0901.cat").write_bytes(b"cat")
+            package = netstack._package_from_directory(
+                str(driver / "OemVista.inf"), "installer")
+            netstack.provision_netstack(str(root), str(app), [package], [])
+            manifest = json.loads(
+                (root / "NetStack" / "netstack.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["drivers"][0]["hardware_id"], "tap0901")
+            script = (root / "NetStack" / "NetStackServices.ps1").read_text(
+                encoding="utf-8")
+            self.assertIn("$candidates = @($installHwid)", script)
+            self.assertIn("$installHwid.Substring(5)", script)
+            self.assertIn("('root\\' + $installHwid)", script)
+            # Литеральный слэш обязан дойти до PowerShell неповреждённым.
+            self.assertIn("-like 'root\\*'", script)
+            self.assertEqual(script.count("$source = @'"), 1)
+            self.assertEqual(script.count("\n'@\n"), 1)
 
 
 class DriverInstallErrorNoteTests(unittest.TestCase):
