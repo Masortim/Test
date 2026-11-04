@@ -308,6 +308,93 @@ def inf_required_files(text: str, arch: str = "") -> List[str]:
     return _unique(required)
 
 
+def inf_hardware_ids(text: str, arch: str = "") -> List[str]:
+    """Настоящие Hardware ID из секции Models этого INF.
+
+    ИХ НЕЛЬЗЯ ВЫДУМЫВАТЬ. Штатный ``OemVista.inf`` проекта OpenVPN объявляет
+    устройство так::
+
+        [Manufacturer]
+        %Provider% = tap0901, NTamd64
+        [tap0901.NTamd64]
+        %DeviceDescription% = tap0901.ndi, tap0901
+
+    то есть ID равен ``tap0901`` — БЕЗ приставки ``root\``. Прежний код
+    собирал ID сам (``root\tap0901``), и ``UpdateDriverForPlugAndPlayDevices``
+    не находил в INF ни одной подходящей модели: устройство создавалось, а
+    драйвер к нему не привязывался. В журнале Windows это видно дословно —
+    ``Searching for hardware ID(s): tap0901``. Именно поэтому и портатив, и
+    сам вендорский клиент писали «Ошибка установки драйвера адаптера».
+
+    Переупакованные вендорские INF действительно используют
+    ``root\tap0901``, поэтому возвращается то, что написано в файле, а не
+    одна заранее выбранная форма.
+    """
+    sections = _inf_assignments(text)
+    strings: Dict[str, str] = {}
+    for name, pairs in sections.items():
+        if name == "strings" or name.startswith("strings."):
+            for key, value in pairs:
+                strings.setdefault(key, value.strip('"').strip())
+    models: List[str] = []
+    for name, pairs in sections.items():
+        if name != "manufacturer" and not name.startswith("manufacturer."):
+            continue
+        if not _inf_section_applies(name, arch):
+            continue
+        for _key, value in pairs:
+            parts = [p.strip().strip('"') for p in value.split(",")]
+            base = _resolve_inf_strings(parts[0], strings).strip()
+            if not base:
+                continue
+            decorations = [p for p in parts[1:] if p]
+            if decorations:
+                for decoration in decorations:
+                    candidate = f"{base}.{decoration}".lower()
+                    if candidate not in models:
+                        models.append(candidate)
+            elif base.lower() not in models:
+                models.append(base.lower())
+    # A Models section named WITHOUT a decoration still has decorated
+    # variants ([tap0901] -> [tap0901.NTamd64]): Windows picks the one for
+    # the target platform, so both spellings must be read.
+    targets: List[str] = []
+    for model in models:
+        for name in sections:
+            if name != model and not name.startswith(model + "."):
+                continue
+            if name not in targets:
+                targets.append(name)
+    found: List[str] = []
+    for model in targets:
+        if not _inf_section_applies(model, arch):
+            continue
+        for _key, value in sections.get(model, []):
+            parts = [p.strip().strip('"') for p in value.split(",")]
+            # parts[0] — секция установки (.ndi), дальше сами Hardware ID.
+            for hwid in parts[1:]:
+                resolved = _resolve_inf_strings(hwid, strings).strip()
+                if resolved and resolved not in found:
+                    found.append(resolved)
+    return found
+
+
+def _pick_hardware_id(text: str, device_id: str, arch: str = "") -> str:
+    """ID для создания корневого устройства: сначала точное совпадение."""
+    if not device_id:
+        return ""
+    wanted = device_id.lower()
+    candidates = inf_hardware_ids(text, arch)
+    for candidate in candidates:
+        if candidate.lower() == wanted:
+            return candidate
+    for candidate in candidates:
+        if candidate.lower().endswith("\\" + wanted):
+            return candidate
+    # В INF модели не разобраны — прежняя догадка остаётся последним шансом.
+    return f"root\\{device_id}"
+
+
 def parse_net_inf(text: str, arch: str = "") -> InfMeta:
     """Минимальный разбор ``.inf``: [Version] + раскрытие %строк%.
 
@@ -360,7 +447,7 @@ def parse_net_inf(text: str, arch: str = "") -> InfMeta:
             device_id = "tap0901"
     elif kind == KIND_OVPN_DCO:
         device_id = "ovpn-dco"
-    hardware_id = f"root\\{device_id}" if device_id else ""
+    hardware_id = _pick_hardware_id(text, device_id, arch)
     return InfMeta(kind=kind, provider=resolved, service=service,
                    device_id=device_id, class_name=class_name,
                    catalog=version.get("catalogfile", ""),
@@ -2407,17 +2494,34 @@ namespace PortablizerNetStack {
           }
      }
      if ('PortablizerNetStack.RootDevice' -as [type]) {
-          try {
-               $ok = [PortablizerNetStack.RootDevice]::Install($infPath, $installHwid)
-               $err = [PortablizerNetStack.RootDevice]::LastError
-               Write-SetupLog ('SetupAPI install ' + $installHwid + ': ok=' + $ok +
-                    ' win32=' + $err)
-               if (-not $ok) { Write-SetupLog (Get-InstallErrorNote $err) }
-               if ($ok -and [PortablizerNetStack.RootDevice]::RebootRequired) {
-                    Write-SetupLog 'SetupAPI: a reboot is required to finish the driver install'
+          # The ID must be the one the INF actually declares. Stock
+          # OemVista.inf says 'tap0901'; repackaged vendor INFs say
+          # 'root\tap0901'. Manifests written before 1.46.3 carry the
+          # guessed 'root\' form, so both shapes are tried: a wrong ID
+          # creates the devnode but never binds the driver, which is the
+          # vendor app's "adapter driver install failed".
+          $candidates = @($installHwid)
+          if ($installHwid -like 'root\*') {
+               $candidates += $installHwid.Substring(5)
+          } else {
+               $candidates += ('root\' + $installHwid)
+          }
+          foreach ($candidate in ($candidates | Select-Object -Unique)) {
+               if (-not $candidate) { continue }
+               try {
+                    $ok = [PortablizerNetStack.RootDevice]::Install($infPath, $candidate)
+                    $err = [PortablizerNetStack.RootDevice]::LastError
+                    Write-SetupLog ('SetupAPI install ' + $candidate + ': ok=' + $ok +
+                         ' win32=' + $err)
+                    if (-not $ok) { Write-SetupLog (Get-InstallErrorNote $err) }
+                    if ($ok -and [PortablizerNetStack.RootDevice]::RebootRequired) {
+                         Write-SetupLog 'SetupAPI: a reboot is required to finish the driver install'
+                    }
+               } catch {
+                    Write-SetupLog ('SetupAPI install failed: ' + $_.Exception.Message)
                }
-          } catch {
-               Write-SetupLog ('SetupAPI install failed: ' + $_.Exception.Message)
+               Start-Sleep -Milliseconds 400
+               if (Test-AdapterReady $hwid) { return $true }
           }
      }
      Start-Sleep -Milliseconds 600
