@@ -1411,6 +1411,143 @@ def provision_netstack(portable_dir: str, app_dir: str,
 # идемпотентны: второй запуск не переустанавливает то, что уже стоит, а
 # --check позволяет лончеру решить, нужен ли UAC вообще, не показывая его зря.
 
+@dataclass
+class NetStackState:
+    """Состояние NetStack у готового портатива — для окна обслуживания.
+
+    Интерфейс обязан показать, ЧТО именно не так, ещё до починки: иначе
+    человек жмёт кнопку наугад. ``missing`` собирается по файлам на диске,
+    а не по флажку ``complete`` в манифесте: старый манифест мог остаться
+    с ``complete=1``, когда ``.sys``/``.cat`` уже нет.
+    """
+
+    present: bool = False
+    #: Есть ли пакеты, которые портатив должен ставить сам (TAP/ovpn-dco).
+    has_installable: bool = False
+    #: Человекочитаемые строки: «tap0901: не хватает tap0901.sys, …».
+    missing: List[str] = field(default_factory=list)
+    #: Службы пакетов, которые уже укомплектованы.
+    ready: List[str] = field(default_factory=list)
+    #: Изолированный режим (драйвер живёт только на время сеанса).
+    isolated: bool = True
+
+    @property
+    def complete(self) -> bool:
+        return self.present and not self.missing
+
+
+def inspect_netstack(portable_dir: str) -> NetStackState:
+    """Чем укомплектован ``NetStack/`` готового портатива (ничего не меняет)."""
+    root = os.path.abspath(portable_dir)
+    manifest_path = os.path.join(root, NETSTACK_DIR_NAME, MANIFEST_NAME)
+    state = NetStackState()
+    if not os.path.isfile(manifest_path):
+        return state
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, ValueError):
+        return state
+    if not isinstance(manifest, dict):
+        return state
+    state.present = True
+    state.isolated = str(manifest.get("isolation", "session")) == "session"
+    for entry in manifest.get("drivers", []):
+        if not isinstance(entry, dict) or entry.get("needs_install") != "1":
+            continue
+        state.has_installable = True
+        name = str(entry.get("service") or entry.get("kind") or "драйвер")
+        inf_rel = str(entry.get("inf", ""))
+        inf_path = os.path.join(root, inf_rel.replace("/", os.sep))
+        required = [part for part in
+                    str(entry.get("required_files", "")).split(";") if part]
+        if not required:
+            # Манифест прежней версии: спрашиваем сам INF, а не гадаем.
+            try:
+                meta = parse_net_inf(
+                    read_inf_text(inf_path),
+                    _arch_of(os.path.dirname(inf_path))
+                    or system_platform_arch())
+                required = list(meta.required_files)
+            except OSError:
+                required = []
+        package = NetDriverPackage(
+            kind=str(entry.get("kind", KIND_TAP_WINDOWS)),
+            service=str(entry.get("service", "")),
+            device_id=str(entry.get("device_id", "")),
+            inf_path=inf_path, required_files=required)
+        missing = package_missing_files(package)
+        if missing:
+            state.missing.append(f"{name}: {', '.join(missing)}")
+        else:
+            state.ready.append(name)
+    return state
+
+
+def refill_netstack_from_system(portable_dir: str,
+                                arch: str = "") -> List[str]:
+    """Долечить портатив пакетом, УЖЕ установленным на этом ПК.
+
+    Второй источник помимо установщика: если VPN-клиент на этой машине
+    работает, полный подписанный пакет лежит в DriverStore или в
+    ``Program Files\\TAP-Windows``. Существующие файлы не перезаписываются.
+    """
+    root = os.path.abspath(portable_dir)
+    manifest_path = os.path.join(root, NETSTACK_DIR_NAME, MANIFEST_NAME)
+    if not os.path.isfile(manifest_path):
+        return []
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    if not isinstance(manifest, dict):
+        return []
+    wanted = [entry for entry in manifest.get("drivers", [])
+              if isinstance(entry, dict) and entry.get("needs_install") == "1"]
+    if not wanted:
+        return []
+    packages = scan_system_driver_packages(arch=arch or system_platform_arch())
+    return _copy_into_manifest(root, wanted, packages)
+
+
+def _copy_into_manifest(root: str, wanted: Sequence[Dict[str, str]],
+                        packages: Sequence[NetDriverPackage]) -> List[str]:
+    """Долить недостающие файлы пакетов в каталоги из манифеста.
+
+    Общий хвост для источников «установщик» и «этот ПК»: совпадение ищется
+    по службе или типу пакета, уже лежащие файлы не трогаются.
+    """
+    added: List[str] = []
+    for entry in wanted:
+        service = str(entry.get("service", ""))
+        kind = str(entry.get("kind", ""))
+        inf_rel = str(entry.get("inf", ""))
+        if not inf_rel:
+            continue
+        target_dir = os.path.dirname(
+            os.path.join(root, inf_rel.replace("/", os.sep)))
+        match = next((p for p in packages
+                      if (service and p.check_service == service)
+                      or (kind and p.kind == kind)), None)
+        if match is None or not match.inf_path:
+            continue
+        base = os.path.dirname(match.inf_path)
+        for src in [match.inf_path] + list(match.file_paths):
+            if not os.path.isfile(src):
+                continue
+            rel = os.path.relpath(src, base)
+            if rel.startswith(os.pardir):
+                rel = os.path.basename(src)
+            dest = os.path.join(target_dir, rel)
+            if os.path.isfile(dest):
+                continue
+            try:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy2(src, dest)
+            except OSError:
+                continue
+            added.append(os.path.relpath(dest, root).replace(os.sep, "/"))
+    return added
+
+
 def refill_netstack_from_installer(portable_dir: str, installer_path: str,
                                   arch: str = "") -> List[str]:
     """Долечить УЖЕ собранный портатив драйвером из установщика.
@@ -1446,37 +1583,7 @@ def refill_netstack_from_installer(portable_dir: str, installer_path: str,
             installer_path, staging, arch=arch or system_platform_arch())
         if not report.packages:
             return []
-        for entry in wanted:
-            service = str(entry.get("service", ""))
-            kind = str(entry.get("kind", ""))
-            inf_rel = str(entry.get("inf", ""))
-            if not inf_rel:
-                continue
-            target_dir = os.path.dirname(
-                os.path.join(root, inf_rel.replace("/", os.sep)))
-            match = next(
-                (p for p in report.packages
-                 if (service and p.check_service == service)
-                 or (kind and p.kind == kind)), None)
-            if match is None:
-                continue
-            sources = [match.inf_path] + list(match.file_paths)
-            base = os.path.dirname(match.inf_path)
-            for src in sources:
-                if not os.path.isfile(src):
-                    continue
-                rel = os.path.relpath(src, base)
-                if rel.startswith(os.pardir):
-                    rel = os.path.basename(src)
-                dest = os.path.join(target_dir, rel)
-                if os.path.isfile(dest):
-                    continue
-                try:
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    shutil.copy2(src, dest)
-                except OSError:
-                    continue
-                added.append(os.path.relpath(dest, root).replace(os.sep, "/"))
+        added = _copy_into_manifest(root, wanted, report.packages)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return added

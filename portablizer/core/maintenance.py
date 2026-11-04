@@ -459,6 +459,103 @@ def refresh(folder: str, log: Optional[Logger] = None,
     return report
 
 
+def repair_netstack(folder: str, installer: str = "",
+                    log: Optional[Logger] = None) -> MaintenanceReport:
+    """Починить драйверы VPN у готового портатива — то же, что кнопка в окне.
+
+    Порядок источников недостающих ``.sys``/``.cat``:
+
+    1. указанный установщик (только читается, НЕ запускается);
+    2. этот компьютер — DriverStore/``Program Files\\TAP-Windows``, если
+       VPN-клиент здесь уже установлен и работает.
+
+    Затем манифест и скрипты ``NetStack/`` пересоздаются текущей версией.
+    Отчёт честно говорит, укомплектован пакет или нет: «обновлено» не
+    означает «драйвер есть».
+    """
+    from . import netstack as netstack_mod
+
+    log = log or Logger()
+    report = MaintenanceReport(folder=folder)
+    root = os.path.abspath(str(folder or ""))
+    if not os.path.isdir(root):
+        report.messages.append(f"Папка не найдена: {root}")
+        log.error(report.messages[-1])
+        return report
+    before = netstack_mod.inspect_netstack(root)
+    if not before.present:
+        report.messages.append(
+            "В этом портативе нет NetStack: программа не использует "
+            "сетевые драйверы VPN либо собрана без них. Чинить нечего.")
+        log.warn(report.messages[-1])
+        return report
+    if not before.has_installable:
+        report.messages.append(
+            "NetStack есть, но ставить драйверы портатив не должен "
+            "(адаптер создаёт само приложение) — починка не нужна.")
+        log.info(report.messages[-1])
+        return report
+    if before.complete:
+        log.info("Пакет драйвера уже укомплектован: "
+                 + ", ".join(before.ready))
+    else:
+        for line in before.missing:
+            log.warn(f"не хватает файлов — {line}")
+        added: List[str] = []
+        if installer:
+            if not os.path.isfile(installer):
+                report.messages.append(f"Установщик не найден: {installer}")
+                log.error(report.messages[-1])
+                return report
+            log.info("Ищу полный пакет драйвера внутри установщика "
+                     "(установщик не запускается)…")
+            try:
+                added = netstack_mod.refill_netstack_from_installer(
+                    root, installer)
+            except (OSError, ValueError) as exc:
+                log.warn(f"из установщика драйверы не извлечены: {exc}")
+            for rel in added:
+                log.ok(f"добавлен {rel}")
+        if not added:
+            log.info("Пробую взять пакет с этого компьютера "
+                     "(DriverStore, Program Files\\TAP-Windows)…")
+            try:
+                added = netstack_mod.refill_netstack_from_system(root)
+            except (OSError, ValueError) as exc:
+                log.warn(f"с этого ПК пакет взять не удалось: {exc}")
+            for rel in added:
+                log.ok(f"добавлен {rel}")
+        report.updated.extend(added)
+    try:
+        report.updated.extend(netstack_mod.refresh_netstack_scripts(root))
+    except (OSError, ValueError) as exc:
+        report.messages.append(f"NetStack: скрипты не обновлены ({exc}).")
+        log.error(report.messages[-1])
+        return report
+    after = netstack_mod.inspect_netstack(root)
+    report.success = after.complete
+    if after.complete:
+        message = (
+            "Драйверы VPN укомплектованы: " + ", ".join(after.ready) + ". "
+            "Скрипты NetStack обновлены. Запустите портатив на нужном "
+            "компьютере и подтвердите запрос прав администратора — адаптер "
+            "будет создан автоматически.")
+        log.ok(message)
+    else:
+        message = (
+            "Полный пакет драйвера получить не удалось. Не хватает: "
+            + "; ".join(after.missing) + ".\n\n"
+            "Укажите установщик той программы, из которой собран портатив "
+            "(кнопка «Починить драйверы VPN» → «Выбрать установщик…»), либо "
+            "выполните починку на компьютере, где этот VPN-клиент уже "
+            "установлен и работает: тогда пакет будет взят из системы. "
+            "Без полного подписанного пакета адаптер на чужом ПК не "
+            "поднимется.")
+        log.warn(message)
+    report.messages.append(message)
+    return report
+
+
 def repair_start_menu(log: Optional[Logger] = None) -> MaintenanceReport:
     """Лечит меню «Пуск» после сборки под администратором.
 

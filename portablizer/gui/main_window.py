@@ -546,7 +546,14 @@ class MainWindow(QMainWindow):
             "полной песочнице — он может менять Windows (реестр, службы, "
             "ярлыки); Portablizer эти изменения не откатывает. Для "
             "недоверенных установщиков используйте Sandbox/виртуальную "
-            "машину. Нужен свежий лончер — сначала «Обновить лончер».")
+            "машину. Нужен свежий лончер — сначала «Обновить лончер».\n"
+            "«Починить драйверы VPN» лечит портатив, у которого при запуске "
+            "появляется «Программе нужны системные сетевые компоненты, "
+            "которых нет на этом компьютере: tap0901». Кнопка показывает, "
+            "каких файлов не хватает, и добирает их из установщика программы "
+            "(он только читается, не запускается) или с этого компьютера, "
+            "если VPN-клиент здесь уже установлен. Пересобирать портатив не "
+            "нужно, данные PortableData не затрагиваются.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -583,10 +590,23 @@ class MainWindow(QMainWindow):
             "ярлыки пользователя не удаляются, explorer.exe не закрывается: "
             "оболочка перестраивает меню сама.")
         self.startmenu_btn.clicked.connect(self._repair_start_menu)
+        # Портатив, собранный до 1.45.0, уезжал с одним OemVista.inf: на
+        # чужом ПК лончер писал «нужны системные сетевые компоненты:
+        # tap0901». Раньше это лечилось только консольной командой.
+        self.netstack_btn = QPushButton("Починить драйверы VPN")
+        self.netstack_btn.setObjectName("Ghost")
+        self.netstack_btn.setToolTip(
+            "Добирает недостающие .sys/.cat драйвера TAP-Windows из "
+            "установщика программы (он НЕ запускается) или с этого "
+            "компьютера и пересоздаёт скрипты NetStack. Нужно, если при "
+            "запуске портатива появляется окно «Программе нужны системные "
+            "сетевые компоненты… tap0901».")
+        self.netstack_btn.clicked.connect(self._repair_netstack)
         buttons.addWidget(self.release_btn)
         buttons.addWidget(self.refresh_btn)
         buttons.addWidget(self.update_btn)
         buttons.addWidget(self.startmenu_btn)
+        buttons.addWidget(self.netstack_btn)
         buttons.addStretch(1)
         self.maintenance_status = QLabel("")
         self.maintenance_status.setObjectName("Hint")
@@ -602,12 +622,93 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setEnabled(False)
         self.update_btn.setEnabled(False)
         self.startmenu_btn.setEnabled(False)
+        self.netstack_btn.setEnabled(False)
         self.maintenance_status.setText("Починяю меню «Пуск»…")
         self.maintenance_worker = MaintenanceWorker("", "startmenu")
         self.maintenance_worker.log_line.connect(self._on_log)
         self.maintenance_worker.finished_report.connect(
             self._on_maintenance_done)
         self.maintenance_worker.start()
+
+    def _repair_netstack(self) -> None:
+        """Починка драйверов VPN у готового портатива — вместо консоли.
+
+        Окно сначала показывает, чего именно не хватает (по файлам на
+        диске, а не по флажку в манифесте), и только потом спрашивает
+        источник. Если пакет уже полный, лишнего вопроса не будет:
+        скрипты просто обновляются.
+        """
+        from ..core import netstack as netstack_mod
+
+        folder = self.maintenance_edit.text().strip()
+        if not folder and self.last_result:
+            folder = self.last_result.portable_dir
+            self.maintenance_edit.setText(folder)
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, "Portablizer",
+                                "Укажите существующую папку портатива.")
+            return
+        if self.maintenance_worker and self.maintenance_worker.isRunning():
+            return
+        try:
+            state = netstack_mod.inspect_netstack(folder)
+        except Exception as exc:  # noqa: BLE001 — окно не должно падать
+            QMessageBox.warning(self, "Portablizer",
+                                f"Не удалось прочитать NetStack: {exc}")
+            return
+        if not state.present:
+            QMessageBox.information(
+                self, "Portablizer",
+                "В этом портативе нет папки NetStack с драйверами: программа "
+                "не использует сетевые компоненты VPN либо портатив собран "
+                "без них. Чинить нечего.")
+            return
+        if not state.has_installable:
+            QMessageBox.information(
+                self, "Portablizer",
+                "NetStack есть, но устанавливать драйверы портатив не должен: "
+                "сетевой адаптер создаёт само приложение. Починка не нужна.")
+            return
+        installer = ""
+        if state.complete:
+            QMessageBox.information(
+                self, "Portablizer",
+                "Пакет драйвера уже укомплектован ("
+                + ", ".join(state.ready) + ").\n\nСкрипты NetStack будут "
+                "обновлены текущей версией — это лечит портативы, собранные "
+                "прежними версиями Portablizer.")
+        else:
+            box = QMessageBox(self)
+            box.setWindowTitle("Portablizer")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(
+                "Пакет драйвера VPN неполный. Не хватает:\n\n  "
+                + "\n  ".join(state.missing)
+                + "\n\nОткуда взять недостающие файлы?\n\n"
+                "• «Выбрать установщик…» — файл установщика той программы, "
+                "из которой собран портатив. Он только ЧИТАЕТСЯ, не "
+                "запускается, Windows не изменяется.\n"
+                "• «С этого компьютера» — взять пакет, уже установленный "
+                "здесь (подходит, если этот VPN-клиент на этом ПК "
+                "работает).\n\n"
+                "Существующие файлы не перезаписываются, данные PortableData "
+                "не затрагиваются.")
+            pick = box.addButton("Выбрать установщик…",
+                                 QMessageBox.ButtonRole.AcceptRole)
+            local = box.addButton("С этого компьютера",
+                                  QMessageBox.ButtonRole.YesRole)
+            box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is pick:
+                installer, _ = QFileDialog.getOpenFileName(
+                    self, "Установщик программы (источник драйвера)", folder,
+                    "Установщики (*.exe *.msi *.cab);;Все файлы (*.*)")
+                if not installer:
+                    return
+            elif clicked is not local:
+                return
+        self._maintenance("netstack", installer)
 
     def _browse_maintenance(self) -> None:
         start = self.maintenance_edit.text().strip() or (
@@ -659,9 +760,12 @@ class MainWindow(QMainWindow):
         self.release_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
         self.update_btn.setEnabled(False)
+        self.startmenu_btn.setEnabled(False)
+        self.netstack_btn.setEnabled(False)
         self.maintenance_status.setText(
             {"release": "Освобождаю папку…",
-             "update": "Обновляю программу…"}.get(action, "Обновляю…"))
+             "update": "Обновляю программу…",
+             "netstack": "Починяю драйверы VPN…"}.get(action, "Обновляю…"))
         lang_code = str(self.language_combo.currentData() or "")
         if action == "refresh":
             self.settings.setValue("install_language", lang_code)
@@ -677,6 +781,7 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.update_btn.setEnabled(True)
         self.startmenu_btn.setEnabled(True)
+        self.netstack_btn.setEnabled(True)
         text = "\n".join(report.messages) or "Готово."
         if report.success:
             self.maintenance_status.setText("✔ Готово")
@@ -1313,6 +1418,7 @@ class MainWindow(QMainWindow):
         self.release_btn.setEnabled(not running)
         self.refresh_btn.setEnabled(not running)
         self.startmenu_btn.setEnabled(not running)
+        self.netstack_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         for w in (self.installer_edit, self.output_edit, self.name_edit,
                   self.args_edit, self.env_edit, self.cb_redirect,
