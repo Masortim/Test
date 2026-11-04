@@ -254,6 +254,19 @@ class RepairNetStackGuiTests(_PortableFixture):
         self.assertTrue(self.window.netstack_btn.isVisibleTo(
             self.window.netstack_btn.parentWidget()))
 
+    def test_start_menu_button_is_gone(self):
+        """Кнопку «Починить меню «Пуск»» убрали из окна по просьбе.
+
+        Сама починка осталась в CLI (repair-start-menu) и в лончере, но в
+        карточке обслуживания её больше нет — ни кнопки, ни обработчика.
+        """
+        from PySide6.QtWidgets import QPushButton
+
+        self.assertFalse(hasattr(self.window, "startmenu_btn"))
+        self.assertFalse(hasattr(self.window, "_repair_start_menu"))
+        titles = [b.text() for b in self.window.findChildren(QPushButton)]
+        self.assertFalse([t for t in titles if "меню «Пуск»" in t], titles)
+
     def test_dialog_names_the_missing_files_and_both_sources(self):
         seen, run = self._dialog()
         self.assertIn("tap0901.sys", seen["text"])
@@ -325,7 +338,7 @@ class RepairNetStackGuiTests(_PortableFixture):
             worker.isRunning.return_value = False
             self.window._maintenance("netstack", "")
         self.assertFalse(self.window.netstack_btn.isEnabled())
-        self.assertFalse(self.window.startmenu_btn.isEnabled())
+        self.assertFalse(self.window.refresh_btn.isEnabled())
         self.assertFalse(self.window.release_btn.isEnabled())
 
     def test_buttons_come_back_after_the_report(self):
