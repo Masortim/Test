@@ -139,6 +139,23 @@ def _prune_to_package_files(package: "netstack.NetDriverPackage"
         if rel in wanted or name in wanted or is_tool:
             kept.append(path)
     package.file_paths = kept
+    return _attach_local_tool(package)
+
+
+def _attach_local_tool(package: "netstack.NetDriverPackage"
+                       ) -> "netstack.NetDriverPackage":
+    """Назвать вендорскую утилиту установки, лежащую рядом с INF.
+
+    Скопировать ``tapinstall.exe`` недостаточно: без ``tool_path``
+    ``provision_netstack`` оставлял ``entry["tool"]`` пустым, и Setup шёл
+    запасным путём через SetupAPI вместо штатного tapinstall (сборка
+    devcon), который создаёт devnode и ставит драйвер одной операцией.
+    """
+    for path in package.file_paths:
+        name = os.path.basename(path).lower()
+        if name.startswith(("tapinstall", "devcon")) and name.endswith(".exe"):
+            package.tool_path = path
+            break
     return package
 
 
@@ -352,7 +369,7 @@ def harvest_into(installer_path: str, destination: str,
                 os.path.join(target, os.path.basename(package.inf_path)),
                 package.origin)
             if rebased is not None:
-                moved.append(rebased)
+                moved.append(_attach_local_tool(rebased))
         report.packages = moved
         return report
     finally:

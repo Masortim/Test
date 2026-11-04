@@ -728,13 +728,29 @@ def _package_from_directory(inf_path: str, origin: str,
         required_files=list(meta.required_files))
 
 
+#: Как вендоры называют каталоги разрядности внутри установщика. TAP-Windows
+#: раскладывает драйвер в ``amd64/`` и ``i386/``, другие — в ``x64/``/``x86/``.
+#: Прежде ``_arch_of`` узнавал только стиль DriverStore (``..._amd64_...``),
+#: поэтому для вендорских каталогов возвращал пуст строку: пакет x86 мог
+#: уехать на 64-битную Windows, где драйвер ядра не загружается вовсе.
+_ARCH_ALIASES = {
+    "amd64": "amd64", "x64": "amd64", "win64": "amd64", "64bit": "amd64",
+    "x86": "x86", "i386": "x86", "win32": "x86", "32bit": "x86",
+    "arm64": "arm64", "aarch64": "arm64",
+}
+
+
 def _arch_of(path: str) -> str:
-    """Разрядность пакета по имени каталога DriverStore."""
-    lowered = os.path.basename(path).lower()
+    """Разрядность пакета по имени каталога (DriverStore или вендорского)."""
+    lowered = os.path.basename(str(path)).lower()
+    if lowered in _ARCH_ALIASES:
+        return _ARCH_ALIASES[lowered]
     for arch in ("arm64", "amd64", "x86"):
         if f"_{arch}_" in lowered or lowered.endswith("_" + arch):
             return arch
-    return ""
+    # Каталог с файлом внутри: ``amd64/OemVista.inf`` -> amd64.
+    parent = os.path.basename(os.path.dirname(str(path))).lower()
+    return _ARCH_ALIASES.get(parent, "")
 
 
 def scan_driverstore_packages(store_dir: str = "", arch: str = "",
@@ -1505,15 +1521,44 @@ def refill_netstack_from_system(portable_dir: str,
     if not wanted:
         return []
     packages = scan_system_driver_packages(arch=arch or system_platform_arch())
-    return _copy_into_manifest(root, wanted, packages)
+    added = _copy_into_manifest(root, wanted, packages)
+    if added:
+        _write_manifest(root, manifest)
+    return added
+
+
+def _manifest_package(entry: Dict[str, str], root: str) -> NetDriverPackage:
+    """Пакет из строки манифеста — чтобы проверить его полноту на диске."""
+    inf_rel = str(entry.get("inf", ""))
+    return NetDriverPackage(
+        kind=str(entry.get("kind", KIND_TAP_WINDOWS)),
+        service=str(entry.get("service", "")),
+        device_id=str(entry.get("device_id", "")),
+        inf_path=os.path.join(root, inf_rel.replace("/", os.sep)),
+        required_files=[part for part in
+                        str(entry.get("required_files", "")).split(";") if part])
 
 
 def _copy_into_manifest(root: str, wanted: Sequence[Dict[str, str]],
                         packages: Sequence[NetDriverPackage]) -> List[str]:
-    """Долить недостающие файлы пакетов в каталоги из манифеста.
+    """Заменить НЕПОЛНЫЙ пакет целиком комплектом из одного источника.
 
-    Общий хвост для источников «установщик» и «этот ПК»: совпадение ищется
-    по службе или типу пакета, уже лежащие файлы не трогаются.
+    Здесь была главная причина «Ошибка установки драйвера адаптера»:
+    прежняя версия доливала только отсутствующие ``.sys``/``.cat`` и
+    никогда не трогала уже лежащий ``.inf``. В итоге рядом оказывались
+    ``.inf`` от одной версии TAP и ``.cat``/``.sys`` от другой — каталог
+    подписи не сходился с INF, и Windows отказывала в установке (тот же
+    отказ видел и сам вендорский клиент).
+
+    Поэтому правило теперь такое:
+
+    * пакет уже полный — не трогаем вовсе (вендорский набор может быть
+      новее, ломать рабочий комплект нельзя);
+    * пакет неполный — перезаписываем ВЕСЬ комплект из одного источника,
+      включая INF, и убираем прежний INF, если у нового другое имя.
+
+    Заодно возвращается ``tapinstall.exe``/``devcon.exe``: с ним адаптер
+    создаёт штатная вендорская утилита, а не запасной путь через SetupAPI.
     """
     added: List[str] = []
     for entry in wanted:
@@ -1522,14 +1567,22 @@ def _copy_into_manifest(root: str, wanted: Sequence[Dict[str, str]],
         inf_rel = str(entry.get("inf", ""))
         if not inf_rel:
             continue
-        target_dir = os.path.dirname(
-            os.path.join(root, inf_rel.replace("/", os.sep)))
+        current = _manifest_package(entry, root)
+        if not package_missing_files(current):
+            # Рабочий комплект не перезаписываем никогда.
+            continue
         match = next((p for p in packages
                       if (service and p.check_service == service)
                       or (kind and p.kind == kind)), None)
         if match is None or not match.inf_path:
             continue
+        if package_missing_files(match):
+            # Нечем лечить: неполный источник только заменил бы один
+            # неполный комплект другим.
+            continue
+        target_dir = os.path.dirname(current.inf_path)
         base = os.path.dirname(match.inf_path)
+        copied: List[str] = []
         for src in [match.inf_path] + list(match.file_paths):
             if not os.path.isfile(src):
                 continue
@@ -1537,15 +1590,40 @@ def _copy_into_manifest(root: str, wanted: Sequence[Dict[str, str]],
             if rel.startswith(os.pardir):
                 rel = os.path.basename(src)
             dest = os.path.join(target_dir, rel)
-            if os.path.isfile(dest):
-                continue
             try:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 shutil.copy2(src, dest)
             except OSError:
                 continue
+            copied.append(dest)
             added.append(os.path.relpath(dest, root).replace(os.sep, "/"))
+        if not copied:
+            continue
+        new_inf = os.path.join(target_dir, os.path.basename(match.inf_path))
+        if os.path.normcase(new_inf) != os.path.normcase(current.inf_path):
+            # Иначе в каталоге остались бы ДВА .inf, и pnputil мог выбрать
+            # прежний — тот самый, чья подпись не сходится.
+            if os.path.isfile(new_inf):
+                try:
+                    os.remove(current.inf_path)
+                except OSError:
+                    pass
+                entry["inf"] = os.path.relpath(new_inf, root).replace(os.sep, "/")
+        # вендорская утилита установки надёжнее запасного SetupAPI-пути
+        for path in copied:
+            name = os.path.basename(path).lower()
+            if name.startswith(("tapinstall", "devcon")) and name.endswith(".exe"):
+                entry["tool"] = os.path.relpath(path, root).replace(os.sep, "/")
+                break
     return added
+
+
+def _write_manifest(root: str, manifest: Dict[str, object]) -> None:
+    """Сохраняет манифест после замены комплекта (имя INF/утилита могли смениться)."""
+    path = os.path.join(root, NETSTACK_DIR_NAME, MANIFEST_NAME)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
 
 
 def refill_netstack_from_installer(portable_dir: str, installer_path: str,
@@ -1584,6 +1662,8 @@ def refill_netstack_from_installer(portable_dir: str, installer_path: str,
         if not report.packages:
             return []
         added = _copy_into_manifest(root, wanted, report.packages)
+        if added:
+            _write_manifest(root, manifest)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return added
@@ -2147,6 +2227,19 @@ function Get-DriverPackageMissing($d) {
      }
      return $missing
 }
+function Get-InstallErrorNote([int]$code) {
+     # Код Windows сам по себе не объясняет отказ. Эти четыре причины
+     # встречаются у TAP чаще всего, и лечатся они по-разному.
+     switch ($code) {
+          13   { return 'WIN32 13 (ERROR_INVALID_DATA): INF повреждён или не подходит этой разрядности Windows.' }
+          2    { return 'WIN32 2 (FILE_NOT_FOUND): рядом с INF нет файла, который он обещает (.sys/.cat).' }
+          5    { return 'WIN32 5 (ACCESS_DENIED): не хватило прав — установка должна идти с повышением.' }
+          577  { return 'WIN32 577 (INVALID_IMAGE_HASH): подпись каталога не совпадает с файлами. Комплект .inf/.sys/.cat должен быть из ОДНОГО пакета; пересоберите портатив или выполните починку драйверов.' }
+          1275 { return 'WIN32 1275 (DRIVER_BLOCKED): политика Windows блокирует этот драйвер (обычно старая подпись или Secure Boot).' }
+          3010 { return 'WIN32 3010 (REBOOT_REQUIRED): нужна перезагрузка, чтобы закончить установку.' }
+          default { return ('WIN32 ' + $code + ': отказ установки драйвера. Полный вывод pnputil — выше в этом журнале.') }
+     }
+}
 function Install-RootDevice([string]$infPath, [string]$hwid, [string]$toolPath,
      [string]$hardwareId = '') {
      if (Test-AdapterReady $hwid) { return $true }
@@ -2271,6 +2364,7 @@ namespace PortablizerNetStack {
                $err = [PortablizerNetStack.RootDevice]::LastError
                Write-SetupLog ('SetupAPI install ' + $installHwid + ': ok=' + $ok +
                     ' win32=' + $err)
+               if (-not $ok) { Write-SetupLog (Get-InstallErrorNote $err) }
                if ($ok -and [PortablizerNetStack.RootDevice]::RebootRequired) {
                     Write-SetupLog 'SetupAPI: a reboot is required to finish the driver install'
                }

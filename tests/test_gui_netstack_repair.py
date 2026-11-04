@@ -153,8 +153,10 @@ class RepairNetStackCoreTests(_PortableFixture):
         self.assertIn("NetStack/Setup.cmd", report.updated)
         self.assertIn("Драйверы VPN укомплектованы", report.messages[-1])
 
-    def test_existing_files_are_not_overwritten(self):
+    def test_complete_vendor_package_is_not_overwritten(self):
+        """Полный рабочий комплект не трогаем; неполный заменяем целиком."""
         (self.driver / "tap0901.sys").write_bytes(b"VENDOR-NEWER")
+        (self.driver / "tap0901.cat").write_bytes(b"VENDOR-CAT")
         first, second = self._fake_extraction()
         with first, second:
             maintenance.repair_netstack(str(self.root), str(self.installer))
