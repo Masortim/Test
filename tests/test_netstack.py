@@ -1436,5 +1436,125 @@ class PowerShellSyntaxGuardTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class NetStackWarningDiagnosisTests(unittest.TestCase):
+    """Окно «нужны системные сетевые компоненты» обязано называть ПРИЧИНУ.
+
+    Прежде в нём было только имя службы («tap0901») и совет запустить
+    Setup.cmd вручную. При неполном пакете этот совет бесполезен: файлов
+    нет, ставить нечего. Четыре причины лечатся по-разному, поэтому текст
+    проверяется для каждой.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.driver = self.root / "NetStack" / "Drivers" / "tap-windows"
+        self.driver.mkdir(parents=True)
+        (self.driver / "OemVista.inf").write_text("[Version]", encoding="utf-8")
+        self.cfg = {
+            "data_dir_name": "PortableData",
+            "netstack": {"manifest": "NetStack/netstack.json"},
+        }
+        self.state = self.root / "PortableData" / "NetStack"
+
+    def _files(self, present=True):
+        for name, blob in (("tap0901.sys", b"MZ"), ("tap0901.cat", b"cat")):
+            path = self.driver / name
+            if present:
+                path.write_bytes(blob)
+            elif path.exists():
+                path.unlink()
+
+    def _manifest(self, complete="1", missing=""):
+        (self.root / "NetStack" / "netstack.json").write_text(json.dumps({
+            "drivers": [{
+                "kind": "tap-windows", "service": "tap0901",
+                "device_id": "tap0901", "needs_install": "1",
+                "inf": "NetStack/Drivers/tap-windows/OemVista.inf",
+                "required_files": "tap0901.sys;tap0901.cat",
+                "complete": complete, "missing_files": missing,
+            }],
+        }), encoding="utf-8")
+
+    def test_incomplete_manifest_names_the_missing_files(self):
+        self._files(present=False)
+        self._manifest("0", "tap0901.sys; tap0901.cat")
+        text = exe_launcher._netstack_diagnose(
+            self.root, self.cfg, ["tap0901"], 2)
+        self.assertIn("НЕПОЛНЫЙ", text)
+        self.assertIn("tap0901.sys", text)
+        self.assertIn("repair-netstack", text)
+        # Главный смысл: не отправлять человека заведомо в бесполезный Setup.
+        self.assertIn("не поможет", text)
+
+    def test_stale_manifest_is_caught_by_looking_at_the_disk(self):
+        """Манифест говорит «complete», а файлов нет — верим диску."""
+        self._files(present=False)
+        self._manifest("1")
+        text = exe_launcher._netstack_diagnose(
+            self.root, self.cfg, ["tap0901"], 2)
+        self.assertIn("НЕПОЛНЫЙ", text)
+        self.assertIn("tap0901.cat", text)
+
+    def test_complete_package_with_declined_uac_blames_the_prompt(self):
+        self._files()
+        self._manifest("1")
+        text = exe_launcher._netstack_diagnose(
+            self.root, self.cfg, ["tap0901"], 1223)
+        self.assertIn("UAC", text)
+        self.assertNotIn("НЕПОЛНЫЙ", text)
+
+    def test_old_powershell_is_reported_as_such(self):
+        self._files()
+        self._manifest("1")
+        text = exe_launcher._netstack_diagnose(
+            self.root, self.cfg, ["tap0901"], 5)
+        self.assertIn("PowerShell", text)
+
+    def test_adapter_failure_shows_status_and_setup_log(self):
+        self._files()
+        self._manifest("1")
+        self.state.mkdir(parents=True)
+        (self.state / "status.txt").write_text(
+            "healthy: False\ndriver tap0901: present\n"
+            "adapter tap0901: missing\n", encoding="utf-8")
+        (self.state / "setup.log").write_text(
+            "tapinstall exit: 1\n", encoding="utf-8")
+        text = exe_launcher._netstack_diagnose(
+            self.root, self.cfg, ["адаптер tap0901"], 3)
+        self.assertIn("адаптер создать", text)
+        self.assertIn("adapter tap0901: missing", text)
+        self.assertIn("tapinstall exit: 1", text)
+
+    def test_missing_manifest_does_not_raise(self):
+        self._files()
+        text = exe_launcher._netstack_diagnose(
+            self.root, self.cfg, ["tap0901"], None)
+        self.assertTrue(text.strip())
+
+    def test_warning_window_uses_the_diagnosis(self):
+        self._files(present=False)
+        self._manifest("0", "tap0901.sys")
+        script = self.root / "NetStack" / "Setup.cmd"
+        script.write_text("@echo off\r\nexit /b 2\r\n", encoding="utf-8")
+        cfg = dict(self.cfg)
+        cfg["netstack"] = dict(self.cfg["netstack"],
+                               setup="NetStack/Setup.cmd",
+                               driver_services=["tap0901"])
+        with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                mock.patch.object(exe_launcher, "_service_key_present",
+                                  return_value=False), \
+                mock.patch.object(exe_launcher, "_run_hidden", return_value=2), \
+                mock.patch.object(exe_launcher, "_run_netstack_script",
+                                  return_value=2), \
+                mock.patch.object(exe_launcher, "_show_warning") as warn:
+            exe_launcher.ensure_netstack(self.root, cfg)
+        self.assertTrue(warn.called, "предупреждение не показано")
+        message = warn.call_args[0][0]
+        self.assertIn("НЕПОЛНЫЙ", message)
+        self.assertIn("tap0901.sys", message)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

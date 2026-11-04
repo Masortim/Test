@@ -1411,6 +1411,77 @@ def provision_netstack(portable_dir: str, app_dir: str,
 # идемпотентны: второй запуск не переустанавливает то, что уже стоит, а
 # --check позволяет лончеру решить, нужен ли UAC вообще, не показывая его зря.
 
+def refill_netstack_from_installer(portable_dir: str, installer_path: str,
+                                  arch: str = "") -> List[str]:
+    """Долечить УЖЕ собранный портатив драйвером из установщика.
+
+    Зачем: портатив, собранный до 1.45.0, уехал с одним ``OemVista.inf``, и
+    на целевом ПК лончер пишет «нужны системные сетевые компоненты:
+    tap0901». Пересобирать всё заново не обязательно — недостающие
+    ``.sys``/``.cat`` можно взять из того же установщика и доложить рядом с
+    INF. Ничего не устанавливается: контейнер только читается.
+
+    Возвращает список добавленных файлов (относительно корня портатива).
+    Существующие файлы не перезаписываются: вендорский набор из App/системы
+    может быть новее того, что лежит в установщике.
+    """
+    from . import driverpayload
+
+    root = os.path.abspath(portable_dir)
+    manifest_path = os.path.join(root, NETSTACK_DIR_NAME, MANIFEST_NAME)
+    if not os.path.isfile(manifest_path):
+        return []
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    if not isinstance(manifest, dict):
+        return []
+    wanted = [entry for entry in manifest.get("drivers", [])
+              if isinstance(entry, dict) and entry.get("needs_install") == "1"]
+    if not wanted:
+        return []
+    staging = os.path.join(root, NETSTACK_DIR_NAME, ".refill")
+    added: List[str] = []
+    try:
+        report = driverpayload.harvest_into(
+            installer_path, staging, arch=arch or system_platform_arch())
+        if not report.packages:
+            return []
+        for entry in wanted:
+            service = str(entry.get("service", ""))
+            kind = str(entry.get("kind", ""))
+            inf_rel = str(entry.get("inf", ""))
+            if not inf_rel:
+                continue
+            target_dir = os.path.dirname(
+                os.path.join(root, inf_rel.replace("/", os.sep)))
+            match = next(
+                (p for p in report.packages
+                 if (service and p.check_service == service)
+                 or (kind and p.kind == kind)), None)
+            if match is None:
+                continue
+            sources = [match.inf_path] + list(match.file_paths)
+            base = os.path.dirname(match.inf_path)
+            for src in sources:
+                if not os.path.isfile(src):
+                    continue
+                rel = os.path.relpath(src, base)
+                if rel.startswith(os.pardir):
+                    rel = os.path.basename(src)
+                dest = os.path.join(target_dir, rel)
+                if os.path.isfile(dest):
+                    continue
+                try:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    shutil.copy2(src, dest)
+                except OSError:
+                    continue
+                added.append(os.path.relpath(dest, root).replace(os.sep, "/"))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return added
+
+
 def refresh_netstack_scripts(portable_dir: str) -> List[str]:
     """Пересоздать NetStack/*.cmd/.ps1 из уже лежащего netstack.json.
 
