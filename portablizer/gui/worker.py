@@ -95,7 +95,7 @@ class MaintenanceWorker(QThread):
                  language: str = "") -> None:
         super().__init__()
         self.folder = folder
-        #: "release" | "refresh" | "update" | "startmenu"
+        #: "release" | "refresh" | "update" | "startmenu" | "netstack"
         self.action = action
         self.installer = installer           # для "update": файл или ссылка
         self.language = language             # для "refresh": код языка ("ru" и т.п.)
@@ -116,6 +116,11 @@ class MaintenanceWorker(QThread):
                 self.folder, self.installer, self.logger)
         elif self.action == "startmenu":
             report = maintenance.repair_start_menu(self.logger)
+        elif self.action == "netstack":
+            # Распаковка установщика ради драйвера может занять секунды —
+            # окно в это время обязано оставаться живым.
+            report = maintenance.repair_netstack(
+                self.folder, self.installer, self.logger)
         else:
             report = maintenance.release(self.folder, self.logger)
         self.finished_report.emit(report)
