@@ -48,7 +48,7 @@ import os
 import re
 import shutil
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -140,6 +140,8 @@ _STRINGS_SECTIONS = frozenset({
 _MAX_INF_BYTES = 400_000
 _MAX_PACKAGES = 8
 _MAX_SIBLINGS = 80
+#: Потолок рекурсивного сбора файлов выделенного каталога драйвера.
+_MAX_PACKAGE_FILES = 400
 #: Потолки для поиска по самому ПК сборщика: DriverStore бывает большим
 #: (тысячи каталогов), но перебирать его целиком незачем — TAP-Windows лежит
 #: в каталоге, имя которого начинается с ``tap0901.inf_``/``oemvista.inf_``.
@@ -161,6 +163,10 @@ class InfMeta:
     #: Class из [Version]; сетевые пакеты — ``Net``.
     class_name: str = ""
     catalog: str = ""
+    #: Полный Hardware ID для создания устройства (``root\\tap0901``).
+    hardware_id: str = ""
+    #: Файлы, обязательные для публикации пакета (каталог + SourceDisksFiles).
+    required_files: List[str] = field(default_factory=list)
 
     @property
     def usable(self) -> bool:
@@ -173,7 +179,136 @@ class InfMeta:
         return self.kind in (KIND_TAP_WINDOWS, KIND_OVPN_DCO)
 
 
-def parse_net_inf(text: str) -> InfMeta:
+def read_inf_text(path: str) -> str:
+    """Читает .inf в типичных кодировках Windows (ANSI/UTF-8/UTF-16 BOM).
+
+    OemVista.inf из старых пакетов TAP-Windows нередко лежит в UTF-16LE.
+    Прежнее чтение как UTF-8 с errors="ignore" превращало его в мусор с
+    нулевыми байтами, пакет не распознавался или терял CatalogFile/SourceDisksFiles.
+    """
+    with open(path, "rb") as fh:
+        raw = fh.read(_MAX_INF_BYTES + 1)
+    if len(raw) > _MAX_INF_BYTES:
+        raise OSError("INF file is too large")
+    for bom, encoding in ((b"\xff\xfe", "utf-16-le"),
+                          (b"\xfe\xff", "utf-16-be"),
+                          (b"\xef\xbb\xbf", "utf-8-sig")):
+        if raw.startswith(bom):
+            return raw[len(bom):].decode(encoding, errors="replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1251", errors="replace")
+
+
+def _inf_assignments(text: str) -> Dict[str, List[Tuple[str, str]]]:
+    """Секции .inf -> список пар (ключ, значение) без комментариев."""
+    sections: Dict[str, List[Tuple[str, str]]] = {}
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith((";", "#")):
+            continue
+        matched = _INF_SECTION_RE.match(line)
+        if matched:
+            section = matched.group(1).strip().lower()
+            sections.setdefault(section, [])
+            continue
+        assign = _INF_ASSIGN_RE.match(line)
+        if assign and section:
+            sections[section].append((assign.group(1).strip(),
+                                      assign.group(2).strip()))
+    return sections
+
+
+def _resolve_inf_strings(value: str, strings: Dict[str, str]) -> str:
+    for _ in range(4):
+        before = value
+        for token, replacement in strings.items():
+            value = re.sub(re.escape(f"%{token}%"), lambda _m: replacement,
+                           value, flags=re.IGNORECASE)
+        if value == before:
+            break
+    return value.strip().strip('"').strip()
+
+
+#: Токены разрядности в_decorated_ секциях INF (``SourceDisksFiles.amd64``).
+_INF_ARCH_TOKENS = ("amd64", "x86", "arm64", "ia64", "ntamd64", "ntx86",
+                    "ntarm64", "nt")
+
+
+def _inf_section_arch(section: str) -> str:
+    """Разрядность decorated-секции INF ("" — секция общая для всех).
+
+    ``sourcedisksfiles.amd64`` -> ``amd64``; ``catalogfile.ntamd64`` -> ``amd64``.
+    Без этого фильтр требовал бы файлы чужих архитектур и валидный
+    одноархитектурный пакет из DriverStore казался неполным.
+    """
+    if "." not in section:
+        return ""
+    decoration = section.split(".", 1)[1].strip().lower()
+    for token in _INF_ARCH_TOKENS:
+        if decoration == token or decoration.startswith(token + "."):
+            return {"ntamd64": "amd64", "ntx86": "x86",
+                    "ntarm64": "arm64", "nt": ""}.get(token, token)
+    return ""
+
+
+def _inf_section_applies(section: str, arch: str) -> bool:
+    """Применима ли секция к выбранной разрядности (пустая — ко всем)."""
+    section_arch = _inf_section_arch(section)
+    if not section_arch or not arch:
+        return True
+    return section_arch == arch
+
+
+def inf_required_files(text: str, arch: str = "") -> List[str]:
+    """Файлы, без которых Windows не примет пакет: каталог и SourceDisksFiles.
+
+    Это не полный парсер INF, а точная проверка тех полей, из-за которых
+    ``pnputil /add-driver`` отвечает «Не удается найти указанный файл» при
+    живом ``OemVista.inf``: отсутствует ``tap0901.sys`` или подписанный
+    ``.cat``, либо они лежат не там, где обещает INF.
+    """
+    sections = _inf_assignments(text)
+    strings: Dict[str, str] = {}
+    for name, pairs in sections.items():
+        if name == "strings" or name.startswith("strings."):
+            for key, value in pairs:
+                strings.setdefault(key, value.strip('"').strip())
+    required: List[str] = []
+    for key, value in sections.get("version", []):
+        if key.lower().startswith("catalogfile"):
+            if not _inf_section_applies(key.lower(), arch):
+                continue
+            resolved = _resolve_inf_strings(value, strings)
+            if resolved:
+                required.append(resolved.replace("\\", "/"))
+    disk_subdirs: Dict[str, str] = {}
+    for name, pairs in sections.items():
+        if name == "sourcedisksnames" or name.startswith("sourcedisksnames."):
+            if not _inf_section_applies(name, arch):
+                continue
+            for disk_id, value in pairs:
+                parts = [p.strip().strip('"') for p in value.split(",")]
+                # diskid = description[,tagfile][,unused][,subdir]
+                subdir = parts[3] if len(parts) > 3 else ""
+                disk_subdirs[disk_id] = _resolve_inf_strings(subdir, strings)
+    for name, pairs in sections.items():
+        if name == "sourcedisksfiles" or name.startswith("sourcedisksfiles."):
+            if not _inf_section_applies(name, arch):
+                continue
+            for filename, value in pairs:
+                parts = [p.strip().strip('"') for p in value.split(",")]
+                disk_id = parts[0] if parts else ""
+                subdir = parts[1] if len(parts) > 1 else ""
+                base = disk_subdirs.get(disk_id, "")
+                rel = "/".join(p for p in (base, subdir, filename) if p)
+                required.append(rel.replace("\\", "/"))
+    return _unique(required)
+
+
+def parse_net_inf(text: str, arch: str = "") -> InfMeta:
     """Минимальный разбор ``.inf``: [Version] + раскрытие %строк%.
 
     Полноценный парсер INF не нужен: важны пять полей и наличие характерных
@@ -225,9 +360,12 @@ def parse_net_inf(text: str) -> InfMeta:
             device_id = "tap0901"
     elif kind == KIND_OVPN_DCO:
         device_id = "ovpn-dco"
+    hardware_id = f"root\\{device_id}" if device_id else ""
     return InfMeta(kind=kind, provider=resolved, service=service,
                    device_id=device_id, class_name=class_name,
-                   catalog=version.get("catalogfile", ""))
+                   catalog=version.get("catalogfile", ""),
+                   hardware_id=hardware_id,
+                   required_files=inf_required_files(text, arch))
 
 
 # --- сканирование установленной программы ---------------------------------------
@@ -271,6 +409,10 @@ class NetDriverPackage:
     tool_path: str = ""
     #: Откуда пакет: ``app``, ``driverstore``, ``program-files``.
     origin: str = "app"
+    #: Полный Hardware ID корневого устройства (``root\\tap0901``).
+    hardware_id: str = ""
+    #: Обязательные файлы пакета относительно каталога INF.
+    required_files: List[str] = field(default_factory=list)
 
     @property
     def needs_install(self) -> bool:
@@ -293,6 +435,120 @@ def _rel(path: str, base: str) -> str:
         return os.path.relpath(path, base).replace(os.sep, "/")
     except ValueError:
         return path.replace("\\", "/")
+
+
+def _safe_rel(path: str, base: str) -> str:
+    """Относительный путь внутри каталога пакета (без выхода наружу)."""
+    rel = _rel(path, base)
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    if not parts or parts[0] == ".." or os.path.isabs(rel):
+        return ""
+    return "/".join(parts)
+
+
+def _collect_app_package_files(inf_path: str, app_dir: str,
+                               meta: InfMeta) -> List[str]:
+    """Соседи INF в App плюс обязательные файлы из подкаталогов.
+
+    INF может обещать ``amd64/tap0901.sys``: плоское копирование соседей
+    теряло такой файл, и pnputil на чистом ПК отвечал «не найден файл».
+    """
+    directory = os.path.dirname(inf_path)
+    found: List[str] = []
+    try:
+        siblings = sorted(os.listdir(directory))[:_MAX_SIBLINGS]
+    except OSError:
+        siblings = []
+    for sibling in siblings:
+        candidate = os.path.join(directory, sibling)
+        if os.path.isfile(candidate) and candidate != inf_path:
+            rel = _safe_rel(candidate, app_dir)
+            if rel:
+                found.append(rel)
+    # Обязательные файлы ищем и глубже одного уровня (amd64/, i386/, ...).
+    for required in meta.required_files:
+        direct = os.path.join(directory, required.replace("/", os.sep))
+        if os.path.isfile(direct):
+            rel = _safe_rel(direct, app_dir)
+            if rel and rel not in found:
+                found.append(rel)
+            continue
+        basename = os.path.basename(required).lower()
+        for current, _dirs, files in os.walk(directory):
+            for name in files:
+                if name.lower() != basename:
+                    continue
+                candidate = os.path.join(current, name)
+                rel = _safe_rel(candidate, app_dir)
+                if rel and rel not in found:
+                    found.append(rel)
+    return found
+
+
+def _collect_system_package_files(inf_path: str) -> List[str]:
+    """Все файлы выделенного каталога драйвера, с сохранением подкаталогов."""
+    directory = os.path.dirname(inf_path)
+    found: List[str] = []
+    for current, dirs, files in os.walk(directory):
+        dirs.sort()
+        for name in sorted(files):
+            candidate = os.path.join(current, name)
+            if candidate == inf_path or not os.path.isfile(candidate):
+                continue
+            found.append(candidate)
+            if len(found) >= _MAX_PACKAGE_FILES:
+                return found
+    return found
+
+
+def package_missing_files(package: NetDriverPackage,
+                          base_dir: str = "") -> List[str]:
+    """Чего не хватает пакету: точные имена из INF, а не «какой-нибудь .sys».
+
+    ``base_dir`` — корень, относительно которого задан ``inf_rel`` пакета
+    из App. Для системного пакета путь к INF абсолютный, base_dir не нужен.
+    """
+    if not package.needs_install:
+        return []
+    if package.inf_path:
+        inf_path = package.inf_path
+        directory = os.path.dirname(inf_path)
+    else:
+        inf_path = os.path.join(base_dir, package.inf_rel.replace("/", os.sep))
+        directory = os.path.dirname(inf_path)
+    missing: List[str] = []
+    if not os.path.isfile(inf_path):
+        missing.append(os.path.basename(inf_path) or package.inf_rel)
+    required = list(package.required_files)
+    if not required:
+        # Старый манифест/пакет без разбора SourceDisksFiles: требуем хотя
+        # бы служебный .sys и подписанный .cat рядом с INF.
+        service = package.check_service or "driver"
+        required = [f"{service}.sys"]
+    available: List[str] = []
+    for rel in required:
+        candidate = os.path.join(directory, rel.replace("/", os.sep))
+        if os.path.isfile(candidate):
+            available.append(rel)
+        else:
+            missing.append(rel)
+    names = [os.path.basename(p).lower() for p in available]
+    if not any(n.endswith(".sys") for n in names):
+        # CatalogFile мог быть единственным обязательным файлом в INF.
+        service = package.check_service or "driver"
+        if not any(os.path.isfile(os.path.join(directory, n))
+                   for n in (f"{service}.sys",)):
+            missing.append(f"{service}.sys")
+    if not any(n.endswith(".cat") for n in names):
+        catalog = ""
+        try:
+            meta = parse_net_inf(read_inf_text(inf_path),
+                                 _arch_of(directory) or system_platform_arch())
+            catalog = meta.catalog
+        except OSError:
+            pass
+        missing.append(catalog or f"{package.check_service or 'driver'}.cat")
+    return _unique(missing)
 
 
 def scan_net_driver_packages(app_dir: str, max_files: int = 20_000
@@ -336,28 +592,19 @@ def scan_net_driver_packages(app_dir: str, max_files: int = 20_000
                 continue
             seen_inf.add(full)
             try:
-                if os.path.getsize(full) > _MAX_INF_BYTES:
-                    continue
-                with open(full, "r", encoding="utf-8", errors="ignore") as fh:
-                    text = fh.read()
+                text = read_inf_text(full)
             except OSError:
                 continue
-            meta = parse_net_inf(text)
+            meta = parse_net_inf(text, system_platform_arch())
             if not meta.usable:
                 continue
-            try:
-                siblings = sorted(os.listdir(current))[:_MAX_SIBLINGS]
-            except OSError:
-                siblings = []
-            files_rel = []
-            for sibling in siblings:
-                candidate = os.path.join(current, sibling)
-                if os.path.isfile(candidate) and sibling != name:
-                    files_rel.append(_rel(candidate, app_dir))
+            files_rel = _collect_app_package_files(full, app_dir, meta)
             packages.append(NetDriverPackage(
                 kind=meta.kind, provider=meta.provider,
                 service=meta.service, device_id=meta.device_id,
-                inf_rel=_rel(full, app_dir), files=files_rel))
+                inf_rel=_rel(full, app_dir), files=files_rel,
+                hardware_id=meta.hardware_id,
+                required_files=list(meta.required_files)))
 
     for package in packages:
         for tool in tools:
@@ -366,7 +613,9 @@ def scan_net_driver_packages(app_dir: str, max_files: int = 20_000
         if installers:
             package.installer_rel = _rel(installers[0], app_dir)
     order = {kind: index for index, kind in enumerate(KIND_ORDER)}
-    packages.sort(key=lambda p: (order.get(p.kind, len(order)), p.service))
+    packages.sort(key=lambda p: (order.get(p.kind, len(order)),
+                                 0 if is_complete_driver_package(p) else 1,
+                                 p.service))
     deduped: List[NetDriverPackage] = []
     seen_key: set = set()
     for package in packages:
@@ -462,28 +711,21 @@ def _package_from_directory(inf_path: str, origin: str,
                             ) -> Optional[NetDriverPackage]:
     """Собирает описание пакета по инф-файлу и его соседям."""
     try:
-        if os.path.getsize(inf_path) > _MAX_INF_BYTES:
-            return None
-        with open(inf_path, "r", encoding="utf-8", errors="ignore") as fh:
-            meta = parse_net_inf(fh.read())
+        text = read_inf_text(inf_path)
     except OSError:
         return None
+    # DriverStore names the package dir ..._amd64_...; that is the arch this
+    # package was actually built for, so validate exactly its own files.
+    meta = parse_net_inf(text, _arch_of(os.path.dirname(inf_path))
+                         or system_platform_arch())
     if not meta.usable:
         return None
-    directory = os.path.dirname(inf_path)
-    files: List[str] = []
-    try:
-        for name in sorted(os.listdir(directory))[:_MAX_SYSTEM_FILES]:
-            full = os.path.join(directory, name)
-            if (os.path.isfile(full)
-                    and os.path.normcase(full) != os.path.normcase(inf_path)):
-                files.append(full)
-    except OSError:
-        pass
+    files = _collect_system_package_files(inf_path)
     return NetDriverPackage(
         kind=meta.kind, provider=meta.provider, service=meta.service,
         device_id=meta.device_id, inf_path=inf_path, file_paths=files,
-        origin=origin)
+        origin=origin, hardware_id=meta.hardware_id,
+        required_files=list(meta.required_files))
 
 
 def _arch_of(path: str) -> str:
@@ -630,9 +872,15 @@ def is_complete_driver_package(package: NetDriverPackage) -> bool:
     if not package.needs_install:
         return True
     names = package_file_names(package)
-    return (any(name.endswith(".inf") for name in names)
+    if not (any(name.endswith(".inf") for name in names)
             and any(name.endswith(".sys") for name in names)
-            and any(name.endswith(".cat") for name in names))
+            and any(name.endswith(".cat") for name in names)):
+        return False
+    # Если INF уже разобран, требуем именно его CatalogFile/SourceDisksFiles,
+    # а не «любой соседний .cat»: чужой каталог не подпишет этот пакет.
+    required = [os.path.basename(rel).lower()
+                for rel in package.required_files if rel]
+    return all(name in names for name in required)
 
 
 def merge_driver_packages(app_packages: Sequence[NetDriverPackage],
@@ -651,6 +899,13 @@ def merge_driver_packages(app_packages: Sequence[NetDriverPackage],
         key = (package.kind, package.check_service)
         replacement = by_key.get(key)
         if replacement is not None and not is_complete_driver_package(package):
+            # Полный пакет из DriverStore важнее, но утилиту/установщик,
+            # принесённые самой программой, не теряем.
+            if not replacement.tool_rel and package.tool_rel:
+                replacement = replace(replacement, tool_rel=package.tool_rel)
+            if not replacement.installer_rel and package.installer_rel:
+                replacement = replace(replacement,
+                                      installer_rel=package.installer_rel)
             merged.append(replacement)
         else:
             merged.append(package)
@@ -703,7 +958,9 @@ def _rank_system_packages(packages: Sequence[NetDriverPackage],
                              or package_arch == arch) else 1
         kind_order = (KIND_ORDER.index(package.kind)
                       if package.kind in KIND_ORDER else len(KIND_ORDER))
-        ranked.append(((kind_order, arch_penalty, package.service), package))
+        complete_penalty = 0 if is_complete_driver_package(package) else 1
+        ranked.append(((kind_order, arch_penalty, complete_penalty,
+                        package.service), package))
     ranked.sort(key=lambda item: item[0])
     result: List[NetDriverPackage] = []
     seen: set = set()
@@ -916,6 +1173,13 @@ class NetStackReport:
     def needed(self) -> bool:
         return bool(self.drivers or self.services)
 
+    @property
+    def complete(self) -> bool:
+        """Все обязательные драйверы можно поставить на чистом ПК."""
+        return all(entry.get("complete", "1") != "0"
+                   for entry in self.drivers
+                   if entry.get("needs_install") == "1")
+
     def to_config(self) -> Dict[str, object]:
         return {
             "manifest": self.manifest_rel,
@@ -956,10 +1220,15 @@ def _entry_for_package(package: NetDriverPackage) -> Dict[str, str]:
         "provider": package.provider,
         "service": package.check_service,
         "device_id": package.device_id,
+        "hardware_id": package.hardware_id or (
+            f"root\\{package.device_id}" if package.device_id else ""),
         "needs_install": "1" if package.needs_install else "",
         "inf": package.inf_rel,
         "tool": package.tool_rel,
         "installer": package.installer_rel,
+        "required_files": ";".join(package.required_files),
+        "complete": "1",
+        "missing_files": "",
     }
 
 
@@ -991,17 +1260,28 @@ def provision_netstack(portable_dir: str, app_dir: str,
         entry = _entry_for_package(package)
         dest_dir = os.path.join(drivers_root, package.kind or "other")
         package_copied = False
+        if package.inf_path:
+            source_inf = package.inf_path
+        else:
+            source_inf = os.path.join(
+                app_dir, package.inf_rel.replace("/", os.sep))
+        source_dir = os.path.dirname(source_inf)
+        missing = package_missing_files(
+            package, "" if package.inf_path else app_dir)
+        if missing:
+            entry["complete"] = "0"
+            entry["missing_files"] = ";".join(missing)
+            report.notes.append(
+                f"пакет {package.kind}: неполный набор драйвера — нет "
+                + ", ".join(missing)
+                + ". На чистом ПК pnputil ответит «Не удается найти указанный "
+                  "файл»; возьмите полный пакет из DriverStore или "
+                  "Program Files\\TAP-Windows и соберите портатив заново.")
         try:
             os.makedirs(dest_dir, exist_ok=True)
-            # Пакет из App лежит относительным путём, пакет из DriverStore —
-            # абсолютным. Копируется и то, и другое: в портативе всегда
-            # должен оказаться ПОЛНЫЙ набор (inf + sys + подписанный cat),
-            # иначе pnputil откажется ставить драйвер на чистом ПК.
-            if package.inf_path:
-                source_inf = package.inf_path
-            else:
-                source_inf = os.path.join(
-                    app_dir, package.inf_rel.replace("/", os.sep))
+            # Копируем с сохранением подкаталогов относительно INF: amd64/ и
+            # i386/ нельзя сплющивать в один каталог, иначе INF ссылается в
+            # пустоту и подпись каталога не сходится.
             if os.path.isfile(source_inf):
                 shutil.copy2(
                     source_inf,
@@ -1012,15 +1292,21 @@ def provision_netstack(portable_dir: str, app_dir: str,
                 copied_any = True
                 package_copied = True
             if package.file_paths:
-                sources = list(package.file_paths[:_MAX_SYSTEM_FILES])
+                sources = list(package.file_paths[:_MAX_PACKAGE_FILES])
             else:
                 sources = [os.path.join(app_dir, rel.replace("/", os.sep))
-                           for rel in package.files[:_MAX_SIBLINGS]]
+                           for rel in package.files[:_MAX_PACKAGE_FILES]]
             for src in sources:
-                if os.path.isfile(src):
-                    shutil.copy2(src,
-                                 os.path.join(dest_dir, os.path.basename(src)))
+                if not os.path.isfile(src):
+                    continue
+                rel = _safe_rel(src, source_dir)
+                if not rel:
+                    continue
+                dest = os.path.join(dest_dir, rel.replace("/", os.sep))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy2(src, dest)
         except OSError as exc:
+            entry["complete"] = "0"
             report.notes.append(
                 f"пакет {package.kind}: часть файлов не скопирована ({exc})")
         if package.tool_path:
@@ -1125,6 +1411,83 @@ def provision_netstack(portable_dir: str, app_dir: str,
 # идемпотентны: второй запуск не переустанавливает то, что уже стоит, а
 # --check позволяет лончеру решить, нужен ли UAC вообще, не показывая его зря.
 
+def refresh_netstack_scripts(portable_dir: str) -> List[str]:
+    """Пересоздать NetStack/*.cmd/.ps1 из уже лежащего netstack.json.
+
+    Нужно для старых портативов: в них остались скрипты, которые верили
+    ``pnputil /scan-devices`` и писали ``healthy: True`` без драйвера.
+    Заодно манифест обогащается ``hardware_id``/``required_files`` и честно
+    помечает неполный пакет. Файлы драйвера отсюда не появляются: если
+    ``.sys``/``.cat`` не были скопированы при сборке, портатив надо
+    пересобрать/починить на ПК с полным подписанным пакетом.
+    """
+    root = os.path.abspath(portable_dir)
+    netstack_dir = os.path.join(root, NETSTACK_DIR_NAME)
+    manifest_path = os.path.join(netstack_dir, MANIFEST_NAME)
+    if not os.path.isfile(manifest_path):
+        return []
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    if not isinstance(manifest, dict):
+        return []
+    report = NetStackReport()
+    report.isolation = str(manifest.get("isolation", "session"))
+    report.drivers = [dict(entry) for entry in manifest.get("drivers", [])
+                      if isinstance(entry, dict)]
+    report.services = [dict(entry) for entry in manifest.get("services", [])
+                       if isinstance(entry, dict)]
+    for entry in report.drivers:
+        if entry.get("needs_install") != "1":
+            continue
+        rel = str(entry.get("inf", ""))
+        inf_path = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            text = read_inf_text(inf_path)
+        except OSError:
+            text = ""
+        if text:
+            meta = parse_net_inf(text, _arch_of(os.path.dirname(inf_path))
+                                 or system_platform_arch())
+            entry["hardware_id"] = meta.hardware_id
+            entry["required_files"] = ";".join(meta.required_files)
+        package = NetDriverPackage(
+            kind=str(entry.get("kind", KIND_TAP_WINDOWS)),
+            service=str(entry.get("service", "")),
+            device_id=str(entry.get("device_id", "")),
+            inf_path=inf_path,
+            hardware_id=str(entry.get("hardware_id", "")),
+            required_files=[part for part in
+                            str(entry.get("required_files", "")).split(";")
+                            if part],
+        )
+        missing = package_missing_files(package)
+        entry["complete"] = "0" if missing else "1"
+        entry["missing_files"] = ";".join(missing)
+    manifest["drivers"] = report.drivers
+    manifest["services"] = report.services
+    updated: List[str] = []
+    try:
+        with open(manifest_path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(manifest, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        updated.append(f"{NETSTACK_DIR_NAME}/{MANIFEST_NAME}")
+        with open(os.path.join(netstack_dir, SERVICES_SCRIPT_NAME), "w",
+                  encoding="utf-8-sig", newline="\r\n") as fh:
+            fh.write(render_services_ps1())
+        updated.append(f"{NETSTACK_DIR_NAME}/{SERVICES_SCRIPT_NAME}")
+        with open(os.path.join(netstack_dir, SETUP_SCRIPT_NAME), "w",
+                  encoding="ascii", errors="replace", newline="") as fh:
+            fh.write(render_setup_cmd(report))
+        updated.append(f"{NETSTACK_DIR_NAME}/{SETUP_SCRIPT_NAME}")
+        with open(os.path.join(netstack_dir, TEARDOWN_SCRIPT_NAME), "w",
+                  encoding="ascii", errors="replace", newline="") as fh:
+            fh.write(render_teardown_cmd(report))
+        updated.append(f"{NETSTACK_DIR_NAME}/{TEARDOWN_SCRIPT_NAME}")
+    except OSError:
+        return updated
+    return updated
+
+
 def _ascii_token(text: str, limit: int = 120) -> str:
     """Только печатный ASCII без «опасных» символов cmd — для echo/меток."""
     cleaned = "".join(
@@ -1162,9 +1525,10 @@ def render_setup_cmd(report: NetStackReport) -> str:
     * по умолчанию (и ``--elevated``) — установить недостающие пакеты
       драйверов и зарегистрировать/запустить службы.
     """
+    services_script = f'"%NETSTACK_ROOT%{SERVICES_SCRIPT_NAME}"'
     lines = [
         "@echo off",
-        "setlocal EnableExtensions",
+        "setlocal EnableExtensions EnableDelayedExpansion",
         "rem NetStack setup: bundled network drivers (TAP-Windows and friends)",
         "rem plus the companion services, generated by Portablizer.",
         "rem   --check    verify only (no admin rights needed, no changes)",
@@ -1182,12 +1546,22 @@ def render_setup_cmd(report: NetStackReport) -> str:
         "rem for the whole batch, so nobody has to click through the device",
         'rem "install the software for this device" dialog by hand.',
         'if /i "%NETSTACK_MODE%" == "--check" goto netstack_pass',
-        ">nul 2>&1 net session || (",
-        "  powershell -NoProfile -ExecutionPolicy Bypass -Command "
-        "\"Start-Process -Verb RunAs -Wait -WindowStyle Hidden "
-        "-FilePath '%~f0' -ArgumentList '--elevated'\" >nul 2>&1",
-        "  goto netstack_done",
-        ")",
+        "rem Preflight runs WITHOUT elevation: a bundle with a missing",
+        "rem tap0901.sys/.cat must not ask for UAC or run pnputil at all.",
+        'set "NETSTACK_SELF=%~f0"',
+        "powershell -NoProfile -ExecutionPolicy Bypass -File "
+        f"{services_script} -Mode preflight",
+        'if "%ERRORLEVEL%" == "5" (set "NETSTACK_RC=5" & goto netstack_done)',
+        'if "%ERRORLEVEL%" == "2" (set "NETSTACK_RC=2" & goto netstack_done)',
+        'if errorlevel 1 (set "NETSTACK_RC=5" & goto netstack_done)',
+        ">nul 2>&1 net session",
+        "if not errorlevel 1 goto netstack_pass",
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        "\"try { $p = Start-Process -Verb RunAs -Wait -WindowStyle Hidden "
+        "-PassThru -FilePath $env:NETSTACK_SELF -ArgumentList '--elevated' "
+        "-ErrorAction Stop; exit $p.ExitCode } catch { exit 1223 }\"",
+        'set "NETSTACK_RC=%ERRORLEVEL%"',
+        "goto netstack_done",
         "",
         ":netstack_pass",
         'set "PNPMODERN=0"',
@@ -1291,7 +1665,6 @@ def render_setup_cmd(report: NetStackReport) -> str:
             f":netstack_after_driver_{index}",
         ]
 
-    services_script = f'"%NETSTACK_ROOT%{SERVICES_SCRIPT_NAME}"'
     if isolated:
         # Дифф снимков INF делает .ps1: свои пути он выводит из
         # $PSScriptRoot, поэтому кириллица в имени папки портатива не
@@ -1314,22 +1687,20 @@ def render_setup_cmd(report: NetStackReport) -> str:
         'if /i "%NETSTACK_MODE%" == "--check" set "PS_MODE=check"',
         f"powershell -NoProfile -ExecutionPolicy Bypass -File "
         f"{services_script} -Mode %PS_MODE%",
-        "rem 6 = a service exists but did not start, 4 = service missing or",
-        "rem its ImagePath points into another folder, 3 = adapter missing.",
-        "rem 'if errorlevel N' also matches greater codes, so 6 is tested",
-        "rem before 4, and 4 before 3 - only real returns set the code.",
-        "if errorlevel 6 (set \"NETSTACK_RC=6\") else if errorlevel 4 "
-        "(set \"NETSTACK_RC=4\") else if errorlevel 3 "
-        "set \"NETSTACK_RC=3\"",
-        "rem Re-verify honestly: services that still do not exist keep the",
-        "rem exit code at 4, the launcher asks UAC only when it really helps.",
+        "rem The .ps1 is the authority: 2 = driver package/service missing,",
+        "rem 3 = adapter not ready, 4 = companion service stale/absent,",
+        "rem 6 = companion service did not start. Batch-side pnputil warnings",
+        "rem must not survive a successful PowerShell repair.",
+        'set "NETSTACK_RC=%ERRORLEVEL%"',
         'if /i not "%NETSTACK_MODE%" == "--check" (',
         f"  powershell -NoProfile -ExecutionPolicy Bypass -File "
         f"{services_script} -Mode check >nul 2>&1",
-        '  if not "%NETSTACK_RC%" == "6" if errorlevel 4 set "NETSTACK_RC=4"',
+        '  if "!ERRORLEVEL!" == "2" set "NETSTACK_RC=2"',
+        '  if "!ERRORLEVEL!" == "3" if "!NETSTACK_RC!" == "0" set "NETSTACK_RC=3"',
+        '  if "!ERRORLEVEL!" == "4" if "!NETSTACK_RC!" == "0" set "NETSTACK_RC=4"',
         ")",
         "",
-        'if /i not "%NETSTACK_MODE%" == "--check" echo   NetStack ready.',
+        'if /i not "%NETSTACK_MODE%" == "--check" if "%NETSTACK_RC%" == "0" echo   NetStack ready.',
         ":netstack_done",
         "endlocal & exit /b %NETSTACK_RC%",
         "",
@@ -1386,12 +1757,17 @@ def render_teardown_cmd(report: NetStackReport) -> str:
          'set "TEARDOWN_MODE=--keep-driver"' if isolated else
          'for %%A in (%*) do if /i "%%~A" == "--remove-device" '
          'set "TEARDOWN_MODE=--remove-device"'),
-        ">nul 2>&1 net session || (",
-        "  powershell -NoProfile -ExecutionPolicy Bypass -Command "
-        "\"Start-Process -Verb RunAs -Wait -WindowStyle Hidden "
-        "-FilePath '%~f0' -ArgumentList '--elevated %TEARDOWN_MODE%'\" >nul 2>&1",
-        "  exit /b 0",
-        ")",
+        'set "NETSTACK_SELF=%~f0"',
+        ">nul 2>&1 net session",
+        "if not errorlevel 1 goto netstack_teardown_pass",
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        "\"try { $p = Start-Process -Verb RunAs -Wait -WindowStyle Hidden "
+        "-PassThru -FilePath $env:NETSTACK_SELF -ArgumentList @('--elevated', "
+        "$env:TEARDOWN_MODE) -ErrorAction Stop; exit $p.ExitCode } "
+        "catch { exit 1223 }\"",
+        "exit /b %ERRORLEVEL%",
+        "",
+        ":netstack_teardown_pass",
         "",
         "rem Companion services first: the .ps1 knows exactly what Setup",
         "rem created on THIS machine and removes nothing else.",
@@ -1459,19 +1835,55 @@ $devicesPath = Join-Path $stateDir 'created-devices.txt'
 # supported way without foreign tools is SetupAPI - the same sequence devcon
 # uses. When the vendor shipped tapinstall.exe, that tool goes first: it is
 # the exact program the VPN vendor's own installer runs.
+function Write-SetupLog([string]$message) {
+     $line = ('[' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '] ' + $message)
+     Write-Output $line
+     try {
+          Add-Content -LiteralPath (Join-Path $stateDir 'setup.log') `
+               -Value $line -Encoding UTF8 -ErrorAction Stop
+     } catch { }
+}
+function Test-HwidMatch([string]$value, [string]$hwid) {
+     if (-not $value -or -not $hwid) { return $false }
+     $v = $value.Trim().ToLower()
+     $n = $hwid.Trim().ToLower()
+     return ($v -eq $n -or $v -eq ('root\' + $n))
+}
+function Test-DriverService([string]$name) {
+     if (-not $name) { return $false }
+     return (Test-Path -LiteralPath ('HKLM:\SYSTEM\CurrentControlSet\Services\' + $name))
+}
 function Find-HwidDevices([string]$hwid) {
      $found = @()
      if (-not $hwid) { return $found }
-     $needle = $hwid.ToLower()
      $pnpWorks = $false
      try {
-          foreach ($d in @(Get-PnpDevice -Class Net -ErrorAction Stop)) {
+          # Get-PnpDevice returns only a summary; HardwareID is a separate
+          # device property. Reading $d.HardwareID always yielded $null and
+          # made a perfectly installed TAP adapter look missing.
+          foreach ($d in @(Get-PnpDevice -Class Net -PresentOnly -ErrorAction Stop)) {
                $pnpWorks = $true
-               foreach ($h in @($d.HardwareID)) {
-                    if ($h -and $h.ToLower().Contains($needle)) {
+               $ids = @()
+               try {
+                    $ids = @((Get-PnpDeviceProperty -InstanceId $d.InstanceId `
+                         -KeyName 'DEVPKEY_Device_HardwareIds' -ErrorAction Stop).Data)
+               } catch {
+                    $reg = 'HKLM:\SYSTEM\CurrentControlSet\Enum\' + [string]$d.InstanceId
+                    $ids = @((Get-ItemProperty -LiteralPath $reg -Name HardwareID `
+                         -ErrorAction SilentlyContinue).HardwareID)
+               }
+               foreach ($h in $ids) {
+                    if (Test-HwidMatch $h $hwid) {
+                         $problem = $null
+                         try {
+                              $problem = (Get-PnpDeviceProperty -InstanceId $d.InstanceId `
+                                   -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction Stop).Data
+                         } catch { }
                          $found += [pscustomobject]@{
                               InstanceId = [string]$d.InstanceId
                               RegistryPath = ''
+                              Status = [string]$d.Status
+                              ProblemCode = $problem
                          }
                          break
                     }
@@ -1480,31 +1892,96 @@ function Find-HwidDevices([string]$hwid) {
      } catch { }
      if ($pnpWorks) { return $found }
      # Windows without the PnpDevice module (7/8): the same facts are in Enum.
+     # The layout is Enum\<bus>\<device>\<instance> (ROOT\NET\0000) and
+     # HardwareID lives on the INSTANCE key. Walking only two levels found
+     # nothing and produced a truncated instance id, which Teardown could
+     # never remove.
      $enum = 'HKLM:\SYSTEM\CurrentControlSet\Enum'
      foreach ($bus in @(Get-ChildItem -LiteralPath $enum -ErrorAction SilentlyContinue)) {
           foreach ($dev in @(Get-ChildItem -LiteralPath $bus.PSPath -ErrorAction SilentlyContinue)) {
-               $ids = @((Get-ItemProperty -LiteralPath $dev.PSPath `
-                    -Name HardwareID -ErrorAction SilentlyContinue).HardwareID)
-               foreach ($h in $ids) {
-                    if ($h -and $h.ToLower().Contains($needle)) {
-                         $found += [pscustomobject]@{
-                              InstanceId = ($bus.PSChildName + '\' + $dev.PSChildName)
-                              RegistryPath = $dev.PSPath
+               foreach ($inst in @(Get-ChildItem -LiteralPath $dev.PSPath -ErrorAction SilentlyContinue)) {
+                    $ids = @((Get-ItemProperty -LiteralPath $inst.PSPath `
+                         -Name HardwareID -ErrorAction SilentlyContinue).HardwareID)
+                    foreach ($h in $ids) {
+                         if (Test-HwidMatch $h $hwid) {
+                              # No PnpDevice API here. 'Driver' exists only
+                              # once a driver is bound to the devnode, and
+                              # ConfigFlags bit 0x1 is CONFIGFLAG_DISABLED.
+                              # Without this the fallback always said Unknown
+                              # and the adapter was never considered ready.
+                              $props = Get-ItemProperty -LiteralPath $inst.PSPath `
+                                   -ErrorAction SilentlyContinue
+                              $state = 'Error'
+                              $problem = 28   # CM_PROB_FAILED_INSTALL
+                              if ($props.Driver) {
+                                   if (([int]$props.ConfigFlags -band 1) -ne 0) {
+                                        $state = 'Disabled'
+                                        $problem = 22  # CM_PROB_DISABLED
+                                   } else {
+                                        $state = 'OK'
+                                        $problem = 0
+                                   }
+                              }
+                              $found += [pscustomobject]@{
+                                   InstanceId = ($bus.PSChildName + '\' +
+                                        $dev.PSChildName + '\' + $inst.PSChildName)
+                                   RegistryPath = $inst.PSPath
+                                   Status = $state
+                                   ProblemCode = $problem
+                              }
+                              break
                          }
-                         break
                     }
                }
           }
      }
      return $found
 }
-function Install-RootDevice([string]$infPath, [string]$hwid, [string]$toolPath) {
-     if (@(Find-HwidDevices $hwid).Count -gt 0) { return $true }
-     if ($toolPath -and (Test-Path -LiteralPath $toolPath)) {
-          & $toolPath install $infPath $hwid 2>&1 | Out-Null
-          Start-Sleep -Milliseconds 400
-          if (@(Find-HwidDevices $hwid).Count -gt 0) { return $true }
+function Test-AdapterReady([string]$hwid) {
+     foreach ($dev in @(Find-HwidDevices $hwid)) {
+          if ([string]$dev.Status -eq 'OK') { return $true }
+          if ($null -ne $dev.ProblemCode -and [int]$dev.ProblemCode -eq 0) { return $true }
      }
+     return $false
+}
+function Get-DriverPackageMissing($d) {
+     $missing = @()
+     if (-not $d.inf) { return @('INF path is empty') }
+     $inf = Join-Path $root ([string]$d.inf -replace '/', '\')
+     if (-not (Test-Path -LiteralPath $inf)) { return @([string]$d.inf) }
+     $dir = Split-Path -Parent $inf
+     $required = @()
+     if ($d.required_files) {
+          $required = @([string]$d.required_files -split ';' | Where-Object { $_ })
+     }
+     if ($required.Count -eq 0) {
+          $svc = [string]$d.service
+          if ($svc) { $required += ($svc + '.sys') }
+     }
+     foreach ($rel in $required) {
+          $path = Join-Path $dir ($rel -replace '/', '\')
+          if (-not (Test-Path -LiteralPath $path)) { $missing += $rel }
+     }
+     if ($required.Count -gt 0 -and -not (@($required | Where-Object { $_ -like '*.cat' }).Count)) {
+          $cat = Get-ChildItem -LiteralPath $dir -Filter '*.cat' -File -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if (-not $cat) { $missing += ([string]$d.service + '.cat') }
+     }
+     return $missing
+}
+function Install-RootDevice([string]$infPath, [string]$hwid, [string]$toolPath,
+     [string]$hardwareId = '') {
+     if (Test-AdapterReady $hwid) { return $true }
+     if ($toolPath -and (Test-Path -LiteralPath $toolPath)) {
+          Write-SetupLog ('tapinstall: ' + $toolPath + ' install ' + $infPath + ' ' + $hwid)
+          & $toolPath install $infPath $hwid 2>&1 |
+               ForEach-Object { Write-SetupLog ([string]$_) }
+          Write-SetupLog ('tapinstall exit: ' + $LASTEXITCODE)
+          Start-Sleep -Milliseconds 400
+          if (Test-AdapterReady $hwid) { return $true }
+     }
+     $installHwid = $hwid
+     if ($hardwareId) { $installHwid = $hardwareId }
      if (-not ('PortablizerNetStack.RootDevice' -as [type])) {
           $source = @'
 using System;
@@ -1559,29 +2036,44 @@ namespace PortablizerNetStack {
       string hardwareId, string fullInfPath, uint installFlags,
       out bool rebootRequired);
 
+    public static int LastError;
+    public static bool RebootRequired;
+
+    static bool Fail() {
+      LastError = Marshal.GetLastWin32Error();
+      return false;
+    }
+
     public static bool Install(string infPath, string hwid) {
+      LastError = 0;
+      RebootRequired = false;
       Guid classGuid;
       StringBuilder className = new StringBuilder(MAX_CLASS_NAME_LEN);
       uint required;
       if (!SetupDiGetINFClass(infPath, out classGuid, className,
-          MAX_CLASS_NAME_LEN, out required)) return false;
+          MAX_CLASS_NAME_LEN, out required)) return Fail();
       IntPtr set = SetupDiCreateDeviceInfoList(ref classGuid, IntPtr.Zero);
-      if (set == IntPtr.Zero || set == new IntPtr(-1)) return false;
+      if (set == IntPtr.Zero || set == new IntPtr(-1)) return Fail();
       SP_DEVINFO_DATA data = new SP_DEVINFO_DATA();
       data.cbSize = (uint)Marshal.SizeOf(typeof(SP_DEVINFO_DATA));
       try {
         if (!SetupDiCreateDeviceInfo(set, className.ToString(), ref classGuid,
-            null, IntPtr.Zero, DICD_GENERATE_ID, ref data)) return false;
+            null, IntPtr.Zero, DICD_GENERATE_ID, ref data)) return Fail();
         byte[] ids = Encoding.Unicode.GetBytes(hwid + "\0\0");
         if (!SetupDiSetDeviceRegistryProperty(set, ref data, SPDRP_HARDWAREID,
-            ids, (uint)ids.Length)) return false;
+            ids, (uint)ids.Length)) return Fail();
         if (!SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set, ref data))
-          return false;
+          return Fail();
         bool reboot;
         bool ok = UpdateDriverForPlugAndPlayDevices(IntPtr.Zero, hwid, infPath,
             INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE, out reboot);
-        if (!ok) SetupDiCallClassInstaller(DIF_REMOVE, set, ref data);
-        return ok;
+        if (!ok) {
+          LastError = Marshal.GetLastWin32Error();
+          SetupDiCallClassInstaller(DIF_REMOVE, set, ref data);
+          return false;
+        }
+        RebootRequired = reboot;
+        return true;
       } finally {
         SetupDiDestroyDeviceInfoList(set);
       }
@@ -1589,16 +2081,27 @@ namespace PortablizerNetStack {
   }
 }
 '@
-          Add-Type -TypeDefinition $source -ErrorAction SilentlyContinue
+          try {
+               Add-Type -TypeDefinition $source -ErrorAction Stop
+          } catch {
+               Write-SetupLog ('SetupAPI compiler unavailable: ' + $_.Exception.Message)
+          }
      }
      if ('PortablizerNetStack.RootDevice' -as [type]) {
           try {
-               [PortablizerNetStack.RootDevice]::Install($infPath, $hwid) |
-                    Out-Null
-          } catch { }
+               $ok = [PortablizerNetStack.RootDevice]::Install($infPath, $installHwid)
+               $err = [PortablizerNetStack.RootDevice]::LastError
+               Write-SetupLog ('SetupAPI install ' + $installHwid + ': ok=' + $ok +
+                    ' win32=' + $err)
+               if ($ok -and [PortablizerNetStack.RootDevice]::RebootRequired) {
+                    Write-SetupLog 'SetupAPI: a reboot is required to finish the driver install'
+               }
+          } catch {
+               Write-SetupLog ('SetupAPI install failed: ' + $_.Exception.Message)
+          }
      }
      Start-Sleep -Milliseconds 600
-     return (@(Find-HwidDevices $hwid).Count -gt 0)
+     return (Test-AdapterReady $hwid)
 }
 function Remember-Device([string]$hwid, [string]$instance) {
      if (-not $hwid) { return }
@@ -1619,15 +2122,18 @@ function Remove-RememberedDevices {
      $modern = ((& pnputil '/?' 2>$null) | Out-String) -match '/add-driver'
      foreach ($line in @(Get-Content -LiteralPath $devicesPath)) {
           $parts = @($line -split '\s+' | Where-Object { $_ })
-          if ($parts.Count -lt 1) { continue }
-          $hwid = $parts[0]
-          foreach ($dev in @(Find-HwidDevices $hwid)) {
-               if ($modern -and $dev.InstanceId) {
-                    & pnputil /remove-device $dev.InstanceId 2>&1 | Out-Null
-               } elseif ($dev.RegistryPath) {
-                    Remove-Item -LiteralPath $dev.RegistryPath -Recurse `
-                         -Force -ErrorAction SilentlyContinue
-               }
+          if ($parts.Count -lt 2) {
+               Write-SetupLog ('skip device without exact instance id: ' + $line)
+               continue
+          }
+          $instance = $parts[1]
+          # Remove ONLY the instance this portable created. Matching by hwid
+          # here would also delete a TAP adapter owned by another VPN.
+          if ($modern) {
+               & pnputil /remove-device $instance 2>&1 | Out-Null
+          } else {
+               $reg = 'HKLM:\SYSTEM\CurrentControlSet\Enum\' + $instance
+               Remove-Item -LiteralPath $reg -Recurse -Force -ErrorAction SilentlyContinue
           }
      }
      Remove-Item -LiteralPath $devicesPath -Force -ErrorAction SilentlyContinue
@@ -1709,26 +2215,34 @@ function Enable-HwidDevices([string]$hwid) {
      if ($changed) { Start-Sleep -Milliseconds 700 }
      return $changed
 }
-function Write-NetStackStatus([bool]$healthy) {
+function Write-NetStackStatus([bool]$serviceHealthy) {
      $lines = @()
      $lines += ('root: ' + $root)
      $lines += ('time: ' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
-     $lines += ('healthy: ' + $healthy)
+     $driverHealthy = $true
      foreach ($d in @($cfg.drivers)) {
           if (-not $d.needs_install) { continue }
           $hwid = [string]$d.device_id
+          $svcName = [string]$d.service
+          if ($svcName) {
+               $svcState = 'missing'
+               if (Test-DriverService $svcName) { $svcState = 'present' }
+               else { $driverHealthy = $false }
+               $lines += ('driver ' + $svcName + ': ' + $svcState)
+          }
           if (-not $hwid) { continue }
           $devices = @(Find-HwidDevices $hwid)
           $state = 'missing'
           if ($devices.Count -gt 0) {
-               $state = 'present'
-               $first = $devices[0].InstanceId
-               try {
-                    $pnp = Get-PnpDevice -InstanceId $first -ErrorAction Stop
-                    $state = [string]$pnp.Status
-               } catch { }
+               $state = [string]$devices[0].Status
+               if (-not $state) { $state = 'present' }
           }
+          if (-not (Test-AdapterReady $hwid)) { $driverHealthy = $false }
           $lines += ('adapter ' + $hwid + ': ' + $state)
+          $missing = @(Get-DriverPackageMissing $d)
+          if ($missing.Count -gt 0) {
+               $lines += ('package ' + $hwid + ': incomplete | ' + ($missing -join ', '))
+          }
      }
      foreach ($s in @($cfg.services)) {
           $name = [string]$s.name
@@ -1739,8 +2253,29 @@ function Write-NetStackStatus([bool]$healthy) {
           $lines += ('service ' + $name + ': ' + $state + ' | ' +
                (Get-ServiceImagePath $name))
      }
+     $healthy = ($serviceHealthy -and $driverHealthy)
+     $lines = @(('healthy: ' + $healthy)) + $lines
      Set-Content -LiteralPath (Join-Path $stateDir 'status.txt') -Value $lines `
           -Encoding UTF8 -ErrorAction SilentlyContinue
+     return $healthy
+}
+function Test-NetStackPackages {
+     foreach ($d in @($cfg.drivers)) {
+          if (-not $d.needs_install) { continue }
+          $hwid = [string]$d.device_id
+          $svcName = [string]$d.service
+          if ($hwid -and (Test-AdapterReady $hwid) -and
+               (-not $svcName -or (Test-DriverService $svcName))) {
+               continue
+          }
+          $missing = @(Get-DriverPackageMissing $d)
+          if ($missing.Count -gt 0) {
+               Write-SetupLog ('driver package ' + $hwid + ' is incomplete: ' +
+                    ($missing -join ', '))
+               return $false
+          }
+     }
+     return $true
 }
 function Ensure-NetAdapters {
      $failed = $false
@@ -1749,25 +2284,31 @@ function Ensure-NetAdapters {
           if (-not $d.needs_install) { continue }
           $hwid = [string]$d.device_id
           if (-not $hwid) { continue }
-          if (@(Find-HwidDevices $hwid).Count -gt 0) {
+          if (Test-AdapterReady $hwid) {
                Enable-HwidDevices $hwid | Out-Null
                continue
           }
-          if (-not $d.inf) { $failed = $true; continue }
+          $missing = @(Get-DriverPackageMissing $d)
+          if ($missing.Count -gt 0) {
+               Write-SetupLog ('driver package ' + $hwid + ' is incomplete: ' +
+                    ($missing -join ', '))
+               return 2
+          }
           $inf = Join-Path $root ([string]$d.inf -replace '/', '\')
           $tool = ''
           if ($d.tool) {
                $tool = Join-Path $root ([string]$d.tool -replace '/', '\')
           }
-          if (-not (Test-Path -LiteralPath $inf)) { $failed = $true; continue }
-          $created = Install-RootDevice $inf $hwid $tool
+          $hardwareId = [string]$d.hardware_id
+          if (-not $hardwareId) { $hardwareId = 'root\' + $hwid }
+          $created = Install-RootDevice $inf $hwid $tool $hardwareId
           if (-not $scanned) {
                & pnputil /scan-devices 2>&1 | Out-Null
                $scanned = $true
           }
           Enable-HwidDevices $hwid | Out-Null
           $instances = @(Find-HwidDevices $hwid)
-          if ($instances.Count -eq 0) { $failed = $true }
+          if (-not (Test-AdapterReady $hwid)) { $failed = $true }
           if ($created) {
                $instance = ''
                if ($instances.Count -gt 0) {
@@ -1776,7 +2317,8 @@ function Ensure-NetAdapters {
                Remember-Device $hwid $instance
           }
      }
-     return (-not $failed)
+     if ($failed) { return 3 }
+     return 0
 }
 # --- ownership: what THIS portable published into the driver store ----------
 # Setup snapshots %SystemRoot%\INF\oem*.inf before and after the install and
@@ -1854,16 +2396,28 @@ if ($Mode -eq 'rollback') {
           Remove-Item -LiteralPath $packagesPath -Force
           Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue
      }
+     Write-NetStackStatus $false | Out-Null
      exit 0
 }
 $services = @($cfg.services)
+if ($Mode -eq 'preflight') {
+     if (Test-NetStackPackages) { exit 0 }
+     Write-NetStackStatus $false | Out-Null
+     exit 2
+}
 if ($Mode -eq 'check') {
-     # The adapter is checked as well: a registered service without a device
-     # is exactly the vendor app's "adapter not found" state.
+     # Both halves are mandatory: the driver service AND a ready network
+     # adapter. A registered service without a device is exactly the vendor
+     # app's "adapter not found" state; a ghost/disabled device is not ready.
+     $checkCode = 0
      foreach ($d in @($cfg.drivers)) {
           if (-not $d.needs_install) { continue }
           $hwid = [string]$d.device_id
-          if ($hwid -and (@(Find-HwidDevices $hwid).Count -eq 0)) { exit 3 }
+          $svcName = [string]$d.service
+          if ($svcName -and -not (Test-DriverService $svcName)) { $checkCode = 2 }
+          if ($hwid -and -not (Test-AdapterReady $hwid)) {
+               if ($checkCode -eq 0) { $checkCode = 3 }
+          }
      }
      # A service is only useful when it exists, points to THIS copy and is
      # running: a stopped or stale service is exactly the "no protocol works"
@@ -1872,22 +2426,24 @@ if ($Mode -eq 'check') {
           $name = [string]$s.name
           if (-not $name) { continue }
           $current = Get-ServiceImagePath $name
-          if (-not $current) { exit 4 }
+          if (-not $current) { $checkCode = 4; break }
           if (Test-ForeignService $current) { continue }
           $exe = ([string]$s.image).Replace($token, $root)
-          if (-not (Test-SamePath (Get-ServiceExePath $current) $exe)) { exit 4 }
-          if (-not (Test-Path -LiteralPath $exe)) { exit 4 }
+          if (-not (Test-SamePath (Get-ServiceExePath $current) $exe)) { $checkCode = 4; break }
+          if (-not (Test-Path -LiteralPath $exe)) { $checkCode = 4; break }
           $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
-          if ($null -eq $svc) { exit 4 }
+          if ($null -eq $svc) { $checkCode = 4; break }
           if (@('Running', 'StartPending') -notcontains [string]$svc.Status) {
-               exit 4
+               $checkCode = 4; break
           }
      }
-     exit 0
+     Write-NetStackStatus ($checkCode -eq 0) | Out-Null
+     exit $checkCode
 }
 if ($Mode -eq 'detach') {
      # Shared mode (--remove-device): detach only our adapters, keep packages.
      Remove-RememberedDevices
+     Write-NetStackStatus $false | Out-Null
      exit 0
 }
 if ($Mode -eq 'teardown') {
@@ -1899,17 +2455,22 @@ if ($Mode -eq 'teardown') {
           sc.exe delete $n | Out-Null
      }
      Remove-Item -LiteralPath $createdPath -Force
+     Write-NetStackStatus $false | Out-Null
      exit 0
 }
 # ensure: create only what is absent, remember only what we created.
 # Adapters first: the VPN client cannot do anything without one, and its own
 # driver installation needs the rights this elevated pass already has.
-if (-not (Ensure-NetAdapters)) { exit 3 }
+$adapterCode = Ensure-NetAdapters
+if ($adapterCode -ne 0) {
+     Write-NetStackStatus $false | Out-Null
+     exit $adapterCode
+}
 if ($services.Count -eq 0) {
      # Драйвер-адаптер сам по себе: состояние всё равно фиксируется, иначе
      # после сеанса нечем объяснить, что именно было на машине.
-     Write-NetStackStatus $true
-     exit 0
+     if (Write-NetStackStatus $true) { exit 0 }
+     exit 3
 }
 $created = @()
 if (Test-Path -LiteralPath $createdPath) {
@@ -1993,8 +2554,9 @@ $created = @($created | Select-Object -Unique)
 if ($created.Count -gt 0) {
      Set-Content -LiteralPath $createdPath -Value $created -Encoding UTF8
 }
-Write-NetStackStatus (-not $serviceFailed)
+$healthy = Write-NetStackStatus (-not $serviceFailed)
 if ($serviceFailed) { exit 6 }
+if (-not $healthy) { exit 3 }
 exit 0
 '''
 

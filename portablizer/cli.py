@@ -159,6 +159,13 @@ def build_parser() -> argparse.ArgumentParser:
         "repair-start-menu",
         help="починить меню «Пуск» и вернуть папку «Документы» в профиль "
              "пользователя после сборки под администратором")
+    rn = sub.add_parser(
+        "repair-netstack",
+        help="пересоздать NetStack у готового портатива: скрипты, манифест "
+             "и проверка полноты драйвера TAP-Windows")
+    rn.add_argument("folder", help="корень портатива (папка с Launch.bat)")
+    rn.add_argument("--log-file", default="",
+                    help="куда писать журнал (по умолчанию рядом с портативом)")
     return parser
 
 
@@ -315,6 +322,60 @@ def cmd_repair_start_menu(ns: argparse.Namespace) -> int:
     return 0 if report.success else 1
 
 
+def cmd_repair_netstack(ns: argparse.Namespace) -> int:
+    """``repair-netstack``: вылечить tap0901 у уже собранного портатива.
+
+    Старые ``Setup.cmd``/``NetStackServices.ps1`` могли писать ``healthy:
+    True`` без драйвера и дважды показывать UAC. Команда пересоздаёт их из
+    ``NetStack/netstack.json`` и честно помечает неполный пакет. Если
+    ``.sys``/``.cat`` не были скопированы при сборке, их надо положить в
+    ``NetStack/Drivers/...`` (или пересобрать портатив на ПК с полным
+    подписанным TAP-Windows) и повторить команду.
+    """
+    from .core.logutil import Logger
+    from .core import netstack as netstack_mod
+
+    folder = os.path.abspath(str(ns.folder or ""))
+    if not os.path.isdir(folder):
+        print(f"ОШИБКА: папка не найдена: {folder}", file=sys.stderr)
+        return 2
+    log_file = ns.log_file or os.path.join(
+        os.path.dirname(folder), "portablizer-netstack.log")
+    log = Logger(logfile=log_file)
+    log.add_sink(lambda level, message: print(f"{level:<5} {message}"))
+    try:
+        updated = netstack_mod.refresh_netstack_scripts(folder)
+    except (OSError, ValueError) as exc:
+        log.error(f"NetStack: не удалось обновить скрипты ({exc})")
+        return 1
+    if not updated:
+        log.warn("NetStack/netstack.json не найден — чинить нечего. "
+                 "Соберите портатив заново с включённым NetStack.")
+        return 1
+    for rel in updated:
+        log.ok(f"обновлён {rel}")
+    manifest_path = os.path.join(folder, netstack_mod.NETSTACK_DIR_NAME,
+                                 netstack_mod.MANIFEST_NAME)
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, ValueError):
+        manifest = {}
+    incomplete = [entry for entry in manifest.get("drivers", [])
+                  if isinstance(entry, dict) and entry.get("complete") == "0"]
+    if incomplete:
+        for entry in incomplete:
+            log.warn(
+                f"пакет {entry.get('service', '?')} неполный: "
+                f"{entry.get('missing_files', '')}. Положите недостающие "
+                "файлы рядом с INF в NetStack/Drivers и повторите команду, "
+                "либо пересоберите портатив на ПК с полным подписанным "
+                "TAP-Windows/OpenVPN.")
+        return 1
+    log.ok("NetStack обновлён. Запустите NetStack\Setup.cmd на целевом ПК.")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     attach_console()
@@ -324,5 +385,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_build(ns)
     if ns.command == "repair-start-menu":
         return cmd_repair_start_menu(ns)
+    if ns.command == "repair-netstack":
+        return cmd_repair_netstack(ns)
     parser.print_help()
     return 2

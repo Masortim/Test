@@ -665,7 +665,7 @@ jobs:
               if ($handoff) { break }
               if ($attempt % 10 -eq 0 -and (Test-Path $runLog)) {
                 $text = Get-Content $runLog -Raw
-                if ($text -match 'browser login: opened https://opencode\.ai/zen(?:\s|$)') {
+                if ($text -match 'browser login: opened https://(?:opencode\.ai/zen|zed\.dev/\S*)(?:\s|$)') {
                   $handoff = $true
                   $handoffMode = "host reopen"
                   break
@@ -682,7 +682,7 @@ jobs:
                 foreach ($sample in $samples) {
                   if ($existingBrowserIds -contains $sample.ProcessId) { continue }
                   if ($appProcessIds -contains $sample.ParentProcessId -and
-                      $sample.CommandLine -match 'https://opencode\.ai/zen(?:\s|$)') {
+                      $sample.CommandLine -match 'https://(?:opencode\.ai/zen|zed\.dev/\S*)(?:\s|$)') {
                     $handoff = $true
                     $handoffMode = "short-lived default-browser launcher: $($sample.ProcessId)"
                     break
@@ -699,7 +699,7 @@ jobs:
                   if ($existingBrowserIds -notcontains $window.Current.ProcessId) {
                     continue
                   }
-                  $windowMatch = $window.Current.Name -match '(?i)(opencode|zen)'
+                  $windowMatch = $window.Current.Name -match '(?i)(opencode|zen|sign in to github)'
                   if (-not $windowMatch) {
                     $controls = $window.FindAll(
                       [System.Windows.Automation.TreeScope]::Descendants,
@@ -707,7 +707,7 @@ jobs:
                     $count = 0
                     foreach ($control in $controls) {
                       if ($count++ -ge 400) { break }
-                      if ([string]$control.Current.Name -match '(?i)(opencode|zen)') {
+                      if ([string]$control.Current.Name -match '(?i)(opencode|zen|sign in to github)') {
                         $windowMatch = $true
                         break
                       }
