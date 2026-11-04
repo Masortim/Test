@@ -1255,6 +1255,99 @@ class Tap0901RegressionTests(unittest.TestCase):
         self.assertIn("-Mode preflight", setup)
 
 
+class DeviceEnumDepthTests(unittest.TestCase):
+    """HardwareID живёт на уровне ЭКЗЕМПЛЯРА, а не устройства.
+
+    Enum\\ROOT\\NET\\0000, а не Enum\\ROOT\\NET. Прежний обход читал
+    значение на уровень выше, поэтому установленный адаптер не находился
+    никогда: лончер считал tap0901 отсутствующим и просил UAC каждый запуск,
+    а Teardown получал обрезанный Instance ID и не мог удалить устройство.
+    """
+
+    def test_python_probe_reads_the_instance_level(self):
+        opened = []
+
+        class FakeKey:
+            def __init__(self, path):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+        tree = {
+            "SYSTEM\\CurrentControlSet\\Enum": ["ROOT"],
+            "SYSTEM\\CurrentControlSet\\Enum\\ROOT": ["NET"],
+            "SYSTEM\\CurrentControlSet\\Enum\\ROOT\\NET": ["0000"],
+        }
+
+        class FakeWinreg:
+            HKEY_LOCAL_MACHINE = "HKLM"
+
+            @staticmethod
+            def OpenKey(_root, path):
+                opened.append(path)
+                if path not in tree and not path.endswith("0000"):
+                    raise OSError("no key")
+                return FakeKey(path)
+
+            @staticmethod
+            def QueryInfoKey(key):
+                return (len(tree.get(key.path, [])), 0)
+
+            @staticmethod
+            def EnumKey(key, index):
+                names = tree.get(key.path, [])
+                if index >= len(names):
+                    raise OSError("no more keys")  # real winreg raises OSError
+                return names[index]
+
+            @staticmethod
+            def QueryValueEx(key, name):
+                # Only the instance key carries HardwareID.
+                if key.path.endswith("NET\\0000") and name == "HardwareID":
+                    return (["root\\tap0901"], 7)
+                raise OSError("no value")
+
+        with mock.patch.dict(sys.modules, {"winreg": FakeWinreg}), \
+                mock.patch.object(exe_launcher, "IS_WINDOWS", True):
+            self.assertTrue(exe_launcher._device_hwid_present("tap0901"))
+        self.assertIn("SYSTEM\\CurrentControlSet\\Enum\\ROOT\\NET\\0000",
+                      opened)
+
+    def test_python_probe_rejects_a_similar_hardware_id(self):
+        src = Path(exe_launcher.__file__).read_text(encoding="utf-8")
+        body = src.split("def _device_hwid_present")[1].split("\ndef ")[0]
+        self.assertIn("if text in wanted:", body)
+        self.assertNotIn("if needle in ", body)
+
+    def test_powershell_fallback_walks_three_levels_and_judges_readiness(self):
+        ps1 = netstack.render_services_ps1()
+        self.assertIn("foreach ($inst in @(Get-ChildItem -LiteralPath $dev.PSPath",
+                      ps1)
+        self.assertIn("$dev.PSChildName + '\\' + $inst.PSChildName", ps1)
+        # Unknown is no longer hard-coded: Driver + ConfigFlags decide.
+        self.assertIn("if ($props.Driver)", ps1)
+        self.assertIn("CONFIGFLAG_DISABLED", ps1)
+        self.assertNotIn("Status = 'Unknown'", ps1)
+
+    def test_inf_validation_is_architecture_aware(self):
+        inf = ("[Version]\nClass=Net\nCatalogFile=tap0901.cat\n"
+               "CatalogFile.ntamd64=tap64.cat\n"
+               "[SourceDisksFiles]\ntap0901.sys=1\n"
+               "[SourceDisksFiles.amd64]\ntap64.sys=1\n"
+               "[SourceDisksFiles.x86]\ntap32.sys=1\n")
+        amd64 = netstack.inf_required_files(inf, "amd64")
+        self.assertIn("tap64.sys", amd64)
+        self.assertNotIn("tap32.sys", amd64)
+        x86 = netstack.inf_required_files(inf, "x86")
+        self.assertIn("tap32.sys", x86)
+        self.assertNotIn("tap64.sys", x86)
+        self.assertNotIn("tap64.cat", x86)
+
+
 class PowerShellSyntaxGuardTests(unittest.TestCase):
     """Сгенерированные .ps1/.cmd должны хотя бы разбираться Windows.
 

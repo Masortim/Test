@@ -232,7 +232,37 @@ def _resolve_inf_strings(value: str, strings: Dict[str, str]) -> str:
     return value.strip().strip('"').strip()
 
 
-def inf_required_files(text: str) -> List[str]:
+#: Токены разрядности в_decorated_ секциях INF (``SourceDisksFiles.amd64``).
+_INF_ARCH_TOKENS = ("amd64", "x86", "arm64", "ia64", "ntamd64", "ntx86",
+                    "ntarm64", "nt")
+
+
+def _inf_section_arch(section: str) -> str:
+    """Разрядность decorated-секции INF ("" — секция общая для всех).
+
+    ``sourcedisksfiles.amd64`` -> ``amd64``; ``catalogfile.ntamd64`` -> ``amd64``.
+    Без этого фильтр требовал бы файлы чужих архитектур и валидный
+    одноархитектурный пакет из DriverStore казался неполным.
+    """
+    if "." not in section:
+        return ""
+    decoration = section.split(".", 1)[1].strip().lower()
+    for token in _INF_ARCH_TOKENS:
+        if decoration == token or decoration.startswith(token + "."):
+            return {"ntamd64": "amd64", "ntx86": "x86",
+                    "ntarm64": "arm64", "nt": ""}.get(token, token)
+    return ""
+
+
+def _inf_section_applies(section: str, arch: str) -> bool:
+    """Применима ли секция к выбранной разрядности (пустая — ко всем)."""
+    section_arch = _inf_section_arch(section)
+    if not section_arch or not arch:
+        return True
+    return section_arch == arch
+
+
+def inf_required_files(text: str, arch: str = "") -> List[str]:
     """Файлы, без которых Windows не примет пакет: каталог и SourceDisksFiles.
 
     Это не полный парсер INF, а точная проверка тех полей, из-за которых
@@ -249,12 +279,16 @@ def inf_required_files(text: str) -> List[str]:
     required: List[str] = []
     for key, value in sections.get("version", []):
         if key.lower().startswith("catalogfile"):
+            if not _inf_section_applies(key.lower(), arch):
+                continue
             resolved = _resolve_inf_strings(value, strings)
             if resolved:
                 required.append(resolved.replace("\\", "/"))
     disk_subdirs: Dict[str, str] = {}
     for name, pairs in sections.items():
         if name == "sourcedisksnames" or name.startswith("sourcedisksnames."):
+            if not _inf_section_applies(name, arch):
+                continue
             for disk_id, value in pairs:
                 parts = [p.strip().strip('"') for p in value.split(",")]
                 # diskid = description[,tagfile][,unused][,subdir]
@@ -262,6 +296,8 @@ def inf_required_files(text: str) -> List[str]:
                 disk_subdirs[disk_id] = _resolve_inf_strings(subdir, strings)
     for name, pairs in sections.items():
         if name == "sourcedisksfiles" or name.startswith("sourcedisksfiles."):
+            if not _inf_section_applies(name, arch):
+                continue
             for filename, value in pairs:
                 parts = [p.strip().strip('"') for p in value.split(",")]
                 disk_id = parts[0] if parts else ""
@@ -272,7 +308,7 @@ def inf_required_files(text: str) -> List[str]:
     return _unique(required)
 
 
-def parse_net_inf(text: str) -> InfMeta:
+def parse_net_inf(text: str, arch: str = "") -> InfMeta:
     """Минимальный разбор ``.inf``: [Version] + раскрытие %строк%.
 
     Полноценный парсер INF не нужен: важны пять полей и наличие характерных
@@ -329,7 +365,7 @@ def parse_net_inf(text: str) -> InfMeta:
                    device_id=device_id, class_name=class_name,
                    catalog=version.get("catalogfile", ""),
                    hardware_id=hardware_id,
-                   required_files=inf_required_files(text))
+                   required_files=inf_required_files(text, arch))
 
 
 # --- сканирование установленной программы ---------------------------------------
@@ -506,7 +542,8 @@ def package_missing_files(package: NetDriverPackage,
     if not any(n.endswith(".cat") for n in names):
         catalog = ""
         try:
-            meta = parse_net_inf(read_inf_text(inf_path))
+            meta = parse_net_inf(read_inf_text(inf_path),
+                                 _arch_of(directory) or system_platform_arch())
             catalog = meta.catalog
         except OSError:
             pass
@@ -558,7 +595,7 @@ def scan_net_driver_packages(app_dir: str, max_files: int = 20_000
                 text = read_inf_text(full)
             except OSError:
                 continue
-            meta = parse_net_inf(text)
+            meta = parse_net_inf(text, system_platform_arch())
             if not meta.usable:
                 continue
             files_rel = _collect_app_package_files(full, app_dir, meta)
@@ -677,7 +714,10 @@ def _package_from_directory(inf_path: str, origin: str,
         text = read_inf_text(inf_path)
     except OSError:
         return None
-    meta = parse_net_inf(text)
+    # DriverStore names the package dir ..._amd64_...; that is the arch this
+    # package was actually built for, so validate exactly its own files.
+    meta = parse_net_inf(text, _arch_of(os.path.dirname(inf_path))
+                         or system_platform_arch())
     if not meta.usable:
         return None
     files = _collect_system_package_files(inf_path)
@@ -1406,7 +1446,8 @@ def refresh_netstack_scripts(portable_dir: str) -> List[str]:
         except OSError:
             text = ""
         if text:
-            meta = parse_net_inf(text)
+            meta = parse_net_inf(text, _arch_of(os.path.dirname(inf_path))
+                                 or system_platform_arch())
             entry["hardware_id"] = meta.hardware_id
             entry["required_files"] = ";".join(meta.required_files)
         package = NetDriverPackage(
@@ -1851,20 +1892,45 @@ function Find-HwidDevices([string]$hwid) {
      } catch { }
      if ($pnpWorks) { return $found }
      # Windows without the PnpDevice module (7/8): the same facts are in Enum.
+     # The layout is Enum\<bus>\<device>\<instance> (ROOT\NET\0000) and
+     # HardwareID lives on the INSTANCE key. Walking only two levels found
+     # nothing and produced a truncated instance id, which Teardown could
+     # never remove.
      $enum = 'HKLM:\SYSTEM\CurrentControlSet\Enum'
      foreach ($bus in @(Get-ChildItem -LiteralPath $enum -ErrorAction SilentlyContinue)) {
           foreach ($dev in @(Get-ChildItem -LiteralPath $bus.PSPath -ErrorAction SilentlyContinue)) {
-               $ids = @((Get-ItemProperty -LiteralPath $dev.PSPath `
-                    -Name HardwareID -ErrorAction SilentlyContinue).HardwareID)
-               foreach ($h in $ids) {
-                    if (Test-HwidMatch $h $hwid) {
-                         $found += [pscustomobject]@{
-                              InstanceId = ($bus.PSChildName + '\' + $dev.PSChildName)
-                              RegistryPath = $dev.PSPath
-                              Status = 'Unknown'
-                              ProblemCode = $null
+               foreach ($inst in @(Get-ChildItem -LiteralPath $dev.PSPath -ErrorAction SilentlyContinue)) {
+                    $ids = @((Get-ItemProperty -LiteralPath $inst.PSPath `
+                         -Name HardwareID -ErrorAction SilentlyContinue).HardwareID)
+                    foreach ($h in $ids) {
+                         if (Test-HwidMatch $h $hwid) {
+                              # No PnpDevice API here. 'Driver' exists only
+                              # once a driver is bound to the devnode, and
+                              # ConfigFlags bit 0x1 is CONFIGFLAG_DISABLED.
+                              # Without this the fallback always said Unknown
+                              # and the adapter was never considered ready.
+                              $props = Get-ItemProperty -LiteralPath $inst.PSPath `
+                                   -ErrorAction SilentlyContinue
+                              $state = 'Error'
+                              $problem = 28   # CM_PROB_FAILED_INSTALL
+                              if ($props.Driver) {
+                                   if (([int]$props.ConfigFlags -band 1) -ne 0) {
+                                        $state = 'Disabled'
+                                        $problem = 22  # CM_PROB_DISABLED
+                                   } else {
+                                        $state = 'OK'
+                                        $problem = 0
+                                   }
+                              }
+                              $found += [pscustomobject]@{
+                                   InstanceId = ($bus.PSChildName + '\' +
+                                        $dev.PSChildName + '\' + $inst.PSChildName)
+                                   RegistryPath = $inst.PSPath
+                                   Status = $state
+                                   ProblemCode = $problem
+                              }
+                              break
                          }
-                         break
                     }
                }
           }
