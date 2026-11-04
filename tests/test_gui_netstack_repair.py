@@ -339,5 +339,59 @@ class RepairNetStackGuiTests(_PortableFixture):
         self.assertTrue(self.window.netstack_btn.isEnabled())
 
 
+@unittest.skipIf(QApplication is None, f"PySide6 недоступен: {_QT_ERROR}")
+class DialogReadabilityTests(unittest.TestCase):
+    """Текст диалогов обязан быть читаемым на тёмной теме.
+
+    Правило ``* { color: TEXT }`` красило текст ВСЕХ виджетов в светлый, а
+    фон QMessageBox/QDialog оставался системным светлым: сообщения
+    обслуживания («Портатив обновлён», вопрос починки драйверов) было
+    невозможно прочесть. Дефект был общим для всех окон приложения.
+    """
+
+    def setUp(self):
+        self.app = _qt_app()
+        if self.app is None:
+            self.skipTest("Qt не может создать приложение (нет графики)")
+        from PySide6.QtWidgets import QMessageBox
+
+        from portablizer.gui import style
+
+        self.style = style
+        self.previous = self.app.styleSheet()
+        self.app.setStyleSheet(style.QSS)
+        self.addCleanup(self.app.setStyleSheet, self.previous)
+        self.box = QMessageBox()
+        self.addCleanup(self.box.close)
+        self.box.setText("Портатив обновлён: файлов 6")
+        self.box.show()
+
+    def _luminance(self, color):
+        return (0.299 * color.red() + 0.587 * color.green()
+                + 0.114 * color.blue())
+
+    def test_dialog_background_is_dark_like_the_theme(self):
+        background = self.box.palette().color(
+            self.box.palette().ColorRole.Window)
+        self.assertLess(self._luminance(background), 128,
+                        f"фон диалога остался светлым: {background.name()}")
+
+    def test_message_text_contrasts_with_the_dialog(self):
+        from PySide6.QtWidgets import QLabel
+
+        label = self.box.findChild(QLabel, "qt_msgbox_label")
+        self.assertIsNotNone(label)
+        background = self.box.palette().color(
+            self.box.palette().ColorRole.Window)
+        text = label.palette().color(label.palette().ColorRole.WindowText)
+        self.assertGreater(
+            abs(self._luminance(text) - self._luminance(background)), 80,
+            f"текст {text.name()} сливается с фоном {background.name()}")
+
+    def test_theme_styles_every_dialog_kind(self):
+        for kind in ("QMessageBox", "QDialog", "QFileDialog"):
+            self.assertIn(kind, self.style.QSS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

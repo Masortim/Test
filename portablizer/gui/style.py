@@ -26,6 +26,22 @@ QSS = f"""
 QMainWindow, QWidget#Root {{
     background: {BG};
 }}
+/* Диалоги (QMessageBox, QFileDialog, QDialog) наследуют системный СВЕТЛЫЙ
+   фон, а правило `*` выше задаёт им светлый же текст — сообщения были
+   нечитаемы (белым по белому). Особенно заметно на вопросах обслуживания:
+   «Починить драйверы VPN», «Обновить программу», итог «Портатив обновлён».
+   Фон диалогов задаётся явно, вместе с цветом текста. */
+QMessageBox, QDialog, QFileDialog {{
+    background: {BG_CARD};
+}}
+QMessageBox QLabel, QDialog QLabel, QFileDialog QLabel {{
+    color: {TEXT};
+    background: transparent;
+}}
+QMessageBox QPushButton, QDialog QPushButton, QFileDialog QPushButton {{
+    background: {BG_INPUT};
+    color: {TEXT};
+}}
 QLabel#Title {{
     font-size: 22px;
     font-weight: 700;
