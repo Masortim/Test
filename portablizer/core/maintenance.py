@@ -459,6 +459,10 @@ def refresh(folder: str, log: Optional[Logger] = None,
     return report
 
 
+#: Значение ``installer``, требующее свежий официальный драйвер OpenVPN.
+OFFICIAL_SOURCE = "@official"
+
+
 def repair_netstack(folder: str, installer: str = "",
                     log: Optional[Logger] = None) -> MaintenanceReport:
     """Починить драйверы VPN у готового портатива — то же, что кнопка в окне.
@@ -467,7 +471,11 @@ def repair_netstack(folder: str, installer: str = "",
 
     1. указанный установщик (только читается, НЕ запускается);
     2. этот компьютер — DriverStore/``Program Files\\TAP-Windows``, если
-       VPN-клиент здесь уже установлен и работает.
+       VPN-клиент здесь уже установлен и работает;
+    3. официальный архив OpenVPN — когда комплект ПОЛНЫЙ, но Windows
+       блокирует драйвер как уязвимый (TAP младше 9.27, CVE-2024-1305).
+       Тогда ни установщик, ни система не помогут: там лежит тот же
+       старый файл, и его отвергает сама Windows.
 
     Затем манифест и скрипты ``NetStack/`` пересоздаются текущей версией.
     Отчёт честно говорит, укомплектован пакет или нет: «обновлено» не
@@ -495,6 +503,32 @@ def repair_netstack(folder: str, installer: str = "",
             "(адаптер создаёт само приложение) — починка не нужна.")
         log.info(report.messages[-1])
         return report
+    forced_official = str(installer or "") == OFFICIAL_SOURCE
+    if forced_official:
+        installer = ""
+    if forced_official:
+        # Комплект может быть полным и всё равно нерабочим: Windows
+        # отказывается ставить tap0901.sys младше 9.27. Именно это видит
+        # и вендорский клиент как «Ошибка установки драйвера адаптера».
+        for line in before.outdated:
+            log.warn(f"драйвер устарел и блокируется Windows — {line}")
+        log.info("Беру актуальный подписанный TAP-Windows у проекта "
+                 "OpenVPN (нужна сеть; установка только по вашему запуску)…")
+        # В сеть идём ТОЛЬКО по явному выбору человека: обычная починка
+        # обязана работать без интернета и ничего не скачивать молча.
+        try:
+            replaced = netstack_mod.refill_netstack_from_official(
+                root, log=log, only_outdated=not forced_official)
+            report.updated.extend(replaced)
+            for rel in replaced:
+                log.ok(f"заменён {rel}")
+            if replaced:
+                before = netstack_mod.inspect_netstack(root)
+        except (OSError, ValueError, RuntimeError) as exc:
+            log.warn(f"официальный драйвер получить не удалось: {exc}")
+            report.messages.append(
+                "Свежий драйвер скачать не удалось (нужен доступ в интернет): "
+                f"{exc}")
     if before.complete:
         log.info("Пакет драйвера уже укомплектован: "
                  + ", ".join(before.ready))
@@ -533,8 +567,21 @@ def repair_netstack(folder: str, installer: str = "",
         log.error(report.messages[-1])
         return report
     after = netstack_mod.inspect_netstack(root)
-    report.success = after.complete
-    if after.complete:
+    # Комплектный, но заблокированный Windows драйвер успехом не считается:
+    # именно в этом состоянии установка падает и у самого VPN-клиента.
+    report.success = after.complete and not after.outdated
+    if after.complete and after.outdated:
+        message = (
+            "Файлы драйвера на месте, но сама Windows откажется его "
+            "ставить: " + "; ".join(after.outdated) + ".\n\n"
+            "В этих версиях tap0901.sys есть уязвимость CVE-2024-1305, "
+            "поэтому современные Windows блокируют драйвер — отсюда "
+            "«Ошибка установки драйвера адаптера» и у самого VPN-клиента. "
+            "Нужен TAP-Windows 9.27.0 или новее. Нажмите «Починить драйверы "
+            "VPN» → «Скачать свежий драйвер» (нужен интернет), затем "
+            "запустите портатив и подтвердите запрос прав администратора.")
+        log.warn(message)
+    elif after.complete:
         message = (
             "Драйверы VPN укомплектованы: " + ", ".join(after.ready) + ". "
             "Скрипты NetStack обновлены. Запустите портатив на нужном "

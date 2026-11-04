@@ -254,6 +254,31 @@ class RepairNetStackGuiTests(_PortableFixture):
         self.assertTrue(self.window.netstack_btn.isVisibleTo(
             self.window.netstack_btn.parentWidget()))
 
+    def test_blocked_driver_offers_a_fresh_download(self):
+        """Файлы на месте, но Windows их отвергает: окно обязано сказать это.
+
+        Прежняя починка видела полный комплект и рапортовала успех, а
+        адаптер не вставал ни у портатива, ни у самого VPN-клиента.
+        """
+        from portablizer.core.maintenance import OFFICIAL_SOURCE
+
+        (self.driver / "tap0901.sys").write_bytes(b"MZ")
+        (self.driver / "tap0901.cat").write_bytes(b"cat")
+        (self.driver / "OemVista.inf").write_text(
+            TAP_INF.replace("03/19/2024,9.27.0.0", "11/29/2019,9.24.2.1"),
+            encoding="utf-8")
+        seen, run = self._dialog("Скачать свежий драйвер")
+        self.assertIn("CVE-2024-1305", seen["text"])
+        self.assertIn("9.24.2.1", seen["text"])
+        self.assertIn("Скачать свежий драйвер", seen["buttons"])
+        run.assert_called_once_with("netstack", OFFICIAL_SOURCE)
+
+    def test_incomplete_package_also_offers_the_official_source(self):
+        seen, run = self._dialog("Скачать свежий драйвер")
+        self.assertIn("Скачать свежий драйвер", seen["buttons"])
+        self.assertIn("Выбрать установщик…", seen["buttons"])
+        run.assert_called_once()
+
     def test_start_menu_button_is_gone(self):
         """Кнопку «Починить меню «Пуск»» убрали из окна по просьбе.
 

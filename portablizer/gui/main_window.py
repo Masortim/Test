@@ -632,8 +632,37 @@ class MainWindow(QMainWindow):
                 "NetStack есть, но устанавливать драйверы портатив не должен: "
                 "сетевой адаптер создаёт само приложение. Починка не нужна.")
             return
+        from ..core.maintenance import OFFICIAL_SOURCE
+
         installer = ""
-        if state.complete:
+        if state.outdated:
+            # Файлы на месте, но Windows отказывается ставить драйвер:
+            # tap0901.sys младше 9.27 блокируется как уязвимый. прежняя
+            # починка рапортовала «всё укомплектовано» и не лечила ничего.
+            box = QMessageBox(self)
+            box.setWindowTitle("Portablizer")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(
+                "Драйвер VPN устарел, и Windows отказывается его "
+                "устанавливать:\n\n  " + "\n  ".join(state.outdated)
+                + "\n\nВ этих версиях tap0901.sys есть уязвимость "
+                "CVE-2024-1305, поэтому современные Windows блокируют "
+                "драйвер. Из-за этого «Ошибка установки драйвера адаптера» "
+                "появляется и у самого VPN-клиента — он ставит тот же "
+                "старый файл.\n\n"
+                "«Скачать свежий драйвер» возьмёт подписанный TAP-Windows "
+                f"{netstack_mod.tapdriver.OFFICIAL_TAP_VERSION} у проекта "
+                "OpenVPN (нужен интернет) и заменит комплект целиком. "
+                "Ничего не устанавливается: установка произойдёт при "
+                "запуске портатива, с вашим подтверждением UAC.")
+            fresh = box.addButton("Скачать свежий драйвер",
+                                  QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not fresh:
+                return
+            installer = OFFICIAL_SOURCE
+        elif state.complete:
             QMessageBox.information(
                 self, "Portablizer",
                 "Пакет драйвера уже укомплектован ("
@@ -653,13 +682,18 @@ class MainWindow(QMainWindow):
                 "запускается, Windows не изменяется.\n"
                 "• «С этого компьютера» — взять пакет, уже установленный "
                 "здесь (подходит, если этот VPN-клиент на этом ПК "
-                "работает).\n\n"
-                "Существующие файлы не перезаписываются, данные PortableData "
-                "не затрагиваются.")
+                "работает).\n"
+                "• «Скачать свежий драйвер» — подписанный TAP-Windows "
+                "проекта OpenVPN (нужен интернет). Подходит, когда "
+                "установщик возит старый драйвер, который Windows "
+                "блокирует.\n\n"
+                "Данные PortableData не затрагиваются.")
             pick = box.addButton("Выбрать установщик…",
                                  QMessageBox.ButtonRole.AcceptRole)
             local = box.addButton("С этого компьютера",
                                   QMessageBox.ButtonRole.YesRole)
+            fresh = box.addButton("Скачать свежий драйвер",
+                                  QMessageBox.ButtonRole.ActionRole)
             box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
             box.exec()
             clicked = box.clickedButton()
@@ -669,6 +703,8 @@ class MainWindow(QMainWindow):
                     "Установщики (*.exe *.msi *.cab);;Все файлы (*.*)")
                 if not installer:
                     return
+            elif clicked is fresh:
+                installer = OFFICIAL_SOURCE
             elif clicked is not local:
                 return
         self._maintenance("netstack", installer)
