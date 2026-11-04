@@ -1436,6 +1436,41 @@ class PowerShellSyntaxGuardTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class DriverInstallErrorNoteTests(unittest.TestCase):
+    """Отказ установки должен быть объясним прямо в setup.log.
+
+    «Ошибка установки драйвера адаптера» у вендорского клиента и код
+    Windows в журнале сами по себе не говорят, что делать. Чаще всего это
+    несовпадение подписи (комплект собран из разных версий TAP), поэтому
+    расшифровка обязана называть причину и лечение.
+    """
+
+    def setUp(self):
+        self.text = netstack.render_services_ps1()
+
+    def test_helper_is_generated_and_called(self):
+        self.assertIn("function Get-InstallErrorNote", self.text)
+        self.assertIn("Get-InstallErrorNote $err", self.text)
+
+    def test_signature_mismatch_names_the_real_cause_and_fix(self):
+        start = self.text.index("function Get-InstallErrorNote")
+        block = self.text[start:self.text.index("function Install-RootDevice")]
+        self.assertIn("577", block)
+        self.assertIn("INVALID_IMAGE_HASH", block)
+        self.assertIn("ОДНОГО", block)
+
+    def test_common_failure_codes_are_covered(self):
+        start = self.text.index("function Get-InstallErrorNote")
+        block = self.text[start:self.text.index("function Install-RootDevice")]
+        for code in ("2", "5", "13", "577", "1275", "3010"):
+            self.assertRegex(block, r"\b" + code + r"\s*\{")
+
+    def test_unknown_code_still_produces_a_message(self):
+        start = self.text.index("function Get-InstallErrorNote")
+        block = self.text[start:self.text.index("function Install-RootDevice")]
+        self.assertIn("default", block)
+
+
 class NetStackWarningDiagnosisTests(unittest.TestCase):
     """Окно «нужны системные сетевые компоненты» обязано называть ПРИЧИНУ.
 

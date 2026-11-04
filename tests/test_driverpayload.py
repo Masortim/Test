@@ -275,6 +275,80 @@ class CabinetHarvestTests(unittest.TestCase):
         self.assertFalse(report.found)
 
 
+class DriverInstallBlockerTests(unittest.TestCase):
+    """Три причины, по которым адаптер не вставал на целевом ПК.
+
+    Жалоба: и лончер писал «нужны компоненты: tap0901», и сам вендорский
+    клиент отвечал «Ошибка установки драйвера адаптера». Причины были в
+    комплекте, а не в diagnostике.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def _installer(self, layout):
+        """layout: {относительный путь: содержимое} внутри установщика."""
+        installer = self.tmp / "setup.exe"
+        with zipfile.ZipFile(installer, "w") as handle:
+            for rel, blob in layout.items():
+                handle.writestr(rel, blob)
+        return installer
+
+    def _harvest(self, installer, arch="amd64"):
+        with mock.patch.object(driverpayload.unpacker, "find_extractors",
+                               return_value=_fake_extractors()), \
+                mock.patch.object(unpacker, "_default_runner",
+                                  side_effect=_zip_runner):
+            return driverpayload.harvest_into(
+                str(installer), str(self.tmp / "out"), arch=arch)
+
+    def test_vendor_arch_directories_are_recognised(self):
+        """``amd64``/``i386`` — так вендоры раскладывают драйвер."""
+        for name, expected in (("amd64", "amd64"), ("x64", "amd64"),
+                               ("i386", "x86"), ("x86", "x86"),
+                               ("arm64", "arm64")):
+            self.assertEqual(netstack._arch_of("/pkg/" + name), expected, name)
+
+    def test_package_for_the_target_arch_wins(self):
+        """x86-драйвер на 64-битной Windows не загрузится вовсе."""
+        installer = self._installer({
+            "i386/OemVista.inf": TAP_INF,
+            "i386/tap0901.sys": b"X86-SYS",
+            "i386/tap0901.cat": b"X86-CAT",
+            "amd64/OemVista.inf": TAP_INF,
+            "amd64/tap0901.sys": b"AMD64-SYS",
+            "amd64/tap0901.cat": b"AMD64-CAT",
+        })
+        report = self._harvest(installer, arch="amd64")
+        self.assertTrue(report.found, report.notes)
+        chosen = report.packages[0]
+        sys_file = next(f for f in chosen.file_paths if f.endswith(".sys"))
+        self.assertEqual(Path(sys_file).read_bytes(), b"AMD64-SYS")
+
+    def test_tapinstall_is_named_in_the_manifest_not_only_copied(self):
+        """Без entry['tool'] Setup шёл запасным путём вместо tapinstall."""
+        installer = self._installer({
+            "amd64/OemVista.inf": TAP_INF,
+            "amd64/tap0901.sys": b"MZ",
+            "amd64/tap0901.cat": b"cat",
+            "amd64/tapinstall.exe": b"MZ-TOOL",
+        })
+        report = self._harvest(installer)
+        self.assertTrue(report.found, report.notes)
+        package = report.packages[0]
+        self.assertTrue(package.tool_path)
+        self.assertEqual(Path(package.tool_path).name, "tapinstall.exe")
+        root = self.tmp / "portable"
+        (root / "App").mkdir(parents=True)
+        built = netstack.provision_netstack(
+            str(root), str(root / "App"), [package], [], isolated=True)
+        self.assertEqual(built.drivers[0].get("tool"),
+                         "NetStack/bin/tapinstall.exe")
+        self.assertTrue((root / "NetStack" / "bin" / "tapinstall.exe").is_file())
+
+
 class RefillExistingPortableTests(unittest.TestCase):
     """Починка УЖЕ собранного портатива: жалоба «нужны компоненты: tap0901».
 
@@ -315,8 +389,10 @@ class RefillExistingPortableTests(unittest.TestCase):
 
     def test_missing_files_are_added_and_the_package_becomes_complete(self):
         added = self._refill()
+        # INF тоже приходит из источника: комплект обязан быть из одного
+        # набора, иначе каталог подписи не сойдётся с INF.
         self.assertEqual(sorted(os.path.basename(p) for p in added),
-                         ["tap0901.cat", "tap0901.sys"])
+                         ["OemVista.inf", "tap0901.cat", "tap0901.sys"])
         netstack.refresh_netstack_scripts(str(self.root))
         manifest = json.loads(
             (self.root / "NetStack" / "netstack.json").read_text(
@@ -325,12 +401,73 @@ class RefillExistingPortableTests(unittest.TestCase):
         self.assertEqual(entry["complete"], "1")
         self.assertEqual(entry["missing_files"], "")
 
-    def test_existing_files_are_never_overwritten(self):
-        """Вендорский файл из App может быть новее, чем в установщике."""
+    def test_complete_vendor_package_is_never_overwritten(self):
+        """Рабочий комплект новее — его ломать нельзя, даже частично."""
         (self.driver / "tap0901.sys").write_bytes(b"VENDOR-NEWER")
-        self._refill()
+        (self.driver / "tap0901.cat").write_bytes(b"VENDOR-CAT")
+        before = (self.driver / "OemVista.inf").read_bytes()
+        self.assertEqual(self._refill(), [])
         self.assertEqual((self.driver / "tap0901.sys").read_bytes(),
                          b"VENDOR-NEWER")
+        self.assertEqual((self.driver / "OemVista.inf").read_bytes(), before)
+
+    def test_incomplete_set_is_replaced_as_a_whole_not_merged(self):
+        """Причина отказа установки: старый INF + новые .sys/.cat.
+
+        Каталог подписи (.cat) подписывает конкретный INF. Прежняя починка
+        доливала только недостающие файлы и оставляла старый INF — подпись
+        не сходилась, и Windows отвечала «Ошибка установки драйвера
+        адаптера». Комплект должен заменяться целиком.
+        """
+        (self.driver / "OemVista.inf").write_text(
+            TAP_INF.replace("TAP-Windows Provider V9", "OLD-9.21"),
+            encoding="utf-8")
+        (self.driver / "tap0901.sys").write_bytes(b"STALE-SYS")
+        self._refill()
+        text = (self.driver / "OemVista.inf").read_text(encoding="utf-8")
+        self.assertNotIn("OLD-9.21", text)
+        self.assertNotEqual((self.driver / "tap0901.sys").read_bytes(),
+                            b"STALE-SYS")
+        inf_files = sorted(p.name for p in self.driver.glob("*.inf"))
+        self.assertEqual(len(inf_files), 1, "два INF — pnputil выберет не тот")
+
+    def test_set_mixed_by_the_old_repair_is_healed(self):
+        """Главный случай из жалобы: починка уже была, а адаптер не встаёт.
+
+        Версии до 1.46.1 доливали .sys/.cat и оставляли старый INF. Все
+        файлы на месте, поэтому пакет выглядит полным — и починка
+        отказывалась его трогать, а Windows отказывала в установке.
+        """
+        payload = self.tmp / "payload"
+        (self.driver / "OemVista.inf").write_text(
+            TAP_INF.replace("TAP-Windows Provider V9", "OLD-9.21"),
+            encoding="utf-8")
+        # .sys/.cat уже пришли из этого установщика прежней починкой
+        for name in ("tap0901.sys", "tap0901.cat"):
+            (self.driver / name).write_bytes((payload / name).read_bytes())
+        entry = {"kind": "tap-windows", "service": "tap0901",
+                 "needs_install": "1",
+                 "inf": "NetStack/Drivers/tap-windows/OemVista.inf",
+                 "required_files": "tap0901.sys;tap0901.cat"}
+        self.assertEqual(
+            netstack.package_missing_files(
+                netstack._manifest_package(entry, str(self.root))), [],
+            "комплект должен выглядеть полным — в этом и была ловушка")
+        added = self._refill()
+        self.assertTrue(added, "испорченный комплект обязан быть вылечен")
+        self.assertNotIn(
+            "OLD-9.21",
+            (self.driver / "OemVista.inf").read_text(encoding="utf-8"))
+
+    def test_genuinely_different_vendor_set_is_left_alone(self):
+        """Другой рабочий комплект — не «смешанный», его ломать нельзя."""
+        (self.driver / "tap0901.sys").write_bytes(b"VENDOR-SYS")
+        (self.driver / "tap0901.cat").write_bytes(b"VENDOR-CAT")
+        before = (self.driver / "OemVista.inf").read_bytes()
+        self.assertEqual(self._refill(), [])
+        self.assertEqual((self.driver / "tap0901.sys").read_bytes(),
+                         b"VENDOR-SYS")
+        self.assertEqual((self.driver / "OemVista.inf").read_bytes(), before)
 
     def test_staging_directory_is_removed(self):
         self._refill()
