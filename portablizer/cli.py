@@ -170,6 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--from-installer", default="",
         help="добрать недостающие .sys/.cat из этого установщика, не "
              "пересобирая портатив (установщик только читается, не запускается)")
+    rn.add_argument(
+        "--official", action="store_true",
+        help="заменить TAP свежим подписанным пакетом проекта OpenVPN "
+             "(нужен интернет). Лечит отказ установки, когда Windows "
+             "блокирует старый драйвер как уязвимый (CVE-2024-1305)")
     return parser
 
 
@@ -348,6 +353,11 @@ def cmd_repair_netstack(ns: argparse.Namespace) -> int:
     log = Logger(logfile=log_file)
     log.add_sink(lambda level, message: print(f"{level:<5} {message}"))
     installer = str(getattr(ns, "from_installer", "") or "")
+    if getattr(ns, "official", False):
+        from .core.maintenance import OFFICIAL_SOURCE, repair_netstack
+
+        report = repair_netstack(folder, OFFICIAL_SOURCE, log)
+        return 0 if report.success else 1
     if installer:
         if not os.path.isfile(installer):
             log.error(f"установщик не найден: {installer}")

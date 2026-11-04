@@ -51,6 +51,8 @@ import sys
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from . import tapdriver
+
 IS_WINDOWS = sys.platform.startswith("win")
 
 #: Маркер папки портатива в путях из манифеста (тот же, что в .reg-файлах).
@@ -167,6 +169,9 @@ class InfMeta:
     hardware_id: str = ""
     #: Файлы, обязательные для публикации пакета (каталог + SourceDisksFiles).
     required_files: List[str] = field(default_factory=list)
+    #: DriverVer из [Version] — по нему видно, что пакет устарел и Windows
+    #: блокирует его как уязвимый (tap-windows6 <= 9.26, CVE-2024-1305).
+    driver_version: str = ""
 
     @property
     def usable(self) -> bool:
@@ -452,6 +457,7 @@ def parse_net_inf(text: str, arch: str = "") -> InfMeta:
                    device_id=device_id, class_name=class_name,
                    catalog=version.get("catalogfile", ""),
                    hardware_id=hardware_id,
+                   driver_version=version.get("driverver", "").strip(),
                    required_files=inf_required_files(text, arch))
 
 
@@ -500,6 +506,8 @@ class NetDriverPackage:
     hardware_id: str = ""
     #: Обязательные файлы пакета относительно каталога INF.
     required_files: List[str] = field(default_factory=list)
+    #: DriverVer: по нему видно, что пакет устарел и Windows его блокирует.
+    driver_version: str = ""
 
     @property
     def needs_install(self) -> bool:
@@ -812,6 +820,7 @@ def _package_from_directory(inf_path: str, origin: str,
         kind=meta.kind, provider=meta.provider, service=meta.service,
         device_id=meta.device_id, inf_path=inf_path, file_paths=files,
         origin=origin, hardware_id=meta.hardware_id,
+        driver_version=meta.driver_version,
         required_files=list(meta.required_files))
 
 
@@ -1330,6 +1339,7 @@ def _entry_for_package(package: NetDriverPackage) -> Dict[str, str]:
         "tool": package.tool_rel,
         "installer": package.installer_rel,
         "required_files": ";".join(package.required_files),
+        "driver_version": package.driver_version,
         "complete": "1",
         "missing_files": "",
     }
@@ -1533,6 +1543,10 @@ class NetStackState:
     ready: List[str] = field(default_factory=list)
     #: Изолированный режим (драйвер живёт только на время сеанса).
     isolated: bool = True
+    #: Пакеты, которые комплектны, но слишком стары: Windows блокирует
+    #: tap0901.sys до 9.27 (CVE-2024-1305), поэтому установка падает и у
+    #: нашего Setup, и у самого вендорского клиента.
+    outdated: List[str] = field(default_factory=list)
 
     @property
     def complete(self) -> bool:
@@ -1584,6 +1598,19 @@ def inspect_netstack(portable_dir: str) -> NetStackState:
             state.missing.append(f"{name}: {', '.join(missing)}")
         else:
             state.ready.append(name)
+        # Комплектный, но заблокированный Windows драйвер — отдельная
+        # беда: файлов хватает, а установка всё равно падает.
+        version = str(entry.get("driver_version", ""))
+        if not version:
+            try:
+                version = parse_net_inf(read_inf_text(inf_path)).driver_version
+            except OSError:
+                version = ""
+        if str(entry.get("kind", "")) == KIND_TAP_WINDOWS and \
+                tapdriver.is_vulnerable_tap(version):
+            shown = tapdriver.version_tuple(version)
+            state.outdated.append(
+                f"{name}: {'.'.join(str(p) for p in shown)}")
     return state
 
 
@@ -1622,6 +1649,7 @@ def _manifest_package(entry: Dict[str, str], root: str) -> NetDriverPackage:
         service=str(entry.get("service", "")),
         device_id=str(entry.get("device_id", "")),
         inf_path=os.path.join(root, inf_rel.replace("/", os.sep)),
+        driver_version=str(entry.get("driver_version", "")),
         required_files=[part for part in
                         str(entry.get("required_files", "")).split(";") if part])
 
@@ -1672,7 +1700,8 @@ def _is_mixed_set(current: NetDriverPackage,
 
 
 def _copy_into_manifest(root: str, wanted: Sequence[Dict[str, str]],
-                        packages: Sequence[NetDriverPackage]) -> List[str]:
+                        packages: Sequence[NetDriverPackage],
+                        force: bool = False) -> List[str]:
     """Заменить НЕПОЛНЫЙ пакет целиком комплектом из одного источника.
 
     Здесь была главная причина «Ошибка установки драйвера адаптера»:
@@ -1687,7 +1716,10 @@ def _copy_into_manifest(root: str, wanted: Sequence[Dict[str, str]],
     * пакет уже полный — не трогаем вовсе (вендорский набор может быть
       новее, ломать рабочий комплект нельзя);
     * пакет неполный — перезаписываем ВЕСЬ комплект из одного источника,
-      включая INF, и убираем прежний INF, если у нового другое имя.
+      включая INF, и убираем прежний INF, если у нового другое имя;
+    * ``force`` — комплект полный, но Windows его блокирует как уязвимый
+      (TAP до 9.27). Такой набор меняем целиком: чинить в нём нечего,
+      его отвергает сама система, и об этом молчит проверка полноты.
 
     Заодно возвращается ``tapinstall.exe``/``devcon.exe``: с ним адаптер
     создаёт штатная вендорская утилита, а не запасной путь через SetupAPI.
@@ -1705,7 +1737,7 @@ def _copy_into_manifest(root: str, wanted: Sequence[Dict[str, str]],
                       or (kind and p.kind == kind)), None)
         if match is None or not match.inf_path:
             continue
-        if not package_missing_files(current):
+        if not package_missing_files(current) and not force:
             # Формально полный комплект может быть ИСПОРЧЕН прежней
             # починкой (чужой INF при своих .sys/.cat) — такой лечим.
             # Настоящий рабочий набор не перезаписываем никогда.
@@ -1744,6 +1776,15 @@ def _copy_into_manifest(root: str, wanted: Sequence[Dict[str, str]],
                 except OSError:
                     pass
                 entry["inf"] = os.path.relpath(new_inf, root).replace(os.sep, "/")
+        # Манифест обязан описывать НОВЫЙ комплект: у свежего INF свои
+        # обязательные файлы, Hardware ID и версия. Иначе проверка полноты
+        # и создание устройства работали бы по данным прежнего драйвера.
+        if match.required_files:
+            entry["required_files"] = ";".join(match.required_files)
+        if match.hardware_id:
+            entry["hardware_id"] = match.hardware_id
+        if match.driver_version:
+            entry["driver_version"] = match.driver_version
         # вендорская утилита установки надёжнее запасного SetupAPI-пути
         for path in copied:
             name = os.path.basename(path).lower()
@@ -1802,6 +1843,94 @@ def refill_netstack_from_installer(portable_dir: str, installer_path: str,
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return added
+
+
+def refill_netstack_from_official(portable_dir: str, arch: str = "",
+                                  log: Optional[object] = None,
+                                  only_outdated: bool = True) -> List[str]:
+    """Заменить TAP официальным свежим пакетом проекта OpenVPN.
+
+    Последний шаг, когда комплект ПОЛНЫЙ, а установка всё равно падает и у
+    NetStack, и у самого вендорского клиента: ``tap0901.sys`` младше 9.27
+    содержит CVE-2024-1305, и Windows отказывается его ставить (список
+    уязвимых драйверов, на Windows 11 ещё и HVCI). Никакая починка комплекта
+    тут не помогает — нужен другой драйвер.
+
+    Архив только скачивается и распаковывается, ничего не устанавливается:
+    установку по-прежнему делает NetStack с повышением прав. При
+    ``only_outdated`` рабочий современный комплект не затрагивается.
+    """
+    root = os.path.abspath(portable_dir)
+    manifest_path = os.path.join(root, NETSTACK_DIR_NAME, MANIFEST_NAME)
+    if not os.path.isfile(manifest_path):
+        return []
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    if not isinstance(manifest, dict):
+        return []
+    wanted = [entry for entry in manifest.get("drivers", [])
+              if isinstance(entry, dict)
+              and entry.get("needs_install") == "1"
+              and entry.get("kind") == KIND_TAP_WINDOWS]
+    if not wanted:
+        return []
+    say = getattr(log, "info", None) or (lambda _message: None)
+    if only_outdated:
+        state = inspect_netstack(root)
+        if not state.outdated:
+            say("TAP уже современной версии — замена не нужна.")
+            return []
+        else:
+            for line in state.outdated:
+                say(f"Windows блокирует устаревший драйвер — {line}; "
+                    f"нужен {tapdriver.OFFICIAL_TAP_VERSION} или новее.")
+    staging = os.path.join(root, NETSTACK_DIR_NAME, ".official")
+    added: List[str] = []
+    try:
+        downloaded = tapdriver.download_official_tap(staging, log=say)
+        signed, note = tapdriver.check_catalog_signature(downloaded)
+        say("Подпись официального пакета: " + note)
+        if signed is False:
+            raise ValueError("официальный пакет не прошёл проверку подписи: "
+                             + note)
+        packages = scan_downloaded_driver_packages(
+            downloaded, arch=arch or system_platform_arch())
+        if not packages:
+            raise ValueError("в официальном архиве не найден пакет TAP "
+                             "для этой разрядности")
+        added = _copy_into_manifest(root, wanted, packages, force=True)
+        if added:
+            _write_manifest(root, manifest)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return added
+
+
+def scan_downloaded_driver_packages(directory: str,
+                                    arch: str = "") -> List[NetDriverPackage]:
+    """Полные пакеты TAP в распакованном официальном архиве.
+
+    Архив несёт сразу несколько разрядностей (``amd64``/``i386``/``arm64``),
+    поэтому пакет своей архитектуры выбирается явно, а не первым попавшимся.
+    """
+    found: List[NetDriverPackage] = []
+    for current, dirs, files in os.walk(directory):
+        dirs.sort()
+        for name in sorted(files):
+            if not name.lower().endswith(".inf"):
+                continue
+            package = _package_from_directory(
+                os.path.join(current, name), "official")
+            if package is None or not package.needs_install:
+                continue
+            if package_missing_files(package):
+                continue
+            found.append(package)
+    if not arch:
+        return found
+    exact = [p for p in found
+             if _arch_of(os.path.dirname(p.inf_path)) == arch]
+    return exact or found
 
 
 def refresh_netstack_scripts(portable_dir: str) -> List[str]:

@@ -32,7 +32,7 @@ Signature   = "$Chicago$"
 Class       = Net
 Provider    = %Prov%
 CatalogFile = tap0901.cat
-DriverVer   = 11/29/2019,9.24.2.1
+DriverVer   = 03/19/2024,9.27.0.0
 
 [Manufacturer]
 %Prov% = tapwindows6, NTamd64
