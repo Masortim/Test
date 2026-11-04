@@ -9426,6 +9426,18 @@ class Portablizer:
             return None
         for note in report.notes:
             self.log.info(f"  • {note}")
+        if not report.complete:
+            missing = "; ".join(
+                f"{entry.get('service', '?')}: {entry.get('missing_files', '')}"
+                for entry in report.drivers
+                if entry.get("complete") == "0")
+            hint = ("NetStack: пакет драйвера неполный (" + missing + "). "
+                    "Соберите портатив на ПК, где установлен полный "
+                    "подписанный TAP-Windows/OpenVPN, или положите рядом "
+                    "с OemVista.inf его .sys/.cat и пересоберите. "
+                    "На чистом ПК адаптер tap0901 не появится.")
+            self.log.warn(hint)
+            result.hints.append(hint)
         result.netstack_drivers = sorted({
             entry.get("service") or entry.get("kind", "")
             for entry in report.drivers})
@@ -9441,10 +9453,14 @@ class Portablizer:
             parts.append("драйверы: " + ", ".join(result.netstack_drivers))
         if result.netstack_services:
             parts.append("службы: " + ", ".join(result.netstack_services))
-        if parts:
+        if parts and report.complete:
             self.log.ok("Сетевые компоненты перенесены в NetStack — "
                         + "; ".join(parts)
                         + ". Лончер проверит и досоздаст их на любом ПК.")
+        elif parts:
+            self.log.warn("Сетевые компоненты скопированы в NetStack — "
+                          + "; ".join(parts)
+                          + ", но пакет драйвера неполный.")
         if report.isolation == "session":
             # Изолированный режим: на сборочном ПК ничего не остаётся.
             self._retire_captured_services(portable_dir, report)

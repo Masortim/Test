@@ -439,12 +439,17 @@ def _device_hwid_present(hwid: str) -> bool:
                             continue
                         values = raw if isinstance(raw, (list, tuple)) else [raw]
                         for value in values:
-                            if needle in str(value).lower():
+                            text = str(value).strip().lower()
+                            # tapinstall creates "tap0901", tapctl/SetupAPI
+                            # create "root\tap0901"; both are the same driver,
+                            # but a substring match would also accept an
+                            # unrelated "root\tap0901x".
+                            if text == needle or text == "root\\" + needle:
                                 return True
             except OSError:
                 continue
-    except Exception:  # noqa: BLE001 — проверка не должна мешать запуску
-        return True
+    except Exception:  # noqa: BLE001 — не угадываем: пусть проверит Setup.cmd
+        return False
     return False
 
 
@@ -564,12 +569,13 @@ def _run_netstack_script(root: Path, relative: str, argument: str = ""
 #: Что означает код возврата NetStack-скриптов — в журнале запуска, а не
 #: только цифрой: по нему видно, чего именно не хватает на этом ПК.
 _NETSTACK_CODE_NOTES = {
-    2: "driver package is missing",
+    2: "driver package is missing or incomplete",
     3: "the network adapter was not created",
     4: "a companion service is missing, points into the previous folder or is "
        "not running",
     5: "PowerShell is too old (no ConvertFrom-Json)",
     6: "a companion service is registered but did not start",
+    1223: "the UAC prompt was declined",
 }
 
 
@@ -607,9 +613,13 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
     # один реестр (он видит и корневое устройство), но и без неё решаем.
     if not missing:
         code = _run_hidden(["cmd.exe", "/c", str(script), "--check"])
-        if code in (0, None):
+        if code == 0:
             return []
-        notes.append("Setup.cmd --check reported missing components")
+        if code is None:
+            notes.append("Setup.cmd --check could not be started; "
+                         "the real state is unknown")
+        else:
+            notes.append("Setup.cmd --check reported missing components")
     code = _run_netstack_script(root, setup)
     if code is None:
         notes.append("UAC prompt was declined or unavailable - the driver "
@@ -619,10 +629,10 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
         notes.append(f"NetStack setup exit code {code}"
                      + (f" ({detail})" if detail else ""))
     still = netstack_missing(root, cfg)
-    if still and code not in (None, 0):
-        # Второй проход: пакет уже опубликован в DriverStore, и теперь
-        # создаётся само устройство адаптера (tapinstall/SetupAPI). Иногда
-        # PnP успевает привязать драйвер только к этому моменту.
+    # A missing/incomplete driver package (2), old PowerShell (5) or a declined
+    # UAC prompt (1223) is deterministic: repeating Setup.cmd only shows the
+    # same prompt again and cannot conjure tap0901.sys/.cat out of nowhere.
+    if still and code not in (None, 0, 2, 5, 1223):
         time.sleep(1.0)
         second = _run_netstack_script(root, setup)
         detail = _netstack_code_note(second)
@@ -639,7 +649,7 @@ def ensure_netstack(root: Path, cfg: Dict[str, Any]) -> "list[str]":
         verify = _run_hidden(["cmd.exe", "/c", str(script), "--check"])
     except Exception:  # noqa: BLE001 - проверка не мешает запуску
         verify = None
-    if verify not in (0, None):
+    if verify != 0:
         reason = _netstack_code_note(verify) or "components are not ready"
         notes.append(f"NetStack verify exit code {verify} ({reason})")
         still = still or [reason]

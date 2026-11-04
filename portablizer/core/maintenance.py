@@ -435,6 +435,19 @@ def refresh(folder: str, log: Optional[Logger] = None,
             if copy_exe(folder, alias):
                 report.updated.append(alias)
 
+    # NetStack: старые портативы несли Setup.cmd/NetStackServices.ps1, которые
+    # верили pnputil и писали healthy=True без драйвера. Пересоздаём их из
+    # манифеста вместе с лончером, чтобы «Обновить лончер» чинило и tap0901.
+    try:
+        from . import netstack as netstack_mod
+        netstack_updated = netstack_mod.refresh_netstack_scripts(folder)
+        report.updated.extend(netstack_updated)
+        if netstack_updated:
+            report.messages.append("NetStack: скрипты установки/проверки "
+                                   "драйверов обновлены.")
+    except Exception as exc:  # noqa: BLE001 — NetStack не должен ронять refresh
+        report.messages.append(f"NetStack: не удалось обновить скрипты ({exc}).")
+
     report.success = bool(report.updated)
     if report.success:
         message = ("Портатив обновлён: теперь он сам закрывает фоновые "

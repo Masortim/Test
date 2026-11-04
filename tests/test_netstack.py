@@ -51,7 +51,7 @@ Provider    = %TapProvider%
 Class       = Net
 ClassGUID   = {4d36e972-e325-11ce-bfc1-08002be10318}
 DriverVer   = 11/29/2019,9.24.2.1
-CatalogFile = tap-windows6.cat
+CatalogFile = tap0901.cat
 
 [Manufacturer]
 %TapProvider% = tapwindows6, NTamd64
@@ -63,6 +63,12 @@ CatalogFile = tap-windows6.cat
 [tap0901.ndis6]
 Characteristics = 0x81
 AddReg = tap0901.reg, TapAdapter_Basic_Settings
+
+[SourceDisksNames]
+1 = %TapDescription%, tap0901.sys
+
+[SourceDisksFiles]
+tap0901.sys = 1
 
 [Strings]
 TapProvider = "TAP-Windows Provider V9"
@@ -642,7 +648,7 @@ class SystemCaptureTests(unittest.TestCase):
         directory.mkdir()
         (directory / "OemVista.inf").write_text(inf_text, encoding="utf-8")
         (directory / "tap0901.sys").write_bytes(b"MZ")
-        (directory / "tap-windows6.cat").write_bytes(b"MZ")
+        (directory / "tap0901.cat").write_bytes(b"MZ")
         return directory
 
     def test_driverstore_package_is_found_with_absolute_paths(self):
@@ -657,7 +663,7 @@ class SystemCaptureTests(unittest.TestCase):
         self.assertEqual(Path(package.inf_path), directory / "OemVista.inf")
         names = {Path(path).name for path in package.file_paths}
         self.assertIn("tap0901.sys", names)
-        self.assertIn("tap-windows6.cat", names)
+        self.assertIn("tap0901.cat", names)
 
     def test_foreign_drivers_are_not_captured(self):
         directory = self.store / "intelwifi.inf_amd64_1234"
@@ -671,12 +677,12 @@ class SystemCaptureTests(unittest.TestCase):
         x86.mkdir()
         (x86 / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
         (x86 / "tap0901.sys").write_bytes(b"MZ")
-        (x86 / "tap-windows6.cat").write_bytes(b"MZ")
+        (x86 / "tap0901.cat").write_bytes(b"MZ")
         arm = self.store / "oemvista.inf_arm64_bbbb"
         arm.mkdir()
         (arm / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
         (arm / "tap0901.sys").write_bytes(b"MZ")
-        (arm / "tap-windows6.cat").write_bytes(b"MZ")
+        (arm / "tap0901.cat").write_bytes(b"MZ")
         packages = netstack.scan_driverstore_packages(str(self.store),
                                                       arch="arm64")
         self.assertEqual(Path(packages[0].inf_path).parent, arm)
@@ -687,7 +693,7 @@ class SystemCaptureTests(unittest.TestCase):
         driver.mkdir(parents=True)
         (driver / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
         (driver / "tap0901.sys").write_bytes(b"MZ")
-        (driver / "tap-windows6.cat").write_bytes(b"MZ")
+        (driver / "tap0901.cat").write_bytes(b"MZ")
         binary = programs / "TAP-Windows" / "bin"
         binary.mkdir(parents=True)
         (binary / "tapinstall.exe").write_bytes(b"MZ")
@@ -704,7 +710,7 @@ class SystemCaptureTests(unittest.TestCase):
         driver.mkdir(parents=True)
         (driver / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
         (driver / "tap0901.sys").write_bytes(b"MZ")
-        (driver / "tap-windows6.cat").write_bytes(b"MZ")
+        (driver / "tap0901.cat").write_bytes(b"MZ")
         packages = netstack.scan_system_driver_packages(
             store_dir=str(self.store), program_files=[str(programs)])
         self.assertEqual(len(packages), 1)
@@ -732,7 +738,7 @@ class SystemCaptureTests(unittest.TestCase):
         app.mkdir()
         (app / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
         (app / "tap0901.sys").write_bytes(b"MZ")
-        (app / "tap-windows6.cat").write_bytes(b"MZ")
+        (app / "tap0901.cat").write_bytes(b"MZ")
         packages = netstack.scan_net_driver_packages(str(app))
         self.assertTrue(netstack.is_complete_driver_package(packages[0]))
         tool = self.base / "tapinstall.exe"
@@ -763,7 +769,7 @@ class SystemPackageProvisionTests(unittest.TestCase):
         package_dir.mkdir(parents=True)
         (package_dir / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
         (package_dir / "tap0901.sys").write_bytes(b"MZ")
-        (package_dir / "tap-windows6.cat").write_bytes(b"MZ")
+        (package_dir / "tap0901.cat").write_bytes(b"MZ")
         self.packages = netstack.scan_driverstore_packages(str(self.store))
 
     def provision(self):
@@ -777,7 +783,7 @@ class SystemPackageProvisionTests(unittest.TestCase):
         drivers = self.root / "NetStack" / "Drivers" / "tap-windows"
         self.assertTrue((drivers / "OemVista.inf").is_file())
         self.assertEqual((drivers / "tap0901.sys").read_bytes(), b"MZ")
-        self.assertTrue((drivers / "tap-windows6.cat").is_file())
+        self.assertTrue((drivers / "tap0901.cat").is_file())
         manifest = json.loads((self.root / "NetStack" / "netstack.json")
                               .read_text(encoding="utf-8"))
         self.assertEqual(manifest["drivers"][0]["device_id"], "tap0901")
@@ -832,7 +838,7 @@ class BuildIntegrationTests(unittest.TestCase):
         store.mkdir(parents=True)
         (store / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
         (store / "tap0901.sys").write_bytes(b"MZ")
-        (store / "tap-windows6.cat").write_bytes(b"MZ")
+        (store / "tap0901.cat").write_bytes(b"MZ")
         tool = self.base / "tapinstall.exe"
         tool.write_bytes(b"MZ")
         self.store = self.base / "store"
@@ -935,11 +941,11 @@ class ServiceRepairScriptTests(unittest.TestCase):
             services=[{"name": "PlanetVPNService", "image": "x", "args": "",
                        "display": "PlanetVPN", "start": "demand"}])
         setup = netstack.render_setup_cmd(report)
-        lines = _command_lines_with(setup, "errorlevel 6")
-        self.assertTrue(lines, "NetStack RC=6 не доходит до лончера")
-        self.assertIn('set "NETSTACK_RC=6"', setup)
-        # 6 не перетирается повторной проверкой (она ставит только 4).
-        self.assertIn('if not "%NETSTACK_RC%" == "6" if errorlevel 4', setup)
+        # Код .ps1 теперь авторитетен: 6 доходит до лончера без перетирания
+        #.batch-предупреждениями про pnputil.
+        self.assertIn('set "NETSTACK_RC=%ERRORLEVEL%"', setup)
+        self.assertIn("6 = companion service did not start", setup)
+        self.assertIn('if "!ERRORLEVEL!" == "4" if "!NETSTACK_RC!" == "0"', setup)
 
     def test_state_file_is_named_in_the_script(self):
         self.assertIn("status.txt", netstack.render_services_ps1())
@@ -1150,6 +1156,103 @@ class CapturedServiceRetirementTests(unittest.TestCase):
         with mock.patch.object(engine_mod.procutil, "services_in_detail",
                                side_effect=AssertionError("must not look")):
             engine._retire_captured_services(r"E:\P", self._report("shared"))
+
+
+class Tap0901RegressionTests(unittest.TestCase):
+    """Жалоба: pnputil «не найден файл», Setup 3/3, check 2, healthy=True."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name) / "planetvpn_Portable"
+        self.app = self.root / "App"
+        self.driver = self.app / "driver"
+        self.driver.mkdir(parents=True)
+        (self.driver / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+
+    def test_inf_only_bundle_is_marked_incomplete_and_preflight_blocks_uac(self):
+        packages = netstack.scan_net_driver_packages(str(self.app))
+        report = netstack.provision_netstack(str(self.root), str(self.app),
+                                             packages, [])
+        self.assertIsNotNone(report)
+        self.assertFalse(report.complete)
+        entry = report.drivers[0]
+        self.assertEqual(entry["complete"], "0")
+        self.assertIn("tap0901.sys", entry["missing_files"])
+        self.assertIn("tap0901.cat", entry["missing_files"])
+        setup = (self.root / "NetStack" / "Setup.cmd").read_text(encoding="ascii")
+        lines = setup.splitlines()
+        preflight = next(i for i, line in enumerate(lines)
+                         if "-Mode preflight" in line)
+        uac = next(i for i, line in enumerate(lines)
+                   if "Start-Process -Verb RunAs" in line)
+        self.assertLess(preflight, uac)
+        self.assertIn('if "%ERRORLEVEL%" == "2" (set "NETSTACK_RC=2"', setup)
+        ps1 = (self.root / "NetStack" / "NetStackServices.ps1").read_text(
+            encoding="utf-8-sig")
+        self.assertIn("function Test-NetStackPackages", ps1)
+        self.assertIn("DEVPKEY_Device_HardwareIds", ps1)
+        self.assertFalse([line for line in ps1.splitlines()
+                          if "$d.HardwareID" in line
+                          and not line.strip().startswith("#")])
+        self.assertIn("driver ' + $svcName + ': ' + $svcState", ps1)
+        self.assertIn("$healthy = ($serviceHealthy -and $driverHealthy)", ps1)
+
+    def test_required_files_keep_subdirectories_when_copied(self):
+        nested = self.driver / "amd64"
+        nested.mkdir()
+        (nested / "tap0901.sys").write_bytes(b"MZ")
+        (self.driver / "tap0901.cat").write_bytes(b"cat")
+        inf = TAP_INF.replace("tap0901.sys = 1", "tap0901.sys = 1, amd64")
+        (self.driver / "OemVista.inf").write_text(inf, encoding="utf-8")
+        packages = netstack.scan_net_driver_packages(str(self.app))
+        report = netstack.provision_netstack(str(self.root), str(self.app),
+                                             packages, [])
+        self.assertTrue(report.complete)
+        copied = self.root / "NetStack" / "Drivers" / "tap-windows"
+        self.assertTrue((copied / "amd64" / "tap0901.sys").is_file())
+        self.assertTrue((copied / "tap0901.cat").is_file())
+
+    def test_launcher_does_not_retry_missing_package_or_declined_uac(self):
+        for code in (2, 5, 1223):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "NetStack").mkdir()
+                (root / "NetStack" / "Setup.cmd").write_text("@echo off")
+                cfg = {"netstack": {"setup": "NetStack/Setup.cmd"}}
+                with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                        mock.patch.object(exe_launcher, "netstack_missing",
+                                          return_value=["tap0901"]), \
+                        mock.patch.object(exe_launcher, "_run_hidden",
+                                          return_value=code), \
+                        mock.patch.object(exe_launcher, "_run_netstack_script",
+                                          return_value=code) as setup, \
+                        mock.patch.object(exe_launcher, "_show_warning"):
+                    notes = exe_launcher.ensure_netstack(root, cfg)
+                self.assertEqual(setup.call_count, 1)
+                self.assertFalse(any("retry" in note for note in notes))
+
+    def test_refresh_regenerates_old_netstack_scripts_and_marks_missing(self):
+        netstack_dir = self.root / "NetStack"
+        netstack_dir.mkdir(parents=True)
+        drivers = netstack_dir / "Drivers" / "tap-windows"
+        drivers.mkdir(parents=True)
+        (drivers / "OemVista.inf").write_text(TAP_INF, encoding="utf-8")
+        (netstack_dir / "netstack.json").write_text(json.dumps({
+            "schema": 1, "isolation": "session", "root_token": "@@PORTABLE_ROOT@@",
+            "drivers": [{"kind": "tap-windows", "service": "tap0901",
+                         "device_id": "tap0901", "needs_install": "1",
+                         "inf": "NetStack/Drivers/tap-windows/OemVista.inf"}],
+            "services": [], "state_dir": "PortableData/NetStack",
+            "created_services_file": "created-services.txt"}), encoding="utf-8")
+        (netstack_dir / "Setup.cmd").write_text("@echo off\r\nrem old\r\n")
+        updated = netstack.refresh_netstack_scripts(str(self.root))
+        self.assertIn("NetStack/Setup.cmd", updated)
+        manifest = json.loads((netstack_dir / "netstack.json").read_text())
+        self.assertEqual(manifest["drivers"][0]["complete"], "0")
+        self.assertEqual(manifest["drivers"][0]["hardware_id"], "root\\tap0901")
+        setup = (netstack_dir / "Setup.cmd").read_text(encoding="ascii")
+        self.assertIn("-Mode preflight", setup)
 
 
 class PowerShellSyntaxGuardTests(unittest.TestCase):
