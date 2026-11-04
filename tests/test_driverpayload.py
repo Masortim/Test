@@ -431,6 +431,44 @@ class RefillExistingPortableTests(unittest.TestCase):
         inf_files = sorted(p.name for p in self.driver.glob("*.inf"))
         self.assertEqual(len(inf_files), 1, "два INF — pnputil выберет не тот")
 
+    def test_set_mixed_by_the_old_repair_is_healed(self):
+        """Главный случай из жалобы: починка уже была, а адаптер не встаёт.
+
+        Версии до 1.46.1 доливали .sys/.cat и оставляли старый INF. Все
+        файлы на месте, поэтому пакет выглядит полным — и починка
+        отказывалась его трогать, а Windows отказывала в установке.
+        """
+        payload = self.tmp / "payload"
+        (self.driver / "OemVista.inf").write_text(
+            TAP_INF.replace("TAP-Windows Provider V9", "OLD-9.21"),
+            encoding="utf-8")
+        # .sys/.cat уже пришли из этого установщика прежней починкой
+        for name in ("tap0901.sys", "tap0901.cat"):
+            (self.driver / name).write_bytes((payload / name).read_bytes())
+        entry = {"kind": "tap-windows", "service": "tap0901",
+                 "needs_install": "1",
+                 "inf": "NetStack/Drivers/tap-windows/OemVista.inf",
+                 "required_files": "tap0901.sys;tap0901.cat"}
+        self.assertEqual(
+            netstack.package_missing_files(
+                netstack._manifest_package(entry, str(self.root))), [],
+            "комплект должен выглядеть полным — в этом и была ловушка")
+        added = self._refill()
+        self.assertTrue(added, "испорченный комплект обязан быть вылечен")
+        self.assertNotIn(
+            "OLD-9.21",
+            (self.driver / "OemVista.inf").read_text(encoding="utf-8"))
+
+    def test_genuinely_different_vendor_set_is_left_alone(self):
+        """Другой рабочий комплект — не «смешанный», его ломать нельзя."""
+        (self.driver / "tap0901.sys").write_bytes(b"VENDOR-SYS")
+        (self.driver / "tap0901.cat").write_bytes(b"VENDOR-CAT")
+        before = (self.driver / "OemVista.inf").read_bytes()
+        self.assertEqual(self._refill(), [])
+        self.assertEqual((self.driver / "tap0901.sys").read_bytes(),
+                         b"VENDOR-SYS")
+        self.assertEqual((self.driver / "OemVista.inf").read_bytes(), before)
+
     def test_staging_directory_is_removed(self):
         self._refill()
         self.assertFalse((self.root / "NetStack" / ".refill").exists())

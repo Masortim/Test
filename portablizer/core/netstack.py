@@ -1539,6 +1539,51 @@ def _manifest_package(entry: Dict[str, str], root: str) -> NetDriverPackage:
                         str(entry.get("required_files", "")).split(";") if part])
 
 
+def _files_equal(left: str, right: str) -> bool:
+    """Побайтовое сравнение небольших файлов драйвера."""
+    try:
+        with open(left, "rb") as fh1, open(right, "rb") as fh2:
+            while True:
+                a, b = fh1.read(65536), fh2.read(65536)
+                if a != b:
+                    return False
+                if not a:
+                    return True
+    except OSError:
+        return False
+
+
+def _is_mixed_set(current: NetDriverPackage,
+                 source: NetDriverPackage) -> bool:
+    """Комплект, испорченный прежней починкой: чужой INF при своих .sys/.cat.
+
+    Версии до 1.46.1 доливали недостающие ``.sys``/``.cat`` и оставляли
+    старый INF. Формально все файлы на месте, поэтому проверка полноты
+    считает пакет целым — и новая починка отказывалась его трогать, а
+    Windows продолжала отказывать в установке (подпись не сходится).
+
+    Признак ровно один и он однозначный: файлы драйвера побайтово совпали
+    с источником, а INF — нет. Значит INF остался от другого набора, и
+    комплект нужно пересобрать из источника целиком.
+    """
+    if not current.inf_path or not source.inf_path:
+        return False
+    if not os.path.isfile(current.inf_path):
+        return False
+    if _files_equal(current.inf_path, source.inf_path):
+        return False
+    base = os.path.dirname(source.inf_path)
+    for src in source.file_paths:
+        name = os.path.basename(src).lower()
+        if not name.endswith((".sys", ".cat")):
+            continue
+        target = os.path.join(os.path.dirname(current.inf_path),
+                              os.path.relpath(src, base))
+        if os.path.isfile(target) and _files_equal(target, src):
+            return True
+    return False
+
+
 def _copy_into_manifest(root: str, wanted: Sequence[Dict[str, str]],
                         packages: Sequence[NetDriverPackage]) -> List[str]:
     """Заменить НЕПОЛНЫЙ пакет целиком комплектом из одного источника.
@@ -1568,14 +1613,17 @@ def _copy_into_manifest(root: str, wanted: Sequence[Dict[str, str]],
         if not inf_rel:
             continue
         current = _manifest_package(entry, root)
-        if not package_missing_files(current):
-            # Рабочий комплект не перезаписываем никогда.
-            continue
         match = next((p for p in packages
                       if (service and p.check_service == service)
                       or (kind and p.kind == kind)), None)
         if match is None or not match.inf_path:
             continue
+        if not package_missing_files(current):
+            # Формально полный комплект может быть ИСПОРЧЕН прежней
+            # починкой (чужой INF при своих .sys/.cat) — такой лечим.
+            # Настоящий рабочий набор не перезаписываем никогда.
+            if not _is_mixed_set(current, match):
+                continue
         if package_missing_files(match):
             # Нечем лечить: неполный источник только заменил бы один
             # неполный комплект другим.
