@@ -9348,6 +9348,46 @@ class Portablizer:
                 f"{setup.migrated}. Их увидят все способы запуска.")
         return setup
 
+    def _harvest_installer_drivers(self, portable_dir: str,
+                                   opts: PortableOptions,
+                                   packages: List["netstack_mod.NetDriverPackage"]
+                                   ) -> List["netstack_mod.NetDriverPackage"]:
+        """Дополняет список пакетов драйверами, найденными В установщике.
+
+        Полный пакет из установщика важнее неполного из ``App``, но не
+        важнее уже полного: вендорская версия из App/DriverStore остаётся
+        приоритетной, если она укомплектована. Ничего не устанавливается —
+        контейнер только читается распаковщиком.
+        """
+        from . import driverpayload
+
+        installer = opts.installer_path
+        if not installer or not os.path.isfile(installer):
+            return packages
+        staging = os.path.join(portable_dir, netstack_mod.NETSTACK_DIR_NAME,
+                               ".payload")
+        try:
+            report = driverpayload.harvest_into(
+                installer, staging,
+                arch=netstack_mod.system_platform_arch())
+        except Exception as exc:  # noqa: BLE001 — не роняем сборку
+            self.log.debug(f"Драйверы из установщика не извлечены: {exc}")
+            return packages
+        for note in report.notes:
+            self.log.info(f"  • {note}")
+        if not report.packages:
+            shutil.rmtree(staging, ignore_errors=True)
+            return packages
+        # ВАЖНО: staging НЕ удаляется здесь. Пути в report.packages указывают
+        # внутрь него, а файлы копирует provision_netstack — уже после
+        # возврата. Каталог уберёт _provision_netstack в своём finally.
+        merged = netstack_mod.merge_driver_packages(packages, report.packages)
+        self.log.ok(
+            "Драйверы извлечены из установщика: "
+            + ", ".join(sorted({p.check_service or p.kind
+                                for p in report.packages})))
+        return merged
+
     def _provision_netstack(self, portable_dir: str, app_dir: str,
                             opts: PortableOptions,
                             result: PortableResult,
@@ -9397,6 +9437,17 @@ class Portablizer:
                     self.log.debug(f"Поиск tapinstall не удался: {exc}")
                     tools = []
                 packages = netstack_mod.attach_netstack_tools(packages, tools)
+            # Драйвер прямо из установщика. Это то, что делает портатив
+            # самодостаточным: если VPN-клиент не поставил драйвер на машину
+            # сборки (или сборка шла распаковкой, без запуска), в App и в
+            # DriverStore его нет — но внутри самого установщика он есть.
+            # Вскрываем контейнер, НЕ запуская его, и берём полный пакет.
+            if vpn_hint or not any(
+                    p.needs_install
+                    and netstack_mod.is_complete_driver_package(p)
+                    for p in packages):
+                packages = self._harvest_installer_drivers(
+                    portable_dir, opts, packages)
             service_names: List[str] = []
             if IS_WINDOWS:
                 try:
@@ -9405,20 +9456,33 @@ class Portablizer:
                     self.log.debug(f"Не удалось перечислить службы: {exc}")
             records = netstack_mod.collect_companion_services(
                 app_dir, service_names) if service_names else []
-            report = netstack_mod.provision_netstack(
-                portable_dir, app_dir, packages, records,
-                isolated=opts.netstack_isolated)
+            try:
+                report = netstack_mod.provision_netstack(
+                    portable_dir, app_dir, packages, records,
+                    isolated=opts.netstack_isolated)
+            finally:
+                # Пакеты, добытые из установщика, к этому моменту скопированы
+                # в NetStack/Drivers — промежуточный каталог больше не нужен.
+                shutil.rmtree(
+                    os.path.join(portable_dir, netstack_mod.NETSTACK_DIR_NAME,
+                                 ".payload"), ignore_errors=True)
         except Exception as exc:  # noqa: BLE001 — компоненты не роняют сборку
             self.log.warn(f"Сетевые компоненты не перенесены: {exc}")
             return None
         if report is None:
             if vpn_hint:
-                self.log.warn(
-                    "Это VPN-клиент, но пакет драйвера TAP-Windows не найден "
-                    "ни в App, ни на этом ПК — портатив без него не "
-                    "подключится. Установите клиент на этом компьютере один "
-                    "раз (вместе с ним ставится драйвер), затем соберите "
-                    "портатив снова: пакет будет взят из DriverStore.")
+                hint = (
+                    "Это VPN-клиент, но полный пакет драйвера TAP-Windows не "
+                    "найден ни в App, ни на этом ПК, ни внутри установщика — "
+                    "портатив без него не подключится. Установите клиент на "
+                    "этом компьютере один раз (вместе с ним ставится "
+                    "драйвер), затем соберите портатив снова: пакет будет "
+                    "взят из DriverStore. Либо положите полный подписанный "
+                    "пакет (OemVista.inf + tap0901.sys + tap0901.cat) в "
+                    "<портатив>\\NetStack\\Drivers\\tap-windows и выполните "
+                    "'Portablizer.exe repair-netstack <папка>'.")
+                self.log.warn(hint)
+                result.hints.append(hint)
             else:
                 self.log.debug(
                     "Сетевых компонентов (TAP-Windows/wintun/ovpn-dco) не "
