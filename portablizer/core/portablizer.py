@@ -58,6 +58,7 @@ from .. import __version__
 from . import adobe as adobe_mod
 from . import crashinfo as crash_mod
 from . import elevate as elevate_mod
+from . import inno as inno_mod
 from . import launcher as launcher_mod
 from . import netstack as netstack_mod
 from . import procutil
@@ -6113,8 +6114,13 @@ class Portablizer:
         unpacker = unpacker_mod.find_unpacker()
         if not unpacker:
             self.log.info(
-                "Распаковщик (7-Zip) на этом компьютере не найден: достать "
-                "содержимое вложенного установщика без запуска нечем."
+                "Распаковщик (7-Zip) на этом компьютере не найден."
+            )
+            if kind == InstallerType.INNO:
+                return self._try_builtin_inno(nested, app_dir, portable_dir,
+                                              name)
+            self.log.info(
+                "Доставать содержимое вложенного установщика без запуска нечем."
             )
             return False
         work = os.path.join(portable_dir, "_nested_unpacked")
@@ -6136,6 +6142,9 @@ class Portablizer:
                 "Содержимое вложенного установщика без запуска не дало "
                 f"файлов программы: {message}"
             )
+            if kind == InstallerType.INNO:
+                return self._try_builtin_inno(nested, app_dir, portable_dir,
+                                              name)
             return False
         main_exe = self._find_main_exe(app_dir, name)
         base = os.path.basename(main_exe or "").lower()
@@ -6151,6 +6160,57 @@ class Portablizer:
     def _unpacker_worth_trying(self, det: DetectionResult) -> bool:
         """Есть ли смысл доставать содержимое установщика распаковщиком."""
         return det.installer_type in UNPACKABLE_TYPES
+
+    def _try_builtin_inno(self, installer_path: str, app_dir: str,
+                          portable_dir: str, name: str) -> bool:
+        """Inno Setup — своим распаковщиком, без 7-Zip и без запуска установщика.
+
+        Когда 7-Zip на компьютере нет (или он не помог), контейнер Inno
+        Setup 6.x разбирается стандартной библиотекой Python
+        (:mod:`portablizer.core.inno`): заголовок, chanки LZMA/zlib/stored и
+        обратное преобразование CALL/JMP. Код установщика при этом не
+        выполняется вовсе — системе это ничего не делает.
+        """
+        if not inno_mod.looks_like_inno(installer_path):
+            return False
+        self._check_cancel()
+        self.progress(64, "Распаковка установщика своим распаковщиком Inno")
+        self.log.info(
+            "Достаю содержимое установщика Inno Setup своим распаковщиком "
+            "(стандартная библиотека Python, код установщика не выполняется)..."
+        )
+        work = os.path.join(portable_dir, "_inno_unpacked")
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            ok, message = inno_mod.extract_installer(
+                installer_path, work, log=self.log.info,
+                should_cancel=lambda: self.cancel.is_set())
+            if not ok:
+                self._unpacker_result = message
+                self.log.warn(message)
+                return False
+            copied = unpacker_mod.promote_payload(
+                work, app_dir, installer_path=installer_path)
+            if copied and self._find_main_exe(app_dir, name):
+                self._unpacked_with = "inno-builtin"
+                self.log.ok(
+                    "Установщик Inno Setup распакован без запуска своим "
+                    f"распаковщиком — файлы программы в папке App ({message})."
+                )
+                return True
+            self._unpacker_result = (
+                "Свой распаковщик Inno Setup извлёк файлы, но исполняемого "
+                f"файла программы среди них нет: {message}")
+            self.log.warn(self._unpacker_result)
+            return False
+        except RuntimeError:
+            raise  # отмена пользователем — не перехватываем
+        except Exception as exc:  # noqa: BLE001 - распаковка не должна ронять сборку
+            self._unpacker_result = f"свой распаковщик Inno упал с ошибкой: {exc}"
+            self.log.warn(self._unpacker_result)
+            return False
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
     def _try_unpacker_fallback(self, opts: PortableOptions, app_dir: str,
                                portable_dir: str, det: DetectionResult,
@@ -6188,9 +6248,16 @@ class Portablizer:
         unpacker = unpacker_mod.find_unpacker()
         if not unpacker:
             self.log.info(
-                "Распаковщик (7-Zip) на этом компьютере не найден: достать "
-                "содержимое установщика без запуска нечем. В подсказках ниже "
-                "сказано, что это меняет."
+                "Распаковщик (7-Zip) на этом компьютере не найден."
+            )
+            # Inno Setup 6.x при этом вовсе не тупик: контейнер разбирается
+            # своим распаковщиком (core/inno.py) вообще без сторонних программ.
+            if det.installer_type == InstallerType.INNO:
+                return self._try_builtin_inno(opts.installer_path, app_dir,
+                                              portable_dir, name)
+            self.log.info(
+                "Доставать содержимое установщика без запуска нечем. В "
+                "подсказках ниже сказано, что это меняет."
             )
             return False
 
@@ -6226,6 +6293,10 @@ class Portablizer:
             f"файлов программы: {message}"
         )
         self.log.warn(self._unpacker_result)
+        # 7-Zip не справился — для Inno Setup пробуем свой распаковщик.
+        if det.installer_type == InstallerType.INNO:
+            return self._try_builtin_inno(opts.installer_path, app_dir,
+                                          portable_dir, name)
         return False
 
     def _run_unpacker_command(self, cmd: Sequence[str], console_log: str,
