@@ -20,6 +20,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -81,16 +82,54 @@ def _lzma1_compress(raw: bytes) -> bytes:
     return bytes([props]) + struct.pack("<I", dict_size) + body
 
 
+def _chunk_blob(blob: bytes) -> bytes:
+    """Разбивает распакованный блок на порции <=4096 байт, каждая со своим
+    u32 CRC32 (как TCompressedBlockWriter.DoCompress в issrc)."""
+    out = bytearray()
+    pos = 0
+    while pos < len(blob):
+        chunk = blob[pos:pos + 4096]
+        out += struct.pack("<I", zlib.crc32(chunk) & 0xFFFFFFFF) + chunk
+        pos += len(chunk)
+    return bytes(out)
+
+
+def _block_wrap(blob: bytes) -> bytes:
+    """Оборачивает сериализованный заголовок+записи в сжатый блок:
+    u32 CRC + u32 stored_size + u8 compressed + LZMA1-поток."""
+    payload = _lzma1_compress(_chunk_blob(blob))
+    return struct.pack("<IIB", zlib.crc32(payload) & 0xFFFFFFFF,
+                       len(payload), 1) + payload
+
+
 def _build_header(version=(6, 4, 0), compression=3, files=(), data_entries=()):
-    """Сериализует заголовок формата 6.x: files = [(dest, location, options)],
+    """Сериализует область заголовка на диске: 64-байтовая сигнатура SetupID,
+    (для 6.5+ — 53-байтовый encryption-заголовок) и LZMA1-блок со всеми
+    записями. files = [(dest, location, options)],
     data_entries = [(sort_offset, file_offset, file_size, chunk_size, options)]."""
+    major, minor, build = version
+    v4 = (major, minor, build, 0)
+    setup_id = f"Inno Setup Setup Data ({major}.{minor}.{build})".encode("ascii")
+    head = setup_id.ljust(64, b"\x00")
+    if v4 >= (6, 5, 0, 0):
+        head += b"\x00" * (4 + 49)    # CRC32 + TSetupEncryptionHeader
+    return head + _block_wrap(_build_header_blob(version, compression,
+                                                  files, data_entries))
+
+
+def _build_header_blob(version=(6, 4, 0), compression=3, files=(), data_entries=()):
+    if version[0] == 7 or (version[0], version[1], version[2], 0) >= (6, 5, 0, 0):
+        return _build_header_blob_modern(version, compression, files, data_entries)
+    return _build_header_blob_le64(version, compression, files, data_entries)
+
+
+def _build_header_blob_le64(version=(6, 4, 0), compression=3, files=(), data_entries=()):
+    """Сериализованный (внутри блока) заголовок формата 6.0–6.4."""
     major, minor, build = version
     v630 = version >= (6, 3, 0)
     v640 = version >= (6, 4, 0)
     v6401 = version >= (6, 4, 0, 1)
     out = bytearray()
-    setup_id = f"Inno Setup Setup Data ({major}.{minor}.{build})".encode("ascii")
-    out += setup_id.ljust(64, b"\x00")
     for _ in range(29):
         out += _ustring("")
     if v630:
@@ -152,6 +191,78 @@ def _build_header(version=(6, 4, 0), compression=3, files=(), data_entries=()):
     return bytes(out)
 
 
+def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(), data_entries=()):
+    """Сериализованный (внутри блока) заголовок формата 6.5+/7.x — раскладки
+    по TSetupHeader/TSetup*Entry в issrc (is-6_5_0 … main)."""
+    major, minor, build = version
+    group = inno_mod._version_group((major, minor, build, 0))
+    v66 = group in ("v66", "v67", "v70", "v71")
+    v67 = group in ("v67", "v70", "v71")
+    v7 = group in ("v70", "v71")
+    out = bytearray()
+    n_strings = {"v65": 34, "v66": 34, "v67": 39, "v70": 39, "v71": 38}[group]
+    for _ in range(n_strings):
+        out += _ustring("")
+    for _ in range(4):
+        out += _raw_string()
+    counts = [0] * 17
+    counts[8] = len(files)          # NumFileEntries
+    counts[9] = len(data_entries)   # NumFileLocationEntries
+    for count in counts:
+        out += struct.pack("<I", count)
+    if v7:
+        out += struct.pack("<I", 0)   # compiled_code_version
+    out += _winver() * 2
+    if group == "v65":
+        out += struct.pack("<B", 1)           # wizard_style
+        out += struct.pack("<II", 100, 100)
+        out += struct.pack("<B", 0)           # alpha format
+    else:
+        out += struct.pack("<II", 100, 100)
+        out += struct.pack("<B", 0)           # dark style
+        out += struct.pack("<B", 0)           # alpha format
+        out += b"\x00" * (4 if group == "v66" else 6) * 4  # back colors
+        if v67:
+            out += struct.pack("<BBB", 255, 255, 0)  # opacities + styling
+    out += struct.pack("<q", 0)           # extra_disk_space
+    out += struct.pack("<I", 1)           # slices_per_disk
+    out += struct.pack("<BBBB", 1, 0, 2, 0)  # log mode, dir exists, priv, priv overrides
+    out += struct.pack("<BBB", 2, 0, compression)  # show lang, lang detect, compress
+    out += struct.pack("<BB", 0, 0)       # disable dir/pg page
+    out += struct.pack("<Q", 0)           # uninstall_display_size
+    out += b"\x00" * (6 if group in ("v65", "v66") else 8)  # options
+    # file entries
+    for dest, location, options in files:
+        out += _ustring("src.bin")
+        out += _ustring(dest)
+        for _ in range(13):
+            out += _ustring("")
+        if v67:
+            out += _raw_string()          # verification: allowed keys
+            out += b"\x00" * 32           # verification: sha256
+            out += struct.pack("<B", 0)   # verification: type
+        out += _winver()                  # min_version
+        out += _winver()                  # only_below_version
+        out += struct.pack("<I", location)
+        out += struct.pack("<I", 0)       # attributes
+        out += struct.pack("<Q", 0)       # external_size
+        out += struct.pack("<h", -1)      # permission
+        if v7:
+            out += struct.pack("<B", 0)   # bitness
+        out += b"\x00" * (5 if not v67 else 8)  # options (33 -> 5B, packed 57 -> 8B)
+        out += struct.pack("<B", 0)       # file type
+    # data entries
+    for sort_offset, file_offset, file_size, chunk_size, options in data_entries:
+        out += struct.pack("<II", 0, 0)
+        out += struct.pack("<I" if group == "v65" else "<Q", sort_offset)
+        out += struct.pack("<QQQ", file_offset, file_size, chunk_size)
+        out += b"\x00" * 32               # sha256
+        out += struct.pack("<q", 0)       # timestamp
+        out += struct.pack("<II", 0, 0)   # file version
+        out += struct.pack("<B", options)  # flags(5)
+    return bytes(out)
+
+
 def _resource_dir_entry(entry_id, offset, is_table):
     return struct.pack("<II", entry_id, offset | (0x80000000 if is_table else 0))
 
@@ -198,18 +309,30 @@ def _build_pe_with_resource(resource: bytes) -> bytes:
     return pe if isinstance(pe, bytes) else bytes(pe)
 
 
-def _build_offset_table(header_offset: int, data_offset: int) -> bytes:
-    """Таблица смещений Inno 5.1.5+ (12-байтовая магика + поля)."""
-    magic = bytes([0x6E, 0x53, 0x35, 0x57, 0x37, 0x64, 0x54, 0x83, 0xAA, 0x1B, 0x0F, 0x6A])
+def _build_offset_table(header_offset: int, data_offset: int, version=(6, 4, 0)) -> bytes:
+    """Таблица смещений Inno 5.1.5+: версия 1 (u32-поля, 6.0–6.4) или
+    версия 2 (Int64-смещения, 6.5.0+/7.x)."""
+    magic = bytes([0x72, 0x44, 0x6C, 0x50, 0x74, 0x53, 0xCD, 0xE6, 0xD7, 0x7B, 0x0B, 0x2A])
     out = bytearray(magic)
-    out += struct.pack("<I", 1)              # revision
-    out += struct.pack("<I", 0)              # checksum (не проверяем)
-    out += struct.pack("<I", 0)              # exe_offset
-    out += struct.pack("<I", 0)              # exe_uncompressed_size
-    out += struct.pack("<I", 0)              # exe checksum
-    out += struct.pack("<I", header_offset)
-    out += struct.pack("<I", data_offset)
-    out += struct.pack("<I", 0)              # expected checksum (не проверяем)
+    if version[0] == 7 or (version[0], version[1], version[2], 0) >= (6, 5, 0, 0):
+        out += struct.pack("<I", 2)              # table version 2
+        out += struct.pack("<Q", 0)              # total_size
+        out += struct.pack("<Q", 0)              # offset_exe
+        out += struct.pack("<I", 0)              # uncompressed_size_exe
+        out += struct.pack("<i", 0)              # crc_exe
+        out += struct.pack("<Q", header_offset)  # offset0 = заголовок
+        out += struct.pack("<Q", data_offset)    # offset1 = данные
+        out += struct.pack("<I", 0)              # reserved padding
+        out += struct.pack("<i", 0)              # table crc (не проверяем)
+    else:
+        out += struct.pack("<I", 1)              # table version 1
+        out += struct.pack("<I", 0)              # total_size (бывший checksum)
+        out += struct.pack("<I", 0)              # exe_offset
+        out += struct.pack("<I", 0)              # exe_uncompressed_size
+        out += struct.pack("<I", 0)              # exe checksum
+        out += struct.pack("<I", header_offset)
+        out += struct.pack("<I", data_offset)
+        out += struct.pack("<I", 0)              # table crc (не проверяем)
     return bytes(out)
 
 
@@ -221,6 +344,9 @@ def _build_installer(path, files_payload, version=(6, 4, 0), compression=3,
     таблицу смещений в PE-ресурсе 11111 (или по указателю 0x30).
     """
     # chanки: файлы с одинаковым chunk_group делят один (solid) chanк
+    modern = version[0] == 7 or (version[0], version[1], version[2], 0) >= (6, 5, 0, 0)
+    comp_bit = 4 if modern else inno_mod.DE_CHUNK_COMPRESSED
+    call_bit = 2 if modern else inno_mod.DE_CALL_INSTRUCTION_OPTIMIZED
     groups = {}
     for dest, raw, call_opt, group in files_payload:
         groups.setdefault(group, []).append((dest, raw, call_opt))
@@ -238,9 +364,9 @@ def _build_installer(path, files_payload, version=(6, 4, 0), compression=3,
             plain += blob
             options = 0
             if compression != inno_mod.COMPRESS_STORED:
-                options |= 1 << inno_mod.DE_CHUNK_COMPRESSED
+                options |= 1 << comp_bit
             if call_opt:
-                options |= 1 << inno_mod.DE_CALL_INSTRUCTION_OPTIMIZED
+                options |= 1 << call_bit
             group_marks.append((dest, file_offset, len(raw), options))
         sort_offset = len(data_area)
         if compression == inno_mod.COMPRESS_LZMA:
@@ -257,15 +383,12 @@ def _build_installer(path, files_payload, version=(6, 4, 0), compression=3,
 
     if use_pe_resource:
         # PE: [0x00..0x80) DOS+PE stub, ресурс по 0x400
-        pe = bytearray(_build_pe_with_resource(b"PLACEHOLDER"))
-        # заменяем ресурс на таблицу смещений, а заголовок+данные пишем в конец
-        table = _build_offset_table(0, 0)  # временно, смещения посчитаем ниже
         # layout: pe_blob (с ресурсом-таблицей) + header + data
-        # сначала узнаем размер pe с ресурсом нужного размера
+        table = _build_offset_table(0, 0, version)
         base = _build_pe_with_resource(table)
         header_offset = len(base)
         data_offset = header_offset + len(header)
-        table = _build_offset_table(header_offset, data_offset)
+        table = _build_offset_table(header_offset, data_offset, version)
         base = _build_pe_with_resource(table)
         assert len(base) == header_offset
         blob = base + header + bytes(data_area)
@@ -275,7 +398,7 @@ def _build_installer(path, files_payload, version=(6, 4, 0), compression=3,
         data_offset = header_offset + len(header)
         table_off = 0x40
         blob = bytearray(b"\x00" * table_off)
-        blob += _build_offset_table(header_offset, data_offset)
+        blob += _build_offset_table(header_offset, data_offset, version)
         blob += b"\x00" * (header_offset - len(blob))
         blob += header + bytes(data_area)
         struct.pack_into("<III", blob, 0x30, inno_mod.LOADER_PTR_MAGIC,
@@ -390,6 +513,66 @@ class SyntheticInnoTests(unittest.TestCase):
             addr += len(block)
             pos += len(block)
         self.assertEqual(bytes(decoded), bytes(original))
+
+    def test_modern_65_table_v2_block_header(self):
+        # Inno Setup 6.5.x: таблица смещений v2 (Int64), encryption-заголовок
+        # 53 байта после сигнатуры, заголовок — внутри LZMA1-блока
+        installer = os.path.join(self.temp.name, "setup65.exe")
+        payload = {
+            "{app}\\bin\\app.exe": b"MZ" + bytes(range(256)) * 20,
+            "{app}\\lib\\data.bin": os.urandom(50_000),
+        }
+        files = [(dest, raw, False, 0) for dest, raw in payload.items()]
+        _build_installer(installer, files, version=(6, 5, 0), compression=3)
+        ok, message = self._extract(installer)
+        self.assertTrue(ok, message)
+        for dest, raw in payload.items():
+            rel = dest.replace("\\", os.sep)
+            with open(os.path.join(self.work, rel), "rb") as fh:
+                self.assertEqual(fh.read(), raw, dest)
+
+    def test_modern_67_table_v2_block_header(self):
+        # Inno Setup 6.7.x — то, на чём собран PyCharm 2026.2.x
+        installer = os.path.join(self.temp.name, "setup67.exe")
+        payload = {
+            "{app}\\bin\\pycharm64.exe": b"MZ" + bytes(range(256)) * 40,
+            "{app}\\lib\\data.bin": os.urandom(100_000),
+            "{app}\\readme.txt": "привет, inno 6.7".encode("utf-8"),
+        }
+        files = [(dest, raw, False, 0) for dest, raw in payload.items()]
+        _build_installer(installer, files, version=(6, 7, 0), compression=3)
+        ok, message = self._extract(installer)
+        self.assertTrue(ok, message)
+        for dest, raw in payload.items():
+            rel = dest.replace("\\", os.sep)
+            with open(os.path.join(self.work, rel), "rb") as fh:
+                self.assertEqual(fh.read(), raw, dest)
+
+    def test_modern_71_inno7(self):
+        # Inno Setup 7.x
+        installer = os.path.join(self.temp.name, "setup71.exe")
+        raw = b"inno7-payload" * 3000
+        _build_installer(installer, [("{app}\\tool.exe", raw, False, 0)],
+                         version=(7, 1, 1), compression=3)
+        ok, message = self._extract(installer)
+        self.assertTrue(ok, message)
+        with open(os.path.join(self.work, "{app}", "tool.exe"), "rb") as fh:
+            self.assertEqual(fh.read(), raw)
+
+    def test_modern_67_call_instruction_transform(self):
+        exe = bytearray()
+        exe += b"\x55\x8b\xec"
+        exe += b"\xe8" + struct.pack("<i", -0x100)
+        exe += b"\x90" * 10
+        exe += b"\xe9" + struct.pack("<i", 0x200)
+        exe += b"\xcc" * 20
+        installer = os.path.join(self.temp.name, "setup67.exe")
+        _build_installer(installer, [("{app}\\prog.exe", bytes(exe), True, 0)],
+                         version=(6, 7, 0), compression=3)
+        ok, message = self._extract(installer)
+        self.assertTrue(ok, message)
+        with open(os.path.join(self.work, "{app}", "prog.exe"), "rb") as fh:
+            self.assertEqual(fh.read(), bytes(exe))
 
     def test_garbage_file_is_a_clean_error(self):
         installer = os.path.join(self.temp.name, "garbage.exe")
