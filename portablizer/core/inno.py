@@ -418,34 +418,45 @@ def _read_block_stream(reader: _Reader, version: Tuple[int, int, int, int]) -> b
     return blob
 
 
-def parse_header(fh, header_offset: int) -> _Header:
+def parse_header(fh, header_offset: int,
+                 log: Optional[Callable[[str], None]] = None) -> _Header:
     """Читает заголовок и возвращает файлы + data entries (формат 6.x/7.x)."""
+    def info(text: str) -> None:
+        if log:
+            log(text)
+
     reader = _Reader(fh)
     reader.seek(header_offset)
     version = _parse_version(reader)
     group = _version_group(version)
+    info(f"Inno Setup: сигнатура данных {version[0]}.{version[1]}.{version[2]}")
     if version >= (6, 5, 0, 0):
         # 6.5.0+: после 64-байтовой сигнатуры идёт CRC32 + 49-байтовый
         # TSetupEncryptionHeader (его содержимое нам не нужно — мы паролем
         # не владеем, но chanки без пароля всё равно читаются).
         reader.read(4 + 49)
     blob = _read_block_stream(reader, version)
+    info(f"Inno Setup: блок заголовка разжат, байт: {len(blob)}, "
+         f"первые 16: {blob[:16].hex()}")
     # Основная раскладка — по версии из сигнатуры; если она не сходится
     # (например, у repack-версии строка версии не совпала с реальной
-    # раскладкой), пробуем соседние группы формата 6.5+/7.x.
-    order = [group] + [g for g in ("v65", "v66", "v67", "v70", "v71") if g != group]
-    if group == "le64":
-        order = ["le64"]
-    last_exc: Optional[InnoError] = None
+    # раскладкой), пробуем соседние группы формата 6.x/7.x.
+    all_groups = ("le64", "v65", "v66", "v67", "v70", "v71")
+    order = [group] + [g for g in all_groups if g != group]
+    failures: List[str] = []
     for candidate in order:
         try:
             parsed = _parse_blob(_Reader(io.BytesIO(blob)), version, candidate)
         except InnoError as exc:
-            last_exc = exc
+            failures.append(f"{candidate}: {exc}")
             continue
         if parsed.files or candidate == order[-1]:
+            info(f"Inno Setup: раскладка заголовка сошлась как {candidate}, "
+                 f"файлов: {len(parsed.files)}")
             return parsed
-    raise last_exc or InnoError("заголовок Inno не разобран")
+    raise InnoError(
+        f"ни одна раскладка заголовка не сошлась (блок {len(blob)} байт, "
+        f"начало {blob[:16].hex()}); попытки: " + " | ".join(failures))
 
 
 def _parse_blob(reader: _Reader, version: Tuple[int, int, int, int], group: str) -> _Header:
@@ -1052,7 +1063,7 @@ def extract_installer(installer_path: str, work_dir: str,
     try:
         with open(installer_path, "rb") as fh:
             header_offset, data_offset = locate_offsets(fh)
-            header = parse_header(fh, header_offset)
+            header = parse_header(fh, header_offset, log=info)
             info(f"Inno Setup: формат данных {header.version[0]}.{header.version[1]}."
                  f"{header.version[2]}, сжатие {header.compression}, "
                  f"файлов: {len(header.files)}")
