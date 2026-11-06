@@ -385,10 +385,13 @@ def _read_block_stream(reader: _Reader, version: Tuple[int, int, int, int]) -> b
 
     Все Inno 6.x/7.x хранят сериализованный заголовок внутри LZMA1-блока
     (TCompressedBlockReader): u32 CRC заголовка + TCompressedBlockHeader
-    {stored_size, compressed} + сам блок. До 6.6 включительно stored_size —
-    u32 (заголовок блока 9 байт), с 6.7.0 — Int64 (13 байт). Затем, если
-    compressed, идёт LZMA1 (5 байт свойств + raw); распакованное — порции до
-    4096 байт, каждая со своим u32 CRC32.
+    {stored_size, compressed} + stored_size байт. До 6.6 включительно
+    stored_size — u32 (заголовок блока 9 байт), с 6.7.0 — Int64 (13 байт).
+    Хранимый поток всегда разбит на порции до 4096 байт, каждая со своим
+    u32 CRC32 (TCompressedBlockWriter.FlushOutputBuffer) — эти CRC стоят
+    ВНУТРИ сжатого потока, до LZMA-декомпрессии: сначала снимаем CRC
+    порций, и только потом, если compressed, разжимаем LZMA1 (5 байт
+    свойств + raw). Распакованное — и есть сериализованный заголовок.
     """
     _crc = reader.u32()
     if version >= (6, 7, 0, 0):
@@ -398,18 +401,21 @@ def _read_block_stream(reader: _Reader, version: Tuple[int, int, int, int]) -> b
     compressed = reader.u8()
     if stored_size > 2 * 1024 * 1024 * 1024:
         raise InnoError("нереальный размер сжатого блока заголовка Inno")
-    payload = reader.read(stored_size)
-    blob = _lzma1_decompress(payload) if compressed else payload
-    out = bytearray()
+    stored = reader.read(stored_size)
+    # снимаем CRC32 у каждой порции <= 4096 байт хранимого потока
+    stream = bytearray()
     pos = 0
-    while pos + 4 <= len(blob):
-        pos += 4                      # CRC32 порции
-        take = min(4096, len(blob) - pos)
-        out += blob[pos:pos + take]
+    while pos + 4 <= len(stored):
+        pos += 4
+        take = min(4096, len(stored) - pos)
+        stream += stored[pos:pos + take]
         pos += take
-    if not out:
+    if not stream:
         raise InnoError("сжатый блок заголовка Inno пуст")
-    return bytes(out)
+    blob = _lzma1_decompress(bytes(stream)) if compressed else bytes(stream)
+    if not blob:
+        raise InnoError("сжатый блок заголовка Inno пуст")
+    return blob
 
 
 def parse_header(fh, header_offset: int) -> _Header:
