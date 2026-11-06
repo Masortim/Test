@@ -6206,7 +6206,8 @@ class Portablizer:
         except RuntimeError:
             raise  # отмена пользователем — не перехватываем
         except Exception as exc:  # noqa: BLE001 - распаковка не должна ронять сборку
-            self._unpacker_result = f"свой распаковщик Inno упал с ошибкой: {exc}"
+            self._unpacker_result = (f"свой распаковщик Inno упал с ошибкой: "
+                                     f"{type(exc).__name__}: {exc}")
             self.log.warn(self._unpacker_result)
             return False
         finally:

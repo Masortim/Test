@@ -94,12 +94,14 @@ def _chunk_blob(blob: bytes) -> bytes:
     return bytes(out)
 
 
-def _block_wrap(blob: bytes) -> bytes:
+def _block_wrap(blob: bytes, version=(6, 4, 0)) -> bytes:
     """Оборачивает сериализованный заголовок+записи в сжатый блок:
-    u32 CRC + u32 stored_size + u8 compressed + LZMA1-поток."""
+    u32 CRC + TCompressedBlockHeader + LZMA1-поток. StoredSize — u32 до 6.6
+    включительно, Int64 с 6.7.0 (TCompressedBlockHeader в issrc)."""
     payload = _lzma1_compress(_chunk_blob(blob))
-    return struct.pack("<IIB", zlib.crc32(payload) & 0xFFFFFFFF,
-                       len(payload), 1) + payload
+    wide = version[0] == 7 or (version[0], version[1], version[2], 0) >= (6, 7, 0, 0)
+    hdr = struct.pack("<Q" if wide else "<I", len(payload)) + struct.pack("<B", 1)
+    return struct.pack("<I", zlib.crc32(hdr) & 0xFFFFFFFF) + hdr + payload
 
 
 def _build_header(version=(6, 4, 0), compression=3, files=(), data_entries=()):
@@ -114,7 +116,7 @@ def _build_header(version=(6, 4, 0), compression=3, files=(), data_entries=()):
     if v4 >= (6, 5, 0, 0):
         head += b"\x00" * (4 + 49)    # CRC32 + TSetupEncryptionHeader
     return head + _block_wrap(_build_header_blob(version, compression,
-                                                  files, data_entries))
+                                                  files, data_entries), version)
 
 
 def _build_header_blob(version=(6, 4, 0), compression=3, files=(), data_entries=()):
