@@ -378,16 +378,21 @@ def _version_group(version: Tuple[int, int, int, int]) -> str:
     raise InnoError(f"неподдержанный формат данных Inno Setup {version[0]}.{version[1]}")
 
 
-def _read_block_stream(reader: _Reader) -> bytes:
+def _read_block_stream(reader: _Reader, version: Tuple[int, int, int, int]) -> bytes:
     """Читает один сжатый блок (заголовок+все записи) из потока по header_offset.
 
     Все Inno 6.x/7.x хранят сериализованный заголовок внутри LZMA1-блока
-    (TCompressedBlockReader): u32 CRC + u32 stored_size + u8 compressed,
-    затем LZMA1 (5 байт свойств + raw), а распакованное — порции до 4096 байт,
-    каждая со своим u32 CRC32.
+    (TCompressedBlockReader): u32 CRC заголовка + TCompressedBlockHeader
+    {stored_size, compressed} + сам блок. До 6.6 включительно stored_size —
+    u32 (заголовок блока 9 байт), с 6.7.0 — Int64 (13 байт). Затем, если
+    compressed, идёт LZMA1 (5 байт свойств + raw); распакованное — порции до
+    4096 байт, каждая со своим u32 CRC32.
     """
     _crc = reader.u32()
-    stored_size = reader.u32()
+    if version >= (6, 7, 0, 0):
+        stored_size = reader.u64()
+    else:
+        stored_size = reader.u32()
     compressed = reader.u8()
     if stored_size > 2 * 1024 * 1024 * 1024:
         raise InnoError("нереальный размер сжатого блока заголовка Inno")
@@ -416,7 +421,7 @@ def parse_header(fh, header_offset: int) -> _Header:
         # TSetupEncryptionHeader (его содержимое нам не нужно — мы паролем
         # не владеем, но chanки без пароля всё равно читаются).
         reader.read(4 + 49)
-    blob = _read_block_stream(reader)
+    blob = _read_block_stream(reader, version)
     return _parse_blob(_Reader(io.BytesIO(blob)), version, group)
 
 
@@ -849,8 +854,8 @@ def _lzma1_decompress(payload: bytes) -> bytes:
     dict_size = struct.unpack("<I", payload[1:5])[0]
     filters = [{"id": lzma.FILTER_LZMA1, "dict_size": dict_size,
                 "lc": lc, "lp": lp, "pb": pb}]
-    dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
     try:
+        dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
         return dec.decompress(payload[5:])
     except lzma.LZMAError as exc:
         raise InnoError(f"LZMA-chanк Inno повреждён: {exc}") from exc
@@ -866,8 +871,8 @@ def _lzma2_decompress(payload: bytes) -> bytes:
     dict_size = 0xFFFFFFFF if prop == 40 else \
         (2 | (prop & 1)) << (prop // 2 + 11)
     filters = [{"id": lzma.FILTER_LZMA2, "dict_size": dict_size}]
-    dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
     try:
+        dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
         return dec.decompress(payload[1:])
     except lzma.LZMAError as exc:
         raise InnoError(f"LZMA2-chanк Inno повреждён: {exc}") from exc
@@ -1093,5 +1098,8 @@ def extract_installer(installer_path: str, work_dir: str,
         return False, f"свой распаковщик Inno не смог разобрать контейнер: {exc}"
     except (OSError, struct.error) as exc:
         return False, f"ошибка чтения установщика Inno: {exc}"
+    except Exception as exc:  # noqa: BLE001 - диагностика вместо «Internal error»
+        return False, (f"свой распаковщик Inno не смог разобрать контейнер: "
+                       f"{type(exc).__name__}: {exc}")
     finally:
         shutil.rmtree(chunk_dir, ignore_errors=True)
