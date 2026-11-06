@@ -94,20 +94,24 @@ def _chunk_blob(blob: bytes) -> bytes:
     return bytes(out)
 
 
-def _block_wrap(blob: bytes, version=(6, 4, 0)) -> bytes:
-    """Оборачивает сериализованный заголовок+записи в сжатый блок:
-    u32 CRC + TCompressedBlockHeader + LZMA1-поток. StoredSize — u32 до 6.6
-    включительно, Int64 с 6.7.0 (TCompressedBlockHeader в issrc)."""
-    payload = _lzma1_compress(_chunk_blob(blob))
+def _block_wrap(blob: bytes, version=(6, 4, 0), compressed=True) -> bytes:
+    """Оборачивает сериализованный заголовок+записи в сжатый блок, как
+    TCompressedBlockWriter в issrc: u32 CRC + TCompressedBlockHeader
+    {stored_size, compressed} + хранимый поток. Хранимый поток всегда режется
+    на порции <=4096 байт, каждая со своим u32 CRC32, и уже поверх этого
+    идёт LZMA1 (5 байт свойств + raw). StoredSize — u32 до 6.6 включительно,
+    Int64 с 6.7.0."""
     wide = version[0] == 7 or (version[0], version[1], version[2], 0) >= (6, 7, 0, 0)
-    hdr = struct.pack("<Q" if wide else "<I", len(payload)) + struct.pack("<B", 1)
-    return struct.pack("<I", zlib.crc32(hdr) & 0xFFFFFFFF) + hdr + payload
+    stored = _chunk_blob(_lzma1_compress(blob) if compressed else blob)
+    hdr = struct.pack("<Q" if wide else "<I", len(stored)) + struct.pack("<B", 1 if compressed else 0)
+    return struct.pack("<I", zlib.crc32(hdr) & 0xFFFFFFFF) + hdr + stored
 
 
-def _build_header(version=(6, 4, 0), compression=3, files=(), data_entries=()):
+def _build_header(version=(6, 4, 0), compression=3, files=(), data_entries=(),
+                  block_compressed=True):
     """Сериализует область заголовка на диске: 64-байтовая сигнатура SetupID,
-    (для 6.5+ — 53-байтовый encryption-заголовок) и LZMA1-блок со всеми
-    записями. files = [(dest, location, options)],
+    (для 6.5+ — 53-байтовый encryption-заголовок) и блок со всеми записями
+    (сжатый LZMA1 или хранимый). files = [(dest, location, options)],
     data_entries = [(sort_offset, file_offset, file_size, chunk_size, options)]."""
     major, minor, build = version
     v4 = (major, minor, build, 0)
@@ -116,7 +120,8 @@ def _build_header(version=(6, 4, 0), compression=3, files=(), data_entries=()):
     if v4 >= (6, 5, 0, 0):
         head += b"\x00" * (4 + 49)    # CRC32 + TSetupEncryptionHeader
     return head + _block_wrap(_build_header_blob(version, compression,
-                                                  files, data_entries), version)
+                                                  files, data_entries), version,
+                              compressed=block_compressed)
 
 
 def _build_header_blob(version=(6, 4, 0), compression=3, files=(), data_entries=()):
@@ -339,7 +344,7 @@ def _build_offset_table(header_offset: int, data_offset: int, version=(6, 4, 0))
 
 
 def _build_installer(path, files_payload, version=(6, 4, 0), compression=3,
-                     use_pe_resource=True):
+                     use_pe_resource=True, block_compressed=True):
     """files_payload = [(dest_name, raw_bytes, call_optimize, chunk_group)].
 
     Собирает настоящий контейнер: chanки (LZMA или stored) + заголовок +
@@ -381,7 +386,8 @@ def _build_installer(path, files_payload, version=(6, 4, 0), compression=3,
             data_entries.append((sort_offset, foff, fsize, len(payload), opts))
 
     header = _build_header(version=version, compression=compression,
-                           files=file_entries, data_entries=data_entries)
+                           files=file_entries, data_entries=data_entries,
+                           block_compressed=block_compressed)
 
     if use_pe_resource:
         # PE: [0x00..0x80) DOS+PE stub, ресурс по 0x400
@@ -575,6 +581,18 @@ class SyntheticInnoTests(unittest.TestCase):
         self.assertTrue(ok, message)
         with open(os.path.join(self.work, "{app}", "prog.exe"), "rb") as fh:
             self.assertEqual(fh.read(), bytes(exe))
+
+    def test_modern_67_stored_block_header(self):
+        # Блок заголовка может быть и НЕ сжат (compressed=0): тогда хранимый
+        # поток — просто порции по 4096 байт с CRC, LZMA нет
+        installer = os.path.join(self.temp.name, "setup67s.exe")
+        raw = os.urandom(20_000)   # больше одной порции в 4096 байт
+        _build_installer(installer, [("{app}\\data.bin", raw, False, 0)],
+                         version=(6, 7, 0), compression=0, block_compressed=False)
+        ok, message = self._extract(installer)
+        self.assertTrue(ok, message)
+        with open(os.path.join(self.work, "{app}", "data.bin"), "rb") as fh:
+            self.assertEqual(fh.read(), raw)
 
     def test_garbage_file_is_a_clean_error(self):
         installer = os.path.join(self.temp.name, "garbage.exe")
