@@ -489,6 +489,26 @@ class EngineFallbackTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.portable,
                                                      "_inno_unpacked")))
 
+    def test_unknown_type_inno_container_still_unpacked(self):
+        # Детектор не узнал контейнер (UNKNOWN), но сигнатуры Inno внутри
+        # файла узнаем мы сами — портатив всё равно создаётся без 7-Zip.
+        from unittest import mock
+        from portablizer.core import unpacker as unpacker_mod
+        installer = os.path.join(self.temp.name, "weird_name.bin")
+        _build_installer(installer, [("{app}\\tool.exe", b"MZ" + b"\x01" * 50,
+                                      False, 0)], compression=3)
+        opts = self.PortableOptions(installer_path=installer,
+                                    output_dir=self.temp.name)
+        det = self.DetectionResult(installer_type=self.InstallerType.UNKNOWN,
+                                   confidence=0.5)
+        engine = self.Portablizer(self.Logger())
+        with mock.patch.object(unpacker_mod, "find_unpacker", return_value=""):
+            ok = engine._try_unpacker_fallback(opts, self.app, self.portable,
+                                               det, "Tool")
+        self.assertTrue(ok)
+        self.assertEqual(engine._unpacked_with, "inno-builtin")
+        self.assertTrue(os.path.isfile(os.path.join(self.app, "tool.exe")))
+
     def test_fallback_reports_clean_failure_for_non_inno(self):
         from unittest import mock
         from portablizer.core import unpacker as unpacker_mod
