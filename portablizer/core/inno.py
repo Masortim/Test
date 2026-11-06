@@ -368,8 +368,10 @@ def _version_group(version: Tuple[int, int, int, int]) -> str:
     if version[0] == 6:
         if version < (6, 5, 0, 0):
             return "le64"   # 6.0.0–6.4.x — раскладка по innoextract
+        if version < (6, 5, 2, 0):
+            return "v650"   # 6.5.0–6.5.1
         if version < (6, 6, 0, 0):
-            return "v65"
+            return "v652"   # 6.5.2+: +2 цвета wizard, Verification в file entry, i64 StartOffset
         if version < (6, 7, 0, 0):
             return "v66"
         return "v67"
@@ -441,7 +443,7 @@ def parse_header(fh, header_offset: int,
     # Основная раскладка — по версии из сигнатуры; если она не сходится
     # (например, у repack-версии строка версии не совпала с реальной
     # раскладкой), пробуем соседние группы формата 6.x/7.x.
-    all_groups = ("le64", "v65", "v66", "v67", "v70", "v71")
+    all_groups = ("le64", "v650", "v652", "v66", "v67", "v70", "v71")
     order = [group] + [g for g in all_groups if g != group]
     failures: List[str] = []
     for candidate in order:
@@ -676,12 +678,13 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
     """Заголовок формата данных 6.5.0+ / 7.x (раскладки по issrc: TSetupHeader
     и TSetup*Entry для тегов is-6_5_0 … is-7_0_0, main; поля-строки идут первыми,
     затем «сырые» поля записи)."""
+    v652 = group in ("v652", "v66", "v67", "v70", "v71")   # Verification в file entry, i64 StartOffset
     v66 = group in ("v66", "v67", "v70", "v71")
     v67 = group in ("v67", "v70", "v71")
     v7 = group in ("v70", "v71")
 
     # --- строковые поля заголовка ---
-    n_strings = {"v65": 34, "v66": 34, "v67": 39, "v70": 39, "v71": 38}[group]
+    n_strings = {"v650": 34, "v652": 34, "v66": 34, "v67": 39, "v70": 39, "v71": 38}[group]
     for _ in range(n_strings):
         reader.ustring()
     for _ in range(4):          # license/info_before/info_after/compiled_code
@@ -702,11 +705,14 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
     # --- «сырые» поля заголовка ---
     reader.winver()
     reader.winver()
-    if group == "v65":
+    if group in ("v650", "v652"):
         reader.enum()           # wizard_style
         reader.u32()            # wizard_size_percent_x
         reader.u32()            # wizard_size_percent_y
         reader.enum()           # wizard_image_alpha_format
+        if group == "v652":
+            reader.i32()        # wizard_image_back_color (с 6.5.2)
+            reader.i32()        # wizard_small_image_back_color (с 6.5.2)
     else:
         reader.u32()            # wizard_size_percent_x
         reader.u32()            # wizard_size_percent_y
@@ -730,16 +736,16 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
     reader.enum()               # disable_dir_page
     reader.enum()               # disable_program_group_page
     reader.i64()                # uninstall_display_size
-    reader.flags(43 if group == "v65" else (46 if group == "v66" else 57))  # options
+    reader.flags(43 if group in ("v650", "v652") else (46 if group == "v66" else 57))  # options
 
     # --- записи метаданных (нам нужны только имена/счётчики, остальное пропускаем) ---
     for _ in range(language_count):
-        for _ in range(6 if group == "v65" else 4):
+        for _ in range(6 if group in ("v650", "v652") else 4):
             reader.ustring()
         for _ in range(4):
             reader.ansi_string()
-        if group == "v65":
-            reader.u32()        # language_id (Cardinal в 6.5)
+        if group in ("v650", "v652"):
+            reader.u32()        # language_id (Cardinal в 6.5.x)
         else:
             reader.u16()        # language_id (Word в 6.6+)
         for _ in range(4):
@@ -801,8 +807,8 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
         dest_name = reader.ustring()
         for _ in range(13):
             reader.ustring()
-        if v67:
-            reader.ansi_string()  # verification: ISSigAllowedKeys
+        if v652:
+            reader.ansi_string()  # verification: ISSigAllowedKeys (с 6.5.2)
             reader.read(32)       # verification: SHA256 hash
             reader.enum()         # verification: type
         reader.winver()           # min_version
@@ -816,6 +822,7 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
         options = reader.flags(33 if not v67 else 57)
         file_type = reader.enum()
         header.files.append(_FileEntry(dest_name, location, options, file_type))
+
 
     for _ in range(icon_count):
         for _ in range(13):
@@ -865,7 +872,7 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
     for _ in range(_data_count):
         first_slice = reader.u32()
         _last_slice = reader.u32()
-        sort_offset = reader.u32() if group == "v65" else reader.u64()
+        sort_offset = reader.u32() if group == "v650" else reader.u64()
         file_offset = reader.u64()
         file_size = reader.u64()
         chunk_size = reader.u64()

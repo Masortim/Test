@@ -209,11 +209,12 @@ def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(),
     dir/issig/icon/ini/registry/delete/run), чтобы зафиксировать раскладку тестами."""
     major, minor, build = version
     group = inno_mod._version_group((major, minor, build, 0))
+    v652 = group in ("v652", "v66", "v67", "v70", "v71")
     v66 = group in ("v66", "v67", "v70", "v71")
     v67 = group in ("v67", "v70", "v71")
     v7 = group in ("v70", "v71")
     out = bytearray()
-    n_strings = {"v65": 34, "v66": 34, "v67": 39, "v70": 39, "v71": 38}[group]
+    n_strings = {"v650": 34, "v652": 34, "v66": 34, "v67": 39, "v70": 39, "v71": 38}[group]
     for _ in range(n_strings):
         out += _ustring("")
     for _ in range(4):
@@ -232,10 +233,12 @@ def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(),
     if v7:
         out += struct.pack("<I", 0)   # compiled_code_version
     out += _winver() * 2
-    if group == "v65":
+    if group in ("v650", "v652"):
         out += struct.pack("<B", 1)           # wizard_style
         out += struct.pack("<II", 100, 100)
         out += struct.pack("<B", 0)           # alpha format
+        if group == "v652":
+            out += struct.pack("<ii", 0, 0)   # back colors (с 6.5.2)
     else:
         out += struct.pack("<II", 100, 100)
         out += struct.pack("<B", 0)           # dark style
@@ -249,7 +252,7 @@ def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(),
     out += struct.pack("<BBB", 2, 0, compression)  # show lang, lang detect, compress
     out += struct.pack("<BB", 0, 0)       # disable dir/pg page
     out += struct.pack("<Q", 0)           # uninstall_display_size
-    out += b"\x00" * (6 if group in ("v65", "v66") else 8)  # options
+    out += b"\x00" * (6 if group in ("v650", "v652", "v66") else 8)  # options
     # --- метаданные до file entries: type, component, task, dir, issig ---
     if with_meta:
         # type: 4 строки + 2 winver + flags(1) + enum + i64
@@ -270,8 +273,8 @@ def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(),
         out += _ustring(dest)
         for _ in range(13):
             out += _ustring("")
-        if v67:
-            out += _raw_string()          # verification: allowed keys
+        if v652:
+            out += _raw_string()          # verification: allowed keys (с 6.5.2)
             out += b"\x00" * 32           # verification: sha256
             out += struct.pack("<B", 0)   # verification: type
         out += _winver()                  # min_version
@@ -303,7 +306,7 @@ def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(),
     # data entries
     for sort_offset, file_offset, file_size, chunk_size, options in data_entries:
         out += struct.pack("<II", 0, 0)
-        out += struct.pack("<I" if group == "v65" else "<Q", sort_offset)
+        out += struct.pack("<I" if group == "v650" else "<Q", sort_offset)
         out += struct.pack("<QQQ", file_offset, file_size, chunk_size)
         out += b"\x00" * 32               # sha256
         out += struct.pack("<q", 0)       # timestamp
@@ -657,6 +660,24 @@ class SyntheticInnoTests(unittest.TestCase):
         self.assertTrue(ok, message)
         with open(os.path.join(self.work, "{app}", "a.bin"), "rb") as fh:
             self.assertEqual(fh.read(), raw)
+
+    def test_modern_652_full_meta_entries_layout(self):
+        # 6.5.2 (как у реального PyCharm 2026.2.3): +2 цвета wizard в заголовке,
+        # Verification в file entry, Int64 StartOffset в data entry
+        installer = os.path.join(self.temp.name, "setup652m.exe")
+        payload = {
+            "{app}\\bin\\pycharm64.exe": b"MZ" + bytes(range(256)) * 30,
+            "{app}\\lib\\data.bin": os.urandom(60_000),
+        }
+        files = [(dest, raw, False, 0) for dest, raw in payload.items()]
+        _build_installer(installer, files, version=(6, 5, 2), compression=3,
+                         with_meta=True)
+        ok, message = self._extract(installer)
+        self.assertTrue(ok, message)
+        for dest, raw in payload.items():
+            rel = dest.replace("\\", os.sep)
+            with open(os.path.join(self.work, rel), "rb") as fh:
+                self.assertEqual(fh.read(), raw, dest)
 
     def test_garbage_file_is_a_clean_error(self):
         installer = os.path.join(self.temp.name, "garbage.exe")
