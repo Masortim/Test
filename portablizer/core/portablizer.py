@@ -6116,7 +6116,7 @@ class Portablizer:
             self.log.info(
                 "Распаковщик (7-Zip) на этом компьютере не найден."
             )
-            if kind == InstallerType.INNO:
+            if kind == InstallerType.INNO or inno_mod.looks_like_inno(nested):
                 return self._try_builtin_inno(nested, app_dir, portable_dir,
                                               name)
             self.log.info(
@@ -6142,7 +6142,7 @@ class Portablizer:
                 "Содержимое вложенного установщика без запуска не дало "
                 f"файлов программы: {message}"
             )
-            if kind == InstallerType.INNO:
+            if kind == InstallerType.INNO or inno_mod.looks_like_inno(nested):
                 return self._try_builtin_inno(nested, app_dir, portable_dir,
                                               name)
             return False
@@ -6252,7 +6252,10 @@ class Portablizer:
             )
             # Inno Setup 6.x при этом вовсе не тупик: контейнер разбирается
             # своим распаковщиком (core/inno.py) вообще без сторонних программ.
-            if det.installer_type == InstallerType.INNO:
+            # Тип UNKNOWN тоже пробуем: детектор мог не узнать знакомый
+            # контейнер, а сигнатуры Inno внутри файла скажут сами за себя.
+            if (det.installer_type == InstallerType.INNO
+                    or inno_mod.looks_like_inno(opts.installer_path)):
                 return self._try_builtin_inno(opts.installer_path, app_dir,
                                               portable_dir, name)
             self.log.info(
@@ -6294,7 +6297,8 @@ class Portablizer:
         )
         self.log.warn(self._unpacker_result)
         # 7-Zip не справился — для Inno Setup пробуем свой распаковщик.
-        if det.installer_type == InstallerType.INNO:
+        if (det.installer_type == InstallerType.INNO
+                or inno_mod.looks_like_inno(opts.installer_path)):
             return self._try_builtin_inno(opts.installer_path, app_dir,
                                           portable_dir, name)
         return False
