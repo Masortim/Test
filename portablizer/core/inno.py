@@ -135,6 +135,14 @@ class _Reader:
 
     def __init__(self, fh):
         self.fh = fh
+        self.pos = 0
+
+    def tell(self) -> int:
+        return self.pos
+
+    def seek(self, offset: int) -> None:
+        self.fh.seek(offset)
+        self.pos = offset
 
     def seek(self, offset: int) -> None:
         self.fh.seek(offset)
@@ -142,7 +150,9 @@ class _Reader:
     def read(self, size: int) -> bytes:
         data = self.fh.read(size)
         if len(data) != size:
-            raise InnoError("файл установщика обрезан: не хватило байтов")
+            raise InnoError(f"файл установщика обрезан: не хватило байтов "
+                            f"(запрошено {size} с позиции {self.pos})")
+        self.pos += size
         return data
 
     def _unpack(self, fmt: str):
@@ -447,18 +457,43 @@ def parse_header(fh, header_offset: int,
     order = [group] + [g for g in all_groups if g != group]
     failures: List[str] = []
     for candidate in order:
+        br = _Reader(io.BytesIO(blob))
         try:
-            parsed = _parse_blob(_Reader(io.BytesIO(blob)), version, candidate)
+            parsed = _parse_blob(br, version, candidate)
         except InnoError as exc:
-            failures.append(f"{candidate}: {exc}")
+            failures.append(f"{candidate}: {exc} (на позиции {br.tell()} из {len(blob)})")
             continue
         if parsed.files or candidate == order[-1]:
             info(f"Inno Setup: раскладка заголовка сошлась как {candidate}, "
                  f"файлов: {len(parsed.files)}")
             return parsed
+    # зонд: счётчики записей сразу после строк заголовка (для диагностики)
+    probe = _probe_counts(blob, group)
     raise InnoError(
         f"ни одна раскладка заголовка не сошлась (блок {len(blob)} байт, "
-        f"начало {blob[:16].hex()}); попытки: " + " | ".join(failures))
+        f"начало {blob[:16].hex()}, счётчики {probe}); попытки: "
+        + " | ".join(failures))
+
+
+def _probe_counts(blob: bytes, group: str) -> str:
+    """Читает только строки/ansi + счётчики заголовка — для диагностики."""
+    try:
+        br = _Reader(io.BytesIO(blob))
+        n_strings = {"le64": 29, "v650": 34, "v652": 34, "v66": 34,
+                     "v67": 39, "v70": 39, "v71": 38}[group]
+        for _ in range(n_strings):
+            br.ustring()
+        n_ansi = 4
+        for _ in range(n_ansi):
+            br.ansi_string()
+        if group == "le64":
+            br.raw_string()
+            counts = [br.u32() for _ in range(16)]
+        else:
+            counts = [br.u32() for _ in range(17)]
+        return f"позиция {br.tell()}, счётчики {counts}"
+    except InnoError as exc:
+        return f"зонд упал: {exc}"
 
 
 def _parse_blob(reader: _Reader, version: Tuple[int, int, int, int], group: str) -> _Header:
