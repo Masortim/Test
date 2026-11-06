@@ -430,7 +430,22 @@ def parse_header(fh, header_offset: int) -> _Header:
         # не владеем, но chanки без пароля всё равно читаются).
         reader.read(4 + 49)
     blob = _read_block_stream(reader, version)
-    return _parse_blob(_Reader(io.BytesIO(blob)), version, group)
+    # Основная раскладка — по версии из сигнатуры; если она не сходится
+    # (например, у repack-версии строка версии не совпала с реальной
+    # раскладкой), пробуем соседние группы формата 6.5+/7.x.
+    order = [group] + [g for g in ("v65", "v66", "v67", "v70", "v71") if g != group]
+    if group == "le64":
+        order = ["le64"]
+    last_exc: Optional[InnoError] = None
+    for candidate in order:
+        try:
+            parsed = _parse_blob(_Reader(io.BytesIO(blob)), version, candidate)
+        except InnoError as exc:
+            last_exc = exc
+            continue
+        if parsed.files or candidate == order[-1]:
+            return parsed
+    raise last_exc or InnoError("заголовок Inno не разобран")
 
 
 def _parse_blob(reader: _Reader, version: Tuple[int, int, int, int], group: str) -> _Header:
@@ -728,7 +743,8 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
     for _ in range(type_count):
         for _ in range(4):
             reader.ustring()
-        reader.winver()
+        reader.winver()           # min_version
+        reader.winver()           # only_below_version
         reader.flags(1)
         reader.enum()
         reader.u64()
@@ -741,7 +757,8 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
         else:
             reader.i32()        # level (Integer в 6.5/6.6)
         reader.boolean()        # used
-        reader.winver()
+        reader.winver()           # min_version
+        reader.winver()           # only_below_version
         reader.flags(5)
         reader.u64()            # size
     for _ in range(task_count):
@@ -752,13 +769,15 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
         else:
             reader.i32()
         reader.boolean()
-        reader.winver()
+        reader.winver()           # min_version
+        reader.winver()           # only_below_version
         reader.flags(5)
     for _ in range(directory_count):
         reader.ustring()
         reader.condition_data()
         reader.u32()
-        reader.winver()
+        reader.winver()           # min_version
+        reader.winver()           # only_below_version
         reader.i16()
         reader.flags(5)
     for _ in range(issig_count):
@@ -791,7 +810,8 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
         for _ in range(13):
             reader.ustring()
         reader.read(16)         # AppUserModelToastActivatorCLSID
-        reader.winver()
+        reader.winver()           # min_version
+        reader.winver()           # only_below_version
         reader.i32()            # icon_index
         reader.i32()            # show_cmd
         reader.enum()           # close_on_exit
@@ -801,13 +821,15 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
         for _ in range(4):
             reader.ustring()
         reader.condition_data()
-        reader.winver()
+        reader.winver()           # min_version
+        reader.winver()           # only_below_version
         reader.flags(5)
     for _ in range(registry_count):
         for _ in range(3):
             reader.ustring()
         reader.condition_data()
-        reader.winver()
+        reader.winver()           # min_version
+        reader.winver()           # only_below_version
         reader.u32()            # root key
         reader.i16()            # permission
         reader.enum()           # type
@@ -815,13 +837,15 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
     for _ in range(delete_count + uninstall_delete_count):
         reader.ustring()
         reader.condition_data()
-        reader.winver()
+        reader.winver()           # min_version
+        reader.winver()           # only_below_version
         reader.enum()
     for _ in range(run_count + uninstall_run_count):
         for _ in range(7):
             reader.ustring()
         reader.condition_data()
-        reader.winver()
+        reader.winver()           # min_version
+        reader.winver()           # only_below_version
         reader.i32()            # show_cmd
         reader.enum()           # wait
         reader.flags(12)

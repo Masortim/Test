@@ -108,7 +108,7 @@ def _block_wrap(blob: bytes, version=(6, 4, 0), compressed=True) -> bytes:
 
 
 def _build_header(version=(6, 4, 0), compression=3, files=(), data_entries=(),
-                  block_compressed=True):
+                  block_compressed=True, with_meta=False):
     """Сериализует область заголовка на диске: 64-байтовая сигнатура SetupID,
     (для 6.5+ — 53-байтовый encryption-заголовок) и блок со всеми записями
     (сжатый LZMA1 или хранимый). files = [(dest, location, options)],
@@ -120,13 +120,16 @@ def _build_header(version=(6, 4, 0), compression=3, files=(), data_entries=(),
     if v4 >= (6, 5, 0, 0):
         head += b"\x00" * (4 + 49)    # CRC32 + TSetupEncryptionHeader
     return head + _block_wrap(_build_header_blob(version, compression,
-                                                  files, data_entries), version,
+                                                  files, data_entries,
+                                                  with_meta=with_meta), version,
                               compressed=block_compressed)
 
 
-def _build_header_blob(version=(6, 4, 0), compression=3, files=(), data_entries=()):
+def _build_header_blob(version=(6, 4, 0), compression=3, files=(), data_entries=(),
+                       with_meta=False):
     if version[0] == 7 or (version[0], version[1], version[2], 0) >= (6, 5, 0, 0):
-        return _build_header_blob_modern(version, compression, files, data_entries)
+        return _build_header_blob_modern(version, compression, files, data_entries,
+                                         with_meta=with_meta)
     return _build_header_blob_le64(version, compression, files, data_entries)
 
 
@@ -198,9 +201,12 @@ def _build_header_blob_le64(version=(6, 4, 0), compression=3, files=(), data_ent
     return bytes(out)
 
 
-def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(), data_entries=()):
+def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(),
+                              data_entries=(), with_meta=False):
     """Сериализованный (внутри блока) заголовок формата 6.5+/7.x — раскладки
-    по TSetupHeader/TSetup*Entry в issrc (is-6_5_0 … main)."""
+    по TSetupHeader/TSetup*Entry в issrc (is-6_5_0 … main). with_meta=True
+    добавляет по одной записи каждого метаданного типа (type/component/task/
+    dir/issig/icon/ini/registry/delete/run), чтобы зафиксировать раскладку тестами."""
     major, minor, build = version
     group = inno_mod._version_group((major, minor, build, 0))
     v66 = group in ("v66", "v67", "v70", "v71")
@@ -212,7 +218,13 @@ def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(), data_e
         out += _ustring("")
     for _ in range(4):
         out += _raw_string()
+    # порядок счётчиков как в TSetupHeader (6.5+): language, message,
+    # permission, type, component, task, dir, issig, file, filelocation,
+    # icon, ini, registry, installdelete, uninstalldelete, run, uninstallrun
     counts = [0] * 17
+    if with_meta:
+        for idx in (3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16):
+            counts[idx] = 1
     counts[8] = len(files)          # NumFileEntries
     counts[9] = len(data_entries)   # NumFileLocationEntries
     for count in counts:
@@ -238,6 +250,20 @@ def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(), data_e
     out += struct.pack("<BB", 0, 0)       # disable dir/pg page
     out += struct.pack("<Q", 0)           # uninstall_display_size
     out += b"\x00" * (6 if group in ("v65", "v66") else 8)  # options
+    # --- метаданные до file entries: type, component, task, dir, issig ---
+    if with_meta:
+        # type: 4 строки + 2 winver + flags(1) + enum + i64
+        out += _ustring("t") * 4 + _winver() * 2 + b"\x00" + struct.pack("<B", 0) + struct.pack("<Q", 0)
+        # component: 5 строк + i64 + level + bool + 2 winver + flags(5) + i64
+        out += _ustring("c") * 5 + struct.pack("<Q", 0)
+        out += struct.pack("<B" if v67 else "<i", 0) + b"\x00" + _winver() * 2 + b"\x00" + struct.pack("<Q", 0)
+        # task: 6 строк + level + bool + 2 winver + flags(5)
+        out += _ustring("k") * 6
+        out += struct.pack("<B" if v67 else "<i", 0) + b"\x00" + _winver() * 2 + b"\x00"
+        # dir: 7 строк + u32 + 2 winver + i16 + flags(5)
+        out += _ustring("d") * 7 + struct.pack("<I", 0) + _winver() * 2 + struct.pack("<h", -1) + b"\x00"
+        # issig: 3 строки
+        out += _ustring("s") * 3
     # file entries
     for dest, location, options in files:
         out += _ustring("src.bin")
@@ -258,6 +284,22 @@ def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(), data_e
             out += struct.pack("<B", 0)   # bitness
         out += b"\x00" * (5 if not v67 else 8)  # options (33 -> 5B, packed 57 -> 8B)
         out += struct.pack("<B", 0)       # file type
+    # --- метаданные после file entries: icon, ini, registry, delete x2, run x2 ---
+    if with_meta:
+        # icon: 13 строк + guid16 + 2 winver + i32 + i32 + u8 + u16 + flags(6)
+        out += _ustring("i") * 13 + b"\x00" * 16 + _winver() * 2
+        out += struct.pack("<ii", 0, 0) + struct.pack("<B", 0) + struct.pack("<H", 0) + b"\x00"
+        # ini: 4 строки + 6 строк + 2 winver + flags(5)
+        out += _ustring("n") * 4 + _ustring("") * 6 + _winver() * 2 + b"\x00"
+        # registry: 3 строки + 6 строк + 2 winver + u32 + i16 + u8 + flags(12)
+        out += _ustring("r") * 3 + _ustring("") * 6 + _winver() * 2
+        out += struct.pack("<I", 0) + struct.pack("<h", -1) + struct.pack("<B", 0) + b"\x00" * 2
+        # delete (install + uninstall): 7 строк + 2 winver + u8 — дважды
+        for _ in range(2):
+            out += _ustring("x") * 7 + _winver() * 2 + struct.pack("<B", 0)
+        # run (install + uninstall): 13 строк + 2 winver + i32 + u8 + flags(12) — дважды
+        for _ in range(2):
+            out += _ustring("p") * 13 + _winver() * 2 + struct.pack("<i", 0) + struct.pack("<B", 0) + b"\x00" * 2
     # data entries
     for sort_offset, file_offset, file_size, chunk_size, options in data_entries:
         out += struct.pack("<II", 0, 0)
@@ -344,7 +386,7 @@ def _build_offset_table(header_offset: int, data_offset: int, version=(6, 4, 0))
 
 
 def _build_installer(path, files_payload, version=(6, 4, 0), compression=3,
-                     use_pe_resource=True, block_compressed=True):
+                     use_pe_resource=True, block_compressed=True, with_meta=False):
     """files_payload = [(dest_name, raw_bytes, call_optimize, chunk_group)].
 
     Собирает настоящий контейнер: chanки (LZMA или stored) + заголовок +
@@ -387,7 +429,7 @@ def _build_installer(path, files_payload, version=(6, 4, 0), compression=3,
 
     header = _build_header(version=version, compression=compression,
                            files=file_entries, data_entries=data_entries,
-                           block_compressed=block_compressed)
+                           block_compressed=block_compressed, with_meta=with_meta)
 
     if use_pe_resource:
         # PE: [0x00..0x80) DOS+PE stub, ресурс по 0x400
@@ -592,6 +634,28 @@ class SyntheticInnoTests(unittest.TestCase):
         ok, message = self._extract(installer)
         self.assertTrue(ok, message)
         with open(os.path.join(self.work, "{app}", "data.bin"), "rb") as fh:
+            self.assertEqual(fh.read(), raw)
+
+    def test_modern_67_full_meta_entries_layout(self):
+        # В реальном установщике есть type/component/task/dir/icon/ini/registry/
+        # delete/run-записи — их раскладка (2 winver-поля в 6.5+) должна сходиться
+        installer = os.path.join(self.temp.name, "setup67m.exe")
+        raw = b"MZ" + os.urandom(5000)
+        _build_installer(installer, [("{app}\\bin\\app.exe", raw, False, 0)],
+                         version=(6, 7, 0), compression=3, with_meta=True)
+        ok, message = self._extract(installer)
+        self.assertTrue(ok, message)
+        with open(os.path.join(self.work, "{app}", "bin", "app.exe"), "rb") as fh:
+            self.assertEqual(fh.read(), raw)
+
+    def test_modern_65_full_meta_entries_layout(self):
+        installer = os.path.join(self.temp.name, "setup65m.exe")
+        raw = b"payload-65" * 500
+        _build_installer(installer, [("{app}\\a.bin", raw, False, 0)],
+                         version=(6, 5, 0), compression=3, with_meta=True)
+        ok, message = self._extract(installer)
+        self.assertTrue(ok, message)
+        with open(os.path.join(self.work, "{app}", "a.bin"), "rb") as fh:
             self.assertEqual(fh.read(), raw)
 
     def test_garbage_file_is_a_clean_error(self):
