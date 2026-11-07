@@ -700,8 +700,8 @@ class PortableExeLauncherTests(unittest.TestCase):
                         exe_launcher, "_unpacked_reg",
                         side_effect=lambda source, *_args: source,
                     ), mock.patch.object(
-                        exe_launcher, "_reg",
-                        side_effect=lambda args: calls.append(tuple(args)) or 0,
+                        exe_launcher, "_reg_with_output",
+                        side_effect=lambda args: calls.append(tuple(args)) or (0, ""),
                     ):
                 exe_launcher.RegistrySession(root, cfg).load()
 
@@ -3974,7 +3974,7 @@ class GameLauncherHandoffTests(unittest.TestCase):
         self.assertIn("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", bat)
         self.assertIn("mklink /J", bat)
 
-    def test_electron_and_ollama_do_not_join_the_kill_job(self):
+    def test_electron_ollama_and_pycharm_do_not_join_the_kill_job(self):
         with tempfile.TemporaryDirectory() as temp:
             app = Path(temp, "App")
             app.mkdir()
@@ -3985,6 +3985,10 @@ class GameLauncherHandoffTests(unittest.TestCase):
             self.assertTrue(exe_launcher.is_electron_tree(app))
             self.assertFalse(exe_launcher.should_use_job(app / "ollama app.exe"))
             self.assertFalse(exe_launcher.should_use_job(app / "ollama.exe"))
+            pycharm = app / "PyCharm2026.2" / "bin" / "pycharm.exe"
+            pycharm64 = pycharm.with_name("pycharm64.exe")
+            self.assertFalse(exe_launcher.should_use_job(pycharm))
+            self.assertFalse(exe_launcher.should_use_job(pycharm64))
             plain = Path(temp, "Game")
             plain.mkdir()
             (plain / "game.exe").write_bytes(b"MZ")

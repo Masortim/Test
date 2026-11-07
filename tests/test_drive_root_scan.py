@@ -226,6 +226,20 @@ class ElevationTests(unittest.TestCase):
     def test_import_only_mode_is_a_separate_flag(self):
         self.assertTrue(entry.ELEVATION_IMPORT_ONLY.startswith("--"))
 
+    def test_registry_import_error_is_not_mislabeled_as_a_uac_refusal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            messages = []
+            with mock.patch.object(entry, "mark_elevation_refused") as mark, \
+                    mock.patch.object(entry, "clear_elevation_refusal") as clear, \
+                    mock.patch.object(entry, "_run_log",
+                                      side_effect=lambda _root, line:
+                                      messages.append(line)):
+                entry._report_machine_registry_elevation_result(root, 1)
+            mark.assert_not_called()
+            clear.assert_called_once_with(root)
+            self.assertIn("UAC ran successfully", "\n".join(messages))
+
     def test_no_machine_file_imports_nothing(self):
         with tempfile.TemporaryDirectory() as temp:
             root = make_tree(Path(temp), reg_text=CURSOR_REG, keys=CURSOR_KEYS)
@@ -250,19 +264,31 @@ class ElevationTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(import_text.call_count, 1)
 
-    def test_a_failed_import_is_reported(self):
+    def test_a_failed_import_reports_details_and_uses_prepared_copy(self):
         with tempfile.TemporaryDirectory() as temp:
             root = make_tree(Path(temp), reg_text=CURSOR_REG, keys=CURSOR_KEYS)
-            (root / "portable_machine.reg").write_text(
-                "[HKEY_LOCAL_MACHINE\\Software\\Cursor]\r\n",
+            source = root / "portable_machine.reg"
+            source.write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_LOCAL_MACHINE\\Software\\Cursor]\r\n"
+                '"InstallDir"="@@PORTABLE_ROOT@@\\App"\r\n',
                 encoding="utf-16", newline="")
-            with mock.patch.object(entry, "_run_log"), \
+            messages = []
+            with mock.patch.object(entry, "_run_log",
+                                   side_effect=lambda _root, line:
+                                   messages.append(line)), \
                     mock.patch.object(entry, "import_registry_text",
                                       return_value=False), \
-                    mock.patch.object(entry, "_reg", return_value=1):
+                    mock.patch.object(entry, "_reg_with_output",
+                                      return_value=(1, "ERROR: access denied")) as reg:
                 code = entry.import_machine_registry_command(
                     root, cursor_config())
             self.assertEqual(code, 1)
+            reg_args = reg.call_args.args[0]
+            self.assertEqual(reg_args[0], "import")
+            self.assertNotEqual(Path(reg_args[1]), source)
+            self.assertTrue(Path(reg_args[1]).is_file())
+            self.assertIn("ERROR: access denied", "\n".join(messages))
 
 
 class ElevatedFollowTests(unittest.TestCase):
