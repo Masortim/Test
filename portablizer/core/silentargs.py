@@ -1091,6 +1091,24 @@ def build_attempts(
             log_file=log_path("install.log"), extra_args=extra,
             detection=detection))
 
+    if itype == InstallerType.INNO and allow_assisted:
+        # Только по явному согласию: не подавляем сообщения и не выбираем
+        # ответы за пользователя. У мастера отдельный журнал.
+        args = [f"/DIR={target_dir}"] + extra
+        if log_path("install-interactive.log"):
+            args.append(f'/LOG={log_path("install-interactive.log")}')
+        attempts.append(SilentPlan(
+            program=installer_path, args=args, interactive=True,
+            label="Inno Setup: мастер установки",
+            output_dir=native_target,
+            progress_logs=[log_path("install-interactive.log")] if log_dir else [],
+            instructions=[
+                "Прочитайте сообщения установщика и пройдите мастер вручную. "
+                "Проверьте, что выбранная папка установки — App; установка "
+                "может менять Windows и не гарантирует переносимость.",
+            ],
+        ))
+
     # Установщик может содержать собственные ключи, даже если опознан движок
     # (bootstrapper часто оборачивает классический установщик).
     if (itype != InstallerType.CUSTOM_CLI

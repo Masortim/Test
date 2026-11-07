@@ -137,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "остаётся в системе (по умолчанию — изоляция "
                               "на время сеанса)")
     toggles.add_argument("--assisted", action="store_true",
-                         help="разрешить окно мастера (старые InstallShield; "
+                         help="разрешить окно мастера (Inno Setup и старые InstallShield; "
                               "WiX Burn распаковывается через /layout)")
     toggles.add_argument("--assisted-timeout", type=int, default=0,
                          metavar="SEC",

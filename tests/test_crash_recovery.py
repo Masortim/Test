@@ -575,6 +575,20 @@ class UnpackerFallbackTests(unittest.TestCase):
         self.assertIn("unsupported format", engine._unpacker_result)
         self.assertFalse(os.path.exists(os.path.join(self.app, "partial.exe")))
 
+    def test_warning_does_not_promote_partial_7zip_payload(self):
+        engine = Portablizer(Logger())
+        def run(cmd, console_log, opts):
+            target = next(arg[2:] for arg in cmd if arg.startswith("-o"))
+            _touch(target, "{app}/Hatred.exe", "partial")
+            return 1, "files missing"
+        with mock.patch.object(unpacker_mod, "find_extractors", return_value=[
+                unpacker_mod.Extractor(unpacker_mod.STYLE_7ZIP, "7z.exe")]), \
+             mock.patch.object(engine, "_run_unpacker_command", side_effect=run):
+            self.assertFalse(engine._try_unpacker_fallback(
+                self.opts, self.app, self.portable, self.det, "Hatred"))
+        self.assertFalse(os.path.exists(os.path.join(self.app, "Hatred.exe")))
+        self.assertIn("files missing", engine._unpacker_result)
+
     def _stuck_run(self, deadline: float):
         """Прогон распаковщика, который запустился и не завершается.
 

@@ -55,6 +55,8 @@ version_file = _version_resource(os.path.join(_build_dir, "version_info.txt"))
 datas = [
     (os.path.join("portablizer", "resources", "app.ico"), os.path.join("resources")),
     (os.path.join("portablizer", "resources", "app_256.png"), os.path.join("resources")),
+    (os.path.join("portablizer", "resources", "7zip", "x64"),
+     os.path.join("resources", "7zip", "x64")),
     # Готовый нативный лончер, который Portablizer копирует в App/ каждого
     # результата. Сначала собирается portable_launcher.spec (см. build.bat/CI).
     (os.path.join("portablizer", "resources", "portable_launcher.exe"),

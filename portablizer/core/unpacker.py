@@ -13,8 +13,8 @@ Inno Setup, NSIS и большинство «самораспаковывающ�
 Что здесь есть
 --------------
 * :func:`find_extractors` — поиск распаковщиков, которые уже есть на машине.
-  Свой бинарник Portablizer с собой не носит и в сеть за ним не ходит: сборка
-  не должна молча скачивать исполняемые файлы. Годится не только 7-Zip:
+  В Windows-сборку включён полный 7-Zip; в сеть за ним приложение не ходит.
+  Годится не только 7-Zip:
   подойдёт WinRAR (``UnRAR.exe``/``Rar.exe``), а на Windows 10 и новее —
   **встроенный ``tar.exe``**: это bsdtar из libarchive, он читает ZIP, 7z и
   RAR/RAR5. Именно поэтому отсутствие 7-Zip больше не тупик.
@@ -121,6 +121,17 @@ def find_extractors(env: Optional[dict] = None,
     found: List[Extractor] = []
 
     seven_zip: List[str] = []
+    if IS_WINDOWS:
+        root = getattr(sys, "_MEIPASS", None)
+        if root:
+            bundled = os.path.join(root, "resources", "7zip", "x64")
+        else:
+            bundled = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                   "resources", "7zip", "x64")
+        exe = os.path.join(bundled, "7z.exe")
+        dll = os.path.join(bundled, "7z.dll")
+        if isfile(exe) and isfile(dll):
+            seven_zip.append(exe)
     for variable in UNPACKER_ENV_VARS:
         root = environment.get(variable, "")
         if not root:
@@ -135,6 +146,13 @@ def find_extractors(env: Optional[dict] = None,
     seven = _first_existing(seven_zip, isfile)
     if seven:
         found.append(Extractor(STYLE_7ZIP, seven))
+    # Не прячем установленный 7-Zip за встроенным: разные версии могут
+    # поддерживать разные варианты контейнеров.
+    for candidate in seven_zip:
+        if (candidate and candidate != seven and isfile(candidate)
+                and os.path.basename(candidate).lower() == "7z.exe"):
+            found.append(Extractor(STYLE_7ZIP, candidate))
+            break
 
     rar: List[str] = []
     for variable in UNPACKER_ENV_VARS:
@@ -392,7 +410,8 @@ def unpack_installer(unpacker: str, installer: str, destination: str,
                      work_dir: str, runner: Optional[Runner] = None,
                      timeout: Optional[float] = None,
                      installer_path: str = "",
-                     extractor: Optional[Extractor] = None) -> Tuple[bool, str]:
+                     extractor: Optional[Extractor] = None,
+                     accept_warnings: bool = True) -> Tuple[bool, str]:
     """Распаковывает установщик в ``destination``. Возвращает ``(успех, текст)``.
 
     Текст во втором элементе — причина неудачи словами (её видно в журнале и
@@ -417,7 +436,7 @@ def unpack_installer(unpacker: str, installer: str, destination: str,
     tail = " ".join((output or "").split())[-300:]
     # Код 1 у 7-Zip означает предупреждение (часть файлов не распакована), а
     # не отказ: то, что достали, всё равно нужно проверить.
-    if code not in ((0, 1) if extractor.style == STYLE_7ZIP else (0,)):
+    if code not in ((0, 1) if extractor.style == STYLE_7ZIP and accept_warnings else (0,)):
         return False, (f"{os.path.basename(unpacker)} завершился с кодом {code}"
                        + (f": {tail}" if tail else ""))
 
