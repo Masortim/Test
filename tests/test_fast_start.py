@@ -84,6 +84,27 @@ class LauncherPackagingTests(unittest.TestCase):
             self.assertIn("Сам лончер", report)
             self.assertIn("ОДНИМ ФАЙЛОМ", report)
 
+    def test_diagnose_marks_a_retained_registry_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = make_portable(Path(temp))
+            (root / "launcher_config.json").write_text(json.dumps({
+                "app_name": "PyCharm", "target_exe_rel": "App/pycharm.exe",
+                "data_dir_name": "PortableData",
+                "registry": {"enabled": True, "keys": []},
+            }), encoding="utf-8")
+            backup = root / "PortableData" / "RegistryHostBackup"
+            backup.mkdir(parents=True)
+            (backup / entry.REGISTRY_SNAPSHOT_NAME).write_text(
+                "retained", encoding="utf-8")
+            with mock.patch.object(entry, "IS_WINDOWS", False):
+                entry.diagnose(root)
+            report = (root / "PortableData" / "diagnostics.txt").read_text(
+                encoding="utf-8")
+            self.assertIn(
+                f"резервная копия реестра: {entry.REGISTRY_SNAPSHOT_NAME}",
+                report)
+            self.assertIn("не удаляйте", report)
+
     def test_launcher_payload_is_bundled_into_the_portable(self):
         """Portablizer кладёт рядом с exe папку содержимого (без распаковки)."""
         with tempfile.TemporaryDirectory() as temp:

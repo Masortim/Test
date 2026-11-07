@@ -2440,7 +2440,16 @@ def browser_login_settings(cfg: "LauncherConfig") -> Dict[str, object]:
     explicit = cfg.browser_login or {}
     if isinstance(explicit, dict):
         settings.update(explicit)
-    if settings.get("enabled") is not False:
+    pycharm = (
+        "pycharm" in str(cfg.app_name or "").casefold()
+        or "pycharm" in str(cfg.target_exe_rel or "").casefold()
+    )
+    if pycharm:
+        # PyCharm authenticates inside JetBrains Runtime. The generic browser
+        # bridge is unrelated and can otherwise delete a browser-profile copy
+        # from PortableData when the IDE starts.
+        settings["enabled"] = False
+    elif settings.get("enabled") is not False:
         settings["enabled"] = True
     return settings
 

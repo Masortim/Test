@@ -1430,6 +1430,30 @@ def _reg(args: Sequence[str]) -> int:
         return 1
 
 
+def _reg_with_output(args: Sequence[str]) -> tuple[int, str]:
+    """Run reg.exe quietly while retaining short diagnostic output on failure."""
+    if not IS_WINDOWS:
+        return 1, "reg.exe is only available on Windows"
+    try:
+        result = subprocess.run(
+            ["reg.exe", *args],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=NO_WINDOW,
+        )
+        output = result.stdout or b""
+        if isinstance(output, bytes):
+            detail = output.decode("utf-8", "replace")
+        else:
+            detail = str(output)
+        detail = " ".join(detail.split())[:400]
+        return int(result.returncode), detail
+    except OSError as exc:
+        return 1, str(exc)[:400]
+
+
 def _decode_reg(raw: bytes) -> str:
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16")
@@ -4575,20 +4599,62 @@ def import_registry_file(path: Path, root: "Optional[Path]" = None) -> bool:
     if import_registry_text(text):
         _run_log(root, "registry import " + path.name + ": ok (direct)")
         return True
+    import_path = path
+    temporary: Optional[Path] = None
     if dropped:
         # Нельзя падать обратно на исходный файл: reg.exe импортировал бы
         # удалённые browser-секции вместе с остальными значениями.
         temporary = path.with_name(path.stem + ".browser-safe.reg")
         if not write_reg_file(temporary, text):
             return False
-        try:
-            return _reg(("import", str(temporary))) == 0
-        finally:
+        import_path = temporary
+    try:
+        code, detail = _reg_with_output(("import", str(import_path)))
+        if code == 0:
+            return True
+        _run_log(root, f"registry import {path.name}: reg.exe rc={code}"
+                       + (f" ({detail})" if detail else ""))
+        return False
+    finally:
+        if temporary is not None:
             try:
                 temporary.unlink()
             except OSError:
                 pass
-    return _reg(("import", str(path))) == 0
+
+
+def _registry_file_contains_hklm(path: Path) -> bool:
+    """Whether a registry backup contains machine-hive sections."""
+    try:
+        sections = _parse_reg_sections(_decode_reg(path.read_bytes()))
+    except (OSError, UnicodeError):
+        return False
+    return any(header.casefold().startswith("hkey_local_machine\\")
+               for header in sections)
+
+
+def _restore_registry_file(path: Path, root: Path) -> tuple[bool, str]:
+    """Restore a snapshot, elevating only if its HKLM sections require it.
+
+    A failed import is never treated as a successful restore: the caller keeps
+    the backup file so the next launch can retry it.
+    """
+    if import_registry_file(path, root):
+        return True, ""
+    if (not IS_WINDOWS or _is_elevated()
+            or not _registry_file_contains_hklm(path)):
+        return False, " (backup retained)"
+
+    _run_log(root, "registry restore: HKLM snapshot needs administrator "
+                   "rights; retrying through UAC")
+    code = _run_elevated(["--import-reg", str(path)])
+    if code == 0:
+        return True, " (elevated)"
+    if code is None:
+        return False, " (UAC did not complete; backup retained)"
+    if code == 1223:
+        return False, " (UAC was declined; backup retained)"
+    return False, f" (elevated import rc={code}; backup retained)"
 
 
 def write_reg_file(path: Path, text: str) -> bool:
@@ -5343,12 +5409,16 @@ class RegistrySession:
                 _run_log(self.root, f"registry import {source.name}: ok "
                                     "(direct)")
             else:
-                code = _reg(("import", str(imported)))
-                _run_log(
-                    self.root,
-                    f"registry import {source.name}: "
-                    f"{'ok' if code == 0 else f'FAILED (reg.exe rc={code})'}",
-                )
+                code, detail = _reg_with_output(("import", str(imported)))
+                if code == 0:
+                    _run_log(self.root, f"registry import {source.name}: ok "
+                                          "(reg.exe)")
+                else:
+                    suffix = f"; {detail}" if detail else ""
+                    _run_log(
+                        self.root,
+                        f"registry import {source.name}: FAILED "
+                        f"(reg.exe rc={code}{suffix})")
         for ext_file in self.created_exports:
             if ext_file.is_file():
                 try:
@@ -5477,27 +5547,33 @@ class RegistrySession:
                     delete_failed = True
 
         # Все существовавшие ключи — включая created_keys — восстанавливаются
-        # из снимка текущего ПК. При неудаче backup и state остаются для
-        # повторного восстановления при следующем запуске, а не удаляются.
+        # из снимка текущего ПК. HKLM требует UAC, если обычный сеанс не
+        # повышен. При любой неудаче backup/state остаются для повтора.
         if snapshot.is_file():
-            if import_registry_file(snapshot, self.root):
-                _run_log(self.root, "registry restore: ok")
+            restored, detail = _restore_registry_file(snapshot, self.root)
+            if restored:
+                suffix = " (snapshot kept: cleanup incomplete)" if delete_failed else detail
+                _run_log(self.root, "registry restore: ok" + suffix)
                 if not delete_failed:
                     try:
                         snapshot.unlink()
                     except OSError:
                         pass
             else:
-                _run_log(self.root, "registry restore: FAILED")
+                _run_log(self.root, "registry restore: FAILED" + detail)
         for index, _key in enumerate(tracked):
             backup_file = self.backup / f"k{index:02d}.reg"
             if not backup_file.is_file():
                 continue
-            if import_registry_file(backup_file, self.root):
+            restored, detail = _restore_registry_file(backup_file, self.root)
+            if restored:
                 try:
                     backup_file.unlink()
                 except OSError:
                     pass
+            else:
+                _run_log(self.root, f"registry restore: FAILED for "
+                                   f"{backup_file.name}" + detail)
 
         backups_left = snapshot.is_file() or any(
             self.backup.glob("k[0-9][0-9].reg"))
@@ -6327,18 +6403,34 @@ def is_chromium_tree(directory: Path) -> bool:
     return False
 
 
+def _is_pycharm_target(target: Path) -> bool:
+    """Whether ``target`` is a PyCharm launcher executable."""
+    return target.name.casefold().startswith("pycharm")
+
+
+def _is_pycharm_app(target: Path, cfg: Optional[Dict[str, Any]] = None) -> bool:
+    """Recognize PyCharm from either its executable or portable app name."""
+    if _is_pycharm_target(target):
+        return True
+    return "pycharm" in str((cfg or {}).get("app_name", "")).casefold()
+
+
 def should_use_job(target: Path) -> bool:
-    """False for Chromium/Ollama: a kill-on-close job breaks their windows.
+    """False for Chromium/Ollama and PyCharm: launch them without a job.
 
     Chromium creates its own job and GPU/renderer processes with
     ``CREATE_BREAKAWAY_FROM_JOB``.  Even with BREAKAWAY_OK, starting the
     main process *suspended* (so it can be assigned to our job) races the
-    sandbox setup: the tray icon appears, "Open Ollama" never shows a
-    window, then the UI stops responding.  Cleanup still finds those
-    processes by image path.
+    sandbox setup. PyCharm's native launcher also gets a normal, unsuspended
+    process start: the diagnostic log showed its ``pycharm.exe`` exiting with
+    ``0xC0000005`` when it was started inside our kill-on-close job. This
+    avoids that extra launch constraint without claiming it is the only
+    possible cause. Cleanup still finds portable descendants by image path.
     """
     name = target.name.casefold()
     if "ollama" in name and "setup" not in name:
+        return False
+    if _is_pycharm_target(target):
         return False
     return not is_chromium_tree(target.parent)
 
@@ -7229,6 +7321,7 @@ class BrowserLoginBridge:
         # сеанс. При следующем запуске UserChoice читается заново.
         self._default_images: "Optional[set[str]]" = None
         self._default_pairs: "Optional[set[tuple[str, str]]]" = None
+        self._prepared = False
 
     # -- настройки ---------------------------------------------------------
     @property
@@ -7262,6 +7355,11 @@ class BrowserLoginBridge:
             return False
         if not IS_WINDOWS:
             return False
+        # PyCharm authenticates in its own JetBrains UI, not by spawning the
+        # user's default browser. Its portable data must never be cleaned or
+        # junctioned as a side effect of launching the IDE.
+        if _is_pycharm_app(self.target, self.cfg):
+            return False
         # Портатив самого браузера не перехватываем: его окна и вкладки —
         # это и есть программа, а не чужой «вход».
         return not self._is_browser_process(str(self.target))
@@ -7279,6 +7377,7 @@ class BrowserLoginBridge:
         """Подготовить профиль и запомнить, что было открыто до старта."""
         if not self.enabled:
             return
+        self._prepared = True
         try:
             self._baseline = {pid for pid, _ppid, _image in _process_table()}
         except Exception:  # noqa: BLE001 - снимок необязателен
@@ -7308,7 +7407,9 @@ class BrowserLoginBridge:
         self.target_pid = int(pid or 0)
 
     def teardown(self) -> None:
-        """Снять junction'ы: в папке портатива не должно остаться ссылок."""
+        """Снять только ссылки, которыми управлял активный мост."""
+        if not self._prepared:
+            return
         for var, rel in _browser_profile_pairs():
             root = self._portable_root(var)
             if root is None:
@@ -7322,6 +7423,7 @@ class BrowserLoginBridge:
             except OSError:
                 continue
         self._bridged.clear()
+        self._prepared = False
 
     def poll(self) -> None:
         """Один проход наблюдения; вызывается из цикла ожидания программы."""
@@ -8991,6 +9093,33 @@ def _run_elevated(arguments: Sequence[str],
         return None
 
 
+def _report_machine_registry_elevation_result(
+        root: Path, code: Optional[int]) -> None:
+    """Record what the elevated registry helper actually did.
+
+    A nonzero helper exit means UAC succeeded but the registry import failed;
+    it must not be mislabeled as a declined/unavailable UAC prompt.
+    """
+    if code == 0:
+        clear_elevation_refusal(root)
+        _run_log(root, "machine registry: imported through the UAC hop; "
+                       "the program itself starts normally")
+    elif code == 1223:
+        mark_elevation_refused(root, "declined at the UAC prompt")
+        _run_log(root, "elevation declined at the UAC prompt; the captured "
+                       "HKLM entries stay unimported and the request will "
+                       "not repeat for an hour")
+    elif code is None:
+        mark_elevation_refused(root, "no result from the UAC prompt")
+        _run_log(root, "elevation was unavailable or timed out; continuing "
+                       "without the HKLM import")
+    else:
+        clear_elevation_refusal(root)
+        _run_log(root, "machine registry: elevated import failed with exit "
+                       f"code {code}; UAC ran successfully, continuing "
+                       "without the HKLM import")
+
+
 def _run_elevated_with_handoff(arguments: Sequence[str], handoff_token: str,
                                **kwargs: Any) -> Optional[int]:
     """Pass the one-shot BAT token to a UAC child, without leaking it onward.
@@ -9047,6 +9176,33 @@ def mark_elevation_refused(root: Path, reason: str = "") -> None:
         pass
 
 
+def _elevated_machine_import_failed_near(root: Path, when: float) -> bool:
+    """Detect an old launcher stamp that misreported an import error as UAC refusal."""
+    import time
+
+    log_path = root / "PortableData" / "launcher-run.log"
+    try:
+        raw = log_path.read_bytes()[-65_536:]
+        lines = raw.decode("utf-8", "replace").splitlines()
+    except OSError:
+        return False
+    for line in reversed(lines):
+        if "machine registry: FAILED" not in line or "(elevated)" not in line:
+            continue
+        if not line.startswith("[") or "]" not in line:
+            continue
+        try:
+            stamp = line[1:line.index("]")]
+            logged_when = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, OverflowError):
+            continue
+        # The child records its error just before the parent writes the old,
+        # misleading "no result" stamp. Both timestamps have one-second
+        # resolution, so allow a small window around the stamp.
+        return when - 10.0 <= logged_when <= when + 5.0
+    return False
+
+
 def elevation_recently_refused(root: Path,
                               memory: float = ELEVATION_REFUSAL_MEMORY
                               ) -> bool:
@@ -9057,6 +9213,13 @@ def elevation_recently_refused(root: Path,
         data = json.loads(_elevation_stamp(root).read_text(encoding="utf-8"))
         when = float(data.get("when", 0.0))
     except (OSError, ValueError, TypeError):
+        return False
+    if (str(data.get("reason", "")) == "no result from the UAC prompt"
+            and _elevated_machine_import_failed_near(root, when)):
+        # Versions before the import-result fix wrote a refusal stamp even
+        # when the UAC child ran and reg.exe itself failed. Let the corrected
+        # launcher retry that import instead of inheriting the false cooldown.
+        clear_elevation_refusal(root)
         return False
     if float(memory) <= 0.0:
         return False
@@ -13811,20 +13974,39 @@ def import_machine_registry_command(root: Path, cfg: "Optional[Dict[str, Any]]"
     if not name or not path.is_file():
         _run_log(root, "machine registry: nothing to import")
         return 0
+    runtime = root / str(cfg.get("data_dir_name") or "PortableData") / "Runtime"
     try:
-        text = _decode_reg(_unpacked_reg(path, root / "PortableData" / "Runtime",
-                                         root, 0)
-                           .read_bytes())
-    except OSError:
-        text = ""
+        source_text = _decode_reg(path.read_bytes())
+    except OSError as exc:
+        _run_log(root, f"machine registry: cannot read {name} ({exc})")
+        return 1
+    unpacked = _unpacked_reg(path, runtime, root, 0)
+    if unpacked is None:
+        cleaned, _dropped = sanitize_reg_text(source_text)
+        if not cleaned:
+            _run_log(root, "machine registry: nothing to import after "
+                           "protected shell sections were removed")
+            return 0
+        _run_log(root, "machine registry: could not prepare an importable "
+                       "runtime copy")
+        return 1
+    try:
+        text = _decode_reg(unpacked.read_bytes())
+    except OSError as exc:
+        _run_log(root, "machine registry: cannot read prepared file "
+                       f"{unpacked.name} ({exc})")
+        return 1
     if text and import_registry_text(text):
         _run_log(root, "machine registry: imported (elevated)")
         return 0
-    code = _reg(("import", str(path)))
-    _run_log(root, "machine registry: "
-             f"{'imported' if code == 0 else f'FAILED (reg.exe rc={code})'}"
-             " (elevated)")
-    return 0 if code == 0 else 1
+    code, detail = _reg_with_output(("import", str(unpacked)))
+    if code == 0:
+        _run_log(root, "machine registry: imported (elevated, reg.exe)")
+        return 0
+    suffix = f"; {detail}" if detail else ""
+    _run_log(root, f"machine registry: FAILED (reg.exe rc={code}{suffix}) "
+                   "(elevated)")
+    return 1
 
 
 def update_command(root: Path, argv: Sequence[str]) -> int:
@@ -14193,19 +14375,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             elevated_code = _run_elevated(
                 [], timeout_ms=min(ELEVATED_WAIT_MS, 45_000),
                 extra=[ELEVATION_IMPORT_ONLY])
-            if elevated_code == 0:
-                clear_elevation_refusal(root)
-                _run_log(root, "machine registry: imported through the UAC "
-                               "hop; the program itself starts normally")
-            elif elevated_code == 1223:
-                mark_elevation_refused(root, "declined at the UAC prompt")
-                _run_log(root, "elevation declined at the UAC prompt; "
-                               "the captured HKLM entries stay unimported "
-                               "and the request will not repeat for an hour")
-            else:
-                mark_elevation_refused(root, "no result from the UAC prompt")
-                _run_log(root, "elevation was refused, unavailable or timed "
-                               "out; continuing without the HKLM import")
+            _report_machine_registry_elevation_result(root, elevated_code)
         else:
             elevated_code = _run_elevated_with_handoff(
                 raw_arguments, handoff_token, follow=True,
@@ -14476,6 +14646,22 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                         f"{root / str(cfg.get('data_dir_name') or 'PortableData')}"
                         f"\\AppData\\Roaming\\{info['name']}\\logs\n\n"
                         "Полный отчёт: Launch.bat --diagnose")
+                elif _is_pycharm_app(target, cfg) and code != 0:
+                    code_hex = f"0x{int(code) & 0xFFFFFFFF:08X}"
+                    _run_log(root, "PyCharm closed immediately after launch "
+                                   f"with code {code} ({code_hex}); "
+                                   "the kill-on-close job was disabled")
+                    data_dir = str(cfg.get("data_dir_name") or "PortableData")
+                    _show_warning(
+                        "PyCharm завершился сразу после запуска, не показав "
+                        f"окна (код {code}, {code_hex}).\n\n"
+                        "В этой версии он запущен без kill-on-close Job Object. "
+                        "Ошибка импорта portable_machine.reg — отдельный "
+                        "факт; по этому коду причина падения не установлена.\n\n"
+                        f"Журнал: {root / data_dir / 'launcher-run.log'}\n"
+                        "Если там есть `registry restore: FAILED`, не удаляйте "
+                        "`PortableData\\RegistryHostBackup`: резервный снимок "
+                        "сохраняется для повтора.")
             # Companion services first: a registered service whose binary
             # lives in App/ keeps the whole folder locked no matter how the
             # processes are closed. Teardown removes ONLY what this portable
@@ -14912,6 +15098,16 @@ def diagnose(root: Optional[Path] = None) -> int:
         add(f"реестр:          ключей {len(registry.get('keys') or [])}")
     else:
         add("реестр:          не применяется")
+    registry_backup = data / "RegistryHostBackup"
+    pending_registry_files = sorted(
+        path.name for path in registry_backup.glob("*.reg")
+        if path.name == REGISTRY_SNAPSHOT_NAME
+        or re.fullmatch(r"k[0-9][0-9]\.reg", path.name, re.IGNORECASE))
+    if pending_registry_files:
+        add("резервная копия реестра: " + ", ".join(pending_registry_files)
+            + " (не удаляйте: хранится до успешного восстановления)")
+    else:
+        add("резервная копия реестра: нет ожидающего снимка")
     add(f"обновления:      {'секция есть' if cfg.get('update') else 'нет секции'}")
     add("")
 
