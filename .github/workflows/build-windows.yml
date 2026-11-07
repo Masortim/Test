@@ -851,18 +851,16 @@ jobs:
             }
           }
 
-      - name: Publish OpenCode smoke failure details
+      - name: Upload OpenCode smoke failure details
         if: failure()
-        shell: bash
-        run: |
-          set -e
-          if ! test -f opencode-smoke-failure.txt; then exit 0; fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f opencode-smoke-failure.txt
-          if test -f opencode-smoke-failure.png; then git add -f opencode-smoke-failure.png; fi
-          git commit -m "ci: publish OpenCode smoke failure [skip ci]"
-          git push origin HEAD:"${GITHUB_REF_NAME}"
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-smoke-failure
+          path: |
+            opencode-smoke-failure.txt
+            opencode-smoke-failure.png
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Smoke test portable App EXE
         shell: pwsh
