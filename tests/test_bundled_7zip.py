@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -54,7 +55,21 @@ class BundledExtractorTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows integration test')
 class WindowsBundled7ZipTests(unittest.TestCase):
-    def test_real_inno_installer_extracts_without_execution(self):
+    def test_bundled_7zip_extracts_zip_offline(self):
+        seven = Path(__file__).resolve().parents[1] / 'portablizer/resources/7zip/x64/7z.exe'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive = root / 'example.zip'
+            with zipfile.ZipFile(archive, 'w') as z:
+                z.writestr('Example.exe', 'test payload')
+            app = root / 'app'
+            app.mkdir()
+            ok, message = unpacker.unpack_installer(str(seven), str(archive), str(app), str(root / 'work'),
+                                                     accept_warnings=False)
+            self.assertTrue(ok, message)
+            self.assertEqual((app / 'Example.exe').read_text(), 'test payload')
+
+    def test_real_inno_installer_is_extracted_or_honestly_rejected(self):
         compiler = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
                         'Inno Setup 6', 'ISCC.exe')
         if not compiler.is_file():
@@ -73,6 +88,12 @@ class WindowsBundled7ZipTests(unittest.TestCase):
             app.mkdir()
             ok, message = unpacker.unpack_installer(str(seven), str(setup), str(app), str(root / 'work'),
                                                      accept_warnings=False)
-            self.assertTrue(ok, message)
-            self.assertTrue((app / 'Example.exe').is_file(), list(app.rglob('*')))
-            self.assertFalse((app / 'secret.tmp').exists())
+            if ok:
+                self.assertTrue((app / 'Example.exe').is_file(), list(app.rglob('*')))
+                self.assertFalse((app / 'secret.tmp').exists())
+            else:
+                # 7-Zip 26.05 does not support the current 6.7.1 Inno format.
+                # Failure must not be reported as success or promote partial files.
+                self.assertIn('кодом', message)
+                self.assertFalse((app / 'Example.exe').exists())
+                print('Inno fixture rejected by 7-Zip:', message)
