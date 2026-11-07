@@ -1174,7 +1174,8 @@ class MainWindow(QMainWindow):
                     "напрямую (" + os.path.basename(result.unpacked_with) + "). "
                     "Файлы программы на месте, но настроек, которые установщик "
                     "записал бы в реестр, в портативе нет — игре или программе "
-                    "может понадобиться задать их при первом запуске.",
+                    "может понадобиться задать их при первом запуске. Это "
+                    "предупреждение о реестре само по себе запуск EXE не блокирует.",
                 ]
             if result.crash_report_rel:
                 details += [
@@ -1212,6 +1213,11 @@ class MainWindow(QMainWindow):
                     "нужны. Подробности — в "
                     f"{result.adobe_note_rel}.",
                 ]
+            if result.main_exe_rel:
+                details.append(
+                    "Основной файл приложения: "
+                    + result.main_exe_rel.replace("\\", "/")
+                )
             if result.portable_launcher_exe_rel:
                 details.append(
                     "Запуск из EXE: " + result.portable_launcher_exe_rel

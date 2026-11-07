@@ -8890,7 +8890,20 @@ class Portablizer:
             preferred = [item for item in non_ignored if item[3] == "launcher"]
         if not preferred:
             preferred = non_ignored
-        main_exe = preferred[0][1]
+
+        # JetBrains' Inno payload can contain both pycharm.exe and
+        # pycharm64.exe under <product>/bin. For PyCharm, prefer the exact
+        # pycharm.exe entry when present: it is the user-facing launcher and
+        # avoids depending on which order Inno's file table happened to use.
+        pycharm_main = []
+        if "pycharm" in str(app_name or "").casefold():
+            pycharm_main = [
+                item for item in preferred
+                if os.path.basename(item[1]).casefold() == "pycharm.exe"
+                and os.path.basename(os.path.dirname(item[1])).casefold() == "bin"
+            ]
+        main_exe = (sorted(pycharm_main, key=lambda item: item[1].casefold())[0][1]
+                    if pycharm_main else preferred[0][1])
 
         def _safe_slug(s: str) -> str:
             cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", s).strip("_")
