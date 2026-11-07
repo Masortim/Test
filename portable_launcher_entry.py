@@ -39,7 +39,8 @@ WARNING_ICON = 0x00000030
 NO_UI_ENV = "PORTABLE_LAUNCHER_NO_UI"
 #: One-shot token used only for the Launch.bat -> windowed EXE handoff.
 BATCH_HANDOFF_ENV = "PORTABLIZER_LAUNCH_HANDOFF_ID"
-BATCH_HANDOFF_MARKER_PREFIX = "launcher-exe-started-"
+BATCH_HANDOFF_STARTED_PREFIX = "launcher-exe-started-"
+BATCH_HANDOFF_TARGET_PREFIX = "launcher-exe-target-"
 _BATCH_HANDOFF_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 
@@ -5912,6 +5913,87 @@ def _prefer_paired_gui_target(root: Path, cfg: Dict[str, Any],
     return candidate_rel
 
 
+def _prefer_pycharm_target(root: Path, cfg: Dict[str, Any],
+                           target_rel: str) -> str:
+    """Prefer PyCharm's ``bin/pycharm.exe`` for an old main-target config.
+
+    Some portable builds were made while both pycharm.exe and pycharm64.exe
+    existed and the directory enumeration order selected the latter. This
+    repairs the main target at launch time too, so updating LaunchPortable.exe
+    can fix an existing portable without inspecting or touching unrelated
+    files (including activation-code files).
+    """
+    if "pycharm" not in str(cfg.get("app_name", "")).casefold():
+        return target_rel
+    configured = str(cfg.get("target_exe_rel") or "")
+    normalize = lambda value: str(value or "").replace("\\", "/").casefold()
+    if normalize(target_rel) != normalize(configured):
+        # Do not rewrite an explicitly selected auxiliary/alternate target.
+        return target_rel
+
+    target = _as_relative_path(root, target_rel)
+    if target.name.casefold() == "pycharm.exe" and target.is_file():
+        try:
+            target.relative_to(root)
+            return target_rel
+        except ValueError:
+            # A legacy absolute path can still point at a host installation;
+            # prefer the copy in App when one is available.
+            pass
+
+    candidates: list[Path] = []
+    sibling = target.with_name("pycharm.exe")
+    try:
+        if sibling.is_file() and sibling.parent.name.casefold() == "bin":
+            sibling.relative_to(root)
+            candidates.append(sibling)
+    except (OSError, ValueError):
+        pass
+    if not candidates:
+        app = root / "App"
+        try:
+            for current, dirs, files in os.walk(app):
+                try:
+                    depth = len(Path(current).relative_to(app).parts)
+                except ValueError:
+                    depth = 0
+                if depth >= 5:
+                    dirs[:] = []
+                else:
+                    dirs[:] = [name for name in dirs
+                               if name.casefold() not in {
+                                   "activationcodes", "plugins", "resources",
+                                   "locales", "node_modules", "_internal",
+                                   "updates", "cache", "caches",
+                               } and not name.startswith(("_", "."))]
+                if (Path(current).name.casefold() == "bin"
+                        and "pycharm.exe" in {name.casefold()
+                                               for name in files}):
+                    candidate = Path(current) / next(
+                        name for name in files
+                        if name.casefold() == "pycharm.exe")
+                    candidates.append(candidate)
+        except OSError:
+            pass
+    if not candidates:
+        return target_rel
+
+    candidate = sorted(candidates, key=lambda path: (
+        len(path.parts), str(path).casefold()))[0]
+    try:
+        new_rel = str(candidate.relative_to(root)).replace(os.sep, "/")
+    except ValueError:
+        new_rel = str(candidate)
+    if normalize(new_rel) == normalize(target_rel):
+        return target_rel
+
+    cfg["target_exe_rel"] = new_rel
+    if _remember_target(root, new_rel):
+        _run_log(root, f"PyCharm: launcher_config.json now points to {new_rel}")
+    _run_log(root, f"PyCharm: using bin/pycharm.exe instead of {target_rel}")
+    return new_rel
+
+
 def _repair_missing_target(root: Path, cfg: Dict[str, Any], target_rel: str) -> str:
     """Returns a usable target path, repairing the config when it is stale."""
     target = _as_relative_path(root, target_rel)
@@ -8909,6 +8991,30 @@ def _run_elevated(arguments: Sequence[str],
         return None
 
 
+def _run_elevated_with_handoff(arguments: Sequence[str], handoff_token: str,
+                               **kwargs: Any) -> Optional[int]:
+    """Pass the one-shot BAT token to a UAC child, without leaking it onward.
+
+    An elevated target is started by a second LaunchPortable.exe process; that
+    process must write the target-start acknowledgement itself, otherwise the
+    waiting batch file would incorrectly start the app again via its fallback.
+    The environment value is removed by the child's ``main()`` before it builds
+    the target process environment.
+    """
+    token = str(handoff_token or "").strip()
+    if not token:
+        return _run_elevated(arguments, **kwargs)
+    previous = os.environ.get(BATCH_HANDOFF_ENV)
+    os.environ[BATCH_HANDOFF_ENV] = token
+    try:
+        return _run_elevated(arguments, **kwargs)
+    finally:
+        if previous is None:
+            os.environ.pop(BATCH_HANDOFF_ENV, None)
+        else:
+            os.environ[BATCH_HANDOFF_ENV] = previous
+
+
 #: Сколько помнить отказ от UAC, секунды. Раньше отказ нигде не запоминался,
 #: и лончер спрашивал права заново при КАЖДОМ запуске — при неудачном
 #: раскладе это выглядело как «завис запрос UAC».
@@ -9717,18 +9823,12 @@ def _data_dir(root: Path, cfg: Dict[str, Any]) -> Path:
     return root / str(cfg.get("data_dir_name", "PortableData"))
 
 
-def _write_bat_handoff_marker(root: Path, cfg: Dict[str, Any],
-                              token: str) -> bool:
-    """Mark that this specific windowed EXE instance reached Python startup.
-
-    Launch.bat uses this per-attempt marker instead of tasklist's global image
-    name: another portable app may already have a process named
-    ``LaunchPortable.exe``. The token is constrained before it becomes part of
-    a filename, and the marker is kept inside the portable data directory.
-    """
+def _bat_handoff_marker_path(root: Path, cfg: Dict[str, Any],
+                             token: str, prefix: str) -> "Optional[Path]":
+    """Resolve a one-shot handoff marker inside this portable's data folder."""
     token = str(token or "")
     if not _BATCH_HANDOFF_TOKEN.fullmatch(token):
-        return False
+        return None
 
     data_name = str(cfg.get("data_dir_name", "PortableData") or "PortableData")
     try:
@@ -9741,20 +9841,55 @@ def _write_bat_handoff_marker(root: Path, cfg: Dict[str, Any],
     parts = normalized.split("/")
     if (not normalized or normalized.startswith("/") or ":" in normalized
             or any(part in ("", "..") for part in parts)):
-        return False
+        return None
 
     try:
         root_path = root.resolve()
         data_dir = (root_path.joinpath(*parts)).resolve()
         data_dir.relative_to(root_path)
         data_dir.mkdir(parents=True, exist_ok=True)
-        marker = data_dir / f"{BATCH_HANDOFF_MARKER_PREFIX}{token}.txt"
-        with marker.open("x", encoding="ascii", newline="\n") as handle:
-            handle.write(token + "\n")
-        return True
+        return data_dir / f"{prefix}{token}.txt"
     except (OSError, ValueError):
-        # This handshake is diagnostic/recovery help; a failed marker must
-        # never prevent the application itself from starting.
+        return None
+
+
+def _write_bat_handoff_started_marker(root: Path, cfg: Dict[str, Any],
+                                      token: str, pid: int) -> bool:
+    """Record this specific LaunchPortable.exe PID as soon as Python starts.
+
+    Launch.bat can distinguish a slow/in-progress launcher from one that has
+    already exited without launching the target, avoiding duplicate starts.
+    The token is constrained before it becomes part of a filename.
+    """
+    marker = _bat_handoff_marker_path(
+        root, cfg, token, BATCH_HANDOFF_STARTED_PREFIX)
+    if marker is None:
+        return False
+    try:
+        with marker.open("x", encoding="ascii", newline="\n") as handle:
+            handle.write(str(int(pid)) + "\n")
+        return True
+    except FileExistsError:
+        return True
+    except (OSError, ValueError, TypeError):
+        # Handoff diagnostics must never prevent the application from starting.
+        return False
+
+
+def _write_bat_handoff_target_marker(root: Path, cfg: Dict[str, Any],
+                                     token: str) -> bool:
+    """Acknowledge the batch handoff only after the target process is spawned."""
+    marker = _bat_handoff_marker_path(
+        root, cfg, token, BATCH_HANDOFF_TARGET_PREFIX)
+    if marker is None:
+        return False
+    try:
+        with marker.open("x", encoding="ascii", newline="\n") as handle:
+            handle.write(str(token) + "\n")
+        return True
+    except FileExistsError:
+        return True
+    except (OSError, ValueError, TypeError):
         return False
 
 
@@ -13735,7 +13870,8 @@ def rollback_command(root: Path, argv: Sequence[str] = ()) -> int:
     return 1
 
 
-def run(argv: Optional[Sequence[str]] = None) -> int:
+def run(argv: Optional[Sequence[str]] = None,
+        handoff_token: str = "") -> int:
     """Запуск программы + обновление внутри портатива, если оно понадобилось."""
     root = find_portable_root()
     cfg: Dict[str, Any] = read_launcher_config(root)
@@ -13755,7 +13891,8 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             _run_log(root, f"update: recovery check failed ({exc})")
 
     watch = UpdateWatch(root, cfg)
-    code = _run_session(argv, root, cfg, watch)
+    code = _run_session(argv, root, cfg, watch,
+                        handoff_token=handoff_token)
     # «Перезапустить для обновления»: родной установщик перехвачен, новая
     # версия ставится в портатив, после чего программа запускается снова.
     for _attempt in range(2):
@@ -13771,12 +13908,14 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                         + "\n\nПрограмма останется прежней версии.")
             break
         watch = UpdateWatch(root, cfg)
-        code = _run_session(argv, root, cfg, watch)
+        code = _run_session(argv, root, cfg, watch,
+                            handoff_token=handoff_token)
     return code
 
 
 def _run_session(argv: Optional[Sequence[str]], root: Path,
-                 cfg: Dict[str, Any], watch: "UpdateWatch") -> int:
+                 cfg: Dict[str, Any], watch: "UpdateWatch",
+                 handoff_token: str = "") -> int:
     #: Время начала сеанса (0.0, пока программа не запущена): по нему
     #: определяется, что установщик положил в прежнее место портатива.
     session_start = 0.0
@@ -13989,6 +14128,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     target_rel, forwarded, needs_machine = _select_target(cfg, raw_arguments)
     if not needs_machine:
         target_rel = _prefer_paired_gui_target(root, cfg, target_rel)
+        target_rel = _prefer_pycharm_target(root, cfg, target_rel)
     # Записанная цель могла исчезнуть: неудачное обновление (родной апдейтер
     # Cursor уносит exe в промежуточную папку), переименование, конфиг от
     # сборки на прежнем диске. Ищем программу в App и правим конфиг, вместо
@@ -14067,8 +14207,8 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                 _run_log(root, "elevation was refused, unavailable or timed "
                                "out; continuing without the HKLM import")
         else:
-            elevated_code = _run_elevated(
-                raw_arguments, follow=True,
+            elevated_code = _run_elevated_with_handoff(
+                raw_arguments, handoff_token, follow=True,
                 log=lambda line: _run_log(root, line))
             if elevated_code is not None:
                 # The elevated copy already reported its own result (including
@@ -14262,6 +14402,10 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             started_at = time.monotonic()
             try:
                 process = _spawn_target(command, str(target.parent), child_env, job)
+                if handoff_token and not _write_bat_handoff_target_marker(
+                        root, cfg, handoff_token):
+                    _run_log(root, "Launch.bat handoff: target started but "
+                                   "its acknowledgement marker could not be written")
                 try:
                     browser_login.attach(process.pid)
                 except Exception:  # noqa: BLE001
@@ -14827,12 +14971,12 @@ def main() -> int:
         root = find_portable_root()
         handoff_token = str(os.environ.pop(BATCH_HANDOFF_ENV, "") or "").strip()
         if handoff_token:
-            # Use the configured data directory, and do this before normal
-            # startup can wait on slow settings or the app's own bootstrapper.
-            # If Python/PyInstaller never reached main(), no marker is written
-            # and Launch.bat can safely use its console implementation.
+            # Record this process immediately so Launch.bat can wait while it
+            # performs pre-launch work, but only the later target-start marker
+            # means the application was actually handed off.
             handoff_cfg = read_launcher_config(root)
-            _write_bat_handoff_marker(root, handoff_cfg, handoff_token)
+            _write_bat_handoff_started_marker(
+                root, handoff_cfg, handoff_token, os.getpid())
         if any(str(arg).casefold() == ELEVATION_IMPORT_ONLY
                for arg in sys.argv[1:]):
             return import_machine_registry_command(root)
@@ -14882,7 +15026,7 @@ def main() -> int:
                                        "--diagnostics", "/diagnostics")
                for arg in sys.argv[1:]):
             return diagnose(root)
-        return run()
+        return run(handoff_token=handoff_token)
     except Exception as exc:
         details = f"Не удалось запустить портативную программу.\n\n{exc}"
         _write_error_log(root, details + "\n\n" + traceback.format_exc())

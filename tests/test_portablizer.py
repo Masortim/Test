@@ -3473,6 +3473,38 @@ class InstallShieldRunTests(unittest.TestCase):
 class MultiExecutableDetectionTests(unittest.TestCase):
     """Тесты распознавания и классификации главного exe, лаунчера и конфигуратора."""
 
+    def test_pycharm_prefers_pycharm_exe_in_bin_independent_of_file_order(self):
+        for creation_order in (("pycharm64.exe", "pycharm.exe"),
+                               ("pycharm.exe", "pycharm64.exe")):
+            with self.subTest(creation_order=creation_order), \
+                    tempfile.TemporaryDirectory() as temp:
+                app_dir = Path(temp, "App")
+                bin_dir = app_dir / "PyCharm2026.2" / "bin"
+                bin_dir.mkdir(parents=True)
+                for name in creation_order:
+                    (bin_dir / name).write_bytes(b"MZ" + b"\x00" * 1000)
+
+                main_exe, targets = Portablizer(Logger())._discover_app_executables(
+                    str(app_dir), "PyCharm")
+
+                self.assertEqual(Path(main_exe).name.casefold(), "pycharm.exe")
+                main_target = next(
+                    target for target in targets
+                    if Path(target.rel_path).name.casefold() == "pycharm.exe")
+                self.assertEqual(main_target.role, "main")
+
+    def test_pycharm64_remains_a_fallback_when_pycharm_exe_is_absent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app_dir = Path(temp, "App")
+            bin_dir = app_dir / "PyCharm2026.2" / "bin"
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "pycharm64.exe").write_bytes(b"MZ" + b"\x00" * 1000)
+
+            main_exe, _targets = Portablizer(Logger())._discover_app_executables(
+                str(app_dir), "PyCharm")
+
+            self.assertEqual(Path(main_exe).name.casefold(), "pycharm64.exe")
+
     def test_witcher_layout_classifies_main_launcher_config_and_tool(self):
         with tempfile.TemporaryDirectory() as temp:
             app_dir = Path(temp, "App")

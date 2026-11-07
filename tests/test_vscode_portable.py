@@ -240,16 +240,19 @@ class CursorLaunchBatTests(unittest.TestCase):
         bat = self._render(extra_env={"TITLE": "100% ready"})
         self.assertIn('set "TITLE=100%% ready"', bat)
 
-    def test_exe_launcher_is_watched_and_diagnose_is_offered(self):
+    def test_exe_launcher_handoff_waits_for_target_and_offers_diagnostics(self):
         bat = self._render()
 
-        # App\LaunchPortable.exe запускается и сразу проверяется: если он умер
-        # (сломанный конфиг, пропавшая цель), BAT продолжает работу сам.
+        # LaunchPortable.exe acknowledges only after it successfully starts the
+        # app target; while its own PID is alive, the BAT avoids a duplicate.
         self.assertIn("call :portable_exe_launcher_watch", bat)
         self.assertIn(":portable_exe_launcher_watch", bat)
         self.assertIn("launcher-exe-started-%PORTABLE_EXE_HANDOFF_TOKEN%.txt",
                       bat)
-        self.assertNotIn("tasklist.exe", bat)
+        self.assertIn("launcher-exe-target-%PORTABLE_EXE_HANDOFF_TOKEN%.txt",
+                      bat)
+        self.assertIn("tasklist.exe", bat)
+        self.assertIn("PID eq %PORTABLE_EXE_HANDOFF_PID%", bat)
         self.assertIn("launcher-exe-error.log", bat)
         self.assertIn("--diagnose", bat)
 
@@ -379,6 +382,45 @@ class CursorLauncherRuntimeTests(unittest.TestCase):
             self.assertIn("песочница off:   да", text)
             self.assertIn("kill-on-close:   нет", text)
             self.assertIn("target_exe_rel:  App/Cursor.exe", text)
+
+
+class PyCharmMaintenanceTests(unittest.TestCase):
+    """«Обновить лончер» мигрирует старую цель PyCharm и Launch.bat."""
+
+    def test_refresh_switches_old_pycharm64_default_to_pycharm_exe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "PyCharm_Portable")
+            bin_dir = root / "App" / "PyCharm2026.2" / "bin"
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "pycharm64.exe").write_bytes(b"MZ")
+            (bin_dir / "pycharm.exe").write_bytes(b"MZ")
+            old_target = "App/PyCharm2026.2/bin/pycharm64.exe"
+            new_target = "App/PyCharm2026.2/bin/pycharm.exe"
+            cfg = launcher_mod.LauncherConfig(
+                app_name="PyCharm",
+                target_exe_rel=old_target,
+                targets=[
+                    launcher_mod.TargetInfo(
+                        name="pycharm64", rel_path=old_target, role="main"),
+                    launcher_mod.TargetInfo(
+                        name="pycharm", rel_path=new_target, role="tool"),
+                ],
+            )
+            (root / "launcher_config.json").write_text(
+                launcher_mod.render_config_json(cfg), encoding="utf-8")
+
+            report = maintenance.refresh(
+                str(root), Logger(), shared_saves=False,
+                copy_exe=lambda _folder, rel: rel)
+
+            self.assertTrue(report.success)
+            config = json.loads((root / "launcher_config.json").read_text(
+                encoding="utf-8-sig"))
+            self.assertEqual(config["target_exe_rel"], new_target)
+            self.assertTrue(any("PyCharm" in message
+                                for message in report.messages))
+            bat = (root / "Launch.bat").read_text(encoding="ascii")
+            self.assertIn("pycharm.exe", bat)
 
 
 class CursorMaintenanceTests(unittest.TestCase):

@@ -876,21 +876,24 @@ if "%~1" == "--" set "PORTABLE_USE_EXE_LAUNCHER="
 rem Compute the token/path before the parenthesized IF below: cmd expands %VAR%
 rem references for an entire block before running its first SET command.
 set "PORTABLE_EXE_HANDOFF_TOKEN=%RANDOM%_%RANDOM%_%RANDOM%"
-set "PORTABLE_EXE_HANDOFF_ACK=%~dp0{data_dir}\launcher-exe-started-%PORTABLE_EXE_HANDOFF_TOKEN%.txt"
+set "PORTABLE_EXE_HANDOFF_STARTED=%~dp0{data_dir}\launcher-exe-started-%PORTABLE_EXE_HANDOFF_TOKEN%.txt"
+set "PORTABLE_EXE_HANDOFF_TARGET=%~dp0{data_dir}\launcher-exe-target-%PORTABLE_EXE_HANDOFF_TOKEN%.txt"
 set "PORTABLIZER_LAUNCH_HANDOFF_ID="
+set "PORTABLE_EXE_HANDOFF_PID="
 set "PORTABLE_EXE_HANDOFF_START_FAILED="
 if defined PORTABLE_USE_EXE_LAUNCHER if exist "%~dp0App\LaunchPortable.exe" (
-  rem The EXE writes a per-attempt marker once Python startup is reached.
-  rem This avoids confusing another portable's same-named process with this
-  rem launch, while still recovering if Windows never starts this EXE.
+  rem The EXE writes its PID at Python startup, then acknowledges only after
+  rem CreateProcess successfully starts the configured target application.
+  rem If it is still alive, wait rather than launch a duplicate from this BAT.
   set "PORTABLIZER_LAUNCH_HANDOFF_ID=%PORTABLE_EXE_HANDOFF_TOKEN%"
-  if exist "%PORTABLE_EXE_HANDOFF_ACK%" del /q "%PORTABLE_EXE_HANDOFF_ACK%" >nul 2>&1
+  if exist "%PORTABLE_EXE_HANDOFF_STARTED%" del /q "%PORTABLE_EXE_HANDOFF_STARTED%" >nul 2>&1
+  if exist "%PORTABLE_EXE_HANDOFF_TARGET%" del /q "%PORTABLE_EXE_HANDOFF_TARGET%" >nul 2>&1
   start "" "%~dp0App\LaunchPortable.exe" %*
   if errorlevel 1 set "PORTABLE_EXE_HANDOFF_START_FAILED=1"
   call :portable_exe_launcher_watch
-  if exist "%PORTABLE_EXE_HANDOFF_ACK%" set "PORTABLE_EXE_HANDOFF_OK=1"
   if defined PORTABLE_EXE_HANDOFF_OK (
-    if exist "%PORTABLE_EXE_HANDOFF_ACK%" del /q "%PORTABLE_EXE_HANDOFF_ACK%" >nul 2>&1
+    if exist "%PORTABLE_EXE_HANDOFF_STARTED%" del /q "%PORTABLE_EXE_HANDOFF_STARTED%" >nul 2>&1
+    if exist "%PORTABLE_EXE_HANDOFF_TARGET%" del /q "%PORTABLE_EXE_HANDOFF_TARGET%" >nul 2>&1
     endlocal
     exit /b 0
   )
@@ -899,7 +902,9 @@ if defined PORTABLE_USE_EXE_LAUNCHER if exist "%~dp0App\LaunchPortable.exe" (
 )
 set "PORTABLIZER_LAUNCH_HANDOFF_ID="
 set "PORTABLE_EXE_HANDOFF_TOKEN="
-set "PORTABLE_EXE_HANDOFF_ACK="
+set "PORTABLE_EXE_HANDOFF_STARTED="
+set "PORTABLE_EXE_HANDOFF_TARGET="
+set "PORTABLE_EXE_HANDOFF_PID="
 set "PORTABLE_EXE_HANDOFF_OK="
 set "PORTABLE_EXE_HANDOFF_START_FAILED="
 set "PORTABLE_USE_EXE_LAUNCHER="
@@ -1322,32 +1327,46 @@ if not exist "%PORTABLE_ROOT%\{data_dir}\Temp" md "%PORTABLE_ROOT%\{data_dir}\Te
 goto :eof
 
 :portable_exe_launcher_watch
-rem Did App\LaunchPortable.exe actually start?
+rem Did App\LaunchPortable.exe actually start the configured target?
 rem
-rem Wait briefly for this specific LaunchPortable.exe process to reach Python.
-rem A machine-wide process-name check can mistake a different portable's
-rem LaunchPortable.exe for this one and close the only useful error console.
-rem If this instance never writes its marker, continue through the visible
-rem console path below and print its error log.
+rem The started marker contains this exact launcher's PID. If that process is
+rem still alive, keep waiting instead of starting a second copy from the BAT.
+rem The target marker is written only after CreateProcess returns successfully.
 set "PORTABLE_EXE_HANDOFF_OK="
+set "PORTABLE_EXE_HANDOFF_PID="
+set "PORTABLE_EXE_WAIT_NOTICE="
 set /a PORTABLE_EXE_TICKS=0
 :portable_exe_watch_loop
+if exist "%PORTABLE_EXE_HANDOFF_TARGET%" goto :portable_exe_watch_success
 if defined PORTABLE_EXE_HANDOFF_START_FAILED goto :portable_exe_watch_failed
-rem The marker is unique to this invocation: a different portable app may
-rem already have a process with the same LaunchPortable.exe image name.
-if exist "%PORTABLE_EXE_HANDOFF_ACK%" (
-  set "PORTABLE_EXE_HANDOFF_OK=1"
-  goto :eof
-)
+if exist "%PORTABLE_EXE_HANDOFF_STARTED%" goto :portable_exe_watch_process
 set /a PORTABLE_EXE_TICKS+=1 >nul
 if %PORTABLE_EXE_TICKS% GEQ 16 goto :portable_exe_watch_failed
-rem Allow one-file bootloaders and Windows security scans time to reach Python.
+rem Allow one-file bootloaders and Windows security scans to reach Python.
 "%SystemRoot%\System32\ping.exe" -n 2 127.0.0.1 >nul 2>&1
 goto :portable_exe_watch_loop
 
+:portable_exe_watch_process
+if not defined PORTABLE_EXE_HANDOFF_PID for /f "usebackq delims=" %%P in ("%PORTABLE_EXE_HANDOFF_STARTED%") do set "PORTABLE_EXE_HANDOFF_PID=%%P"
+if not defined PORTABLE_EXE_HANDOFF_PID goto :portable_exe_watch_failed
+"%SystemRoot%\System32\tasklist.exe" /FI "PID eq %PORTABLE_EXE_HANDOFF_PID%" /NH 2>nul | "%SystemRoot%\System32\findstr.exe" /I /C:"LaunchPortable.exe" >nul
+if errorlevel 1 goto :portable_exe_watch_failed
+set /a PORTABLE_EXE_TICKS+=1 >nul
+if %PORTABLE_EXE_TICKS% GEQ 16 if not defined PORTABLE_EXE_WAIT_NOTICE (
+  echo.
+  echo [INFO] LaunchPortable.exe is still preparing the target; waiting to avoid a duplicate launch.
+  set "PORTABLE_EXE_WAIT_NOTICE=1"
+)
+"%SystemRoot%\System32\ping.exe" -n 2 127.0.0.1 >nul 2>&1
+goto :portable_exe_watch_loop
+
+:portable_exe_watch_success
+set "PORTABLE_EXE_HANDOFF_OK=1"
+goto :eof
+
 :portable_exe_watch_failed
 echo.
-echo [WARNING] App\{exe_launcher} did not confirm startup within 15 seconds.
+echo [WARNING] App\{exe_launcher} exited without confirming that it started the target.
 echo Launch.bat is continuing with its own visible console launch path.
 if exist "%~dp0{data_dir}\launcher-exe-error.log" (
   echo.

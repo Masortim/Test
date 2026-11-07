@@ -242,6 +242,79 @@ def _prefer_delta_gui_target(folder: str, cfg) -> bool:
     return True
 
 
+def _prefer_pycharm_target(folder: str, cfg) -> bool:
+    """Repair an old PyCharm main target before regenerating its BAT/config."""
+    if "pycharm" not in str(getattr(cfg, "app_name", "")).casefold():
+        return False
+    current = str(getattr(cfg, "target_exe_rel", "") or "").replace("\\", "/")
+    app_root = os.path.abspath(os.path.join(folder, "App"))
+    current_path = (current if os.path.isabs(current)
+                    else os.path.join(folder, *current.split("/")))
+    current_path = os.path.abspath(current_path)
+    try:
+        if (os.path.basename(current_path).casefold() == "pycharm.exe"
+                and os.path.isfile(current_path)
+                and os.path.commonpath((app_root, current_path)).casefold()
+                == app_root.casefold()):
+            return False
+    except (OSError, ValueError):
+        pass
+
+    candidates = []
+    sibling = os.path.join(os.path.dirname(current_path), "pycharm.exe")
+    try:
+        if (os.path.basename(os.path.dirname(sibling)).casefold() == "bin"
+                and os.path.isfile(sibling)
+                and os.path.commonpath((app_root, sibling)).casefold()
+                == app_root.casefold()):
+            candidates.append(sibling)
+    except (OSError, ValueError):
+        pass
+
+    if not candidates:
+        try:
+            for current_dir, dirs, files in os.walk(app_root):
+                try:
+                    depth = len(os.path.relpath(current_dir, app_root).split(os.sep))
+                    if os.path.abspath(current_dir) == app_root:
+                        depth = 0
+                except ValueError:
+                    depth = 0
+                if depth >= 5:
+                    dirs[:] = []
+                else:
+                    dirs[:] = [name for name in dirs
+                               if name.casefold() not in {
+                                   "activationcodes", "plugins", "resources",
+                                   "locales", "node_modules", "_internal",
+                                   "updates", "cache", "caches",
+                               } and not name.startswith(("_", "."))]
+                if (os.path.basename(current_dir).casefold() == "bin"
+                        and any(name.casefold() == "pycharm.exe"
+                                for name in files)):
+                    filename = next(name for name in files
+                                    if name.casefold() == "pycharm.exe")
+                    candidates.append(os.path.join(current_dir, filename))
+        except OSError:
+            pass
+    if not candidates:
+        return False
+
+    candidate_path = sorted(candidates, key=lambda path: (
+        len(os.path.normpath(path).split(os.sep)), path.casefold()))[0]
+    candidate = os.path.relpath(candidate_path, folder).replace(os.sep, "/")
+    if candidate.casefold() == current.casefold():
+        return False
+    cfg.target_exe_rel = candidate
+    for item in getattr(cfg, "targets", []):
+        rel = str(item.rel_path).replace("\\", "/")
+        if rel.casefold() == current.casefold() and item.role == "main":
+            item.role = "auxiliary"
+        elif rel.casefold() == candidate.casefold():
+            item.role = "main"
+    return True
+
+
 def refresh(folder: str, log: Optional[Logger] = None,
             copy_exe=None, shared_saves: bool = True,
             language: str = "") -> MaintenanceReport:
@@ -289,6 +362,11 @@ def refresh(folder: str, log: Optional[Logger] = None,
     if _prefer_delta_gui_target(folder, cfg):
         message = ("Delta: основной запуск переключён с CLI Delta.exe на "
                    "delta-app.exe — desktop-версию с рабочим browser sign-in.")
+        log.info(message)
+        report.messages.append(message)
+    if _prefer_pycharm_target(folder, cfg):
+        message = ("PyCharm: основной запуск переключён на "
+                   f"{cfg.target_exe_rel}.")
         log.info(message)
         report.messages.append(message)
     log.info(f"Обновляю лончеры портатива «{cfg.app_name}»")
