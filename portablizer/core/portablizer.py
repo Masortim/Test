@@ -3254,6 +3254,26 @@ class Portablizer:
                 "Portablizer.exe → «Запуск от имени администратора»)."
             )
 
+        # Код 5 (Inno: "установка отменена до начала") или 740
+        # (ERROR_ELEVATION_REQUIRED) при уже запущенном от администратора
+        # Portablizer: установщик требует права на конкретную операцию,
+        # а не просто запуск от администратора.
+        if (rc in (5, 740) and IS_WINDOWS and is_elevated()
+                and not any("установщик вернул код, указывающий на отказ в правах"
+                            in h for h in hints)):
+            hints.append(
+                "Установщик вернул код, указывающий на отказ в правах "
+                f"({_format_exit_code(rc)}), но Portablizer уже запущен "
+                "от имени администратора. Это означает, что установщик "
+                "требует отдельных прав на конкретную операцию (например, "
+                "запись в защищённую область реестра или системный каталог), "
+                "которые могут требовать дополнительного подтверждения. "
+                "Проверьте installer-output.log — там часто указана точная "
+                "причина отказа. Если установщик поддерживает запуск с "
+                "явным запросом прав через UAC, попробуйте использовать "
+                "Portablizer с флагом --elevate."
+            )
+
         if det.installer_type == InstallerType.INSTALLSHIELD:
             hints.extend(self._installshield_hints(det, opts, portable_dir))
 
@@ -4540,6 +4560,17 @@ class Portablizer:
             lines.append(
                 "Portablizer запущен без прав администратора: установщику "
                 "может требоваться повышение, и он ждёт его молча."
+            )
+        if IS_WINDOWS and is_elevated():
+            lines.append(
+                "Portablizer запущен от имени администратора, но установщик "
+                "не начал работу: возможно, установщик сам требует отдельных "
+                "прав на конкретную операцию (например, запись в Program Files "
+                "или реестр). Проверьте installer-output.log — там часто указана "
+                "точная причина отказа. Если установщик поддерживает запуск с "
+                "явным запросом прав, попробуйте передать его через "
+                "ShellExecute с флагом runas (в Portablizer такой режим "
+                "можно включить флагом --elevate)."
             )
         lines.append(
             "Если окон нет и UAC не спрашивает, файл, скорее всего, "
@@ -6110,11 +6141,21 @@ class Portablizer:
         kind = self._nested_installer_kind(nested)
         if kind not in (InstallerType.INNO, InstallerType.NSIS):
             return False
-        unpacker = unpacker_mod.find_unpacker()
+        extractors = unpacker_mod.find_extractors()
+        unpacker = (extractors[0].path if extractors
+                    else unpacker_mod.find_unpacker())
         if not unpacker:
+            alt_note = ""
+            if extractors:
+                names = ", ".join(f"\"{e.name}\"" for e in extractors)
+                alt_note = (
+                    f" Установите любой из них (или встроенный tar.exe в Windows 10+): "
+                    f"Portablizer использует {names}."
+                )
             self.log.info(
-                "Распаковщик (7-Zip) на этом компьютере не найден: достать "
+                "Распаковщик на этом компьютере не найден: достать "
                 "содержимое вложенного установщика без запуска нечем."
+                + alt_note
             )
             return False
         work = os.path.join(portable_dir, "_nested_unpacked")
@@ -6185,12 +6226,21 @@ class Portablizer:
             return False
         if not self._unpacker_worth_trying(det):
             return False
-        unpacker = unpacker_mod.find_unpacker()
+        extractors = unpacker_mod.find_extractors()
+        unpacker = (extractors[0].path if extractors
+                    else unpacker_mod.find_unpacker())
         if not unpacker:
+            alt_note = ""
+            if extractors:
+                names = ", ".join(f"\"{e.name}\"" for e in extractors)
+                alt_note = (
+                    f" Установите любой из них (или встроенный tar.exe в Windows 10+): "
+                    f"Portablizer использует {names}."
+                )
             self.log.info(
-                "Распаковщик (7-Zip) на этом компьютере не найден: достать "
-                "содержимое установщика без запуска нечем. В подсказках ниже "
-                "сказано, что это меняет."
+                "Распаковщик на этом компьютере не найден: достать "
+                "содержимое установщика без запуска нечем."
+                + alt_note
             )
             return False
 
