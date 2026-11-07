@@ -247,7 +247,9 @@ class CursorLaunchBatTests(unittest.TestCase):
         # (сломанный конфиг, пропавшая цель), BAT продолжает работу сам.
         self.assertIn("call :portable_exe_launcher_watch", bat)
         self.assertIn(":portable_exe_launcher_watch", bat)
-        self.assertIn("tasklist.exe", bat)
+        self.assertIn("launcher-exe-started-%PORTABLE_EXE_HANDOFF_TOKEN%.txt",
+                      bat)
+        self.assertNotIn("tasklist.exe", bat)
         self.assertIn("launcher-exe-error.log", bat)
         self.assertIn("--diagnose", bat)
 

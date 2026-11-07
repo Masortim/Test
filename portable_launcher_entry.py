@@ -37,6 +37,10 @@ WARNING_ICON = 0x00000030
 #: вечно, и запуск программы не начинается вовсе. Поэтому у всех диалогов
 #: есть выключатель — им пользуются тесты и автоматические прогоны.
 NO_UI_ENV = "PORTABLE_LAUNCHER_NO_UI"
+#: One-shot token used only for the Launch.bat -> windowed EXE handoff.
+BATCH_HANDOFF_ENV = "PORTABLIZER_LAUNCH_HANDOFF_ID"
+BATCH_HANDOFF_MARKER_PREFIX = "launcher-exe-started-"
+_BATCH_HANDOFF_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 
 def _ui_disabled() -> bool:
@@ -9713,6 +9717,47 @@ def _data_dir(root: Path, cfg: Dict[str, Any]) -> Path:
     return root / str(cfg.get("data_dir_name", "PortableData"))
 
 
+def _write_bat_handoff_marker(root: Path, cfg: Dict[str, Any],
+                              token: str) -> bool:
+    """Mark that this specific windowed EXE instance reached Python startup.
+
+    Launch.bat uses this per-attempt marker instead of tasklist's global image
+    name: another portable app may already have a process named
+    ``LaunchPortable.exe``. The token is constrained before it becomes part of
+    a filename, and the marker is kept inside the portable data directory.
+    """
+    token = str(token or "")
+    if not _BATCH_HANDOFF_TOKEN.fullmatch(token):
+        return False
+
+    data_name = str(cfg.get("data_dir_name", "PortableData") or "PortableData")
+    try:
+        data_name.encode("ascii")
+    except UnicodeEncodeError:
+        # Launch.bat has the same fallback for a data directory it cannot
+        # represent safely as ASCII.
+        data_name = "PortableData"
+    normalized = data_name.replace("\\", "/")
+    parts = normalized.split("/")
+    if (not normalized or normalized.startswith("/") or ":" in normalized
+            or any(part in ("", "..") for part in parts)):
+        return False
+
+    try:
+        root_path = root.resolve()
+        data_dir = (root_path.joinpath(*parts)).resolve()
+        data_dir.relative_to(root_path)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        marker = data_dir / f"{BATCH_HANDOFF_MARKER_PREFIX}{token}.txt"
+        with marker.open("x", encoding="ascii", newline="\n") as handle:
+            handle.write(token + "\n")
+        return True
+    except (OSError, ValueError):
+        # This handshake is diagnostic/recovery help; a failed marker must
+        # never prevent the application itself from starting.
+        return False
+
+
 def _update_log(root: Optional[Path], message: str) -> None:
     """Пишет и в общий журнал, и в отдельный журнал обновлений."""
     _run_log(root, "update: " + message)
@@ -14780,6 +14825,14 @@ def main() -> int:
         return repair_start_menu_command(root)
     try:
         root = find_portable_root()
+        handoff_token = str(os.environ.pop(BATCH_HANDOFF_ENV, "") or "").strip()
+        if handoff_token:
+            # Use the configured data directory, and do this before normal
+            # startup can wait on slow settings or the app's own bootstrapper.
+            # If Python/PyInstaller never reached main(), no marker is written
+            # and Launch.bat can safely use its console implementation.
+            handoff_cfg = read_launcher_config(root)
+            _write_bat_handoff_marker(root, handoff_cfg, handoff_token)
         if any(str(arg).casefold() == ELEVATION_IMPORT_ONLY
                for arg in sys.argv[1:]):
             return import_machine_registry_command(root)
