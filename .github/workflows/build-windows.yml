@@ -1156,6 +1156,7 @@ jobs:
         run: dir dist
 
       - name: Upload artifact
+        if: ${{ always() && hashFiles('dist/Portablizer.exe') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: Portablizer-windows-x64
@@ -1167,10 +1168,14 @@ jobs:
       # окружений. Поэтому дополнительно кладём собранный exe прямо в ветку,
       # чтобы его можно было получить обычным git pull.
       - name: Commit built EXE back to branch
-        if: startsWith(github.ref, 'refs/heads/arena/')
+        if: ${{ always() && startsWith(github.ref, 'refs/heads/arena/') }}
         shell: bash
         run: |
           set -e
+          if [[ ! -f dist/Portablizer.exe ]]; then
+            echo "::notice title=Built EXE not available::the Windows build did not produce dist/Portablizer.exe"
+            exit 0
+          fi
           mkdir -p dist-windows
           cp dist/Portablizer.exe dist-windows/Portablizer.exe
           git config user.name "github-actions[bot]"

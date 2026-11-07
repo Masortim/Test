@@ -109,20 +109,23 @@ def _block_wrap(blob: bytes, version=(6, 4, 0), compressed=True) -> bytes:
 
 def _build_header(version=(6, 4, 0), compression=3, files=(), data_entries=(),
                   block_compressed=True, with_meta=False):
-    """Сериализует область заголовка на диске: 64-байтовая сигнатура SetupID,
-    (для 6.5+ — 53-байтовый encryption-заголовок) и блок со всеми записями
-    (сжатый LZMA1 или хранимый). files = [(dest, location, options)],
-    data_entries = [(sort_offset, file_offset, file_size, chunk_size, options)]."""
+    """Сериализует Setup0: сигнатура, encryption header и два compressed block.
+
+    Первый блок содержит заголовок и метаданные; список file-location записей
+    хранится во втором блоке. files = [(dest, location, options)], data_entries
+    = [(start_offset, chunk_suboffset, file_size, chunk_size, options)]."""
     major, minor, build = version
     v4 = (major, minor, build, 0)
     setup_id = f"Inno Setup Setup Data ({major}.{minor}.{build})".encode("ascii")
     head = setup_id.ljust(64, b"\x00")
     if v4 >= (6, 5, 0, 0):
         head += b"\x00" * (4 + 49)    # CRC32 + TSetupEncryptionHeader
-    return head + _block_wrap(_build_header_blob(version, compression,
-                                                  files, data_entries,
-                                                  with_meta=with_meta), version,
-                              compressed=block_compressed)
+    header_blob = _build_header_blob(version, compression, files, data_entries,
+                                     with_meta=with_meta)
+    locations_blob = _build_location_blob(version, data_entries)
+    return (head
+            + _block_wrap(header_blob, version, compressed=block_compressed)
+            + _block_wrap(locations_blob, version, compressed=block_compressed))
 
 
 def _build_header_blob(version=(6, 4, 0), compression=3, files=(), data_entries=(),
@@ -131,6 +134,35 @@ def _build_header_blob(version=(6, 4, 0), compression=3, files=(), data_entries=
         return _build_header_blob_modern(version, compression, files, data_entries,
                                          with_meta=with_meta)
     return _build_header_blob_le64(version, compression, files, data_entries)
+
+
+def _build_location_blob(version, data_entries):
+    """Builds the second Setup0 block of fixed-size file-location records."""
+    v4 = tuple(version) + (0,)
+    group = inno_mod._version_group(v4[:4])
+    out = bytearray()
+    if group == "le64":
+        v630 = v4 >= (6, 3, 0, 0)
+        v640 = v4 >= (6, 4, 0, 0)
+        for start_offset, chunk_suboffset, file_size, chunk_size, options in data_entries:
+            out += struct.pack("<III", 0, 0, start_offset)
+            out += struct.pack("<QQQ", chunk_suboffset, file_size, chunk_size)
+            out += b"\x00" * (32 if v640 else 20)
+            out += struct.pack("<q", 0)       # source timestamp
+            out += struct.pack("<II", 0, 0)   # file version
+            out += struct.pack("<H", options)  # flags(9)
+            if v630:
+                out += struct.pack("<B", 0)   # sign
+    else:
+        for start_offset, chunk_suboffset, file_size, chunk_size, options in data_entries:
+            out += struct.pack("<II", 0, 0)
+            out += struct.pack("<I" if group == "v650" else "<Q", start_offset)
+            out += struct.pack("<QQQ", chunk_suboffset, file_size, chunk_size)
+            out += b"\x00" * 32               # SHA256Sum
+            out += struct.pack("<q", 0)       # source timestamp
+            out += struct.pack("<II", 0, 0)   # file version
+            out += struct.pack("<B", options)  # flags(5)
+    return bytes(out)
 
 
 def _build_header_blob_le64(version=(6, 4, 0), compression=3, files=(), data_entries=()):
@@ -188,16 +220,6 @@ def _build_header_blob_le64(version=(6, 4, 0), compression=3, files=(), data_ent
         out += struct.pack("<h", -1)      # permission
         out += struct.pack("<I", options)  # flags(32)
         out += struct.pack("<B", 0)       # type: user file
-    # data entries
-    for sort_offset, file_offset, file_size, chunk_size, options in data_entries:
-        out += struct.pack("<III", 0, 0, sort_offset)
-        out += struct.pack("<QQQ", file_offset, file_size, chunk_size)
-        out += b"\x00" * (32 if v640 else 20)  # sha256/sha1
-        out += struct.pack("<q", 0)       # filetime
-        out += struct.pack("<II", 0, 0)   # file version
-        out += struct.pack("<H", options)  # flags(9)
-        if v630:
-            out += struct.pack("<B", 0)   # sign
     return bytes(out)
 
 
@@ -303,15 +325,6 @@ def _build_header_blob_modern(version=(6, 7, 0), compression=3, files=(),
         # run (install + uninstall): 13 строк + 2 winver + i32 + u8 + flags(12) — дважды
         for _ in range(2):
             out += _ustring("p") * 13 + _winver() * 2 + struct.pack("<i", 0) + struct.pack("<B", 0) + b"\x00" * 2
-    # data entries
-    for sort_offset, file_offset, file_size, chunk_size, options in data_entries:
-        out += struct.pack("<II", 0, 0)
-        out += struct.pack("<I" if group == "v650" else "<Q", sort_offset)
-        out += struct.pack("<QQQ", file_offset, file_size, chunk_size)
-        out += b"\x00" * 32               # sha256
-        out += struct.pack("<q", 0)       # timestamp
-        out += struct.pack("<II", 0, 0)   # file version
-        out += struct.pack("<B", options)  # flags(5)
     return bytes(out)
 
 
@@ -663,7 +676,8 @@ class SyntheticInnoTests(unittest.TestCase):
 
     def test_modern_652_full_meta_entries_layout(self):
         # 6.5.2 (как у реального PyCharm 2026.2.3): +2 цвета wizard в заголовке,
-        # Verification в file entry, Int64 StartOffset в data entry
+        # Verification в file entry, Int64 StartOffset; file locations идут
+        # отдельным вторым compressed block, как в настоящем Setup0.
         installer = os.path.join(self.temp.name, "setup652m.exe")
         payload = {
             "{app}\\bin\\pycharm64.exe": b"MZ" + bytes(range(256)) * 30,
@@ -674,6 +688,11 @@ class SyntheticInnoTests(unittest.TestCase):
                          with_meta=True)
         ok, message = self._extract(installer)
         self.assertTrue(ok, message)
+        with open(installer, "rb") as fh:
+            header_offset, _data_offset = inno_mod.locate_offsets(fh)
+            parsed = inno_mod.parse_header(fh, header_offset)
+        self.assertEqual(parsed.data_entry_count, len(files))
+        self.assertEqual(len(parsed.data_entries), len(files))
         for dest, raw in payload.items():
             rel = dest.replace("\\", os.sep)
             with open(os.path.join(self.work, rel), "rb") as fh:
