@@ -60,6 +60,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from portablizer.core import detect as detect_mod
 from portablizer.core import portablizer as engine_mod
 from portablizer.core import space as space_mod
+from portablizer.core import unpacker as unpacker_mod
 from portablizer.core.detect import (
     DOWNLOADER_STUB_MAX_BYTES, DetectionResult, InstallerType, detect_installer,
 )
