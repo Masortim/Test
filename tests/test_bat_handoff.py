@@ -178,6 +178,98 @@ class PyCharmTargetRepairTests(unittest.TestCase):
             saved = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["target_exe_rel"], expected)
 
+    def test_quick_access_violation_uses_only_the_adjacent_portable_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "App" / "PyCharm2026.2" / "bin"
+            bin_dir.mkdir(parents=True)
+            primary = bin_dir / "pycharm.exe"
+            fallback = bin_dir / "pycharm64.exe"
+            primary.write_bytes(b"MZ")
+            fallback.write_bytes(b"MZ")
+            cfg = {"app_name": "PyCharm"}
+
+            selected = launcher_entry._pycharm64_fallback_candidate(
+                root, cfg, primary, -1073741819, 3.2)
+
+            self.assertEqual(selected, fallback)
+            self.assertIsNone(launcher_entry._pycharm64_fallback_candidate(
+                root, cfg, primary, 0, 3.2))
+            self.assertIsNone(launcher_entry._pycharm64_fallback_candidate(
+                root, cfg, primary, 0xC0000005, 5.0))
+
+    def test_pycharm_fallback_does_not_search_outside_the_portable_tree(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            root = parent / "Portable"
+            root.mkdir()
+            bin_dir = parent / "HostInstall" / "bin"
+            bin_dir.mkdir(parents=True)
+            primary = bin_dir / "pycharm.exe"
+            (bin_dir / "pycharm64.exe").write_bytes(b"MZ")
+            primary.write_bytes(b"MZ")
+
+            self.assertIsNone(launcher_entry._pycharm64_fallback_candidate(
+                root, {"app_name": "PyCharm"}, primary,
+                0xC0000005, 1.0))
+
+    def test_wait_retries_once_with_pycharm64_after_fast_crash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "App" / "PyCharm2026.2" / "bin"
+            bin_dir.mkdir(parents=True)
+            primary = bin_dir / "pycharm.exe"
+            fallback = bin_dir / "pycharm64.exe"
+            primary.write_bytes(b"MZ")
+            fallback.write_bytes(b"MZ")
+            cfg = {"app_name": "PyCharm"}
+            first = mock.Mock(pid=101)
+            second = mock.Mock(pid=202)
+            env = {"APPDATA": str(root / "PortableData")}
+            job = mock.Mock(handle=None)
+            attached = []
+            clock = iter((10.0, 20.0, 20.25))
+            with mock.patch.object(launcher_entry, "_wait_target",
+                                   side_effect=(0xC0000005, 0)) as wait, \
+                    mock.patch.object(launcher_entry, "_spawn_target",
+                                      return_value=second) as spawn, \
+                    mock.patch.object(launcher_entry,
+                                      "_portable_process_list", return_value=[]), \
+                    mock.patch("time.monotonic", side_effect=lambda: next(clock)):
+                result = launcher_entry._wait_target_with_pycharm_fallback(
+                    root, cfg, primary,
+                    [str(primary), "--test-argument"], env, job, None,
+                    first, 9.5, on_spawn=lambda child: attached.append(child.pid))
+
+            self.assertEqual(result, (0, 0.25, fallback, "pycharm64.exe", True))
+            self.assertEqual(wait.call_count, 2)
+            self.assertEqual(attached, [202])
+            command = spawn.call_args.args[0]
+            self.assertEqual(command[0], str(fallback))
+            self.assertEqual(command[1:], ["--test-argument"])
+
+    def test_wait_does_not_start_a_second_ide_if_a_child_survives(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "App" / "PyCharm2026.2" / "bin"
+            bin_dir.mkdir(parents=True)
+            primary = bin_dir / "pycharm.exe"
+            (bin_dir / "pycharm64.exe").write_bytes(b"MZ")
+            primary.write_bytes(b"MZ")
+            with mock.patch.object(launcher_entry, "_wait_target",
+                                   return_value=0xC0000005), \
+                    mock.patch.object(launcher_entry, "_portable_process_list",
+                                      return_value=[(88, str(primary))]), \
+                    mock.patch.object(launcher_entry, "_spawn_target") as spawn, \
+                    mock.patch("time.monotonic", return_value=1.0):
+                result = launcher_entry._wait_target_with_pycharm_fallback(
+                    root, {"app_name": "PyCharm"}, primary,
+                    [str(primary)], {}, None, None, mock.Mock(), 0.0)
+            self.assertEqual(result[0], 0xC0000005)
+            self.assertEqual(result[2], primary)
+            self.assertFalse(result[4])
+            spawn.assert_not_called()
+
     def test_explicit_alternate_target_is_not_rewritten(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -1129,13 +1129,72 @@ def _write_error_log(root: Optional[Path], message: str) -> None:
         pass
 
 
+_REDACTED_REGISTRY_LOGS: set[str] = set()
+
+
+def _redact_legacy_registry_sync_log(root: Optional[Path]) -> None:
+    """Remove old raw registry values from the append-only launcher journal.
+
+    Earlier versions wrote complete value data in ``registry sync`` notes.
+    Redact those historical lines before a new run or --diagnose can expose
+    them again; safe count-only summaries from current versions are retained.
+    """
+    if root is None:
+        return
+    try:
+        log_path = root / "PortableData" / "launcher-run.log"
+        cache_key = str(root.resolve(strict=False)).casefold()
+    except (OSError, ValueError):
+        return
+    if cache_key in _REDACTED_REGISTRY_LOGS:
+        return
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        _REDACTED_REGISTRY_LOGS.add(cache_key)
+        return
+    except (OSError, UnicodeError):
+        return
+
+    redacted = False
+    cleaned: list[str] = []
+    for line in lines:
+        marker = "registry sync:"
+        position = line.casefold().find(marker)
+        if position < 0:
+            cleaned.append(line)
+            continue
+        detail = line[position + len(marker):].strip()
+        if re.search(r":\s*synchronized\s+\d+\s+value\(s\)$",
+                     detail, re.IGNORECASE):
+            cleaned.append(line)
+            continue
+        cleaned.append(line[:position] +
+                       "registry sync: legacy details redacted")
+        redacted = True
+
+    if redacted:
+        temporary = log_path.with_name(log_path.name + ".redact.tmp")
+        try:
+            temporary.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+            os.replace(temporary, log_path)
+        except OSError:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            return
+    _REDACTED_REGISTRY_LOGS.add(cache_key)
+
+
 def _run_log(root: Optional[Path], message: str) -> None:
     """Append one diagnostic line to PortableData/launcher-run.log.
 
     Old games (The Witcher, GOG editions in particular) simply exit with code 1
-    when something they need is missing.  Without a trace of what was started,
-    with which registry data and what the child process did afterwards, the
-    user only sees "nothing happens".  The log makes that debuggable.
+    when something they need is missing. Without a trace of what was started,
+    which registry operations ran, and what the child process did afterwards,
+    the user only sees "nothing happens". The log makes that debuggable while
+    keeping registry values themselves out of diagnostics.
     """
     if root is None:
         return
@@ -1430,6 +1489,54 @@ def _reg(args: Sequence[str]) -> int:
         return 1
 
 
+def _reg_output_encodings() -> list[str]:
+    """Likely encodings for redirected ``reg.exe`` output on Windows.
+
+    ``reg.exe`` writes localized diagnostics using the active Windows code
+    page, not necessarily UTF-8. Prefer the OEM code page (then ANSI), while
+    keeping deterministic fallbacks for tests and unusual Windows setups.
+    """
+    candidates: list[str] = []
+    if IS_WINDOWS:
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            for getter_name in ("GetOEMCP", "GetACP"):
+                try:
+                    codepage = int(getattr(kernel32, getter_name)())
+                except Exception:
+                    continue
+                if codepage > 0:
+                    candidates.append(f"cp{codepage}")
+        except Exception:
+            pass
+    candidates.extend(("utf-8", "mbcs", "cp866", "cp1252"))
+    return list(dict.fromkeys(candidates))
+
+
+def _decode_reg_output(output: bytes) -> str:
+    """Decode captured ``reg.exe`` text without mangling localized errors."""
+    if not output:
+        return ""
+    if output.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return output.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    if output.startswith(b"\xef\xbb\xbf"):
+        try:
+            return output.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            pass
+    for encoding in _reg_output_encodings():
+        try:
+            return output.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return output.decode("utf-8", "replace")
+
+
 def _reg_with_output(args: Sequence[str]) -> tuple[int, str]:
     """Run reg.exe quietly while retaining short diagnostic output on failure."""
     if not IS_WINDOWS:
@@ -1444,10 +1551,8 @@ def _reg_with_output(args: Sequence[str]) -> tuple[int, str]:
             creationflags=NO_WINDOW,
         )
         output = result.stdout or b""
-        if isinstance(output, bytes):
-            detail = output.decode("utf-8", "replace")
-        else:
-            detail = str(output)
+        detail = (_decode_reg_output(output) if isinstance(output, bytes)
+                  else str(output))
         detail = " ".join(detail.split())[:400]
         return int(result.returncode), detail
     except OSError as exc:
@@ -5068,6 +5173,7 @@ class RegistrySession:
 
         overrides: Dict[str, Tuple[str, Dict[str, Tuple[str, str]]]] = {}
         notes: list[str] = []
+        source_counts: Dict[str, int] = {}
 
         def _record_override(tail: str, v_name: str, v_rhs: str, source_tag: str) -> None:
             if v_name.casefold() in (
@@ -5092,7 +5198,7 @@ class RegistrySession:
             _, ov_map = overrides.setdefault(t_cf, (tail, {}))
             if ov_map.get(v_cf) != (v_name, v_rhs):
                 ov_map[v_cf] = (v_name, v_rhs)
-                notes.append(f"{source_tag}: {tail} -> {v_name}={v_rhs}")
+                source_counts[source_tag] = source_counts.get(source_tag, 0) + 1
 
         # 1. Явно переданные .reg-файлы (например, экспортированный с хоста
         #    created_key перед импортом).
@@ -5150,6 +5256,15 @@ class RegistrySession:
 
         if overrides:
             self._apply_tail_overrides_to_files(overrides, base_values)
+            # Registry data can contain account names, license strings, paths,
+            # or other private values. Keep diagnostics to source and counts;
+            # never include key names or right-hand-side values in the log.
+            safe_sources = {"host-export", "host-registry", "session-hklm"}
+            notes = [
+                f"{source if source in safe_sources else 'application-reg'}: "
+                f"synchronized {count} value(s)"
+                for source, count in sorted(source_counts.items())
+            ]
             for note in notes:
                 _run_log(self.root, f"registry sync: {note}")
         # Отпечаток снимается ПОСЛЕ работы: файлы могли быть перезаписаны, и
@@ -6068,6 +6183,46 @@ def _prefer_pycharm_target(root: Path, cfg: Dict[str, Any],
         _run_log(root, f"PyCharm: launcher_config.json now points to {new_rel}")
     _run_log(root, f"PyCharm: using bin/pycharm.exe instead of {target_rel}")
     return new_rel
+
+
+PYCHARM_ACCESS_VIOLATION = 0xC0000005
+PYCHARM_FALLBACK_WINDOW_SECONDS = 5.0
+
+
+def _pycharm64_fallback_candidate(
+        root: Path, cfg: Dict[str, Any], target: Path, exit_code: int,
+        duration: float) -> Optional[Path]:
+    """Return the adjacent ``pycharm64.exe`` for a quick AV in ``pycharm.exe``.
+
+    This is a narrow, one-shot compatibility fallback: it never switches an
+    explicitly selected alternate executable, never searches outside the
+    portable tree, and only applies to the known access-violation exit code.
+    """
+    try:
+        code = int(exit_code) & 0xFFFFFFFF
+        elapsed = float(duration)
+    except (TypeError, ValueError):
+        return None
+    if (not _is_pycharm_app(target, cfg)
+            or code != PYCHARM_ACCESS_VIOLATION
+            or not 0 <= elapsed < PYCHARM_FALLBACK_WINDOW_SECONDS
+            or target.name.casefold() != "pycharm.exe"
+            or target.parent.name.casefold() != "bin"):
+        return None
+    try:
+        portable_root = root.resolve()
+        target_path = target.resolve(strict=False)
+        target_path.relative_to(portable_root)
+    except (OSError, ValueError):
+        return None
+    candidate = target.with_name("pycharm64.exe")
+    try:
+        if not candidate.is_file():
+            return None
+        candidate.resolve(strict=False).relative_to(portable_root)
+    except (OSError, ValueError):
+        return None
+    return candidate
 
 
 def _repair_missing_target(root: Path, cfg: Dict[str, Any], target_rel: str) -> str:
@@ -10371,6 +10526,67 @@ def _wait_target(process: "subprocess.Popen", watch: "Optional[UpdateWatch]",
                     _run_log(root, f"launch hook failed: {exc}")
 
 
+def _wait_target_with_pycharm_fallback(
+        root: Path, cfg: Dict[str, Any], target: Path,
+        command: Sequence[str], env: Dict[str, str],
+        job: Optional["_JobObject"], watch: "Optional[UpdateWatch]",
+        process: "subprocess.Popen", started_at: float,
+        hooks: "Sequence[Any]" = (), on_spawn: Optional[Any] = None
+        ) -> tuple[int, float, Path, str, bool]:
+    """Wait for PyCharm and retry once with ``pycharm64.exe`` when safe.
+
+    Retry is limited to a quick ``pycharm.exe`` access violation, an adjacent
+    fallback file inside the portable tree, and no surviving portable child.
+    It never launches a second IDE while the first launcher left a process
+    behind. Returns exit code, duration, effective target, fallback name, and
+    whether the fallback process was actually spawned.
+    """
+    code = _wait_target(process, watch, hooks=hooks)
+    duration = time.monotonic() - started_at
+    fallback_target = _pycharm64_fallback_candidate(
+        root, cfg, target, code, duration)
+    if fallback_target is None:
+        return code, duration, target, "", False
+
+    if _portable_process_list(root):
+        _run_log(root, "PyCharm: not retrying with pycharm64.exe because "
+                       "a process from the portable folder is still running")
+        return code, duration, target, "", False
+
+    first_code_hex = f"0x{int(code) & 0xFFFFFFFF:08X}"
+    _run_log(root, f"PyCharm: {target.name} exited with {first_code_hex} "
+                   f"after {duration:.1f}s; retrying once with "
+                   f"{fallback_target.name}")
+    fallback_command = with_electron_flags(
+        [str(fallback_target), *command[1:]], fallback_target)
+    try:
+        fallback_process = _spawn_target(
+            fallback_command, str(fallback_target.parent), env, job)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 14001:
+            raise
+        _run_log(root, f"PyCharm: {fallback_target.name} fallback could not "
+                       f"start ({exc})")
+        return code, duration, target, fallback_target.name, False
+
+    _run_log(root, "start fallback: "
+                   + subprocess.list2cmdline(fallback_command)
+                   + f" (cwd={fallback_target.parent}, "
+                   + f"elevated={_is_elevated()}, "
+                   + f"job={'yes' if job is not None and job.handle else 'no'})")
+    if callable(on_spawn):
+        try:
+            on_spawn(fallback_process)
+        except Exception:  # noqa: BLE001 - attach hook must not block launch
+            pass
+    fallback_started_at = time.monotonic()
+    code = _wait_target(fallback_process, watch, hooks=hooks)
+    duration = time.monotonic() - fallback_started_at
+    _run_log(root, f"PyCharm: {fallback_target.name} fallback exited with "
+                   f"code {code} after {duration:.1f}s")
+    return code, duration, fallback_target, fallback_target.name, True
+
+
 # --- установщик: определение движка и команды тихой установки ------------------
 
 def installer_engine(path: Path) -> str:
@@ -14056,6 +14272,7 @@ def run(argv: Optional[Sequence[str]] = None,
         handoff_token: str = "") -> int:
     """Запуск программы + обновление внутри портатива, если оно понадобилось."""
     root = find_portable_root()
+    _redact_legacy_registry_sync_log(root)
     cfg: Dict[str, Any] = read_launcher_config(root)
 
     # Следы прерванного обновления (принудительно закрытая программа, зависший
@@ -14570,6 +14787,8 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             if delta_profile_alias is not None:
                 atexit.register(delta_profile_alias.cleanup)
             started_at = time.monotonic()
+            pycharm_fallback = ""
+            pycharm_fallback_started = False
             try:
                 process = _spawn_target(command, str(target.parent), child_env, job)
                 if handoff_token and not _write_bat_handoff_target_marker(
@@ -14580,8 +14799,11 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                     browser_login.attach(process.pid)
                 except Exception:  # noqa: BLE001
                     pass
-                code = _wait_target(process, watch,
-                                    hooks=(browser_login.poll,))
+                (code, duration, target, pycharm_fallback,
+                 pycharm_fallback_started) = _wait_target_with_pycharm_fallback(
+                    root, cfg, target, command, child_env, job, watch, process,
+                    started_at, hooks=(browser_login.poll,),
+                    on_spawn=lambda child: browser_login.attach(child.pid))
             except OSError as exc:
                 if getattr(exc, "winerror", None) != 14001:
                     raise
@@ -14606,7 +14828,6 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                     "установит компоненты в тихом режиме и может запросить "
                     "UAC. Подробности и ссылки — в redistributables.txt.")
                 return 14001
-            duration = time.monotonic() - started_at
             _run_log(root, f"{target.name} exited with code {code} after "
                            f"{duration:.1f}s")
             # The official launcher usually starts the game and exits at once.
@@ -14646,18 +14867,30 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
                         f"{root / str(cfg.get('data_dir_name') or 'PortableData')}"
                         f"\\AppData\\Roaming\\{info['name']}\\logs\n\n"
                         "Полный отчёт: Launch.bat --diagnose")
-                elif _is_pycharm_app(target, cfg) and code != 0:
+                elif _is_pycharm_app(target, cfg):
                     code_hex = f"0x{int(code) & 0xFFFFFFFF:08X}"
                     _run_log(root, "PyCharm closed immediately after launch "
                                    f"with code {code} ({code_hex}); "
                                    "the kill-on-close job was disabled")
                     data_dir = str(cfg.get("data_dir_name") or "PortableData")
+                    fallback_note = ""
+                    if pycharm_fallback:
+                        if pycharm_fallback_started:
+                            fallback_note = (
+                                f"\n\nЛончер также повторил запуск через "
+                                f"{pycharm_fallback}, но окно не появилось.")
+                        else:
+                            fallback_note = (
+                                f"\n\nПовторный запуск через "
+                                f"{pycharm_fallback} не удалось начать; "
+                                "подробность записана в журнал.")
                     _show_warning(
                         "PyCharm завершился сразу после запуска, не показав "
                         f"окна (код {code}, {code_hex}).\n\n"
                         "В этой версии он запущен без kill-on-close Job Object. "
                         "Ошибка импорта portable_machine.reg — отдельный "
-                        "факт; по этому коду причина падения не установлена.\n\n"
+                        "факт; по этому коду причина падения не установлена."
+                        f"{fallback_note}\n\n"
                         f"Журнал: {root / data_dir / 'launcher-run.log'}\n"
                         "Если там есть `registry restore: FAILED`, не удаляйте "
                         "`PortableData\\RegistryHostBackup`: резервный снимок "
@@ -15165,6 +15398,7 @@ def main() -> int:
         return repair_start_menu_command(root)
     try:
         root = find_portable_root()
+        _redact_legacy_registry_sync_log(root)
         handoff_token = str(os.environ.pop(BATCH_HANDOFF_ENV, "") or "").strip()
         if handoff_token:
             # Record this process immediately so Launch.bat can wait while it

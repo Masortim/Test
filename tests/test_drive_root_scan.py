@@ -307,6 +307,27 @@ class ElevatedFollowTests(unittest.TestCase):
         self.assertFalse(params["follow"].default)
 
 
+class RegOutputDecodingTests(unittest.TestCase):
+    def test_reg_diagnostics_use_the_windows_code_page_not_utf8(self):
+        expected = "ERROR: отказано в доступе"
+        result = mock.Mock(returncode=1, stdout=expected.encode("cp866"))
+        with mock.patch.object(entry, "IS_WINDOWS", True), \
+                mock.patch.object(entry, "_reg_output_encodings",
+                                  return_value=["cp866"]), \
+                mock.patch.object(entry.subprocess, "run",
+                                  return_value=result):
+            code, detail = entry._reg_with_output(["import", "portable.reg"])
+        self.assertEqual(code, 1)
+        self.assertEqual(detail, expected)
+
+    def test_reg_diagnostics_accept_a_utf16_bom(self):
+        expected = "ERROR: access denied"
+        self.assertEqual(
+            entry._decode_reg_output(bytes.fromhex("fffe")
+                                     + expected.encode("utf-16-le")),
+            expected)
+
+
 class MachineRegistrySkipTests(unittest.TestCase):
     """Машинный .reg без прав администратора больше не дёргается зря."""
 

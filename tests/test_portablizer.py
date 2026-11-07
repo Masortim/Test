@@ -6111,6 +6111,76 @@ class MultitranDriveRootPortableTests(unittest.TestCase):
             self.assertNotIn("c:\\\\multitran", updated.lower())
             self.assertIn('"Interface Language"="Russian"', updated)
 
+    def test_legacy_registry_sync_log_values_are_redacted_in_place(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "PyCharm_Portable")
+            log = root / "PortableData" / "launcher-run.log"
+            log.parent.mkdir(parents=True)
+            sentinel = "PRIVATE_OLD_LOG_SENTINEL"
+            log.write_text(
+                "[2026-11-07 12:00:00] registry sync: host-registry: "
+                f"JetBrains\\PyCharm -> AccountToken={sentinel}\n"
+                "[2026-11-07 12:00:01] registry sync: host-registry: "
+                "synchronized 1 value(s)\n"
+                "[2026-11-07 12:00:02] start: pycharm.exe\n",
+                encoding="utf-8")
+
+            exe_launcher._redact_legacy_registry_sync_log(root)
+
+            cleaned = log.read_text(encoding="utf-8")
+            self.assertNotIn(sentinel, cleaned)
+            self.assertIn("registry sync: legacy details redacted", cleaned)
+            self.assertIn("registry sync: host-registry: synchronized 1 value(s)",
+                          cleaned)
+            self.assertIn("start: pycharm.exe", cleaned)
+
+    def test_registry_sync_logs_only_counts_not_registry_values(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, "PyCharm_Portable")
+            root.mkdir(parents=True)
+            registry_key = r"HKCU\Software\JetBrains\PyCharm2026.2"
+            (root / "portable.reg").write_text(
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                "[HKEY_CURRENT_USER\\Software\\JetBrains\\PyCharm2026.2]\r\n"
+                '"Theme"="Dark"\r\n\r\n',
+                encoding="utf-16")
+            cfg = {
+                "app_name": "PyCharm",
+                "data_dir_name": "PortableData",
+                "registry": {
+                    "enabled": True,
+                    "file": "portable.reg",
+                    "restore_on_exit": True,
+                    "keys": [registry_key],
+                    "created_keys": [],
+                },
+            }
+            sentinel = "PRIVATE_SENTINEL_FOR_TEST_ONLY"
+            logs = []
+
+            def fake_host_read(key: str):
+                if "jetbrains\\pycharm2026.2" in key.casefold():
+                    return {"AccountToken": f'"{sentinel}"'}
+                return {}
+
+            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
+                    mock.patch.object(
+                        exe_launcher,
+                        "_read_host_key_reg_values",
+                        side_effect=fake_host_read,
+                    ), \
+                    mock.patch.object(
+                        exe_launcher, "_run_log",
+                        side_effect=lambda _root, message: logs.append(message),
+                    ):
+                exe_launcher.RegistrySession(root, cfg).sync_external_changes()
+
+            self.assertIn(sentinel, (root / "portable.reg").read_text(
+                encoding="utf-16"))
+            joined = "\n".join(logs)
+            self.assertNotIn(sentinel, joined)
+            self.assertIn("synchronized 1 value(s)", joined)
+
 
 if __name__ == "__main__":
     unittest.main()
