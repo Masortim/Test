@@ -4,3 +4,6 @@
 # Windows batch files must keep CRLF, otherwise cmd.exe breaks on multi-line blocks
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# Preserve upstream license bytes for 7-Zip provenance verification
+portablizer/resources/7zip/x64/License.txt -text

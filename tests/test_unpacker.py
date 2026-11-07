@@ -22,6 +22,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -146,17 +147,19 @@ class FindUnpackerTests(unittest.TestCase):
     def test_standard_7zip_folder_is_found(self):
         with tempfile.TemporaryDirectory() as temp:
             seven = _file(Path(temp, "7-Zip", "7z.exe"))
-            found = unpacker_mod.find_unpacker(
-                env={"ProgramFiles": temp}, which=lambda name: None,
-                isfile=os.path.isfile)
+            with mock.patch.object(unpacker_mod.sys, "_MEIPASS", temp, create=True):
+                found = unpacker_mod.find_unpacker(
+                    env={"ProgramFiles": temp}, which=lambda name: None,
+                    isfile=os.path.isfile)
             self.assertEqual(found, seven)
 
     def test_unpacker_from_path_is_found_when_not_installed_normally(self):
         with tempfile.TemporaryDirectory() as temp:
             portable = _file(Path(temp, "7za.exe"))
-            found = unpacker_mod.find_unpacker(
-                env={}, which=lambda name: portable if name == "7za.exe" else None,
-                isfile=os.path.isfile)
+            with mock.patch.object(unpacker_mod.sys, "_MEIPASS", temp, create=True):
+                found = unpacker_mod.find_unpacker(
+                    env={}, which=lambda name: portable if name == "7za.exe" else None,
+                    isfile=os.path.isfile)
             self.assertEqual(found, portable)
 
     def test_absent_unpacker_is_not_an_error(self):

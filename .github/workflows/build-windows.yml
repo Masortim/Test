@@ -5,6 +5,7 @@ on:
   push:
     branches: [ "arena/**" ]
     paths:
+      - ".gitattributes"
       - "portablizer/**"
       - "app.py"
       - "portablizer.spec"
@@ -53,6 +54,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Verify bundled 7-Zip against upstream release
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/ip7z/7zip/releases/download/26.05/7z2605-x64.exe'
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP/7z-upstream.exe"
+          $actual = (Get-FileHash "$env:RUNNER_TEMP/7z-upstream.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne 'fd99e86f57d8f429ef5ed045bf98315af962e2309b0f1ba87a147a44c71647d0') { throw '7-Zip upstream archive hash mismatch' }
+          $seven = (Get-Command 7z.exe -ErrorAction Stop).Source
+          & $seven x -y "-o$env:RUNNER_TEMP/7z-upstream" "$env:RUNNER_TEMP/7z-upstream.exe" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not unpack upstream 7-Zip' }
+          foreach ($name in @('7z.exe', '7z.dll', 'License.txt')) {
+            $official = (Get-FileHash "$env:RUNNER_TEMP/7z-upstream/$name" -Algorithm SHA256).Hash
+            $bundled = (Get-FileHash "portablizer/resources/7zip/x64/$name" -Algorithm SHA256).Hash
+            if ($official -ne $bundled) { throw "Bundled $name differs from upstream" }
+          }
+
       - name: Build portable App launcher
         shell: pwsh
         run: |
@@ -79,6 +96,9 @@ jobs:
           archive = CArchiveReader(r"dist/Portablizer.exe")
           names = {name.replace("\\", "/") for name in archive.toc}
           expected = {
+              "resources/7zip/x64/7z.exe",
+              "resources/7zip/x64/7z.dll",
+              "resources/7zip/x64/License.txt",
               "resources/redist/x86/d3dcompiler_47.dll",
               "resources/redist/x64/d3dcompiler_47.dll",
               "resources/redist/arm64/d3dcompiler_47.dll",

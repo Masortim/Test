@@ -2670,8 +2670,8 @@ class Portablizer:
 
             # 4c. Последний честный шанс для падающего установщика: достать
             # его содержимое БЕЗ запуска (Inno Setup и NSIS — обычные
-            # контейнеры, и установленный 7-Zip читает их напрямую). Код
-            # установщика при этом не выполняется вовсе — он и не падает.
+            # контейнеры, некоторые из которых 7-Zip читает напрямую).
+            # Совместимость зависит от версии и не гарантируется.
             if not self._find_main_exe(app_dir, name):
                 self._try_unpacker_fallback(opts, app_dir, portable_dir, det,
                                             name)
@@ -3271,6 +3271,25 @@ class Portablizer:
                 "Получен код 740 при уже повышенных правах Portablizer. "
                 "Проверьте журнал установщика: повторное повышение самого "
                 "Portablizer не гарантирует устранение причины."
+            )
+
+        if self._unpacker_result and not self._unpacked_with:
+            hints.append(self._unpacker_result)
+
+        if getattr(opts, "single_file", False):
+            hints.append(
+                "Включён режим единичного файла: установщик запущен из "
+                "пустой временной папки и не видит соседние .bin/.cab и "
+                "другие файлы. Если дистрибутив состоит из нескольких частей, "
+                "снимите этот флажок и выберите исходный EXE рядом со всеми "
+                "частями; журнал может указать недостающий файл."
+            )
+        if (det.installer_type == InstallerType.INNO and rc == 5
+                and not opts.allow_assisted_install):
+            hints.append(
+                "Если доверяете установщику, можно включить «Разрешить окно "
+                "мастера установки» и пройти его вручную, прочитав сообщения "
+                "и проверив путь App. Это не гарантирует успех или переносимость."
             )
 
         if det.installer_type == InstallerType.INSTALLSHIELD:
@@ -4328,9 +4347,13 @@ class Portablizer:
                     # вкладку выбора папки не вбиваем: внутренний мастер
                     # его отклоняет («folder is not accessible») и зависает.
                     dialog_target = "" if plan.prefers_installer_default_dir else app_dir
-                    clicked = redist_mod._dismiss_installer_dialogs(
-                        tally, target_dir=dialog_target, pids=tree_pids,
-                        state=dialog_state)
+                    if plan.interactive and plan.label.startswith("Inno Setup: мастер"):
+                        # Здесь решения, в том числе о лицензии, принимает человек.
+                        clicked = 0
+                    else:
+                        clicked = redist_mod._dismiss_installer_dialogs(
+                            tally, target_dir=dialog_target, pids=tree_pids,
+                            state=dialog_state)
                 except TypeError:
                     # Совместимость с заменённой/старой реализацией:
                     # сначала только счётчик, затем вовсе без аргументов.
@@ -6196,13 +6219,11 @@ class Portablizer:
 
         Когда установщик падает или не понимает ни одного ключа тишины,
         остаётся последний честный путь: Inno Setup и NSIS — это обычные
-        контейнеры, и установленный на компьютере 7-Zip читает их, не
-        выполняя код установщика. Системе это не делает ничего, прав
-        администратора не требует, а программа оказывается в ``App``.
+        контейнеры, некоторые из которых 7-Zip читает без выполнения кода
+        установщика. Современные версии Inno Setup могут не поддерживаться.
 
-        Свой распаковщик Portablizer с собой не носит и не скачивает: сборка
-        не должна молча тянуть из сети исполняемые файлы. Не нашлось — так и
-        говорится в подсказках.
+        В Windows-сборку входит 7-Zip; во время работы сеть не используется.
+        Даже поддерживаемые движки могут иметь неподдерживаемую упаковку.
         """
         if getattr(det, "is_downloader_stub", False) is True:
             self.log.info(
@@ -6254,7 +6275,7 @@ class Portablizer:
                 ok, message = unpacker_mod.unpack_installer(
                     extractor.path, opts.installer_path, stage, work,
                     runner=runner, installer_path=opts.installer_path,
-                    extractor=extractor)
+                    extractor=extractor, accept_warnings=False)
                 self._check_cancel()
                 if ok and self._find_main_exe(stage, name):
                     unpacker_mod.promote_payload(stage, app_dir,
@@ -6273,10 +6294,12 @@ class Portablizer:
             shutil.rmtree(work, ignore_errors=True)
             shutil.rmtree(stage, ignore_errors=True)
 
-        advice = (" Для Inno Setup и NSIS попробуйте полный 7-Zip: tar.exe и "
-                  "UnRAR не являются универсальными распаковщиками EXE. "
-                  "Проверьте unpacker-output.log. Даже при успешном извлечении "
-                  "работоспособность и лицензирование нужно проверить отдельно.")
+        advice = (" Проверьте unpacker-output.log: ни один распаковщик не "
+                  "гарантирует поддержку конкретной версии или упаковки. "
+                  "Даже при успешном извлечении работоспособность и "
+                  "лицензирование нужно проверить отдельно.")
+        if not any(e.style == unpacker_mod.STYLE_7ZIP for e in extractors):
+            advice += " Попробуйте полный 7-Zip из официального источника."
         self._unpacker_result = (
             "Распаковка без запуска не дала файлов программы: "
             + "; ".join(failures) + advice

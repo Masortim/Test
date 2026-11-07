@@ -9,6 +9,15 @@ from portablizer.core.portablizer import (
 
 
 class InnoFailureTests(unittest.TestCase):
+    def test_single_file_mode_warns_about_missing_adjacent_parts(self):
+        engine = Portablizer(Logger())
+        det = DetectionResult(installer_type=InstallerType.INNO, confidence=1.0)
+        opts = PortableOptions(installer_path="setup.exe", output_dir="portable", single_file=True)
+        text = " ".join(engine._failure_hints(det, 5, opts))
+        self.assertIn("единичного файла", text)
+        self.assertIn("снимите этот флажок", text)
+        self.assertIn("Разрешить окно мастера", text)
+
     def test_preparation_failure(self):
         hint = _exit_code_hint(7, InstallerType.INNO)
         self.assertIn("подготовка", hint)
