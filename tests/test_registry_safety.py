@@ -263,67 +263,6 @@ class ExeLauncherRegistrySafetyTests(unittest.TestCase):
             self.assertEqual(deleted, [])
             self.assertIn(entry.REGISTRY_SNAPSHOT_NAME, imported)
 
-    def test_hklm_snapshot_retries_elevated_and_is_removed_only_on_success(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            cfg = {"data_dir_name": "PortableData", "registry": {
-                "enabled": True, "restore_on_exit": True,
-                "keys": [r"HKEY_LOCAL_MACHINE\Software\Vendor"],
-                "created_keys": [],
-            }}
-            session = entry.RegistrySession(root, cfg)
-            session.active = True
-            session.started = True
-            snapshot = session.backup / entry.REGISTRY_SNAPSHOT_NAME
-            text = (
-                "Windows Registry Editor Version 5.00\r\n\r\n"
-                "[HKEY_LOCAL_MACHINE\\Software\\Vendor]\r\n"
-                '"InstallDir"="before"\r\n')
-            self.assertTrue(entry.write_reg_file(snapshot, text))
-            logs = []
-            with mock.patch.object(entry, "IS_WINDOWS", True), \
-                    mock.patch.object(entry, "_is_elevated", return_value=False), \
-                    mock.patch.object(entry, "export_registry_text", return_value=""), \
-                    mock.patch.object(entry, "import_registry_file", return_value=False), \
-                    mock.patch.object(entry, "_run_elevated", return_value=0) as elevate, \
-                    mock.patch.object(entry, "_run_log",
-                                      side_effect=lambda _root, line:
-                                      logs.append(line)):
-                session.save_and_restore()
-            elevate.assert_called_once_with(["--import-reg", str(snapshot)])
-            self.assertFalse(snapshot.exists())
-            self.assertIn("registry restore: ok (elevated)", "\n".join(logs))
-
-    def test_failed_registry_restore_keeps_snapshot_for_a_later_retry(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            cfg = {"data_dir_name": "PortableData", "registry": {
-                "enabled": True, "restore_on_exit": True,
-                "keys": [r"HKEY_LOCAL_MACHINE\Software\Vendor"],
-                "created_keys": [],
-            }}
-            session = entry.RegistrySession(root, cfg)
-            session.active = True
-            session.started = True
-            snapshot = session.backup / entry.REGISTRY_SNAPSHOT_NAME
-            self.assertTrue(entry.write_reg_file(
-                snapshot,
-                "Windows Registry Editor Version 5.00\r\n\r\n"
-                "[HKEY_LOCAL_MACHINE\\Software\\Vendor]\r\n"))
-            logs = []
-            with mock.patch.object(entry, "IS_WINDOWS", True), \
-                    mock.patch.object(entry, "_is_elevated", return_value=False), \
-                    mock.patch.object(entry, "export_registry_text", return_value=""), \
-                    mock.patch.object(entry, "import_registry_file", return_value=False), \
-                    mock.patch.object(entry, "_run_elevated", return_value=None), \
-                    mock.patch.object(entry, "_run_log",
-                                      side_effect=lambda _root, line:
-                                      logs.append(line)):
-                session.save_and_restore()
-            self.assertTrue(snapshot.is_file())
-            self.assertTrue(any("registry restore: FAILED" in line
-                                and "backup retained" in line for line in logs))
-
     def test_added_values_and_subkeys_are_removed_before_baseline_import(self):
         current = self.BACKUP_TEXT + (
             "\r\n[HKEY_CURRENT_USER\\Software\\Classes\\.portablizer-demo"

@@ -1,17 +1,10 @@
 """Регрессии безопасной передачи запуска от Launch.bat к EXE-лончеру."""
-import inspect
-import json
 import os
 import sys
-import tempfile
 import unittest
-from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from portablizer.core import launcher as launcher_mod
-import portable_launcher_entry as launcher_entry
 
 
 class ExeHandoffTests(unittest.TestCase):
@@ -19,7 +12,7 @@ class ExeHandoffTests(unittest.TestCase):
         return launcher_mod.render_bat(launcher_mod.LauncherConfig(
             app_name="Delta", target_exe_rel="App/delta-app.exe"))
 
-    def test_exe_handoff_waits_for_target_start_and_checks_its_own_pid(self):
+    def test_normal_exe_launch_never_falls_through_to_console(self):
         bat = self._bat()
         handoff = bat.split(
             'if defined PORTABLE_USE_EXE_LAUNCHER if exist', 1)[1]
@@ -27,265 +20,23 @@ class ExeHandoffTests(unittest.TestCase):
             'rem ===========================================================================',
             1)[0]
 
-        # Per-attempt files keep unrelated LaunchPortable.exe processes from
-        # claiming success. The first marker contains this PID; the second is
-        # written only after the configured target process has been spawned.
-        self.assertIn("PORTABLE_EXE_HANDOFF_TOKEN=%RANDOM%", bat)
-        self.assertIn("PORTABLIZER_LAUNCH_HANDOFF_ID=%PORTABLE_EXE_HANDOFF_TOKEN%",
-                      handoff)
-        self.assertIn("launcher-exe-started-%PORTABLE_EXE_HANDOFF_TOKEN%.txt",
-                      bat)
-        self.assertIn("launcher-exe-target-%PORTABLE_EXE_HANDOFF_TOKEN%.txt",
-                      bat)
-        self.assertIn("if errorlevel 1 set \"PORTABLE_EXE_HANDOFF_START_FAILED=1\"",
-                      handoff)
-        self.assertIn("tasklist.exe", bat)
-        self.assertIn("PID eq %PORTABLE_EXE_HANDOFF_PID%", bat)
-        self.assertIn("findstr.exe", bat)
-        self.assertIn("if defined PORTABLE_EXE_HANDOFF_OK", handoff)
-        self.assertIn("Launch.bat is continuing", bat)
-        self.assertIn("set \"PORTABLE_USE_EXE_LAUNCHER=\"", handoff)
+        # Нельзя запускать второй экземпляр только потому, что tasklist не
+        # увидел оконный лончер за короткий промежуток времени.
+        self.assertNotIn("PORTABLE_EXE_ALIVE", handoff)
+        self.assertNotIn("goto portable_parsed", handoff)
         self.assertIn("exit /b 0", handoff)
-        self.assertIn("waiting to avoid a duplicate launch", bat)
+        self.assertIn("Launch.bat --bat-fallback", handoff)
 
-    def test_target_ack_is_written_only_after_spawn_returns(self):
-        source = inspect.getsource(launcher_entry._run_session)
-        spawn = source.index("process = _spawn_target(")
-        acknowledgement = source.index(
-            "_write_bat_handoff_target_marker(", spawn)
-        self.assertGreater(acknowledgement, spawn)
-
-    def test_elevated_child_inherits_private_token_without_parent_leak(self):
-        env_key = launcher_entry.BATCH_HANDOFF_ENV
-        with mock.patch.dict(os.environ, {env_key: "parent-token"}, clear=False):
-            observed = []
-
-            def fake_elevated(arguments, **kwargs):
-                observed.append(os.environ.get(env_key))
-                return 7
-
-            with mock.patch.object(launcher_entry, "_run_elevated",
-                                   side_effect=fake_elevated) as elevated:
-                result = launcher_entry._run_elevated_with_handoff(
-                    ["--launcher"], "child-token", follow=True)
-
-            self.assertEqual(result, 7)
-            self.assertEqual(observed, ["child-token"])
-            self.assertEqual(os.environ.get(env_key), "parent-token")
-            elevated.assert_called_once_with(["--launcher"], follow=True)
-
-    def test_failed_watch_exposes_launcher_log_then_falls_back(self):
+    def test_failed_watch_does_not_claim_to_start_console_copy(self):
         bat = self._bat()
-        self.assertIn("launcher-exe-error.log", bat)
-        self.assertIn("Full journal:", bat)
-        self.assertIn("Launch.bat is continuing with its own visible console launch path.",
-                      bat)
-        self.assertIn("exited without confirming that it started the target", bat)
+        self.assertIn("No second copy is started", bat)
+        self.assertNotIn(
+            "The program is started by this console launcher instead", bat)
 
     def test_explicit_console_fallback_is_still_available(self):
         bat = self._bat()
         self.assertIn('if /i "%~1" == "--bat-fallback"', bat)
         self.assertIn('set "PORTABLE_USE_EXE_LAUNCHER="', bat)
-
-
-class ExeHandoffMarkerTests(unittest.TestCase):
-    def test_started_marker_records_pid_and_target_marker_is_separate(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            cfg = {"data_dir_name": "PortableData"}
-            token = "123_456_789"
-
-            self.assertTrue(launcher_entry._write_bat_handoff_started_marker(
-                root, cfg, token, 54321))
-            self.assertTrue(launcher_entry._write_bat_handoff_target_marker(
-                root, cfg, token))
-            started = root / "PortableData" / (
-                launcher_entry.BATCH_HANDOFF_STARTED_PREFIX + token + ".txt")
-            target = root / "PortableData" / (
-                launcher_entry.BATCH_HANDOFF_TARGET_PREFIX + token + ".txt")
-            self.assertEqual(started.read_text(encoding="ascii"), "54321\n")
-            self.assertEqual(target.read_text(encoding="ascii"), token + "\n")
-
-    def test_non_ascii_data_dir_uses_same_ascii_fallback_as_batch(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            token = "432_765_098"
-
-            self.assertTrue(launcher_entry._write_bat_handoff_started_marker(
-                root, {"data_dir_name": "Данные"}, token, 12345))
-            self.assertTrue((root / "PortableData" / (
-                launcher_entry.BATCH_HANDOFF_STARTED_PREFIX + token + ".txt"
-            )).is_file())
-
-    def test_invalid_token_and_path_traversal_are_rejected(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-
-            self.assertFalse(launcher_entry._write_bat_handoff_started_marker(
-                root, {"data_dir_name": "PortableData"}, "../outside", 123))
-            self.assertFalse(launcher_entry._write_bat_handoff_target_marker(
-                root, {"data_dir_name": "PortableData"}, "../outside"))
-            self.assertFalse(launcher_entry._write_bat_handoff_started_marker(
-                root, {"data_dir_name": "../outside"}, "123_456", 123))
-            self.assertFalse((Path(temp).parent / "outside").exists())
-
-    def test_main_records_pid_and_forwards_private_token_without_env_leak(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            cfg = {"data_dir_name": "PortableData"}
-            token = "246_810_357"
-            env_key = launcher_entry.BATCH_HANDOFF_ENV
-
-            with mock.patch.object(launcher_entry, "find_portable_root",
-                                   return_value=root), \
-                    mock.patch.object(launcher_entry, "read_launcher_config",
-                                      return_value=cfg), \
-                    mock.patch.object(launcher_entry, "run", return_value=0) as run_mock, \
-                    mock.patch.object(launcher_entry.sys, "argv",
-                                      ["LaunchPortable.exe"]), \
-                    mock.patch.dict(os.environ, {env_key: token}, clear=False):
-                self.assertEqual(launcher_entry.main(), 0)
-                self.assertNotIn(env_key, os.environ)
-
-            run_mock.assert_called_once_with(handoff_token=token)
-            marker = root / "PortableData" / (
-                launcher_entry.BATCH_HANDOFF_STARTED_PREFIX + token + ".txt")
-            self.assertEqual(marker.read_text(encoding="ascii"),
-                             str(os.getpid()) + "\n")
-
-
-class PyCharmTargetRepairTests(unittest.TestCase):
-    def test_runtime_replaces_old_default_with_bin_pycharm_exe(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            bin_dir = root / "App" / "PyCharm2026.2" / "bin"
-            bin_dir.mkdir(parents=True)
-            (bin_dir / "pycharm64.exe").write_bytes(b"MZ")
-            (bin_dir / "pycharm.exe").write_bytes(b"MZ")
-            cfg = {
-                "app_name": "PyCharm",
-                "target_exe_rel": "App/PyCharm2026.2/bin/pycharm64.exe",
-            }
-            config_path = root / "launcher_config.json"
-            config_path.write_text(json.dumps(cfg), encoding="utf-8")
-
-            selected = launcher_entry._prefer_pycharm_target(
-                root, cfg, cfg["target_exe_rel"])
-
-            expected = "App/PyCharm2026.2/bin/pycharm.exe"
-            self.assertEqual(selected, expected)
-            self.assertEqual(cfg["target_exe_rel"], expected)
-            saved = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["target_exe_rel"], expected)
-
-    def test_quick_access_violation_uses_only_the_adjacent_portable_fallback(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            bin_dir = root / "App" / "PyCharm2026.2" / "bin"
-            bin_dir.mkdir(parents=True)
-            primary = bin_dir / "pycharm.exe"
-            fallback = bin_dir / "pycharm64.exe"
-            primary.write_bytes(b"MZ")
-            fallback.write_bytes(b"MZ")
-            cfg = {"app_name": "PyCharm"}
-
-            selected = launcher_entry._pycharm64_fallback_candidate(
-                root, cfg, primary, -1073741819, 3.2)
-
-            self.assertEqual(selected, fallback)
-            self.assertIsNone(launcher_entry._pycharm64_fallback_candidate(
-                root, cfg, primary, 0, 3.2))
-            self.assertIsNone(launcher_entry._pycharm64_fallback_candidate(
-                root, cfg, primary, 0xC0000005, 5.0))
-
-    def test_pycharm_fallback_does_not_search_outside_the_portable_tree(self):
-        with tempfile.TemporaryDirectory() as temp:
-            parent = Path(temp)
-            root = parent / "Portable"
-            root.mkdir()
-            bin_dir = parent / "HostInstall" / "bin"
-            bin_dir.mkdir(parents=True)
-            primary = bin_dir / "pycharm.exe"
-            (bin_dir / "pycharm64.exe").write_bytes(b"MZ")
-            primary.write_bytes(b"MZ")
-
-            self.assertIsNone(launcher_entry._pycharm64_fallback_candidate(
-                root, {"app_name": "PyCharm"}, primary,
-                0xC0000005, 1.0))
-
-    def test_wait_retries_once_with_pycharm64_after_fast_crash(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            bin_dir = root / "App" / "PyCharm2026.2" / "bin"
-            bin_dir.mkdir(parents=True)
-            primary = bin_dir / "pycharm.exe"
-            fallback = bin_dir / "pycharm64.exe"
-            primary.write_bytes(b"MZ")
-            fallback.write_bytes(b"MZ")
-            cfg = {"app_name": "PyCharm"}
-            first = mock.Mock(pid=101)
-            second = mock.Mock(pid=202)
-            env = {"APPDATA": str(root / "PortableData")}
-            job = mock.Mock(handle=None)
-            attached = []
-            clock = iter((10.0, 20.0, 20.25))
-            with mock.patch.object(launcher_entry, "_wait_target",
-                                   side_effect=(0xC0000005, 0)) as wait, \
-                    mock.patch.object(launcher_entry, "_spawn_target",
-                                      return_value=second) as spawn, \
-                    mock.patch.object(launcher_entry,
-                                      "_portable_process_list", return_value=[]), \
-                    mock.patch("time.monotonic", side_effect=lambda: next(clock)):
-                result = launcher_entry._wait_target_with_pycharm_fallback(
-                    root, cfg, primary,
-                    [str(primary), "--test-argument"], env, job, None,
-                    first, 9.5, on_spawn=lambda child: attached.append(child.pid))
-
-            self.assertEqual(result, (0, 0.25, fallback, "pycharm64.exe", True))
-            self.assertEqual(wait.call_count, 2)
-            self.assertEqual(attached, [202])
-            command = spawn.call_args.args[0]
-            self.assertEqual(command[0], str(fallback))
-            self.assertEqual(command[1:], ["--test-argument"])
-
-    def test_wait_does_not_start_a_second_ide_if_a_child_survives(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            bin_dir = root / "App" / "PyCharm2026.2" / "bin"
-            bin_dir.mkdir(parents=True)
-            primary = bin_dir / "pycharm.exe"
-            (bin_dir / "pycharm64.exe").write_bytes(b"MZ")
-            primary.write_bytes(b"MZ")
-            with mock.patch.object(launcher_entry, "_wait_target",
-                                   return_value=0xC0000005), \
-                    mock.patch.object(launcher_entry, "_portable_process_list",
-                                      return_value=[(88, str(primary))]), \
-                    mock.patch.object(launcher_entry, "_spawn_target") as spawn, \
-                    mock.patch("time.monotonic", return_value=1.0):
-                result = launcher_entry._wait_target_with_pycharm_fallback(
-                    root, {"app_name": "PyCharm"}, primary,
-                    [str(primary)], {}, None, None, mock.Mock(), 0.0)
-            self.assertEqual(result[0], 0xC0000005)
-            self.assertEqual(result[2], primary)
-            self.assertFalse(result[4])
-            spawn.assert_not_called()
-
-    def test_explicit_alternate_target_is_not_rewritten(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            bin_dir = root / "App" / "PyCharm2026.2" / "bin"
-            bin_dir.mkdir(parents=True)
-            (bin_dir / "pycharm.exe").write_bytes(b"MZ")
-            cfg = {
-                "app_name": "PyCharm",
-                "target_exe_rel": "App/PyCharm2026.2/bin/pycharm64.exe",
-            }
-            alternate = "App/tools/custom.exe"
-
-            selected = launcher_entry._prefer_pycharm_target(
-                root, cfg, alternate)
-
-            self.assertEqual(selected, alternate)
 
 
 if __name__ == "__main__":

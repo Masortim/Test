@@ -319,25 +319,6 @@ class ElevationMemoryTests(unittest.TestCase):
             self.assertEqual(data["reason"], "timeout")
             self.assertGreater(data["when"], 0)
 
-    def test_old_misreported_import_failure_does_not_block_retry(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            when = time.time()
-            entry._elevation_stamp(root).parent.mkdir(parents=True)
-            entry._elevation_stamp(root).write_text(json.dumps({
-                "when": when,
-                "reason": "no result from the UAC prompt",
-            }), encoding="utf-8")
-            log = root / "PortableData" / "launcher-run.log"
-            log.parent.mkdir(parents=True, exist_ok=True)
-            logged = time.strftime("%Y-%m-%d %H:%M:%S",
-                                   time.localtime(when - 1.0))
-            log.write_text(
-                f"[{logged}] machine registry: FAILED "
-                "(reg.exe rc=1) (elevated)\n", encoding="utf-8")
-            self.assertFalse(entry.elevation_recently_refused(root))
-            self.assertFalse(entry._elevation_stamp(root).exists())
-
     def test_elevated_launch_is_bounded(self) -> None:
         """Ожидание повышенной копии не должно быть бесконечным."""
         import inspect

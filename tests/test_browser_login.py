@@ -296,37 +296,6 @@ class BridgeSettingsTests(unittest.TestCase):
             with mock.patch.object(entry, "IS_WINDOWS", False):
                 self.assertFalse(bridge.enabled)
 
-    def test_pycharm_never_enables_the_browser_bridge(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            target = make_portable(root, "pycharm.exe")
-            bridge = entry.BrowserLoginBridge(
-                root,
-                {"app_name": "PyCharm 2026.2",
-                 "browser_login": {"enabled": True}},
-                target, log=lambda _message: None)
-            with mock.patch.object(entry, "IS_WINDOWS", True):
-                self.assertFalse(bridge.enabled)
-
-    def test_pycharm_launch_does_not_remove_portable_browser_data(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            target = make_portable(root, "pycharm.exe")
-            profile = (root / "PortableData" / "AppData" / "Local" /
-                       "Yandex" / "YandexBrowser" / "User Data")
-            profile.mkdir(parents=True)
-            (profile / "Bookmarks").write_text("keep", encoding="utf-8")
-            bridge = entry.BrowserLoginBridge(
-                root, {"app_name": "PyCharm", "browser_login": {}}, target,
-                log=lambda _message: None)
-            with mock.patch.object(entry, "IS_WINDOWS", True), \
-                    mock.patch.object(entry, "_process_table",
-                                      side_effect=AssertionError("must stay idle")):
-                bridge.prepare()
-                bridge.teardown()
-            self.assertEqual((profile / "Bookmarks").read_text(encoding="utf-8"),
-                             "keep")
-
     def test_poll_interval_is_sane(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -709,13 +678,6 @@ class LauncherConfigTests(unittest.TestCase):
         restored = launcher_mod.config_from_dict(json.loads(payload))
         self.assertFalse(restored.browser_login["enabled"])
 
-    def test_pycharm_disables_the_browser_bridge_even_when_old_config_enables_it(self):
-        cfg = launcher_mod.LauncherConfig(
-            app_name="PyCharm 2026.2",
-            target_exe_rel="App/PyCharm2026.2/bin/pycharm.exe",
-            browser_login={"enabled": True})
-        self.assertFalse(launcher_mod.browser_login_settings(cfg)["enabled"])
-
 
 class BrowserRegistryTests(unittest.TestCase):
     """Регистрация браузера по умолчанию не переезжает в портатив."""
@@ -1082,11 +1044,10 @@ class SafeRegistryImportTests(unittest.TestCase):
 
             def fake_reg(args):
                 seen.append(Path(args[1]).read_text(encoding="utf-16"))
-                return 0, ""
+                return 0
 
             with mock.patch.object(entry, "import_registry_text", return_value=False), \
-                    mock.patch.object(entry, "_reg_with_output",
-                                      side_effect=fake_reg):
+                    mock.patch.object(entry, "_reg", side_effect=fake_reg):
                 self.assertTrue(entry.import_registry_file(path))
             self.assertEqual(len(seen), 1)
             self.assertIn("Vendor\\App", seen[0])

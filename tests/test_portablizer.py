@@ -700,8 +700,8 @@ class PortableExeLauncherTests(unittest.TestCase):
                         exe_launcher, "_unpacked_reg",
                         side_effect=lambda source, *_args: source,
                     ), mock.patch.object(
-                        exe_launcher, "_reg_with_output",
-                        side_effect=lambda args: calls.append(tuple(args)) or (0, ""),
+                        exe_launcher, "_reg",
+                        side_effect=lambda args: calls.append(tuple(args)) or 0,
                     ):
                 exe_launcher.RegistrySession(root, cfg).load()
 
@@ -3473,38 +3473,6 @@ class InstallShieldRunTests(unittest.TestCase):
 class MultiExecutableDetectionTests(unittest.TestCase):
     """Тесты распознавания и классификации главного exe, лаунчера и конфигуратора."""
 
-    def test_pycharm_prefers_pycharm_exe_in_bin_independent_of_file_order(self):
-        for creation_order in (("pycharm64.exe", "pycharm.exe"),
-                               ("pycharm.exe", "pycharm64.exe")):
-            with self.subTest(creation_order=creation_order), \
-                    tempfile.TemporaryDirectory() as temp:
-                app_dir = Path(temp, "App")
-                bin_dir = app_dir / "PyCharm2026.2" / "bin"
-                bin_dir.mkdir(parents=True)
-                for name in creation_order:
-                    (bin_dir / name).write_bytes(b"MZ" + b"\x00" * 1000)
-
-                main_exe, targets = Portablizer(Logger())._discover_app_executables(
-                    str(app_dir), "PyCharm")
-
-                self.assertEqual(Path(main_exe).name.casefold(), "pycharm.exe")
-                main_target = next(
-                    target for target in targets
-                    if Path(target.rel_path).name.casefold() == "pycharm.exe")
-                self.assertEqual(main_target.role, "main")
-
-    def test_pycharm64_remains_a_fallback_when_pycharm_exe_is_absent(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app_dir = Path(temp, "App")
-            bin_dir = app_dir / "PyCharm2026.2" / "bin"
-            bin_dir.mkdir(parents=True)
-            (bin_dir / "pycharm64.exe").write_bytes(b"MZ" + b"\x00" * 1000)
-
-            main_exe, _targets = Portablizer(Logger())._discover_app_executables(
-                str(app_dir), "PyCharm")
-
-            self.assertEqual(Path(main_exe).name.casefold(), "pycharm64.exe")
-
     def test_witcher_layout_classifies_main_launcher_config_and_tool(self):
         with tempfile.TemporaryDirectory() as temp:
             app_dir = Path(temp, "App")
@@ -3974,7 +3942,7 @@ class GameLauncherHandoffTests(unittest.TestCase):
         self.assertIn("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", bat)
         self.assertIn("mklink /J", bat)
 
-    def test_electron_ollama_and_pycharm_do_not_join_the_kill_job(self):
+    def test_electron_and_ollama_do_not_join_the_kill_job(self):
         with tempfile.TemporaryDirectory() as temp:
             app = Path(temp, "App")
             app.mkdir()
@@ -3985,10 +3953,6 @@ class GameLauncherHandoffTests(unittest.TestCase):
             self.assertTrue(exe_launcher.is_electron_tree(app))
             self.assertFalse(exe_launcher.should_use_job(app / "ollama app.exe"))
             self.assertFalse(exe_launcher.should_use_job(app / "ollama.exe"))
-            pycharm = app / "PyCharm2026.2" / "bin" / "pycharm.exe"
-            pycharm64 = pycharm.with_name("pycharm64.exe")
-            self.assertFalse(exe_launcher.should_use_job(pycharm))
-            self.assertFalse(exe_launcher.should_use_job(pycharm64))
             plain = Path(temp, "Game")
             plain.mkdir()
             (plain / "game.exe").write_bytes(b"MZ")
@@ -6110,76 +6074,6 @@ class MultitranDriveRootPortableTests(unittest.TestCase):
             self.assertIn('"Dictionary Path"="@@PORTABLE_ROOT@@\\\\App\\\\network"', updated)
             self.assertNotIn("c:\\\\multitran", updated.lower())
             self.assertIn('"Interface Language"="Russian"', updated)
-
-    def test_legacy_registry_sync_log_values_are_redacted_in_place(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp, "PyCharm_Portable")
-            log = root / "PortableData" / "launcher-run.log"
-            log.parent.mkdir(parents=True)
-            sentinel = "PRIVATE_OLD_LOG_SENTINEL"
-            log.write_text(
-                "[2026-11-07 12:00:00] registry sync: host-registry: "
-                f"JetBrains\\PyCharm -> AccountToken={sentinel}\n"
-                "[2026-11-07 12:00:01] registry sync: host-registry: "
-                "synchronized 1 value(s)\n"
-                "[2026-11-07 12:00:02] start: pycharm.exe\n",
-                encoding="utf-8")
-
-            exe_launcher._redact_legacy_registry_sync_log(root)
-
-            cleaned = log.read_text(encoding="utf-8")
-            self.assertNotIn(sentinel, cleaned)
-            self.assertIn("registry sync: legacy details redacted", cleaned)
-            self.assertIn("registry sync: host-registry: synchronized 1 value(s)",
-                          cleaned)
-            self.assertIn("start: pycharm.exe", cleaned)
-
-    def test_registry_sync_logs_only_counts_not_registry_values(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp, "PyCharm_Portable")
-            root.mkdir(parents=True)
-            registry_key = r"HKCU\Software\JetBrains\PyCharm2026.2"
-            (root / "portable.reg").write_text(
-                "Windows Registry Editor Version 5.00\r\n\r\n"
-                "[HKEY_CURRENT_USER\\Software\\JetBrains\\PyCharm2026.2]\r\n"
-                '"Theme"="Dark"\r\n\r\n',
-                encoding="utf-16")
-            cfg = {
-                "app_name": "PyCharm",
-                "data_dir_name": "PortableData",
-                "registry": {
-                    "enabled": True,
-                    "file": "portable.reg",
-                    "restore_on_exit": True,
-                    "keys": [registry_key],
-                    "created_keys": [],
-                },
-            }
-            sentinel = "PRIVATE_SENTINEL_FOR_TEST_ONLY"
-            logs = []
-
-            def fake_host_read(key: str):
-                if "jetbrains\\pycharm2026.2" in key.casefold():
-                    return {"AccountToken": f'"{sentinel}"'}
-                return {}
-
-            with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
-                    mock.patch.object(
-                        exe_launcher,
-                        "_read_host_key_reg_values",
-                        side_effect=fake_host_read,
-                    ), \
-                    mock.patch.object(
-                        exe_launcher, "_run_log",
-                        side_effect=lambda _root, message: logs.append(message),
-                    ):
-                exe_launcher.RegistrySession(root, cfg).sync_external_changes()
-
-            self.assertIn(sentinel, (root / "portable.reg").read_text(
-                encoding="utf-16"))
-            joined = "\n".join(logs)
-            self.assertNotIn(sentinel, joined)
-            self.assertIn("synchronized 1 value(s)", joined)
 
 
 if __name__ == "__main__":
