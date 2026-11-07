@@ -3060,6 +3060,18 @@ class FailureDiagnosticsTests(unittest.TestCase):
                 extra_install_args=list(extra_args),
             ))
 
+    def test_inno_five_does_not_claim_access_denied(self):
+        engine = Portablizer(Logger())
+        det = DetectionResult(installer_type=InstallerType.INNO, confidence=0.9)
+        opts = PortableOptions(installer_path="setup.exe", output_dir=".")
+        with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
+             mock.patch("portablizer.core.portablizer.is_elevated", return_value=True):
+            hints = " ".join(engine._failure_hints(det, 5, opts, "."))
+        self.assertIn("отмену до начала", hints)
+        self.assertNotIn("требует отдельных прав", hints)
+        self.assertNotIn("--elevate", hints)
+        self.assertIn("отменена", _exit_code_hint(5, InstallerType.INNO))
+
     def test_failure_explains_admin_rights_and_license_switch(self):
         result = self._failed_result(
             CustomBootstrapperDetectionTests.ZENNO_PAYLOAD)

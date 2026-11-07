@@ -391,7 +391,8 @@ def promote_payload(work_dir: str, destination: str,
 def unpack_installer(unpacker: str, installer: str, destination: str,
                      work_dir: str, runner: Optional[Runner] = None,
                      timeout: Optional[float] = None,
-                     installer_path: str = "") -> Tuple[bool, str]:
+                     installer_path: str = "",
+                     extractor: Optional[Extractor] = None) -> Tuple[bool, str]:
     """Распаковывает установщик в ``destination``. Возвращает ``(успех, текст)``.
 
     Текст во втором элементе — причина неудачи словами (её видно в журнале и
@@ -407,7 +408,8 @@ def unpack_installer(unpacker: str, installer: str, destination: str,
         return False, f"не удалось создать рабочую папку: {exc}"
 
     run = runner or _default_runner
-    cmd = unpacker_argv(unpacker, installer, work_dir)
+    extractor = extractor or Extractor(STYLE_7ZIP, unpacker)
+    cmd = extractor_argv(extractor, installer, work_dir)
     try:
         code, output = run(cmd, timeout)
     except Exception as exc:  # noqa: BLE001 - распаковка не должна ронять сборку
@@ -415,7 +417,7 @@ def unpack_installer(unpacker: str, installer: str, destination: str,
     tail = " ".join((output or "").split())[-300:]
     # Код 1 у 7-Zip означает предупреждение (часть файлов не распакована), а
     # не отказ: то, что достали, всё равно нужно проверить.
-    if code not in (0, 1):
+    if code not in ((0, 1) if extractor.style == STYLE_7ZIP else (0,)):
         return False, (f"{os.path.basename(unpacker)} завершился с кодом {code}"
                        + (f": {tail}" if tail else ""))
 
@@ -424,6 +426,6 @@ def unpack_installer(unpacker: str, installer: str, destination: str,
     if copied == 0:
         return False, ("внутри установщика не нашлось файлов программы "
                        "(возможно, это не самораспаковывающийся архив, "
-                       "установщик JetBrains (PyCharm) или упаковка, "
-                       "которую распаковщик не читает)")
-    return True, f"перенесено файлов: {copied}"
+                       "или упаковка, которую распаковщик не читает)")
+    warning = "; предупреждение 7-Zip: часть файлов может отсутствовать" if code == 1 else ""
+    return True, f"перенесено файлов: {copied}{warning}"

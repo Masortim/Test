@@ -275,6 +275,21 @@ class UnpackInstallerTests(unittest.TestCase):
                 "/usr/bin/7z", installer, str(app), str(work), runner=runner)
             self.assertTrue(ok)
 
+    def test_unrar_uses_its_own_arguments_and_code_one_is_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer, app, work = self._setup(temp)
+            extractor = unpacker_mod.Extractor(unpacker_mod.STYLE_RAR, "UnRAR.exe")
+            commands = []
+            def runner(cmd, timeout):
+                commands.append(cmd)
+                return 1, "archive error"
+            ok, message = unpacker_mod.unpack_installer(
+                extractor.path, installer, str(app), str(work),
+                runner=runner, extractor=extractor)
+            self.assertFalse(ok)
+            self.assertEqual(commands[0][:5], ["UnRAR.exe", "x", "-y", "-o+", "-idq"])
+            self.assertIn("кодом 1", message)
+
     def test_error_code_is_explained_in_words(self):
         with tempfile.TemporaryDirectory() as temp:
             installer, app, work = self._setup(temp)

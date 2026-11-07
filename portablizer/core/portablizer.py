@@ -210,7 +210,7 @@ def bundled_exe_launcher_dir() -> str:
 #: Типовые коды возврата и их расшифровка (для журнала и итоговой ошибки).
 _EXIT_CODE_HINTS: Dict[int, str] = {
     2: "файл не найден",
-    5: "отказано в доступе (нужны права администратора)",
+    5: "значение зависит от установщика; возможен отказ в доступе",
     # WAIT_TIMEOUT: наша собственная метка «установщик перестал подавать
     # признаки работы и был снят», а не код, который вернул сам движок.
     0x102: "установщик молчал дольше отведённого времени и был снят вместе "
@@ -1926,7 +1926,7 @@ class Portablizer:
             "install-retry.log", "install-layout.log", "install-interactive.log",
             "installer-engine.log", "installer-output.log", "installer-crash.log",
             "unpacker-output.log", "portablizer.log", "_bundle_layout",
-            "_unpacked", "setup-installshield.log", redist_mod.REPORT_NAME,
+            "_unpacked", "_unpacked_app", "setup-installshield.log", redist_mod.REPORT_NAME,
             "_redist_cache",
             launcher_mod.STOP_SCRIPT_NAME, launcher_mod.UPDATE_SCRIPT_NAME,
             "Updates",
@@ -3254,31 +3254,23 @@ class Portablizer:
                 "Portablizer.exe → «Запуск от имени администратора»)."
             )
 
-        # Код 5 (Inno: "установка отменена до начала") или 740
-        # (ERROR_ELEVATION_REQUIRED) при уже запущенном от администратора
-        # Portablizer: установщик требует права на конкретную операцию,
-        # а не просто запуск от администратора.
-        # Попробуем явно запросить права через UAC — некоторые установщики
-        # (в том числе PyCharm) требуют отдельного elevation для своей внутренней
-        # операции, даже если Portablizer уже запущен от администратора.
-        if (rc in (5, 740) and IS_WINDOWS and is_elevated()
-                and not any("установщик вернул код, указывающий на отказ в правах"
-                            in h for h in hints)):
+        if rc == 5 and det.installer_type == InstallerType.INNO:
             hints.append(
-                "Установщик вернул код, указывающий на отказ в правах "
-                f"({_format_exit_code(rc)}), но Portablizer уже запущен "
-                "от имени администратора. Это означает, что установщик "
-                "требует отдельных прав на конкретную операцию (например, "
-                "запись в защищённую область реестра или системный каталог), "
-                "которые могут потребовать дополнительного подтверждения UAC. "
-                "PyCharm и подобные установщики JetBrains часто требуют прав для "
-                "записи в программные файлы — попробуйте запустить Portablizer "
-                "с флагом --elevate для явного запроса прав через UAC."
-                "которые могут требовать дополнительного подтверждения. "
-                "Проверьте installer-output.log — там часто указана точная "
-                "причина отказа. Если установщик поддерживает запуск с "
-                "явным запросом прав через UAC, попробуйте использовать "
-                "Portablizer с флагом --elevate."
+                "Inno Setup: код 5 означает отмену до начала установки файлов, "
+                "а не обязательно отказ в доступе. Проверьте install.log и "
+                "installer-output.log; причина может быть указана в журнале "
+                "установщика. Повторный запрос UAC не устраняет её автоматически."
+            )
+        elif rc == 5:
+            hints.append(
+                "Код 5 зависит от установщика и сам по себе не доказывает "
+                "отказ в доступе. Проверьте install.log и installer-output.log."
+            )
+        elif rc == 740 and IS_WINDOWS and is_elevated():
+            hints.append(
+                "Получен код 740 при уже повышенных правах Portablizer. "
+                "Проверьте журнал установщика: повторное повышение самого "
+                "Portablizer не гарантирует устранение причины."
             )
 
         if det.installer_type == InstallerType.INSTALLSHIELD:
@@ -3898,8 +3890,9 @@ class Portablizer:
 
         if capture.reg_file or capture.machine_reg_file:
             self.log.ok(
-                f"Настройки программы сохранены в портатив: "
-                f"{len(capture.keys)} ключ(ей) реестра."
+                f"Для портатива сохранены возможные настройки: "
+                f"{len(capture.keys)} ключ(ей) реестра; их связь с программой "
+                "и создание портатива ещё не подтверждены."
             )
         else:
             self.log.info("Программа не создала собственных настроек в реестре.")
@@ -4214,7 +4207,8 @@ class Portablizer:
             )
             self._note_crash(plan, rc, cmdline, console_log)
         elif rc not in (0, 3010):  # 3010 = успех, требуется перезагрузка
-            hint = _exit_code_hint(rc)
+            detection = getattr(self, "_detection", None)
+            hint = _exit_code_hint(rc, getattr(detection, "installer_type", None))
             self.log.warn(
                 f"Установщик вернул код {_format_exit_code(rc)}."
                 + (f" Похоже, {hint}." if hint else "")
@@ -4570,19 +4564,13 @@ class Portablizer:
             )
         if IS_WINDOWS and is_elevated():
             lines.append(
-                "Portablizer запущен от имени администратора, но установщик "
-                "не начал работу: возможно, установщик сам требует отдельных "
-                "прав на конкретную операцию (например, запись в Program Files "
-                "или реестр). Проверьте installer-output.log — там часто указана "
-                "точная причина отказа. Если установщик поддерживает запуск с "
-                "явным запросом прав, попробуйте передать его через "
-                "ShellExecute с флагом runas (в Portablizer такой режим "
-                "можно включить флагом --elevate)."
+                "Portablizer уже запущен от имени администратора. Проверьте "
+                "окна установщика и installer-output.log: причина ожидания "
+                "по одним только правам процесса неизвестна."
             )
         lines.append(
-            "Если окон нет и UAC не спрашивает, файл, скорее всего, "
-            "проверяет антивирус: добавьте установщик и папку портатива в "
-            "исключения и повторите сборку."
+            "Если окон нет, проверьте журналы установщика и антивирус; "
+            "не отключайте защиту без установленной причины."
         )
         return lines
 
@@ -6173,7 +6161,8 @@ class Portablizer:
         )
         try:
             ok, message = unpacker_mod.unpack_installer(
-                unpacker, nested, app_dir, work, installer_path=nested)
+                unpacker, nested, app_dir, work, installer_path=nested,
+                extractor=extractors[0] if extractors else None)
         except Exception as exc:  # noqa: BLE001 - распаковка не должна ронять сборку
             self.log.warn(f"Распаковка вложенного установщика не удалось: {exc}")
             return False
@@ -6234,53 +6223,63 @@ class Portablizer:
         if not self._unpacker_worth_trying(det):
             return False
         extractors = unpacker_mod.find_extractors()
-        unpacker = (extractors[0].path if extractors
-                    else unpacker_mod.find_unpacker())
-        if not unpacker:
-            alt_note = ""
-            if extractors:
-                names = ", ".join(f"\"{e.name}\"" for e in extractors)
-                alt_note = (
-                    f" Установите любой из них (или встроенный tar.exe в Windows 10+): "
-                    f"Portablizer использует {names}."
-                )
+        if not extractors:
             self.log.info(
                 "Распаковщик на этом компьютере не найден: достать "
-                "содержимое установщика без запуска нечем."
-                + alt_note
+                "содержимое установщика без запуска нечем. Установите 7-Zip "
+                "из официального источника и повторите попытку."
             )
             return False
 
         self._check_cancel()
         self.progress(63, "Распаковка установщика без запуска")
-        self.log.info(
-            "Пробую достать файлы программы из установщика без его запуска: "
-            f"{os.path.basename(unpacker)} читает такие контейнеры напрямую."
-        )
         work = os.path.join(portable_dir, "_unpacked")
-        shutil.rmtree(work, ignore_errors=True)
+        stage = os.path.join(portable_dir, "_unpacked_app")
         console_log = os.path.join(portable_dir, "unpacker-output.log")
 
-        def runner(cmd, timeout):  # noqa: ANN001 - подпись задана unpacker'ом
+        def runner(cmd, timeout):  # noqa: ANN001
             return self._run_unpacker_command(cmd, console_log, opts)
 
+        failures = []
         try:
-            ok, message = unpacker_mod.unpack_installer(
-                unpacker, opts.installer_path, app_dir, work, runner=runner,
-                installer_path=opts.installer_path)
+            for extractor in extractors:
+                self._check_cancel()
+                shutil.rmtree(work, ignore_errors=True)
+                shutil.rmtree(stage, ignore_errors=True)
+                os.makedirs(stage, exist_ok=True)
+                self.log.info(
+                    "Пробую достать файлы программы без запуска установщика "
+                    f"с помощью {extractor.name}; поддержка формата не гарантирована."
+                )
+                ok, message = unpacker_mod.unpack_installer(
+                    extractor.path, opts.installer_path, stage, work,
+                    runner=runner, installer_path=opts.installer_path,
+                    extractor=extractor)
+                self._check_cancel()
+                if ok and self._find_main_exe(stage, name):
+                    unpacker_mod.promote_payload(stage, app_dir,
+                                                 installer_path=opts.installer_path)
+                    self._unpacked_with = extractor.path
+                    self.log.ok(
+                        "Файлы извлечены без запуска установщика в App "
+                        f"({message}). Их полнота и работоспособность не подтверждены."
+                    )
+                    return True
+                if ok:
+                    message = "извлечены файлы, но исполняемый файл программы не найден"
+                failures.append(f"{extractor.name}: {message}")
+                self.log.warn(f"{extractor.name}: {message}")
         finally:
             shutil.rmtree(work, ignore_errors=True)
+            shutil.rmtree(stage, ignore_errors=True)
 
-        if ok and self._find_main_exe(app_dir, name):
-            self._unpacked_with = unpacker
-            self.log.ok(
-                "Установщик распакован без запуска — файлы программы в папке "
-                f"App ({message})."
-            )
-            return True
+        advice = (" Для Inno Setup и NSIS попробуйте полный 7-Zip: tar.exe и "
+                  "UnRAR не являются универсальными распаковщиками EXE. "
+                  "Проверьте unpacker-output.log. Даже при успешном извлечении "
+                  "работоспособность и лицензирование нужно проверить отдельно.")
         self._unpacker_result = (
-            f"Распаковка без запуска ({os.path.basename(unpacker)}) не дала "
-            f"файлов программы: {message}"
+            "Распаковка без запуска не дала файлов программы: "
+            + "; ".join(failures) + advice
         )
         self.log.warn(self._unpacker_result)
         return False
@@ -6316,7 +6315,7 @@ class Portablizer:
         """
         handle = None
         try:
-            handle = open(console_log, "wb")
+            handle = open(console_log, "ab")
             handle.write(("===== распаковка без запуска =====\r\n"
                           + " ".join(cmd) + "\r\n").encode("utf-8", "replace"))
             handle.flush()
