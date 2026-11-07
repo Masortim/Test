@@ -423,5 +423,6 @@ def unpack_installer(unpacker: str, installer: str, destination: str,
                              installer_path=installer_path or installer)
     if copied == 0:
         return False, ("внутри установщика не нашлось файлов программы "
-                       "(это может быть упаковка, которую 7-Zip не читает)")
+                       "(возможно, это не самораспаковывающийся архив или "
+                       "упаковка, которую распаковщик не читает)")
     return True, f"перенесено файлов: {copied}"
