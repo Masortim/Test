@@ -18,9 +18,10 @@ Inno Setup (PyCharm, и вообще любой современный уста�
   (6.5.0+/7.x, смещения Int64);
 * :func:`parse_header` — читает 64-байтовую сигнатуру ``Inno Setup Setup Data
   (X.Y.Z)``, при X ≥ 6.5 пропускает 53-байтовый encryption-заголовок, затем
-  разжимает LZMA1-блок (заголовок + все записи, порции по 4096 байт с CRC) и
-  доходит до списков файлов и «data entries» (ссылок файлов на chanки).
-  Заголовок блока с Inno 6.7.0 шире: размер хранится как Int64 (13 байт
+  разжимает оба блока Setup0: первый содержит заголовок и метаданные файлов,
+  второй — отдельный список «data entries» (ссылок файлов на чанки). Каждый
+  блок разбит на порции по 4096 байт с CRC. Заголовок блока с Inno 6.7.0
+  шире: размер хранится как Int64 (13 байт
   вместо 9) — без этого реальные установщики 6.7+/7.x не разбираются;
 * :func:`decompress_chunk` — разжимает chanк: LZMA1 (с 5-байтовым заголовком
   свойств, как у Inno), zlib, bzip2 или просто stored;
@@ -124,6 +125,7 @@ class _Header:
     compression: int
     files: List[_FileEntry] = field(default_factory=list)
     data_entries: List[_DataEntry] = field(default_factory=list)
+    data_entry_count: int = 0
     # Биты флагов data entry (зависят от группы формата, см. _parse_blob)
     call_bit: int = 4
     enc_bit: int = 6
@@ -143,9 +145,6 @@ class _Reader:
     def seek(self, offset: int) -> None:
         self.fh.seek(offset)
         self.pos = offset
-
-    def seek(self, offset: int) -> None:
-        self.fh.seek(offset)
 
     def read(self, size: int) -> bytes:
         data = self.fh.read(size)
@@ -392,18 +391,17 @@ def _version_group(version: Tuple[int, int, int, int]) -> str:
     raise InnoError(f"неподдержанный формат данных Inno Setup {version[0]}.{version[1]}")
 
 
-def _read_block_stream(reader: _Reader, version: Tuple[int, int, int, int]) -> bytes:
-    """Читает один сжатый блок (заголовок+все записи) из потока по header_offset.
+def _read_block_stream(reader: _Reader, version: Tuple[int, int, int, int],
+                       allow_empty: bool = False) -> bytes:
+    """Читает один Inno compressed block с текущей позиции файла.
 
-    Все Inno 6.x/7.x хранят сериализованный заголовок внутри LZMA1-блока
-    (TCompressedBlockReader): u32 CRC заголовка + TCompressedBlockHeader
-    {stored_size, compressed} + stored_size байт. До 6.6 включительно
+    У каждого блока на диске лежат CRC заголовка, TCompressedBlockHeader
+    {stored_size, compressed} и stored_size байт. До 6.6 включительно
     stored_size — u32 (заголовок блока 9 байт), с 6.7.0 — Int64 (13 байт).
-    Хранимый поток всегда разбит на порции до 4096 байт, каждая со своим
-    u32 CRC32 (TCompressedBlockWriter.FlushOutputBuffer) — эти CRC стоят
-    ВНУТРИ сжатого потока, до LZMA-декомпрессии: сначала снимаем CRC
-    порций, и только потом, если compressed, разжимаем LZMA1 (5 байт
-    свойств + raw). Распакованное — и есть сериализованный заголовок.
+    Хранимый поток разбит на порции до 4096 байт, каждая со своим u32 CRC32;
+    сначала снимаем CRC порций, и только потом при необходимости разжимаем
+    LZMA1 (5 байт свойств + raw). Второй блок Setup0 может быть пустым, если
+    установщик не содержит записей file-location.
     """
     _crc = reader.u32()
     if version >= (6, 7, 0, 0):
@@ -423,9 +421,11 @@ def _read_block_stream(reader: _Reader, version: Tuple[int, int, int, int]) -> b
         stream += stored[pos:pos + take]
         pos += take
     if not stream:
+        if allow_empty:
+            return b""
         raise InnoError("сжатый блок заголовка Inno пуст")
     blob = _lzma1_decompress(bytes(stream)) if compressed else bytes(stream)
-    if not blob:
+    if not blob and not allow_empty:
         raise InnoError("сжатый блок заголовка Inno пуст")
     return blob
 
@@ -450,6 +450,11 @@ def parse_header(fh, header_offset: int,
     blob = _read_block_stream(reader, version)
     info(f"Inno Setup: блок заголовка разжат, байт: {len(blob)}, "
          f"первые 16: {blob[:16].hex()}")
+    # Список TSetupFileLocationEntry — отдельный сжатый блок сразу после
+    # основного блока заголовка (Setup0). Он не входит в blob с языками,
+    # файлами и прочими метаданными.
+    locations_blob = _read_block_stream(reader, version, allow_empty=True)
+    info(f"Inno Setup: блок размещения файлов разжат, байт: {len(locations_blob)}")
     # Основная раскладка — по версии из сигнатуры; если она не сходится
     # (например, у repack-версии строка версии не совпала с реальной
     # раскладкой), пробуем соседние группы формата 6.x/7.x.
@@ -458,14 +463,19 @@ def parse_header(fh, header_offset: int,
     failures: List[str] = []
     for candidate in order:
         br = _Reader(io.BytesIO(blob))
+        lr = _Reader(io.BytesIO(locations_blob))
         try:
             parsed = _parse_blob(br, version, candidate)
+            _parse_location_entries(lr, version, candidate, parsed,
+                                    len(locations_blob))
         except InnoError as exc:
-            failures.append(f"{candidate}: {exc} (на позиции {br.tell()} из {len(blob)})")
+            failures.append(
+                f"{candidate}: {exc} (заголовок {br.tell()} из {len(blob)}, "
+                f"размещения {lr.tell()} из {len(locations_blob)})")
             continue
         if parsed.files or candidate == order[-1]:
             info(f"Inno Setup: раскладка заголовка сошлась как {candidate}, "
-                 f"файлов: {len(parsed.files)}")
+                 f"файлов: {len(parsed.files)}, размещений: {len(parsed.data_entries)}")
             return parsed
     # зонд: счётчики записей сразу после строк заголовка (для диагностики)
     probe = _probe_counts(blob, group)
@@ -507,6 +517,60 @@ def _parse_blob(reader: _Reader, version: Tuple[int, int, int, int], group: str)
     return _parse_blob_modern(reader, version, group, header)
 
 
+def _parse_location_entries(reader: _Reader,
+                            version: Tuple[int, int, int, int],
+                            group: str, header: _Header,
+                            blob_size: int) -> None:
+    """Читает записи TSetupFileLocationEntry из второго блока Inno.
+
+    В первом compressed block Setup0 лежат заголовок и обычные записи; список
+    размещения файлов записан отдельным блоком. Счётчик находится в первом
+    блоке, а сами записи — во втором.
+    """
+    count = header.data_entry_count
+    if group == "le64":
+        v630 = version >= (6, 3, 0, 0)
+        v640 = version >= (6, 4, 0, 0)
+        for _ in range(count):
+            first_slice = reader.u32()
+            reader.u32()             # last_slice
+            sort_offset = reader.u32()
+            file_offset = reader.u64()
+            file_size = reader.u64()
+            chunk_size = reader.u64()
+            reader.read(32 if v640 else 20)  # SHA256/SHA1
+            reader.i64()             # source timestamp
+            reader.u32()             # file_version_ms
+            reader.u32()             # file_version_ls
+            options = reader.flags(9)
+            if v630:
+                reader.enum()        # sign
+            header.data_entries.append(_DataEntry(
+                first_slice, sort_offset, file_offset, file_size, chunk_size,
+                options))
+    else:
+        for _ in range(count):
+            first_slice = reader.u32()
+            reader.u32()             # last_slice
+            sort_offset = reader.u32() if group == "v650" else reader.u64()
+            file_offset = reader.u64()
+            file_size = reader.u64()
+            chunk_size = reader.u64()
+            reader.read(32)          # SHA256Sum
+            reader.i64()             # source timestamp
+            reader.u32()             # file_version_ms
+            reader.u32()             # file_version_ls
+            options = reader.flags(5)
+            header.data_entries.append(_DataEntry(
+                first_slice, sort_offset, file_offset, file_size, chunk_size,
+                options))
+
+    if reader.tell() != blob_size:
+        raise InnoError(
+            f"лишние байты в блоке размещения файлов Inno "
+            f"(позиция {reader.tell()} из {blob_size})")
+
+
 def _parse_blob_le64(reader: _Reader, version: Tuple[int, int, int, int],
                      header: _Header) -> _Header:
     """Заголовок формата данных 6.0.0–6.4.0.1 (раскладка по innoextract)."""
@@ -545,6 +609,7 @@ def _parse_blob_le64(reader: _Reader, version: Tuple[int, int, int, int],
 
     if max(language_count, file_count, data_count, registry_count) > 1_000_000:
         raise InnoError("счётчики записей в заголовке Inno нереальные — файл повреждён?")
+    header.data_entry_count = data_count
 
     reader.winver()
     if not v6401:
@@ -573,7 +638,7 @@ def _parse_blob_le64(reader: _Reader, version: Tuple[int, int, int, int],
     reader.u64()           # uninstall_display_size
     reader.flags(44 if v630 else 43)   # options
 
-    # --- записи: сначала все «метаданные», затем files и data entries ---
+    # --- записи первого блока: сначала метаданные, затем file entries ---
     for _ in range(language_count):
         reader.ustring()   # name
         reader.ustring()   # language_name
@@ -687,24 +752,7 @@ def _parse_blob_le64(reader: _Reader, version: Tuple[int, int, int, int],
         reader.enum()      # wait
         reader.flags(12 if v630 else (11 if v610 else 10))
 
-    # --- data entries (file location): ссылки файлов на chanки ---
-    for _ in range(data_count):
-        first_slice = reader.u32()
-        _last_slice = reader.u32()
-        sort_offset = reader.u32()
-        file_offset = reader.u64()
-        file_size = reader.u64()
-        chunk_size = reader.u64()
-        reader.read(32 if v640 else 20)   # SHA256/SHA1 файлового хеша
-        reader.i64()       # filetime
-        reader.u32()       # file_version_ms
-        reader.u32()       # file_version_ls
-        options = reader.flags(9)
-        if v630:
-            reader.enum()  # sign
-        header.data_entries.append(_DataEntry(
-            first_slice, sort_offset, file_offset, file_size, chunk_size, options))
-
+    # File-location records находятся в следующем compressed block, не здесь.
     return header
 
 
@@ -736,6 +784,7 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
 
     if max(language_count, file_count, _data_count, registry_count) > 1_000_000:
         raise InnoError("счётчики записей в заголовке Inno нереальные — файл повреждён?")
+    header.data_entry_count = _data_count
 
     # --- «сырые» поля заголовка ---
     reader.winver()
@@ -903,22 +952,7 @@ def _parse_blob_modern(reader: _Reader, version: Tuple[int, int, int, int],
         reader.enum()           # wait
         reader.flags(12)
 
-    # --- data entries (file location): ссылки файлов на chanки — в самом конце ---
-    for _ in range(_data_count):
-        first_slice = reader.u32()
-        _last_slice = reader.u32()
-        sort_offset = reader.u32() if group == "v650" else reader.u64()
-        file_offset = reader.u64()
-        file_size = reader.u64()
-        chunk_size = reader.u64()
-        reader.read(32)         # SHA256Sum
-        reader.i64()            # time stamp
-        reader.u32()            # file_version_ms
-        reader.u32()            # file_version_ls
-        options = reader.flags(5)
-        header.data_entries.append(_DataEntry(
-            first_slice, sort_offset, file_offset, file_size, chunk_size, options))
-
+    # File-location records находятся в следующем compressed block, не здесь.
     return header
 
 
