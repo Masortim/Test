@@ -6215,7 +6215,7 @@ def _pycharm64_fallback_candidate(
         target_path.relative_to(portable_root)
     except (OSError, ValueError):
         return None
-    candidate = target_path.with_name("pycharm64.exe")
+    candidate = target.with_name("pycharm64.exe")
     try:
         if not candidate.is_file():
             return None
