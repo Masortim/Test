@@ -5,6 +5,7 @@ on:
   push:
     branches: [ "arena/**" ]
     paths:
+      - ".gitattributes"
       - "portablizer/**"
       - "app.py"
       - "portablizer.spec"
