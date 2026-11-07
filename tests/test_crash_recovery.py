@@ -534,6 +534,47 @@ class UnpackerFallbackTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("не дала файлов программы", engine._unpacker_result)
 
+    def test_tar_uses_native_arguments_and_next_extractor_has_clean_stage(self):
+        engine = Portablizer(Logger())
+        extractors = [unpacker_mod.Extractor(unpacker_mod.STYLE_TAR, "tar.exe"),
+                      unpacker_mod.Extractor(unpacker_mod.STYLE_7ZIP, "7z.exe")]
+        commands = []
+
+        def run(cmd, console_log, opts):
+            commands.append(cmd)
+            if cmd[0] == "tar.exe":
+                self.assertEqual(cmd[1:4], ["-x", "-f", self.installer])
+                self.assertEqual(cmd[4], "-C")
+                _touch(cmd[5], "partial.exe", "partial")
+                return 1, "bad archive"
+            target = next(arg[2:] for arg in cmd if arg.startswith("-o"))
+            self.assertFalse(os.path.exists(os.path.join(target, "partial.exe")))
+            _touch(target, "{app}/Hatred.exe", "program")
+            return 0, "ok"
+
+        with mock.patch.object(unpacker_mod, "find_extractors", return_value=extractors), \
+             mock.patch.object(engine, "_run_unpacker_command", side_effect=run):
+            self.assertTrue(engine._try_unpacker_fallback(
+                self.opts, self.app, self.portable, self.det, "Hatred"))
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(os.path.isfile(os.path.join(self.app, "Hatred.exe")))
+        self.assertFalse(os.path.exists(os.path.join(self.app, "partial.exe")))
+        self.assertFalse(os.path.exists(os.path.join(self.portable, "_unpacked_app")))
+
+    def test_tar_failure_suggests_full_7zip_and_keeps_app_clean(self):
+        engine = Portablizer(Logger())
+        def run(cmd, console_log, opts):
+            _touch(cmd[-1], "partial.exe", "partial")
+            return 1, "unsupported format"
+        with mock.patch.object(unpacker_mod, "find_extractors", return_value=[
+                unpacker_mod.Extractor(unpacker_mod.STYLE_TAR, "tar.exe")]), \
+             mock.patch.object(engine, "_run_unpacker_command", side_effect=run):
+            self.assertFalse(engine._try_unpacker_fallback(
+                self.opts, self.app, self.portable, self.det, "Hatred"))
+        self.assertIn("7-Zip", engine._unpacker_result)
+        self.assertIn("unsupported format", engine._unpacker_result)
+        self.assertFalse(os.path.exists(os.path.join(self.app, "partial.exe")))
+
     def _stuck_run(self, deadline: float):
         """Прогон распаковщика, который запустился и не завершается.
 
