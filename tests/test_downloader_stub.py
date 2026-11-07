@@ -60,6 +60,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from portablizer.core import detect as detect_mod
 from portablizer.core import portablizer as engine_mod
 from portablizer.core import space as space_mod
+from portablizer.core import unpacker as unpacker_mod
 from portablizer.core.detect import (
     DOWNLOADER_STUB_MAX_BYTES, DetectionResult, InstallerType, detect_installer,
 )
@@ -540,8 +541,10 @@ class DownloaderHintsTests(unittest.TestCase):
     def test_unpacker_is_not_offered_for_a_known_downloader(self):
         """Распаковка нашла бы сам загрузчик — и выдала бы его за программу."""
         engine = Portablizer(Logger())
-        with mock.patch.object(engine_mod.unpacker_mod, "find_unpacker",
-                               return_value="C:\\7-Zip\\7z.exe") as found:
+        with mock.patch.object(engine_mod.unpacker_mod, "find_extractors",
+                               return_value=[unpacker_mod.Extractor(
+                                   unpacker_mod.STYLE_7ZIP,
+                                   "C:\\7-Zip\\7z.exe")]) as found:
             outcome = engine._try_unpacker_fallback(
                 self.opts, self.app, self.portable, self.det, "Fusion")
         self.assertFalse(outcome)
