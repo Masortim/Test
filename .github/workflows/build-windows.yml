@@ -560,7 +560,8 @@ jobs:
             $arguments = 'build "' + $installer + '" --out "' +
               (Join-Path $root "out") + '" --name OpenCode --single-file --no-registry ' +
               '--no-netstack --hard-timeout 180'
-            $builder = Start-Process -FilePath (Resolve-Path "dist-windows/Portablizer.exe").Path `
+            # Test the EXE built in this job, not the previous branch artifact.
+            $builder = Start-Process -FilePath (Resolve-Path "dist/Portablizer.exe").Path `
               -ArgumentList $arguments -PassThru
             if (-not $builder.WaitForExit(600000)) {
               $builder.Kill()
