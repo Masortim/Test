@@ -423,6 +423,7 @@ def unpack_installer(unpacker: str, installer: str, destination: str,
                              installer_path=installer_path or installer)
     if copied == 0:
         return False, ("внутри установщика не нашлось файлов программы "
-                       "(возможно, это не самораспаковывающийся архив или "
-                       "упаковка, которую распаковщик не читает)")
+                       "(возможно, это не самораспаковывающийся архив, "
+                       "установщик JetBrains (PyCharm) или упаковка, "
+                       "которую распаковщик не читает)")
     return True, f"перенесено файлов: {copied}"
