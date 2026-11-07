@@ -540,8 +540,10 @@ class DownloaderHintsTests(unittest.TestCase):
     def test_unpacker_is_not_offered_for_a_known_downloader(self):
         """Распаковка нашла бы сам загрузчик — и выдала бы его за программу."""
         engine = Portablizer(Logger())
-        with mock.patch.object(engine_mod.unpacker_mod, "find_unpacker",
-                               return_value="C:\\7-Zip\\7z.exe") as found:
+        with mock.patch.object(engine_mod.unpacker_mod, "find_extractors",
+                               return_value=[unpacker_mod.Extractor(
+                                   unpacker_mod.STYLE_7ZIP,
+                                   "C:\\7-Zip\\7z.exe")]) as found:
             outcome = engine._try_unpacker_fallback(
                 self.opts, self.app, self.portable, self.det, "Fusion")
         self.assertFalse(outcome)

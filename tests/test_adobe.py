@@ -737,7 +737,10 @@ class AdobeBuildTests(unittest.TestCase):
         det = DetectionResult(InstallerType.SELF_EXTRACT, 0.8,
                               adobe_named=True, has_zip_payload=True)
         engine._adobe_detected = True
-        with mock.patch.object(unpacker_mod, "find_unpacker",
+        with mock.patch.object(unpacker_mod, "find_extractors",
+                               return_value=[unpacker_mod.Extractor(
+                                   unpacker_mod.STYLE_7ZIP, "7z.exe")]), \
+                mock.patch.object(unpacker_mod, "find_unpacker",
                                return_value="7z.exe"):
             self.assertFalse(engine._try_unpacker_fallback(
                 self.opts, self.app, self.portable, det, "Adobe XD"))

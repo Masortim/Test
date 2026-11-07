@@ -375,6 +375,8 @@ class FlowTests(BaseCase):
                                side_effect=fake_extract), \
                 mock.patch.object(self.engine, "_run_install",
                                   return_value=0), \
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=[]), \
                 mock.patch.object(unpacker_mod, "find_unpacker",
                                   return_value=None):
             result = self.engine._run_container_first(
@@ -409,6 +411,9 @@ class FlowTests(BaseCase):
                                side_effect=fake_extract), \
                 mock.patch.object(self.engine, "_run_install",
                                   return_value=0), \
+                mock.patch.object(unpacker_mod, "find_extractors",
+                                  return_value=[unpacker_mod.Extractor(
+                                      unpacker_mod.STYLE_7ZIP, "7z.exe")]), \
                 mock.patch.object(unpacker_mod, "find_unpacker",
                                   return_value="7z.exe"), \
                 mock.patch.object(unpacker_mod, "unpack_installer",
