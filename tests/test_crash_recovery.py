@@ -473,8 +473,9 @@ class UnpackerFallbackTests(unittest.TestCase):
             _touch(target, os.path.join("{tmp}", "setup.tmp"), "tmp")
             return 0, "Everything is Ok"
 
-        with mock.patch.object(unpacker_mod, "find_unpacker",
-                               return_value="/usr/bin/7z"), \
+        with mock.patch.object(unpacker_mod, "find_extractors",
+                               return_value=[unpacker_mod.Extractor(
+                                   unpacker_mod.STYLE_7ZIP, "/usr/bin/7z")]), \
                 mock.patch.object(engine, "_run_unpacker_command",
                                   side_effect=fake_unpacker):
             ok = engine._try_unpacker_fallback(self.opts, self.app,
@@ -492,20 +493,25 @@ class UnpackerFallbackTests(unittest.TestCase):
 
     def test_missing_unpacker_is_not_a_failure_but_a_fact(self):
         engine = Portablizer(Logger())
-        with mock.patch.object(unpacker_mod, "find_unpacker",
+        # Эмулируем, что find_extractors() ничего не нашла,
+        # и find_unpacker() (запасной вариант) тоже пустой.
+        with mock.patch.object(unpacker_mod, "find_extractors",
+                               return_value=[]), \
+                mock.patch.object(unpacker_mod, "find_unpacker",
                                return_value=""):
             ok = engine._try_unpacker_fallback(self.opts, self.app,
                                                self.portable, self.det, "Hatred")
         self.assertFalse(ok)
         self.assertEqual(engine._unpacked_with, "")
-        self.assertIn("7-Zip", engine.log.text)
+        self.assertIn("Распаковщик на этом компьютере не найден",
+                      engine.log.text)
 
     def test_unpackable_engines_only(self):
         engine = Portablizer(Logger())
         for itype in (InstallerType.MSI, InstallerType.WIX_BURN,
                       InstallerType.INSTALLSHIELD):
             det = DetectionResult(installer_type=itype, confidence=95)
-            with mock.patch.object(unpacker_mod, "find_unpacker") as finder:
+            with mock.patch.object(unpacker_mod, "find_extractors") as finder:
                 self.assertFalse(engine._try_unpacker_fallback(
                     self.opts, self.app, self.portable, det, "Hatred"))
                 finder.assert_not_called()
@@ -518,8 +524,9 @@ class UnpackerFallbackTests(unittest.TestCase):
             _touch(target, os.path.join("{tmp}", "setup.tmp"), "tmp")
             return 0, ""
 
-        with mock.patch.object(unpacker_mod, "find_unpacker",
-                               return_value="/usr/bin/7z"), \
+        with mock.patch.object(unpacker_mod, "find_extractors",
+                               return_value=[unpacker_mod.Extractor(
+                                   unpacker_mod.STYLE_7ZIP, "/usr/bin/7z")]), \
                 mock.patch.object(engine, "_run_unpacker_command",
                                   side_effect=fake_unpacker):
             ok = engine._try_unpacker_fallback(self.opts, self.app,
