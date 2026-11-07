@@ -45,30 +45,31 @@ def _winver() -> bytes:
 
 
 def _encode_call_instructions(data: bytearray, addr_offset: int = 0) -> None:
-    """Encode=True из Compression.Base.pas (как делает компилятор Inno)."""
+    """Encode=True из Compression.Base.pas по тем же блокам, что и Inno."""
     size = len(data)
-    if size < 5:
-        return
-    i = 0
-    limit = size - 4
-    while i < limit:
-        op = data[i]
-        if op in (0xE8, 0xE9):
-            hi = data[i + 4]
-            if hi in (0x00, 0xFF):
-                addr = (addr_offset + i + 5) & 0xFFFFFF
-                rel = data[i + 1] | (data[i + 2] << 8) | (data[i + 3] << 16)
-                # как в Compression.Base.pas: сначала проверка bit23 и
-                # инверсия старшего байта, потом прибавление адреса (Encode)
-                if rel & 0x800000:
-                    data[i + 4] = (~hi) & 0xFF
-                rel = (rel + addr) & 0xFFFFFFFF
-                data[i + 1] = rel & 0xFF
-                data[i + 2] = (rel >> 8) & 0xFF
-                data[i + 3] = (rel >> 16) & 0xFF
-                i += 5
-                continue
-        i += 1
+    block_size = inno_mod._TRANSFORM_BLOCK
+    for block_start in range(0, size, block_size):
+        block_end = min(size, block_start + block_size)
+        i = block_start
+        limit = block_end - 4
+        while i < limit:
+            op = data[i]
+            if op in (0xE8, 0xE9):
+                hi = data[i + 4]
+                if hi in (0x00, 0xFF):
+                    addr = (addr_offset + i + 5) & 0xFFFFFF
+                    rel = data[i + 1] | (data[i + 2] << 8) | (data[i + 3] << 16)
+                    # как в Compression.Base.pas: сначала проверка bit23 и
+                    # инверсия старшего байта, потом прибавление адреса (Encode)
+                    if rel & 0x800000:
+                        data[i + 4] = (~hi) & 0xFF
+                    rel = (rel + addr) & 0xFFFFFFFF
+                    data[i + 1] = rel & 0xFF
+                    data[i + 2] = (rel >> 8) & 0xFF
+                    data[i + 3] = (rel >> 16) & 0xFF
+                    i += 5
+                    continue
+            i += 1
 
 
 def _lzma1_compress(raw: bytes) -> bytes:
