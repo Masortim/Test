@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from portablizer.core import unpacker
+from portablizer.core import unpacker, inno_log
 from portablizer.core.detect import DetectionResult, InstallerType
 from portablizer.core.silentargs import build_attempts
 
@@ -68,6 +68,31 @@ class WindowsBundled7ZipTests(unittest.TestCase):
                                                      accept_warnings=False)
             self.assertTrue(ok, message)
             self.assertEqual((app / 'Example.exe').read_text(), 'test payload')
+
+    def test_real_inno_suppressed_file_error_returns_five_and_is_reported(self):
+        compiler = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+                        'Inno Setup 6', 'ISCC.exe')
+        if not compiler.is_file():
+            self.skipTest('Inno Setup 6 compiler is not installed')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'Example.txt').write_text('fixture', encoding='ascii')
+            script = root / 'test.iss'
+            script.write_text('''[Setup]\nAppName=Example\nAppVersion=1.0\nDefaultDirName={autopf}\\Example\nOutputBaseFilename=fixture\nPrivilegesRequired=lowest\nUninstallable=no\nCreateUninstallRegKey=no\n[Files]\nSource: "Example.txt"; DestDir: "{app}"\n''', encoding='ascii')
+            compiled = subprocess.run([str(compiler), '/Q', str(script)], capture_output=True, timeout=120)
+            self.assertEqual(compiled.returncode, 0, compiled.stdout.decode(errors='replace'))
+            app = root / 'app'
+            app.mkdir()
+            (app / 'Example.txt').mkdir()  # a directory cannot be overwritten by a file
+            log = root / 'install.log'
+            proc = subprocess.run([str(root / 'Output/fixture.exe'), '/VERYSILENT',
+                                   '/SUPPRESSMSGBOXES', '/NORESTART', '/NOICONS',
+                                   f'/DIR={app}', f'/LOG={log}'], timeout=120)
+            self.assertEqual(proc.returncode, 5, log.read_text(encoding='utf-8-sig', errors='replace'))
+            detail = inno_log.read_dialog(str(log))
+            self.assertIsNotNone(detail, log.read_text(encoding='utf-8-sig', errors='replace'))
+            self.assertTrue(detail.suppressed)
+            self.assertIn('Example.txt', detail.text)
 
     def test_real_inno_installer_is_extracted_or_honestly_rejected(self):
         compiler = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
