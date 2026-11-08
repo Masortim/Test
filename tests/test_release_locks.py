@@ -396,6 +396,118 @@ class ScanPrivilegeTests(unittest.TestCase):
             text = report_file.read_text(encoding='ascii', errors='replace')
             self.assertIn('explorer.exe (pid 4321): locked.db', text)
 
+    def test_remove_path_cleans_readonly_pycharm_directory_and_files(self):
+        from portablizer.core import portablizer as pb
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, 'PyCharm_Portable')
+            app = portable / 'App'
+            pycharm_dir = app / 'PyCharm2025.2'
+            bin_dir = pycharm_dir / 'bin'
+            bin_dir.mkdir(parents=True)
+            data = portable / 'PortableData'
+            data.mkdir()
+            exe = bin_dir / 'pycharm64.exe'
+            exe.write_bytes(b'MZfake')
+            ini = pycharm_dir / 'desktop.ini'
+            ini.write_text('[.ShellClassInfo]\nIconResource=bin\\pycharm64.exe,0\n')
+            os.chmod(exe, 0o444)
+            os.chmod(ini, 0o444)
+            os.chmod(bin_dir, 0o555)
+            os.chmod(pycharm_dir, 0o555)
+            os.chmod(app, 0o555)
+            try:
+                engine = pb.Portablizer(Logger())
+                engine._prepare_output(str(portable), str(app), str(data))
+                self.assertTrue(app.is_dir())
+                self.assertEqual(list(app.iterdir()), [])
+            finally:
+                for p in (app, pycharm_dir, bin_dir, exe, ini):
+                    if p.exists():
+                        try:
+                            os.chmod(p, 0o700)
+                        except OSError:
+                            pass
+
+    def test_clean_app_dir_names_holder_without_requesting_uac(self):
+        from portablizer.core import portablizer as pb
+
+        engine = pb.Portablizer(Logger())
+        perm = PermissionError(
+            5, 'Отказано в доступе', r'E:\Portable\PyCharm_Portable\App\PyCharm2025.2'
+        )
+        perm.winerror = 5
+        holder = procutil.Holder(
+            5412, r'C:\Windows\explorer.exe', 'file',
+            r'E:\Portable\PyCharm_Portable\App\PyCharm2025.2',
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, 'PyCharm_Portable')
+            app = portable / 'App'
+            app.mkdir(parents=True)
+            with mock.patch.object(pb, 'IS_WINDOWS', True), \
+                 mock.patch.object(engine, '_remove_path', side_effect=perm), \
+                 mock.patch.object(procutil, 'busy_files', return_value=[]), \
+                 mock.patch.object(procutil, 'holders', return_value=[holder]), \
+                 mock.patch.object(engine, '_elevated_reclaim_dir',
+                                   side_effect=AssertionError('must not prompt UAC when held')):
+                with self.assertRaises(RuntimeError) as caught:
+                    engine._clean_app_dir(str(portable), str(app))
+            msg = str(caught.exception)
+            self.assertIn('5412', msg)
+            self.assertIn('PyCharm2025.2', msg)
+
+    def test_clean_app_dir_reclaims_elevated_leftovers_once_via_uac(self):
+        from portablizer.core import elevate as elevate_mod
+        from portablizer.core import portablizer as pb
+
+        engine = pb.Portablizer(Logger())
+        self.assertFalse(engine._can_reclaim_portable_dir(''))
+        if os.name == 'nt':
+            self.assertFalse(engine._can_reclaim_portable_dir('E:\\'))
+            self.assertFalse(engine._can_reclaim_portable_dir(r'C:\Windows'))
+            self.assertFalse(engine._can_reclaim_portable_dir(r'C:\Users'))
+
+        with tempfile.TemporaryDirectory() as temp:
+            portable = Path(temp, 'PyCharm_Portable')
+            app = portable / 'App'
+            (app / 'PyCharm2025.2').mkdir(parents=True)
+            perm = PermissionError(
+                5, 'Отказано в доступе', str(app / 'PyCharm2025.2')
+            )
+            perm.winerror = 5
+            calls = {'rm': 0, 'runas': 0}
+            real_remove = engine._remove_path
+
+            def flaky_rm(path, attempts=4):
+                calls['rm'] += 1
+                if calls['rm'] == 1:
+                    raise perm
+                return real_remove(path, attempts=attempts)
+
+            def fake_runas(program, args, directory=''):
+                calls['runas'] += 1
+                cfg = Path(args[-1]).read_text(encoding='utf-8').splitlines()
+                self.assertEqual(cfg[0], 'S-1-5-21-111-222-333-1001')
+                self.assertEqual(cfg[1], os.path.abspath(str(portable)))
+                Path(cfg[2]).write_text('ok', encoding='ascii')
+                return 42
+
+            with mock.patch.object(pb, 'IS_WINDOWS', True), \
+                 mock.patch.object(pb, 'is_elevated', return_value=False), \
+                 mock.patch.object(elevate_mod, 'elevation_disabled', return_value=False), \
+                 mock.patch.object(elevate_mod, '_shell_execute_runas', side_effect=fake_runas), \
+                 mock.patch.object(filelocks, 'current_user_sid_string',
+                                   return_value='S-1-5-21-111-222-333-1001'), \
+                 mock.patch.object(engine, '_remove_path', side_effect=flaky_rm), \
+                 mock.patch.object(procutil, 'busy_files', return_value=[]), \
+                 mock.patch.object(procutil, 'holders', return_value=[]):
+                engine._clean_app_dir(str(portable), str(app))
+
+            self.assertEqual(calls['runas'], 1)
+            self.assertEqual(calls['rm'], 2)
+            self.assertFalse(app.exists())
+
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows actual handle test')
 class WindowsFileOwnerTests(unittest.TestCase):
@@ -604,6 +716,61 @@ k.CloseHandle(ctypes.c_void_p(h))
                     ['icacls', str(vault), '/remove:d', '*S-1-1-0'],
                     capture_output=True,
                 )
+
+    def test_prepare_output_removes_readonly_and_acl_restricted_pycharm_app_dir(self):
+        import subprocess
+        from portablizer.core import portablizer as pb
+
+        sid = filelocks.current_user_sid_string()
+        self.assertRegex(sid, r'^S-1-\d+(?:-\d+)+$')
+
+        with tempfile.TemporaryDirectory(prefix='portable pycharm ro ', ignore_cleanup_errors=True) as temp:
+            portable = Path(temp, 'PyCharm_Portable')
+            app = portable / 'App'
+            pycharm_dir = app / 'PyCharm2025.2'
+            bin_dir = pycharm_dir / 'bin'
+            locked_acl = pycharm_dir / 'acl_locked'
+            bin_dir.mkdir(parents=True)
+            locked_acl.mkdir(parents=True)
+            data = portable / 'PortableData'
+            data.mkdir()
+
+            exe = bin_dir / 'pycharm64.exe'
+            exe.write_bytes(b'MZfake')
+            ini = pycharm_dir / 'desktop.ini'
+            ini.write_text('[.ShellClassInfo]\nIconResource=bin\\pycharm64.exe,0\n')
+            cfg = locked_acl / 'options.xml'
+            cfg.write_text('<application/>')
+
+            try:
+                # Reproduce exact Inno Setup custom-icon folder (+R on directory!)
+                # and restrictive owned DACL inside App\PyCharm2025.2.
+                subprocess.run(['attrib', '+R', str(exe)], check=True, capture_output=True)
+                subprocess.run(['attrib', '+R', '+S', '+H', str(ini)], check=True, capture_output=True)
+                subprocess.run(['attrib', '+R', str(pycharm_dir)], check=True, capture_output=True)
+                subprocess.run(
+                    ['icacls', str(locked_acl), '/deny', '*S-1-1-0:(DE,DC,S,RD)'],
+                    check=True, capture_output=True,
+                )
+                with self.assertRaises(PermissionError):
+                    os.listdir(locked_acl)
+
+                # Simulate unelevated user (no backup/restore/take-ownership privileges).
+                with mock.patch.object(filelocks, '_set_privilege', return_value=False), \
+                     mock.patch.object(procutil, 'release_folder', return_value=[]):
+                    engine = pb.Portablizer(Logger())
+                    engine._prepare_output(str(portable), str(app), str(data))
+
+                self.assertTrue(app.is_dir())
+                self.assertEqual(list(app.iterdir()), [])
+                self.assertTrue(filelocks.ensure_user_dir_access(str(portable)))
+                # Second call hits fast-path idempotence check.
+                self.assertTrue(filelocks.ensure_user_dir_access(str(portable)))
+            finally:
+                subprocess.run(['attrib', '-R', '-S', '-H', str(ini)], capture_output=True)
+                subprocess.run(['attrib', '-R', str(exe)], capture_output=True)
+                subprocess.run(['attrib', '-R', str(pycharm_dir)], capture_output=True)
+                subprocess.run(['icacls', str(locked_acl), '/remove:d', '*S-1-1-0'], capture_output=True)
 
 
 if __name__ == '__main__':

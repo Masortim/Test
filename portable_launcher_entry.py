@@ -6935,7 +6935,10 @@ def _remove_tree(path: Path) -> bool:
                     dirs.remove(name)
     except OSError:
         pass
-    shutil.rmtree(path, ignore_errors=True)
+    shutil.rmtree(
+        path,
+        onerror=filelocks.make_rmtree_onerror(stop_at=str(path), swallow=True),
+    )
     return not path.exists()
 
 
@@ -8291,9 +8294,18 @@ def purge_portable_temp(root: Path, cfg: "Optional[Dict[str, Any]]" = None
                 if _is_junction(entry):
                     _remove_junction(entry)
                 elif entry.is_dir() and not entry.is_symlink():
-                    shutil.rmtree(entry, ignore_errors=True)
+                    shutil.rmtree(
+                        entry,
+                        onerror=filelocks.make_rmtree_onerror(
+                            stop_at=str(entry), swallow=True
+                        ),
+                    )
                 else:
-                    entry.unlink()
+                    try:
+                        entry.unlink()
+                    except PermissionError:
+                        filelocks.clear_readonly(str(entry))
+                        entry.unlink()
                 removed += 1
             except OSError:
                 continue
@@ -10145,12 +10157,18 @@ def install_commands(installer: Path, target_dir: Path, engine: str,
 
 def _clear_dir(path: Path) -> None:
     if path.is_dir():
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(
+            path,
+            onerror=filelocks.make_rmtree_onerror(stop_at=str(path), swallow=True),
+        )
     if path.is_dir():  # антивирус мог держать файл: вторая попытка
         import time
 
         time.sleep(1.0)
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(
+            path,
+            onerror=filelocks.make_rmtree_onerror(stop_at=str(path), swallow=True),
+        )
 
 
 def _app_relative_target(cfg: Dict[str, Any]) -> str:
@@ -12644,8 +12662,11 @@ def _rollback_journal(root: Path, journal: "Dict[str, Any]") -> "list[str]":
         path = app_dir / name
         try:
             if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
+                shutil.rmtree(
+                    path, onerror=filelocks.make_rmtree_onerror(stop_at=str(path))
+                )
             elif path.exists():
+                filelocks.clear_readonly(str(path))
                 path.unlink()
         except OSError as exc:
             problems.append(f"{name}: {exc}")
@@ -12656,8 +12677,11 @@ def _rollback_journal(root: Path, journal: "Dict[str, Any]") -> "list[str]":
         path = app_dir / name
         try:
             if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
+                shutil.rmtree(
+                    path, onerror=filelocks.make_rmtree_onerror(stop_at=str(path))
+                )
             elif path.exists():
+                filelocks.clear_readonly(str(path))
                 path.unlink()
             _move_with_retry(saved, path)
         except OSError as exc:
