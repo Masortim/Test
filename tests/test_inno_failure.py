@@ -56,6 +56,34 @@ class InnoFailureTests(unittest.TestCase):
             self.assertFalse(detail.suppressed)
             self.assertEqual(detail.text, 'Ошибка записи')
 
+    def test_long_path_diagnostic_requires_206_or_its_message(self):
+        engine = Portablizer(Logger())
+        det = DetectionResult(installer_type=InstallerType.INNO, confidence=1.0)
+        opts = PortableOptions(installer_path="setup.exe", output_dir="portable")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, 'install.log')
+            path.write_text('Error 3: The system cannot find the path specified.', encoding='utf-8')
+            self.assertFalse(inno_log.has_long_path_error(str(path)))
+            self.assertNotIn('ошибка Windows 206', ' '.join(engine._failure_hints(det, 5, opts, temp)))
+            for text in ('Error 206: The filename or extension is too long',
+                         'Ошибка 206: Имя файла или его расширение имеет слишком большую длину'):
+                path.write_text(text, encoding='utf-16')
+                self.assertTrue(inno_log.has_long_path_error(str(path)))
+                self.assertIn('ошибка Windows 206', ' '.join(engine._failure_hints(det, 5, opts, temp)))
+
+    def test_ignore_only_counts_for_explicit_error_dialog(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, 'install.log')
+            for choice, expected in [('Ignore', True), ('Retry', False), ('Abort', False)]:
+                path.write_text('[10:00:00.000] Message box (Abort/Retry/Ignore):\n'
+                                'Ошибка 206\n[10:00:01.000] User chose ' + choice + '.\n', encoding='utf-8')
+                self.assertEqual(inno_log.has_ignored_error(str(path)), expected)
+            path.write_text('[10:00:00.000] Existing file is a newer version. Skipping.\n', encoding='utf-8')
+            self.assertFalse(inno_log.has_ignored_error(str(path)))
+            path.write_text('[10:00:00.000] Message box (Yes/No):\n'
+                            'Question\n[10:00:01.000] User chose Ignore.\n', encoding='utf-8')
+            self.assertFalse(inno_log.has_ignored_error(str(path)))
+
     def test_preparation_failure(self):
         hint = _exit_code_hint(7, InstallerType.INNO)
         self.assertIn("подготовка", hint)

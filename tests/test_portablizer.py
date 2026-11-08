@@ -3096,6 +3096,59 @@ class FailureDiagnosticsTests(unittest.TestCase):
             self.assertFalse(Path(result.portable_dir, "Launch.bat").exists())
             self.assertIn("могут быть неполными", " ".join(result.messages))
 
+    def test_inno_ignore_with_success_code_does_not_create_launcher(self):
+        class SkippingInstaller(Portablizer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = 0
+
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.calls += 1
+                Path(app_dir, "Example.exe").write_bytes(b"MZ partial")
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = os.path.join(temp, "Setup.exe")
+            _fake_pe(installer, [".text", ".rsrc"], b"This installation was built with Inno Setup")
+            engine = SkippingInstaller(Logger())
+            with mock.patch('portablizer.core.inno_log.has_ignored_error', return_value=True):
+                result = engine.run(PortableOptions(
+                    installer_path=installer, output_dir=temp, app_name="Example",
+                    capture_registry=False, cleanup_host=False))
+            self.assertFalse(result.success)
+            self.assertEqual(engine.calls, 1)
+            self.assertTrue(Path(result.portable_dir, "App", "Example.exe").is_file())
+            self.assertFalse(Path(result.portable_dir, "Launch.bat").exists())
+            self.assertIn("могут быть неполными", " ".join(result.messages))
+
+    @unittest.skipUnless(os.name == "nt", "Windows-specific Inno output selection")
+    def test_inno_short_root_preserves_existing_results_and_uses_actual_target(self):
+        class AbortingInstaller(Portablizer):
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.target = app_dir
+                self.args = plan.args
+                Path(app_dir, "Example.exe").write_bytes(b"MZ partial")
+                return 5
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = os.path.join(temp, "Setup.exe")
+            _fake_pe(installer, [".text", ".rsrc"], b"This installation was built with Inno Setup")
+            name = "PyCharm_2025.2.3_x64-(IDEa)"
+            old = Path(temp, name + "_Portable", "App")
+            old.mkdir(parents=True)
+            (old / "keep.txt").write_text("original")
+            engine = AbortingInstaller(Logger())
+            result = engine.run(PortableOptions(
+                installer_path=installer, output_dir=temp, app_name=name,
+                capture_registry=False, cleanup_host=False))
+            self.assertFalse(result.success)
+            self.assertEqual(Path(result.portable_dir).parent, Path(temp))
+            self.assertTrue(Path(result.portable_dir).name.startswith("P-"))
+            self.assertEqual(Path(engine.target), Path(result.portable_dir, "App"))
+            self.assertTrue(any(arg.lower() == ("/dir=" + engine.target).lower() for arg in engine.args))
+            self.assertEqual((old / "keep.txt").read_text(), "original")
+            self.assertFalse(Path(result.portable_dir, "Launch.bat").exists())
+
     def test_failure_explains_admin_rights_and_license_switch(self):
         result = self._failed_result(
             CustomBootstrapperDetectionTests.ZENNO_PAYLOAD)
