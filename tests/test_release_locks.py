@@ -170,6 +170,90 @@ class ReleaseDiagnosticsTests(unittest.TestCase):
         kill.assert_not_called()
 
 
+class ScanPrivilegeTests(unittest.TestCase):
+    """Best-effort backup/restore privileges for ACL-hidden cache folders."""
+
+    def test_privileges_are_noop_off_windows(self):
+        if os.name == 'nt':
+            self.skipTest('POSIX no-op path')
+        self.assertEqual(filelocks.acquire_scan_privileges(), [])
+        # Release is a symmetric no-op; it must not raise either.
+        filelocks.release_scan_privileges([filelocks.SE_BACKUP_NAME,
+                                           filelocks.SE_RESTORE_NAME])
+
+    def test_privilege_acquisition_failure_never_breaks_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            Path(temp, 'file.bin').write_text('x')
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            with mock.patch.object(filelocks, 'acquire_scan_privileges',
+                                   side_effect=RuntimeError('no token')), \
+                 mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+            self.assertEqual((locked, issues), ([], []))
+
+    def test_privilege_release_failure_never_breaks_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            Path(temp, 'file.bin').write_text('x')
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            with mock.patch.object(filelocks, 'release_scan_privileges',
+                                   side_effect=RuntimeError('gone')), \
+                 mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+            self.assertEqual((locked, issues), ([], []))
+
+    def test_privileges_are_released_after_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            Path(temp, 'file.bin').write_text('x')
+            released = []
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            with mock.patch.object(filelocks, 'acquire_scan_privileges',
+                                   return_value=['SeBackupPrivilege']), \
+                 mock.patch.object(filelocks, 'release_scan_privileges',
+                                   side_effect=lambda names: released.extend(names)), \
+                 mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+            self.assertEqual((locked, issues), ([], []))
+            self.assertEqual(released, ['SeBackupPrivilege'])
+
+    @staticmethod
+    def _win_error_5_walk(_root, onerror):
+        exc = PermissionError(13, 'denied')
+        exc.winerror = 5
+        onerror(exc)
+        return iter(())
+
+    def test_walk_error_without_privileges_suggests_elevated_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            with mock.patch.object(filelocks, 'acquire_scan_privileges', return_value=[]), \
+                 mock.patch.object(filelocks.os, 'walk', side_effect=self._win_error_5_walk), \
+                 mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+        text = ' '.join(issues)
+        self.assertEqual(locked, [])
+        self.assertIn('WinError 5', text)
+        self.assertIn('администратора', text)
+        self.assertEqual(text.count('администратора'), 1)
+
+    def test_walk_error_with_privileges_reports_no_elevation_hint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            with mock.patch.object(filelocks, 'acquire_scan_privileges',
+                                   return_value=['SeBackupPrivilege']), \
+                 mock.patch.object(filelocks.os, 'walk', side_effect=self._win_error_5_walk), \
+                 mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+        text = ' '.join(issues)
+        self.assertEqual(locked, [])
+        self.assertIn('WinError 5', text)
+        self.assertNotIn('администратора', text)
+
+
 @unittest.skipUnless(sys.platform == 'win32', 'Windows actual handle test')
 class WindowsFileOwnerTests(unittest.TestCase):
     CHILD = r'''
