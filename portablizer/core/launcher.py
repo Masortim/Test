@@ -2042,12 +2042,12 @@ _STOP_PS_FALLBACK = (
     "function Running(){{ $a=@(); foreach($p in [Diagnostics.Process]::GetProcesses()){{ "
     "if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; "
     "if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $a+=$p }} }} }}; return $a }}; "
-    "function Busy(){{ $b=@(); $sw=[Diagnostics.Stopwatch]::StartNew(); "
-    "foreach($f in (Get-ChildItem -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue | "
-    "Where-Object {{ -not $_.PSIsContainer }})){{ "
-    "if($sw.Elapsed.TotalSeconds -gt 20){{ break }}; "
+    "$script:scanIncomplete=$false; function Busy(){{ $b=@(); $sw=[Diagnostics.Stopwatch]::StartNew(); "
+    "try{{ $all=@(Get-ChildItem -LiteralPath $r -Recurse -Force -ErrorAction Stop) }}catch{{ $script:scanIncomplete=$true; return $b }}; "
+    "foreach($f in ($all | Where-Object {{ -not $_.PSIsContainer }})){{ "
+    "if($sw.Elapsed.TotalSeconds -gt 20){{ $script:scanIncomplete=$true; break }}; "
     "try{{ $s=[IO.File]::Open($f.FullName,'Open','Read','None'); $s.Close() }}"
-    "catch [IO.IOException]{{ $b+=$f.FullName; if($b.Count -ge 12){{ break }} }}catch{{}} }}; return $b }}; "
+    "catch [IO.IOException]{{ $b+=$f.FullName; if($b.Count -ge 12){{ break }} }}catch{{ $script:scanIncomplete=$true }} }}; return $b }}; "
     "$ps=@(Running); foreach($p in $ps){{ Write-Host ('Closing ' + $p.ProcessName + ' (pid ' + $p.Id + ')'); "
     "try{{ [void]$p.CloseMainWindow() }}catch{{}} }}; "
     "if($ps.Count -gt 0){{ Start-Sleep -Seconds 3; foreach($p in @(Running)){{ try{{ $p.Kill() }}catch{{}} }}; Start-Sleep -Seconds 1 }}; "
@@ -2056,6 +2056,7 @@ _STOP_PS_FALLBACK = (
     "Get-ChildItem -LiteralPath $tmp -Force -ErrorAction SilentlyContinue | "
     "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }}; "
     "$busy=@(Busy); if($busy.Count -gt 0){{ Start-Sleep -Seconds 1; $busy=@(Busy) }}; "
+    "if($script:scanIncomplete){{ Write-Host 'Could not complete the file check.'; exit 1 }}; "
     "if($busy.Count -gt 0){{ Write-Host 'These files are still open and keep the folder locked:'; "
     "foreach($f in $busy){{ Write-Host ('  ' + $f) }}; exit 1 }}; "
     "Write-Host 'Nothing from this folder is running and no file inside is open.'; exit 0\""
@@ -2068,18 +2069,10 @@ rem
 rem  Run this file when the program has been closed but Windows still refuses
 rem  to delete or move the folder ("the file is open in another program").
 rem
-rem  What it does, in order:
-rem    1. closes every process whose executable lives inside this folder -
-rem       politely first, by force afterwards;
-rem    2. forces every OPEN FILE inside the folder to be released, even when
-rem       the holder is a Windows service (the font cache keeps fonts from
-rem       PortableData\Temp open long after the installer is gone);
-rem    3. wipes the leftovers in PortableData\Temp;
-rem    4. PROVES the result by trying to open every file inside exclusively -
-rem       and only then reports that the folder is free.
-rem
-rem  Step 2 needs administrator rights, so the script asks for them itself
-rem  when the folder is still locked.  Nothing outside this folder is touched.
+rem  It stops processes whose executable is inside this folder and checks
+rem  whether remaining files are shared in a way that blocks deletion.
+rem  External processes and handles are not forcibly closed. A bounded check
+rem  cannot guarantee that a later delete or move will succeed.
 rem ============================================================================
 setlocal
 set "PORTABLE_ROOT=%~dp0"
@@ -2094,9 +2087,7 @@ for %%A in (%*) do (
 )
 
 if not exist "%PORTABLE_ROOT%\App\{exe_launcher}" goto fallback
-rem The launcher knows how to free the folder AND how to prove it, and it
-rem asks for administrator rights on its own when a handle has to be forced
-rem closed.  Its verdict is final: no silent fallback to a weaker check.
+rem The launcher reports its own verdict; do not silently fall back after failure.
 "%PORTABLE_ROOT%\App\{exe_launcher}" --stop
 if errorlevel 1 goto stillbusy
 goto free
@@ -2107,15 +2098,10 @@ if errorlevel 1 goto locked
 goto free
 
 :locked
-if defined STOP_ELEVATED goto stillbusy
-if not defined STOP_PAUSE goto stillbusy
 echo.
-echo Something still holds this folder. Most often it is a Windows service
-echo (the font cache keeps a font from PortableData\Temp open), and only an
-echo administrator can force such a handle closed. Asking for rights now...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Start-Process -FilePath $env:PORTABLE_SELF -ArgumentList '--elevated' -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
-if errorlevel 1 goto stillbusy
-goto free
+echo The file check did not finish or files are still open. Close their owners
+echo normally and try again. External processes and handles are not forced.
+goto stillbusy
 
 :stillbusy
 echo.

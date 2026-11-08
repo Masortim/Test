@@ -45,6 +45,7 @@ from typing import List, Optional
 
 from .. import __version__
 from . import launcher as launcher_mod
+from . import elevate as elevate_mod
 from . import pycharm as pycharm_mod
 from . import procutil
 from . import registry as reg_mod
@@ -143,8 +144,8 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
     errors: List[str] = []
     if procutil.folder_is_free(folder, errors):
         report.success = True
-        message = ("Папка свободна: её можно удалить, перенести или "
-                   "скопировать прямо сейчас.")
+        message = ("При проверке блокировок не обнаружено. Попробуйте удалить "
+                   "или перенести папку; Windows может обнаружить другие препятствия.")
         log.ok(message)
         report.messages.append(message)
         return report
@@ -162,55 +163,51 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
         errors = []
         if procutil.folder_is_free(folder, errors):
             report.success = True
-            message = ("Папка свободна: её можно удалить, перенести или "
-                       "скопировать прямо сейчас.")
+            message = ("При проверке блокировок не обнаружено. Попробуйте удалить "
+                       "или перенести папку; Windows может обнаружить другие препятствия.")
             log.ok(message)
             report.messages.append(message)
             return report
         for line in errors:
             log.debug(f"Папка не отпускается: {line}")
 
-    holders = procutil.holders(folder)
+    locked = procutil.busy_files(folder)
+    holders = procutil.holders(folder, locked_files=locked)
     report.holders = procutil.describe_holders(holders)
     if report.holders:
         message = "Папку держат: " + ", ".join(report.holders)
         log.warn(message + ".")
         report.messages.append(message)
-        if any(item.protected for item in holders):
-            hint = ("Среди них системные процессы Windows — завершать их "
-                    "нельзя. Закройте окна этой папки в проводнике, снимите "
-                    "предпросмотр файла и повторите.")
-            log.warn(hint)
-            report.messages.append(hint)
-        if any(item.kind == "file" and item.protected for item in holders):
-            hint = ("Системный процесс держит открытым файл из папки "
-                    "(так бывает со шрифтами из PortableData\\Temp). Его "
-                    "дескриптор закрывается принудительно, но на это нужны "
-                    "права администратора — запустите Portablizer от имени "
-                    "администратора.")
-            log.warn(hint)
-            report.messages.append(hint)
-        if any(not item.protected for item in holders):
-            hint = ("Процессы, запущенные от имени администратора, обычной "
-                    "программе не подчиняются: запустите Portablizer от "
-                    "имени администратора и повторите.")
-            log.info(hint)
-            report.messages.append(hint)
-    else:
-        locked = procutil.busy_files(folder)
-        if locked:
-            report.holders = [os.path.basename(path) for path in locked]
-            message = ("Папку держат открытые файлы: "
-                       + ", ".join(report.holders[:6])
-                       + ". Кто именно их открыл, без прав администратора "
-                         "не видно — запустите Portablizer от имени "
-                         "администратора, и держатель будет закрыт "
-                         "принудительно.")
+        hint = ("Закройте указанные приложения штатно и повторите проверку. "
+                "Чужие процессы и системные службы автоматически не завершаются, "
+                "их дескрипторы принудительно не закрываются: это может "
+                "повредить данные. При необходимости проверьте PID в "
+                "Диспетчере задач или Мониторе ресурсов.")
+        log.warn(hint)
+        report.messages.append(hint)
+    elif locked:
+        report.holders = [os.path.basename(path) for path in locked]
+        message = ("Windows сообщает о блокировке файлов: "
+                   + ", ".join(report.holders[:6])
+                   + ". Не удалось надёжно определить владельца; "
+                     "он не был принудительно закрыт. Закройте программу "
+                     "или найдите PID в Мониторе ресурсов и повторите.")
+        log.warn(message)
+        report.messages.append(message)
+        if elevate_mod.is_elevated():
+            hint = ("Portablizer уже запущен с повышенными правами; повторный "
+                    "запуск администратором не гарантирует обнаружение владельца.")
         else:
-            message = ("Папка занята, но виновника определить не удалось. "
-                       "Чаще всего это открытое окно проводника, "
-                       "предпросмотр файла или проверка антивирусом — "
-                       "через несколько секунд папка освободится сама.")
+            hint = ("Повышенные права могут помочь диагностике, но не "
+                    "гарантируют обнаружение владельца и не разрешают "
+                    "принудительно закрывать чужие процессы.")
+        log.info(hint)
+        report.messages.append(hint)
+    else:
+        message = ("Не удалось подтвердить, что папка свободна. "
+                   + (" ".join(errors[:2]) if errors else
+                      "Причина может быть в правах, занятом каталоге или "
+                      "неполной проверке; повторите после закрытия приложений."))
         log.warn(message)
         report.messages.append(message)
     return report

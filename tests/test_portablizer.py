@@ -3143,7 +3143,7 @@ class FailureDiagnosticsTests(unittest.TestCase):
                 capture_registry=False, cleanup_host=False))
             self.assertFalse(result.success)
             self.assertEqual(Path(result.portable_dir).parent, Path(temp))
-            self.assertTrue(Path(result.portable_dir).name.startswith("P-"))
+            self.assertTrue(Path(result.portable_dir).name.startswith("PyCharm-"))
             self.assertEqual(Path(engine.target), Path(result.portable_dir, "App"))
             self.assertTrue(any(arg.lower() == ("/dir=" + engine.target).lower() for arg in engine.args))
             self.assertEqual((old / "keep.txt").read_text(), "original")
@@ -4159,7 +4159,8 @@ class GameLauncherHandoffTests(unittest.TestCase):
                     mock.patch.object(exe_launcher, "release_portable_folder",
                                       return_value=["helper.exe"]) as release, \
                     mock.patch.object(exe_launcher, "_portable_process_list",
-                                      return_value=[]):
+                                      return_value=[]), \
+                    mock.patch.object(exe_launcher, "busy_files", return_value=[]):
                 rc = exe_launcher.stop(root)
 
             self.assertEqual(rc, 0)
@@ -5052,7 +5053,7 @@ class ExistingPortableMaintenanceTests(unittest.TestCase):
 
             self.assertTrue(report.success)
             self.assertEqual(report.stopped, ["updater.exe"])
-            self.assertIn("можно удалить", " ".join(report.messages))
+            self.assertIn("блокировок не обнаружено", " ".join(report.messages))
 
     def test_release_names_the_program_holding_the_folder(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -5069,7 +5070,7 @@ class ExistingPortableMaintenanceTests(unittest.TestCase):
 
             self.assertFalse(report.success)
             self.assertIn("explorer.exe (держит ext.dll)", report.holders)
-            self.assertIn("Закройте окна", " ".join(report.messages))
+            self.assertIn("Закройте указанные приложения", " ".join(report.messages))
 
     def test_release_works_on_any_folder_not_only_portables(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -5219,8 +5220,8 @@ class OpenFileHolderTests(unittest.TestCase):
                     procutil.folder_is_free(str(portable), deep=False))
             self.assertTrue(portable.is_dir())
 
-    def test_release_open_files_kills_background_and_frees_system_handles(self):
-        """Фон — завершить, системный процесс — закрыть его дескриптор."""
+    def test_release_open_files_leaves_foreign_processes_and_handles_alone(self):
+        """Открытый файл не доказывает, что чужой процесс безопасно убивать."""
         items = [
             procutil.OpenFile(17208, 900, self.FONT,
                               r"C:\Windows\System32\svchost.exe"),
@@ -5245,14 +5246,9 @@ class OpenFileHolderTests(unittest.TestCase):
                 mock.patch("time.sleep"):
             stopped = procutil.release_open_files(self.ROOT, close_grace=0.0)
 
-        # Фоновый держатель завершён, окно пользователя не тронуто.
-        self.assertEqual(killed, [321])
-        # Дескрипторы закрыты у всех, кто пережил завершение.
-        self.assertIn((17208, 900), closed)
-        self.assertIn((555, 8), closed)
-        self.assertTrue(any("updater.exe" in line for line in stopped))
-        self.assertTrue(any("OpenSans-Semibold.ttf" in line
-                            for line in stopped))
+        self.assertEqual(killed, [])
+        self.assertEqual(closed, [])
+        self.assertEqual(stopped, [])
 
     def test_release_folder_also_frees_open_files_and_fonts(self):
         order = []
@@ -5310,7 +5306,7 @@ class OpenFileHolderTests(unittest.TestCase):
             self.assertFalse(report.success)
             text = " ".join(report.messages)
             self.assertIn("OpenSans-Semibold.ttf", text)
-            self.assertIn("администратора", text)
+            self.assertIn("не гарантируют", text)
             self.assertNotIn("виновника определить не удалось", text)
 
 
@@ -5506,8 +5502,8 @@ class LauncherLeftoverCleanupTests(unittest.TestCase):
             self.assertIn("OpenSans-Regular.ttf", log)
             self.assertNotIn("portable folder released", log)
 
-    def test_stop_asks_for_administrator_rights_before_giving_up(self):
-        """Чужой дескриптор закрывает только администратор — и лончер это знает."""
+    def test_stop_does_not_elevate_to_force_close_external_handles(self):
+        """Чужие дескрипторы не закрываются даже с правами администратора."""
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp, "P")
             (root / "App").mkdir(parents=True)
@@ -5527,9 +5523,9 @@ class LauncherLeftoverCleanupTests(unittest.TestCase):
                     mock.patch.object(exe_launcher, "_show_warning") as warned:
                 code = exe_launcher.stop(root)
 
-            self.assertEqual(code, 0)
-            elevated.assert_called_once_with(["--stop"])
-            warned.assert_not_called()
+            self.assertEqual(code, 1)
+            elevated.assert_not_called()
+            self.assertIn("не закрываются принудительно", warned.call_args[0][0])
 
     def test_stop_reports_the_locked_files_when_even_admin_cannot_help(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -5555,7 +5551,7 @@ class LauncherLeftoverCleanupTests(unittest.TestCase):
             message = warned.call_args[0][0]
             self.assertIn("svchost.exe (pid 17208): OpenSans-Regular.ttf",
                           message)
-            self.assertIn("администратора", message)
+            self.assertIn("не закрываются принудительно", message)
 
     def test_release_sweeps_handles_even_without_processes(self):
         with mock.patch.object(exe_launcher, "IS_WINDOWS", True), \
@@ -5567,7 +5563,7 @@ class LauncherLeftoverCleanupTests(unittest.TestCase):
                 Path(r"D:\P"), {"close_grace": 0.0})
         self.assertEqual(stopped, ["svchost.exe: файл"])
 
-    def test_stop_script_verifies_the_result_and_elevates_itself(self):
+    def test_stop_script_does_not_claim_external_forced_close(self):
         cfg = launcher_mod.LauncherConfig(
             app_name="Fallout New Vegas", target_exe_rel="App/game.exe")
         script = launcher_mod.render_stop_cmd(cfg)
@@ -5585,8 +5581,9 @@ class LauncherLeftoverCleanupTests(unittest.TestCase):
         # Запасной вариант теперь тоже проверяет результат делом.
         self.assertIn("[IO.File]::Open", script)
         self.assertIn("These files are still open", script)
-        # И умеет попросить права администратора.
-        self.assertIn("-Verb RunAs", script)
+        # Чужие процессы и дескрипторы не закрываются принудительно.
+        self.assertNotIn("-Verb RunAs", script)
+        self.assertIn("External processes and handles are not forced", script)
         self.assertIn("exit /b %STOP_RC%", script)
 
     def test_config_carries_the_new_cleanup_policy(self):

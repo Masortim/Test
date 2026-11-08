@@ -1,35 +1,61 @@
-"""Choose a shorter, isolated result directory for path-sensitive installers.
+"""Choose a readable, shorter and isolated directory for sensitive installers.
 
-Shortening saves a bounded number of characters; it cannot guarantee that an
-arbitrary payload fits MAX_PATH or that the resulting app supports relocation.
-We never use SUBST, registry changes, junctions or delete an existing folder.
+Shortening cannot guarantee that an arbitrary payload fits MAX_PATH. No SUBST,
+registry changes, junctions or deletion/reuse of existing folders are used.
 """
 from __future__ import annotations
 
 import os
-import tempfile
-from typing import Optional
+import re
+import secrets
 
-# Inno installers can contain very deep trees. This is a heuristic, not a
-# statement that shorter paths are safe. Windows counts UTF-16 code units.
 MAX_PREFERRED_APP_UNITS = 48
 MIN_SAVING_UNITS = 12
+MAX_LABEL_UNITS = 12
 
 
 def path_units(path: str) -> int:
     return len(path.encode('utf-16-le', 'surrogatepass')) // 2
 
 
+def short_label(name: str) -> str:
+    """A small recognisable product label, with no Windows path characters."""
+    text = str(name or '').strip()
+    # Versions and common packaging suffixes aren't useful in a very short
+    # name. Keep leading numbers (e.g. 7-Zip) and Unicode product names.
+    text = re.split(r'(?i)(?:[_\s-]+(?:setup|installer|install|portable|x64|x86|win64|win32)(?:\b|_)|(?<=[^\d])[_\s-]*\d[\d.]*)', text, maxsplit=1)[0]
+    text = re.sub(r'[^\w-]+', '_', text, flags=re.UNICODE).strip('_.-')
+    chars = []
+    for char in text:
+        if path_units(''.join(chars) + char) > MAX_LABEL_UNITS:
+            break
+        chars.append(char)
+    label = ''.join(chars).rstrip('_.-')
+    return label or 'App'
+
+
 def should_use_short_root(output_dir: str, name: str) -> bool:
     output = os.path.abspath(output_dir)
     normal = os.path.join(output, name + '_Portable', 'App')
-    # tempfile.mkdtemp uses eight random characters after the P- prefix.
-    short = os.path.join(output, 'P-12345678', 'App')
+    short = os.path.join(output, short_label(name) + '-1234', 'App')
     return (path_units(normal) > MAX_PREFERRED_APP_UNITS
             and path_units(normal) - path_units(short) >= MIN_SAVING_UNITS)
 
 
-def reserve_short_root(output_dir: str) -> str:
-    """Atomically reserve a fresh directory within the selected output folder."""
+def reserve_short_root(output_dir: str, name: str) -> str:
+    """Atomically reserve a fresh, human-readable directory inside output_dir.
+
+    A collision (including a symlink) is never reused; mkdir is exclusive. If
+    randomness fails repeatedly we fail safely rather than touching another
+    build. User data from older portables is never overwritten or relocated.
+    """
     os.makedirs(output_dir, exist_ok=True)
-    return tempfile.mkdtemp(prefix='P-', dir=output_dir)
+    label = short_label(name)
+    for _ in range(128):
+        candidate = os.path.join(output_dir, label + '-' + secrets.token_hex(2))
+        try:
+            os.mkdir(candidate)
+            return candidate
+        except FileExistsError:
+            continue
+    raise FileExistsError('Cannot reserve an unused short portable folder')

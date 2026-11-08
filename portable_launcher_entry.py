@@ -7966,37 +7966,21 @@ def _handle_table() -> "list[tuple[int, int, int]]":
         return []
 
 
-def _file_type_index(table: "Sequence[tuple[int, int, int]]") -> int:
-    """Номер типа «File» в этой Windows: определяется по своему же файлу."""
-    if not IS_WINDOWS or not table:
-        return -1
+def _table_with_file_type():
+    """Snapshot while our known file handle is open; never infer from stale IDs."""
+    if not IS_WINDOWS:
+        return [], -1
     try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        kernel32.CreateFileW.restype = ctypes.c_void_p
-        own = os.getpid()
-        fd, path = tempfile.mkstemp(prefix="portable-probe-")
-        try:
-            handle = kernel32.CreateFileW(path, 0x80000000, 7, None, 3,
-                                          0x80, None) or 0
-            if not handle or handle == ctypes.c_void_p(-1).value:
-                return -1
-            try:
-                for pid, value, kind in table:
-                    if pid == own and value == int(handle):
-                        return kind
-            finally:
-                kernel32.CloseHandle(ctypes.c_void_p(handle))
-        finally:
-            os.close(fd)
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-    except Exception:
-        return -1
-    return -1
+        import msvcrt
+        import tempfile
+        with tempfile.TemporaryFile() as probe:
+            value = int(msvcrt.get_osfhandle(probe.fileno()))
+            table = _handle_table()
+            kind = next((kind for pid, handle, kind in table
+                         if pid == os.getpid() and handle == value), -1)
+            return table, kind
+    except (OSError, ImportError, ValueError):
+        return _handle_table(), -1
 
 
 def _path_of_handle(duplicate) -> str:
@@ -8034,10 +8018,9 @@ def open_files_in(root: Path, budget: float = 8.0,
     import time
 
     _enable_debug_privilege()
-    table = _handle_table()
+    table, wanted_type = _table_with_file_type()
     if not table:
         return []
-    wanted_type = _file_type_index(table)
     prefix = str(root).rstrip("\\").casefold() + "\\"
     # Пути интересующих папок: дескрипторы чужих файлов отбрасываются сразу,
     # не доходя до разбора процессов.
@@ -8137,69 +8120,73 @@ def describe_open_files(items: "Sequence[tuple[int, int, str, str]]") -> str:
 
 
 def busy_files(root: Path, budget: float = 4.0, limit: int = 12,
-               roots: "Optional[Sequence[Path]]" = None) -> "list[str]":
-    """Файлы папки, которые Windows прямо сейчас не отдаёт.
-
-    Проверка делом и без всяких прав: файл открывается на монопольный
-    доступ. Именно это условие стоит за «файл открыт в другой программе»,
-    то есть за невозможностью удалить папку. Файлы самого лончера
-    пропускаются - они освободятся, как только лончер выйдет.
-
-    ``roots`` ограничивает обход: у Cursor в ``App`` десятки тысяч файлов, и
-    открывать каждый ради поиска запертого файла во временной папке - это
-    секунды ожидания на ровном месте.
-    """
+               roots: "Optional[Sequence[Path]]" = None,
+               scan_status: "Optional[list[str]]" = None) -> "list[str]":
+    """Find confirmed DELETE-sharing conflicts; report incomplete checks."""
     if not IS_WINDOWS or not root or not os.path.isdir(str(root)):
         return []
-    import time
-
-    walk_roots = [str(item) for item in (roots or ()) if os.path.isdir(str(item))]
-    if not walk_roots:
-        walk_roots = [str(root)]
-
+    walk_roots = [str(item) for item in (roots or ()) if os.path.isdir(str(item))] or [str(root)]
     try:
         import ctypes
-
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         invalid = ctypes.c_void_p(-1).value
-        # Без явного restype ctypes обрежет HANDLE до 32-битного int, и
-        # «не удалось открыть» станет неотличимо от удачи.
         kernel32.CreateFileW.restype = ctypes.c_void_p
         mine = {image.casefold() for image in _own_executable_images()}
 
-        def locked(path: str) -> bool:
+        def locked(path: str) -> Optional[bool]:
             if path.casefold() in mine:
                 return False
-            handle = kernel32.CreateFileW(path, 0x80000000, 0, None, 3,
-                                          0x80, None)
+            handle = kernel32.CreateFileW(path, 0x00010000, 7, None, 3, 0x80, None)
             error = kernel32.GetLastError()
             if handle in (None, 0, invalid):
-                return error in (_ERROR_SHARING_VIOLATION,
-                                 _ERROR_LOCK_VIOLATION)
+                if error in (_ERROR_SHARING_VIOLATION, _ERROR_LOCK_VIOLATION):
+                    return True
+                return False if error in (2, 3) else None
             kernel32.CloseHandle(ctypes.c_void_p(handle))
             return False
 
         deadline = time.monotonic() + budget
         suspects: list[str] = []
+        incomplete = unknown = False
+        def on_walk_error(_exc):
+            nonlocal unknown
+            unknown = True
+
         for walk_root in walk_roots:
-            for current, _dirs, files in os.walk(walk_root):
-                if time.monotonic() > deadline or len(suspects) >= limit:
-                    break
+            for current, _dirs, files in os.walk(walk_root, onerror=on_walk_error):
+                _dirs.sort(key=lambda item: (item.casefold() != "portabledata", item.casefold()))
                 for name in files:
-                    path = os.path.join(current, name)
-                    if locked(path):
-                        suspects.append(path)
-                        if len(suspects) >= limit:
-                            break
-                    if time.monotonic() > deadline:
+                    if time.monotonic() > deadline or len(suspects) >= limit:
+                        incomplete = True
                         break
-                if time.monotonic() > deadline or len(suspects) >= limit:
+                    path = os.path.join(current, name)
+                    outcome = locked(path)
+                    if outcome is True:
+                        suspects.append(path)
+                    elif outcome is None:
+                        unknown = True
+                if incomplete:
                     break
-        if not suspects:
-            return []
-        time.sleep(0.4)
-        return [path for path in suspects if locked(path)]
-    except Exception:
+            if incomplete:
+                break
+        confirmed: list[str] = []
+        if suspects:
+            time.sleep(0.4)
+            for path in suspects:
+                outcome = locked(path)
+                if outcome is True:
+                    confirmed.append(path)
+                elif outcome is None:
+                    unknown = True
+        if scan_status is not None:
+            if incomplete:
+                scan_status.append("проверка не охватила все файлы за отведённое время")
+            if unknown:
+                scan_status.append("некоторые файлы не удалось проверить")
+        return confirmed
+    except Exception as exc:
+        if scan_status is not None:
+            scan_status.append(f"ошибка проверки: {exc}")
         return []
 
 
@@ -8253,8 +8240,8 @@ def _installed_software_image(image: str) -> bool:
     """Программа из системных папок или Program Files - не остаток портатива.
 
     Антивирус, индексатор, синхронизация облака держат файл портатива
-    совершенно законно: они его читают. Завершать их нельзя - у них можно
-    только отобрать дескриптор.
+    совершенно законно: они его читают. Завершать их или принудительно
+    закрывать их дескрипторы небезопасно.
     """
     if not image:
         return True
@@ -8273,47 +8260,29 @@ def _installed_software_image(image: str) -> bool:
 
 def release_open_files(root: Path, budget: float = 8.0,
                        roots: "Optional[Sequence[Path]]" = None) -> "list[str]":
-    """Отпускает файлы папки, открытые кем-то снаружи.
+    """Only stop processes whose executable is inside this portable folder.
 
-    * безымянный фоновый «помощник» (без окна, запущен не из системных
-      папок) - завершается: это и есть остаток портатива, из-за которого
-      папку не удалить;
-    * системный процесс Windows или установленная программа (антивирус,
-      индексатор) - не трогаем, но закрываем её дескриптор на наш файл
-      (это умеет только администратор);
-    * чужое окно (редактор, файловый менеджер) - не трогаем вообще: за ним
-      может быть несохранённый документ, его только называем.
+    Never force-close external processes' handles: they can be browsers,
+    editors or services with unsaved data. Ownership alone is not consent.
     """
     if not IS_WINDOWS:
         return []
-    import time
-
     items = open_files_in(root, budget=budget, roots=roots)
-    if not items:
+    current = dict(_portable_process_list(root))
+    owned = sorted({pid for pid, _handle, _path, image in items
+                    if image and pid in current
+                    and str(current[pid]).casefold() == str(image).casefold()
+                    and _image_name(image).casefold() not in PROTECTED_IMAGES})
+    if not owned:
         return []
-    visible = _visible_window_pids()
-    stopped: list[str] = []
-    background = sorted({
-        pid for pid, _handle, _path, image in items
-        if _image_name(image).casefold() not in PROTECTED_IMAGES
-        and pid not in visible and not _is_interactive_image(image)
-        and not _installed_software_image(image)})
-    if background:
-        names = sorted({_image_name(image) or f"pid {pid}"
-                        for pid, _h, _p, image in items
-                        if pid in background})
-        _post_close_to_windows(background)
-        time.sleep(0.5)
-        _terminate_pids(background)
-        stopped.extend(f"{name} (держал файл портатива)" for name in names)
-        time.sleep(0.3)
-
-    for pid, handle, path, image in open_files_in(root, budget=budget):
-        if _close_remote_handle(pid, handle):
-            stopped.append(
-                f"{_image_name(image) or ('pid ' + str(pid))}: "
-                f"освобождён файл {_image_name(path)}")
-    return stopped
+    _post_close_to_windows(owned)
+    time.sleep(0.5)
+    current = dict(_portable_process_list(root))
+    remaining = [pid for pid in owned if pid in current]
+    if remaining:
+        _terminate_pids(remaining)
+    return [f"{_image_name(current[pid])} (процесс из папки портатива)"
+            for pid in remaining]
 
 
 def purge_portable_temp(root: Path, cfg: "Optional[Dict[str, Any]]" = None
@@ -8518,8 +8487,8 @@ def release_leftover_handles(root: Path,
     После завершения процессов портатива папка всё ещё может быть занята:
     шрифт из ``PortableData\\Temp`` подхватила служба кэша шрифтов, лог
     читает антивирус, сохранение открыл индексатор. Своего процесса у
-    такого держателя нет, ждать его бесполезно - дескриптор закрывается
-    принудительно, а фоновый держатель завершается.
+    такого держателя нет; чужие процессы и их дескрипторы не закрываются
+    принудительно, так как это может повредить пользовательские данные.
 
     Дорогой разбор включается только по делу: сначала дешёвая проверка
     «есть ли вообще хоть один занятый файл». Если папка чиста - лончер
@@ -8538,9 +8507,11 @@ def release_leftover_handles(root: Path,
     # папку чистой, второй не нужен.
     if time.monotonic() - _LAST_CLEAN_SWEEP < 10.0:
         return []
+    scan_status: list[str] = []
     if not busy_files(root, budget=float(cfg.get("busy_budget", 4.0)),
-                      roots=roots):
-        _LAST_CLEAN_SWEEP = time.monotonic()
+                      roots=roots, scan_status=scan_status):
+        if not scan_status and not roots:
+            _LAST_CLEAN_SWEEP = time.monotonic()
         return []
 
     stopped: list[str] = []
@@ -8548,9 +8519,11 @@ def release_leftover_handles(root: Path,
         stopped.append("сняты с регистрации шрифты портатива")
     stopped.extend(release_open_files(root, budget=float(
         cfg.get("handle_budget", 8.0)), roots=roots))
+    scan_status = []
     if not busy_files(root, budget=float(cfg.get("busy_budget", 4.0)),
-                      roots=roots):
-        _LAST_CLEAN_SWEEP = time.monotonic()
+                      roots=roots, scan_status=scan_status):
+        if not scan_status and not roots:
+            _LAST_CLEAN_SWEEP = time.monotonic()
     return stopped
 
 
@@ -8583,7 +8556,11 @@ def _report_folder_state(root: Path,
     # Процессов из папки нет - но «нет процессов» и «папку можно удалить»
     # это разные вещи. Вердикт выдаётся только после проверки делом:
     # остался ли внутри хоть один файл, который Windows не отдаёт.
-    locked = [] if folder_looks_clean() else busy_files(root)
+    scan_status: list[str] = []
+    locked = [] if folder_looks_clean() else busy_files(root, scan_status=scan_status)
+    if not locked and scan_status:
+        _run_log(root, "WARNING: folder check incomplete: " + "; ".join(scan_status))
+        return
     if locked:
         items = [item for item in open_files_in(root)
                  if item[2] in locked] or open_files_in(root)
@@ -8591,8 +8568,8 @@ def _report_folder_state(root: Path,
             _image_name(path) for path in locked[:6])
         _run_log(root, "WARNING: the folder is still locked by open files: "
                  + description
-                 + ". Run StopPortable.cmd as administrator to force them "
-                   "closed.")
+                 + ". Close the owning applications normally; external "
+                   "handles are not forcibly closed.")
         return
     holders = module_holders(root)
     if holders:
@@ -14434,8 +14411,8 @@ def stop(root: Optional[Path] = None) -> int:
         _show_warning(
             "Часть процессов из портативной папки остановить не удалось:\n"
             f"{names}\n\n"
-            "Обычно это значит, что они запущены от имени администратора. "
-            "Запустите этот же файл от имени администратора.")
+            "Закройте процессы штатно и повторите. Если недостаточно прав, "
+            "повышение может помочь, но не гарантирует освобождение.")
         return 1
 
     # Временная папка - главный рассадник вечных блокировок: установщики
@@ -14447,24 +14424,25 @@ def stop(root: Optional[Path] = None) -> int:
     # Раньше скрипт отвечал «папка свободна», опираясь на список
     # процессов, — и ошибался ровно в том случае, ради которого его
     # запускают: процессов нет, а файл внутри открыт.
-    locked = busy_files(root)
+    scan_status: list[str] = []
+    locked = busy_files(root, scan_status=scan_status)
+    if not locked and scan_status:
+        _run_log(root, "--stop: folder check incomplete: " + "; ".join(scan_status))
+        _show_warning("Не удалось подтвердить, что папка свободна: "
+                      + "; ".join(scan_status) + ". Повторите проверку.")
+        return 1
     if locked:
         items = open_files_in(root)
         description = describe_open_files(items) or ", ".join(
             _image_name(path) for path in locked[:6])
         _run_log(root, f"--stop: the folder is still locked: {description}")
-        retry = _retry_stop_elevated(root, "открытые файлы")
-        if retry == 0:
-            return 0
-        if retry == 1:
-            return 1  # повышенная копия уже показала свой вердикт
         _show_warning(
-            "Папка портатива всё ещё занята. Её файлы держат:\n"
+            "Папка портатива всё ещё занята. Файлы или их владельцы:\n"
             f"{description}\n\n"
-            "Это не процессы портатива, а системные службы Windows "
-            "(например, кэш шрифтов) или программа с открытым окном. "
-            "Закрыть такой дескриптор может только администратор: "
-            "запустите StopPortable.cmd от имени администратора.")
+            "Закройте соответствующие приложения штатно. Чужие процессы "
+            "и их дескрипторы не закрываются принудительно: это может "
+            "повредить данные. Если владелец неизвестен, проверьте файл "
+            "в Мониторе ресурсов Windows.")
         return 1
 
     # Процессов из папки нет, занятых файлов нет — но её может держать

@@ -104,7 +104,7 @@ class WindowsBundled7ZipTests(unittest.TestCase):
             (root / 'Example.txt').write_text('deep fixture', encoding='ascii')
             name = 'PyCharm_' + 'x' * 70
             self.assertTrue(longpaths.should_use_short_root(str(root), name))
-            short_root = Path(longpaths.reserve_short_root(str(root)))
+            short_root = Path(longpaths.reserve_short_root(str(root), name))
             app = short_root / 'App'
             # Ensure the same relative file exceeds MAX_PATH at the traditional
             # root while fitting comfortably at the new target. Nothing is moved.
