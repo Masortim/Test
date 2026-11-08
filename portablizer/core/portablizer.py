@@ -2460,7 +2460,7 @@ class Portablizer:
                 # Atomically create a fresh directory: _prepare_output removes
                 # App, so an existing unrelated folder must never be selected.
                 original = portable_dir
-                portable_dir = os.path.normpath(longpaths_mod.reserve_short_root(opts.output_dir))
+                portable_dir = os.path.normpath(longpaths_mod.reserve_short_root(opts.output_dir, name))
                 app_dir = os.path.join(portable_dir, "App")
                 data_dir = os.path.join(portable_dir, "PortableData")
                 result.portable_dir = portable_dir

@@ -20,10 +20,10 @@ class ShortPathsTests(unittest.TestCase):
             existing = Path(temp, 'PyCharm_2025.2.3_x64-(IDEa)_Portable', 'App')
             existing.mkdir(parents=True)
             (existing / 'keep.txt').write_text('untouched')
-            first = longpaths.reserve_short_root(temp)
+            first = longpaths.reserve_short_root(temp, 'PyCharm_2025.2.3_x64-(IDEa)')
             Path(first, 'App').mkdir()
             Path(first, 'App', 'keep.txt').write_text('untouched too')
-            second = longpaths.reserve_short_root(temp)
+            second = longpaths.reserve_short_root(temp, 'PyCharm_2025.2.3_x64-(IDEa)')
             self.assertNotEqual(first, second)
             self.assertEqual(Path(first).parent, Path(temp))
             self.assertEqual(Path(second).parent, Path(temp))
@@ -33,13 +33,30 @@ class ShortPathsTests(unittest.TestCase):
 
     def test_mkdtemp_retries_collision_without_opening_existing_folder(self):
         with tempfile.TemporaryDirectory() as temp:
-            foreign = Path(temp, 'P-existing')
+            foreign = Path(temp, 'PyCharm-abcd')
             foreign.mkdir()
             (foreign / 'keep.txt').write_text('valuable')
-            with mock.patch('tempfile._get_candidate_names', return_value=iter(['existing', 'newname1'])):
-                reserved = longpaths.reserve_short_root(temp)
-            self.assertEqual(Path(reserved).name, 'P-newname1')
+            with mock.patch('portablizer.core.longpaths.secrets.token_hex', side_effect=['abcd', '1234']):
+                reserved = longpaths.reserve_short_root(temp, 'PyCharm_2025.2.3_x64-(IDEa)')
+            self.assertEqual(Path(reserved).name, 'PyCharm-1234')
             self.assertEqual((foreign / 'keep.txt').read_text(), 'valuable')
+
+    def test_readable_labels_are_bounded_and_unicode_safe(self):
+        self.assertEqual(longpaths.short_label('PyCharm_2025.2.3_x64-(IDEa)'), 'PyCharm')
+        self.assertEqual(longpaths.short_label('7-Zip_24.08_x64'), '7-Zip')
+        self.assertEqual(longpaths.short_label('Программа_2025_x64'), 'Программа')
+        self.assertEqual(longpaths.short_label('????'), 'App')
+        self.assertLessEqual(longpaths.path_units(longpaths.short_label('LongProductTitle123')), 12)
+
+    def test_exhausted_collisions_fail_without_touching_anything(self):
+        with tempfile.TemporaryDirectory() as temp:
+            foreign = Path(temp, 'PyCharm-abcd')
+            foreign.mkdir()
+            (foreign / 'keep').write_text('important')
+            with mock.patch('portablizer.core.longpaths.secrets.token_hex', return_value='abcd'):
+                with self.assertRaises(FileExistsError):
+                    longpaths.reserve_short_root(temp, 'PyCharm_2025')
+            self.assertEqual((foreign / 'keep').read_text(), 'important')
 
     def test_utf16_units_count_non_bmp_characters(self):
         self.assertEqual(longpaths.path_units('A😀'), 3)
