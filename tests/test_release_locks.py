@@ -135,7 +135,13 @@ class ReleaseDiagnosticsTests(unittest.TestCase):
             self.assertEqual((locked, status), ([], []))
             self.assertEqual(thread.call_count, 1)
             self.assertEqual(kernel.CreateFileW.call_count, 200)
-            self.assertEqual(kernel.CloseHandle.call_count, 200)
+            # On Windows the scan also opens and closes its token once per
+            # privilege (backup + restore, enable + restore). Those CloseHandle
+            # calls are expected; count only the file probes (handle value 42).
+            probes = [call for call in kernel.CloseHandle.call_args_list
+                      if isinstance(call.args[0], ctypes.c_void_p)
+                      and call.args[0].value == 42]
+            self.assertEqual(len(probes), 200)
 
     def test_incomplete_details_are_not_hidden_by_holder(self):
         with tempfile.TemporaryDirectory() as temp:
