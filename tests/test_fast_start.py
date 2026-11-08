@@ -111,6 +111,28 @@ class LauncherPackagingTests(unittest.TestCase):
             self.assertTrue((payload
                              / portablizer_mod.LAUNCHER_PAYLOAD_MARKER).is_file())
 
+    def test_root_alias_uses_onefile_not_app_onedir(self):
+        with tempfile.TemporaryDirectory() as temp:
+            resources = Path(temp, "resources", "portable_launcher")
+            (resources / "_internal").mkdir(parents=True)
+            (resources / "PortableLauncher.exe").write_bytes(b"MZ onedir")
+            (resources / "_internal" / "python311.dll").write_bytes(b"MZ dll")
+            onefile = Path(temp, "resources", "portable_launcher.exe")
+            onefile.write_bytes(b"MZ onefile")
+            portable = Path(temp, "Portable")
+            (portable / "App").mkdir(parents=True)
+            foreign = portable / "_internal"
+            foreign.mkdir()
+            (foreign / "keep.txt").write_text("keep")
+            engine = portablizer_mod.Portablizer.__new__(portablizer_mod.Portablizer)
+            engine.log = mock.MagicMock()
+            with mock.patch.object(portablizer_mod, "bundled_exe_launcher_dir", return_value=str(resources)), \
+                 mock.patch.object(portablizer_mod, "bundled_exe_launcher_path", return_value=str(onefile)):
+                self.assertTrue(engine._copy_exe_launcher(str(portable), "Launch_Launcher.exe"))
+            self.assertEqual((portable / "Launch_Launcher.exe").read_bytes(), b"MZ onefile")
+            self.assertEqual((foreign / "keep.txt").read_text(), "keep")
+            self.assertFalse((portable / "App" / "_internal").exists())
+
     def test_payload_is_not_copied_twice(self):
         with tempfile.TemporaryDirectory() as temp:
             resources = Path(temp, "resources", "portable_launcher")

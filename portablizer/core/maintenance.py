@@ -45,6 +45,7 @@ from typing import List, Optional
 
 from .. import __version__
 from . import launcher as launcher_mod
+from . import pycharm as pycharm_mod
 from . import procutil
 from . import registry as reg_mod
 from . import relpaths
@@ -242,6 +243,46 @@ def _prefer_delta_gui_target(folder: str, cfg) -> bool:
     return True
 
 
+def _prefer_pycharm_target(folder: str, cfg) -> bool:
+    """Repair an App-based target only when one PyCharm IDE is unambiguous."""
+    current = str(cfg.target_exe_rel or "").replace("\\", "/")
+    if not current.casefold().startswith("app/") or ".." in current.split("/"):
+        return False
+    executable = pycharm_mod.find_pycharm_executable(os.path.join(folder, "App"), cfg.app_name)
+    if not executable:
+        return False
+    candidate = os.path.relpath(executable, folder).replace("\\", "/")
+    if current.casefold() != candidate.casefold():
+        cfg.target_exe_rel = candidate
+        found = False
+        for item in cfg.targets:
+            rel = item.rel_path.replace("\\", "/").casefold()
+            if item.role == "main":
+                item.role = "auxiliary"
+            if rel == candidate.casefold():
+                item.role = "main"
+                found = True
+        if not found:
+            cfg.targets.insert(0, launcher_mod.TargetInfo(
+                name="pycharm64", rel_path=candidate, role="main", bat_name="Launch.bat"))
+    cfg.launcher_target_rel = candidate
+    return True
+
+
+def _generated_main_alias_bat(folder: str) -> bool:
+    """Never overwrite an unrelated user-authored BAT during refresh."""
+    path = os.path.join(folder, "Launch_Launcher.bat")
+    if not os.path.exists(path):
+        return True
+    try:
+        with open(path, "r", encoding="ascii") as fh:
+            header = fh.read(1024)
+        return ("companion portable launcher" in header or
+                "Portablizer main launcher alias" in header)
+    except (OSError, UnicodeError):
+        return False
+
+
 def refresh(folder: str, log: Optional[Logger] = None,
             copy_exe=None, shared_saves: bool = True,
             language: str = "") -> MaintenanceReport:
@@ -291,6 +332,17 @@ def refresh(folder: str, log: Optional[Logger] = None,
                    "delta-app.exe — desktop-версию с рабочим browser sign-in.")
         log.info(message)
         report.messages.append(message)
+    pycharm = _prefer_pycharm_target(folder, cfg)
+    if pycharm:
+        message = "PyCharm: основной запуск направлен на существующий bin/pycharm64.exe."
+        log.info(message)
+        report.messages.append(message)
+        alias_exe = os.path.join(folder, "Launch_Launcher.exe")
+        if ("Launch_Launcher.exe" in cfg.launcher_aliases
+                or not os.path.lexists(alias_exe)):
+            cfg.launcher_aliases["Launch_Launcher.exe"] = cfg.target_exe_rel
+        else:
+            report.messages.append("Существующий чужой Launch_Launcher.exe не изменён.")
     log.info(f"Обновляю лончеры портатива «{cfg.app_name}»")
 
     # Портатив, собранный до 1.15.0, не имеет ни секции относительных путей,
@@ -405,6 +457,10 @@ def refresh(folder: str, log: Optional[Logger] = None,
         launcher_mod.UPDATE_SCRIPT_NAME: (
             launcher_mod.render_update_cmd(cfg), "ascii"),
     }
+    if pycharm and _generated_main_alias_bat(folder):
+        files["Launch_Launcher.bat"] = (launcher_mod.render_main_alias_bat(), "ascii")
+    elif pycharm:
+        report.messages.append("Существующий чужой Launch_Launcher.bat не изменён.")
     for name, (text, encoding) in files.items():
         try:
             with open(os.path.join(folder, name), "w", encoding=encoding,

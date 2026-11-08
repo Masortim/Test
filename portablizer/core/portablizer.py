@@ -61,6 +61,7 @@ from . import elevate as elevate_mod
 from . import inno_log as inno_log_mod
 from . import launcher as launcher_mod
 from . import longpaths as longpaths_mod
+from . import pycharm as pycharm_mod
 from . import netstack as netstack_mod
 from . import procutil
 from . import redist as redist_mod
@@ -8939,6 +8940,7 @@ class Portablizer:
           - tool: редакторы, менеджеры модов/DLC, серверы;
           - auxiliary: прочие вспомогательные бинарники.
         """
+        pycharm_target = pycharm_mod.find_pycharm_executable(app_dir, app_name)
         candidates: List[str] = []
         for root, _dirs, files in os.walk(app_dir):
             for f in files:
@@ -9028,6 +9030,12 @@ class Portablizer:
         if not preferred:
             preferred = non_ignored
         main_exe = preferred[0][1]
+        if pycharm_target:
+            match = next((item[1] for item in non_ignored
+                          if os.path.normcase(os.path.abspath(item[1]))
+                          == os.path.normcase(os.path.abspath(pycharm_target))), None)
+            if match:
+                main_exe = match
 
         def _safe_slug(s: str) -> str:
             cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", s).strip("_")
@@ -9417,33 +9425,26 @@ class Portablizer:
         путь цели, сохраняя изоляцию профиля и переносимость между дисками.
         """
         onedir = bundled_exe_launcher_dir()
-        source = (os.path.join(onedir, "PortableLauncher.exe") if onedir
-                  else bundled_exe_launcher_path())
-        if not os.path.isfile(source):
-            self.log.warn(
-                "В сборке Portablizer отсутствует встроенный "
-                "portable_launcher.exe; LaunchPortable.exe в App не создан. "
-                "Пересоберите проект через build.bat (он сначала выполняет "
-                "portable_launcher.spec)."
-            )
-            return ""
         try:
-            with open(source, "rb") as fh:
-                if fh.read(2) != b"MZ":
-                    raise RuntimeError("ресурс не является Windows EXE (нет заголовка MZ)")
             destination = os.path.abspath(os.path.join(portable_dir, destination_rel))
             portable_abs = os.path.abspath(portable_dir)
             if os.path.commonpath((portable_abs, destination)) != portable_abs:
                 raise RuntimeError("путь EXE-лончера выходит за пределы портатива")
             os.makedirs(os.path.dirname(destination), exist_ok=True)
-            # Содержимое onedir-сборки кладётся РЯДОМ с exe (``App\_internal``):
-            # тогда лончер не распаковывает себя во %TEMP% при каждом запуске.
-            # Если папку скопировать не удалось, остаётся обычный onefile —
-            # он работает всегда, просто стартует медленнее.
-            if not onedir or not self._copy_launcher_payload(onedir, portable_dir):
-                source = bundled_exe_launcher_path()
-                if not os.path.isfile(source):
-                    raise RuntimeError("нет ни onedir-сборки, ни onefile-лончера")
+            # The onedir bootloader searches for _internal next to its own EXE.
+            # Only App/ has that payload. Root aliases must use the bundled
+            # onefile executable; do not create/replace a foreign root _internal.
+            in_app = (os.path.normcase(os.path.dirname(destination)) ==
+                      os.path.normcase(os.path.abspath(os.path.join(portable_dir, "App"))))
+            use_onedir = bool(in_app and onedir and
+                              self._copy_launcher_payload(onedir, portable_dir))
+            source = (os.path.join(onedir, "PortableLauncher.exe") if use_onedir
+                      else bundled_exe_launcher_path())
+            if not os.path.isfile(source):
+                raise RuntimeError("нет подходящей сборки встроенного EXE-лончера")
+            with open(source, "rb") as fh:
+                if fh.read(2) != b"MZ":
+                    raise RuntimeError("ресурс не является Windows EXE (нет заголовка MZ)")
             temporary = destination + ".tmp"
             shutil.copy2(source, temporary)
             os.replace(temporary, destination)
@@ -9795,6 +9796,14 @@ class Portablizer:
                 "%PORTABLE_ROOT%\\PortableData\\WebView2",
             )
 
+        pycharm_target = pycharm_mod.find_pycharm_executable(
+            os.path.join(portable_dir, "App"), name)
+        is_pycharm = bool(pycharm_target and
+                          os.path.normcase(os.path.abspath(pycharm_target)) ==
+                          os.path.normcase(os.path.abspath(main_abs)))
+        if is_pycharm:
+            launcher_target = main_exe_rel.replace("\\", "/")
+
         cfg = launcher_mod.LauncherConfig(
             app_name=name,
             target_exe_rel=main_exe_rel.replace("\\", "/"),
@@ -9879,6 +9888,25 @@ class Portablizer:
             if t.rel_path.replace("\\", "/").lower() != main_norm
             and t.role in ("launcher", "config")
         ]
+        if is_pycharm:
+            # Reserve the standard Launcher names for the actual IDE; preserve
+            # any separately discovered launchers under distinct names/menu.
+            used = {t.bat_name.casefold() for t in companion_targets}
+            for t in companion_targets:
+                if t.bat_name.casefold() == "launch_launcher.bat":
+                    index = 2
+                    while f"launch_launcher_{index}.bat" in used:
+                        index += 1
+                    t.bat_name = f"Launch_Launcher_{index}.bat"
+                    t.vbs_name = f"Launch_Launcher_{index}.vbs"
+                    used.add(t.bat_name.casefold())
+            alias_bat = "Launch_Launcher.bat"
+            self._write_text(os.path.join(portable_dir, alias_bat),
+                             launcher_mod.render_main_alias_bat(), encoding="ascii")
+            created_launchers.append(alias_bat)
+            cfg.launcher_aliases["Launch_Launcher.exe"] = main_exe_rel.replace("\\", "/")
+            self.log.info("PyCharm: Launch_Launcher запускает основной pycharm64.exe; "
+                          "прочие обнаруженные лаунчеры сохранены отдельно.")
         for t in companion_targets:
             t_bat_path = os.path.join(portable_dir, t.bat_name)
             self._write_text(t_bat_path, launcher_mod.render_companion_bat(cfg, t),
