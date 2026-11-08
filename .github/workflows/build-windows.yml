@@ -1081,6 +1081,71 @@ jobs:
           }
           if (Test-Path $root) { throw "Folder was not removed after its external owner exited" }
 
+      - name: Smoke test - long path lock checks in built launcher
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PORTABLE_LAUNCHER_NO_UI: "1"
+        run: |
+          @'
+          import ctypes, json, os, shutil, subprocess, sys, tempfile
+          from portablizer.core.filelocks import extended_path
+
+          root = tempfile.mkdtemp(prefix='Portable deep smoke ')
+          holder = None
+          try:
+              app = os.path.join(root, 'App')
+              os.makedirs(app)
+              exe = os.path.join(app, 'LaunchPortable.exe')
+              shutil.copyfile('dist/PortableLauncher.exe', exe)
+              with open(os.path.join(root, 'launcher_config.json'), 'w', encoding='utf-8') as f:
+                  json.dump({'app_name': 'Deep', 'target_exe_rel': 'App/cmd.exe',
+                             'data_dir_name': 'PortableData', 'registry': {'enabled': False}}, f)
+              deep = os.path.join(root, 'PortableData', 'User')
+              while len(deep) < 290:
+                  deep = os.path.join(deep, 'nested_' + 'x' * 30)
+              os.makedirs(extended_path(deep))
+              path = os.path.join(deep, 'deep-lock.db')
+              with open(extended_path(path), 'w') as f:
+                  f.write('keep')
+              def stop():
+                  run = subprocess.run([exe, '--stop', '--elevated'], timeout=180)
+                  log = os.path.join(root, 'PortableData', 'launcher-run.log')
+                  text = open(log, encoding='utf-8', errors='replace').read() if os.path.exists(log) else ''
+                  print('stop code:', run.returncode, '\n', text)
+                  return run.returncode, text
+              code, text = stop()
+              if code != 0:
+                  raise RuntimeError('unlocked long-path tree was reported busy: ' + text)
+              child = r"""import ctypes, sys, time
+          k = ctypes.windll.kernel32
+          k.CreateFileW.restype = ctypes.c_void_p
+          h = k.CreateFileW(sys.argv[1], 0x80000000, 0, None, 3, 0x80, None)
+          if h in (0, None, ctypes.c_void_p(-1).value):
+              raise OSError(k.GetLastError(), 'cannot create lock')
+          print('READY', flush=True)
+          time.sleep(180)
+          """
+              holder = subprocess.Popen([sys.executable, '-c', child, extended_path(path)],
+                                        stdout=subprocess.PIPE, text=True)
+              if holder.stdout.readline().strip() != 'READY':
+                  raise RuntimeError('failed to lock deep file')
+              code, text = stop()
+              if code == 0 or holder.poll() is not None or 'deep-lock.db' not in text:
+                  raise RuntimeError('deep lock not reported or external owner terminated: ' + text)
+              holder.terminate()
+              holder.wait(timeout=10)
+              code, text = stop()
+              if code != 0:
+                  raise RuntimeError('released deep path still reported busy: ' + text)
+          finally:
+              if holder and holder.poll() is None:
+                  holder.terminate()
+                  holder.wait(timeout=10)
+              shutil.rmtree(extended_path(root), ignore_errors=False)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Smoke test - update inside the portable folder
         shell: pwsh
         run: |

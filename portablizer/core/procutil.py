@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 import time
-from . import restart_manager
+from . import filelocks, restart_manager
 
 from typing import (
     Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence,
@@ -847,72 +847,10 @@ def busy_files(root: str, budget: float = 8.0, limit: int = 20,
     """
     if not IS_WINDOWS or not root or not os.path.isdir(root):
         return []
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        kernel32.CreateFileW.restype = ctypes.c_void_p
-        invalid = ctypes.c_void_p(-1).value
-
-        def probe(path: str) -> Optional[bool]:
-            handle = kernel32.CreateFileW(path, 0x00010000, 7, None, 3, 0x80, None)
-            error = kernel32.GetLastError()
-            if handle in (None, 0, invalid):
-                if error in (_ERROR_SHARING_VIOLATION, _ERROR_LOCK_VIOLATION):
-                    return True
-                # A vanished file is no blocker. Access-denied, timeouts and
-                # other errors are unknown, not proof of a process lock.
-                return False if error in (2, 3) else None
-            kernel32.CloseHandle(ctypes.c_void_p(handle))
-            return False
-
-        def check(path: str) -> Optional[bool]:
-            return _call_with_timeout(lambda: probe(path), timeout=1.5, default=None)
-
-        deadline = time.monotonic() + budget
-        suspects: List[str] = []
-        incomplete = False
-        unknown = False
-        def on_walk_error(_exc):
-            nonlocal unknown
-            unknown = True
-
-        for current, _dirs, files in os.walk(root, onerror=on_walk_error):
-            # Chromium/PyCharm profile locks often live in PortableData;
-            # inspect that tree before a huge App payload exhausts the budget.
-            _dirs.sort(key=lambda item: (item.casefold() != "portabledata", item.casefold()))
-            if time.monotonic() > deadline or len(suspects) >= limit:
-                incomplete = True
-                break
-            for name in files:
-                if time.monotonic() > deadline or len(suspects) >= limit:
-                    incomplete = True
-                    break
-                outcome = check(os.path.join(current, name))
-                if outcome is True:
-                    suspects.append(os.path.join(current, name))
-                elif outcome is None:
-                    unknown = True
-            if incomplete:
-                break
-        confirmed: List[str] = []
-        if suspects:
-            time.sleep(recheck)
-            for path in suspects:
-                outcome = check(path)
-                if outcome is True:
-                    confirmed.append(path)
-                elif outcome is None:
-                    unknown = True
-        if scan_status is not None:
-            if incomplete:
-                scan_status.append("Проверка не охватила все файлы за отведённое время.")
-            if unknown:
-                scan_status.append("Некоторые файлы не удалось проверить (доступ или таймаут).")
-        return confirmed
-    except Exception as exc:  # noqa: BLE001
-        if scan_status is not None:
-            scan_status.append(f"Не удалось проверить файлы: {exc}")
-        return []
+    locked, issues = filelocks.scan([root], budget=budget, limit=limit, recheck=recheck)
+    if scan_status is not None:
+        scan_status.extend(issues)
+    return locked
 
 
 def forget_fonts(root: str, budget: float = 4.0) -> int:
@@ -1325,6 +1263,8 @@ def folder_is_free(root: str, errors: Optional[List[str]] = None,
                          + ".free-probe")
     try:
         if os.path.exists(probe):
+            if errors is not None:
+                errors.append(f"Нельзя проверить переименование: уже существует {probe}")
             return False
         os.rename(root, probe)
     except OSError as exc:
@@ -1345,6 +1285,8 @@ def folder_is_free(root: str, errors: Optional[List[str]] = None,
         except OSError:  # pragma: no cover - крайне маловероятно
             time.sleep(0.2 * (attempt + 1))
     if not restored:
+        if errors is not None:
+            errors.append(f"Не удалось вернуть исходное имя папки; текущий путь: {probe}")
         return False
     if not deep:
         return True

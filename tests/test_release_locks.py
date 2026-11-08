@@ -4,11 +4,13 @@ import ctypes
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from portablizer.core import maintenance, procutil, restart_manager
+from portablizer.core import filelocks, maintenance, procutil, restart_manager
 from portablizer.core.logutil import Logger
 import portable_launcher_entry as launcher
 
@@ -69,6 +71,82 @@ class ReleaseDiagnosticsTests(unittest.TestCase):
                                kw['scan_status'].append('incomplete') or []):
             launcher.release_leftover_handles(Path('portable'))
             self.assertEqual(launcher._LAST_CLEAN_SWEEP, 0)
+
+    def test_extended_paths_for_drive_unc_and_already_extended(self):
+        for source, expected in ((r'C:\Portable\App\file', r'\\?\C:\Portable\App\file'),
+                                 (r'\\server\share\file', r'\\?\UNC\server\share\file'),
+                                 (r'\\?\C:\deep\file', r'\\?\C:\deep\file')):
+            self.assertEqual(filelocks.extended_path(source), expected)
+            self.assertEqual(filelocks.display_path(expected),
+                             source if not source.startswith('\\\\?\\') else source[4:])
+
+    def test_access_denied_reports_exact_path_and_readonly_without_mutation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, 'readonly.bin')
+            path.write_text('unchanged')
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = ctypes.c_void_p(-1).value
+            kernel.GetLastError.return_value = 5
+            kernel.GetFileAttributesW.return_value = 1
+            for module, root in ((procutil, temp), (launcher, Path(temp))):
+                with self.subTest(module=module.__name__), \
+                     mock.patch.object(module, 'IS_WINDOWS', True), \
+                     mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                    status = []
+                    self.assertEqual(module.busy_files(root, scan_status=status), [])
+                    self.assertIn(str(path), ' '.join(status))
+                    self.assertIn('WinError 5', ' '.join(status))
+                    self.assertIn('только чтение', ' '.join(status))
+                    self.assertEqual(path.read_text(), 'unchanged')
+
+    def test_timed_out_probe_reports_path_and_later_closes_handle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp, 'slow.bin')
+            path.write_text('unchanged')
+            release, closed = threading.Event(), threading.Event()
+            kernel = mock.Mock()
+            def delayed(*_args):
+                release.wait(5)
+                return 42
+            kernel.CreateFileW.side_effect = delayed
+            kernel.CloseHandle.side_effect = lambda *_args: closed.set()
+            with mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                try:
+                    start = time.monotonic()
+                    locked, status = filelocks.scan([temp], budget=0.1)
+                    self.assertLess(time.monotonic() - start, 2)
+                    self.assertEqual(locked, [])
+                    self.assertIn(str(path), ' '.join(status))
+                    self.assertIn('не завершилась', ' '.join(status))
+                finally:
+                    release.set()
+                    self.assertTrue(closed.wait(2), 'eventual successful handle must be closed')
+
+    def test_many_files_use_a_single_worker_thread(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for i in range(200):
+                Path(temp, str(i)).touch()
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            real_thread = threading.Thread
+            with mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True), \
+                 mock.patch.object(filelocks.threading, 'Thread', wraps=real_thread) as thread:
+                locked, status = filelocks.scan([temp], budget=5)
+            self.assertEqual((locked, status), ([], []))
+            self.assertEqual(thread.call_count, 1)
+            self.assertEqual(kernel.CreateFileW.call_count, 200)
+            self.assertEqual(kernel.CloseHandle.call_count, 200)
+
+    def test_incomplete_details_are_not_hidden_by_holder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(procutil, 'release_folder', return_value=[]), \
+                 mock.patch.object(procutil, 'folder_is_free', side_effect=lambda root, errors:
+                                   errors.append('file.dat: WinError 5') or False), \
+                 mock.patch.object(procutil, 'busy_files', return_value=['locked']), \
+                 mock.patch.object(procutil, 'holders', return_value=[]):
+                report = maintenance.release(temp, Logger())
+            self.assertFalse(report.success)
+            self.assertIn('file.dat: WinError 5', ' '.join(report.messages))
 
     def test_restart_manager_results_are_reported_without_termination(self):
         root = r'D:\\P'
@@ -139,6 +217,35 @@ k.CloseHandle(ctypes.c_void_p(h))
             self.assertTrue(any(str(proc.pid) in item for item in report.holders), report.holders)
             proc.terminate()
             proc.wait(timeout=10)
+
+    def test_deep_windows_path_is_scanned_and_locked_owner_survives(self):
+        with tempfile.TemporaryDirectory(prefix='portable deep ') as temp:
+            directory = temp
+            while len(directory) < 290:
+                directory = os.path.join(directory, 'long_' + 'a' * 32)
+            native_dir = filelocks.extended_path(directory)
+            os.makedirs(native_dir)
+            path = os.path.join(directory, 'locked.db')
+            native_path = filelocks.extended_path(path)
+            with open(native_path, 'w') as stream:
+                stream.write('keep')
+            status = []
+            self.assertEqual(procutil.busy_files(temp, recheck=0, scan_status=status), [])
+            self.assertEqual(status, [])
+            proc = self._holder(native_path, 0)
+            status = []
+            self.assertIn(path, procutil.busy_files(temp, recheck=0, scan_status=status))
+            self.assertEqual(status, [])
+            self.assertIsNone(proc.poll())
+            proc.terminate()
+            proc.wait(timeout=10)
+            self.assertEqual(procutil.busy_files(temp, recheck=0), [])
+            # Python's default temporary-directory cleanup uses non-prefixed
+            # paths on some Windows configurations.
+            os.remove(native_path)
+            while directory != temp:
+                os.rmdir(filelocks.extended_path(directory))
+                directory = os.path.dirname(directory)
 
     def test_open_file_allowing_delete_is_not_a_sharing_conflict(self):
         with tempfile.TemporaryDirectory(prefix='portable share ', ignore_cleanup_errors=True) as temp:

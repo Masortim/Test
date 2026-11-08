@@ -3190,7 +3190,9 @@ class StuckAt85PercentRegressionTests(unittest.TestCase):
         # Главное: сборка ДОШЛА ДО КОНЦА, а не «висит на 85%» — и уложилась
         # в разумное время, а не в 15-20 минут по сумме всех таймаутов.
         self.assertTrue(result.success, result.messages)
-        self.assertLess(elapsed, 2.0,
+        # Shared Windows runners can pause for antivirus/IO; the independent
+        # attempt-count assertion below still catches per-DLL retries.
+        self.assertLess(elapsed, 5.0,
                         "полный проход не должен стоить сборке минут, даже "
                         "если распаковка и тихая установка зависли — а "
                         "десятки DLL из FULL_KIT одного и того же пакета "

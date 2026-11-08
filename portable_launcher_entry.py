@@ -24,6 +24,8 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from portablizer.core import filelocks
+
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
 IS_WINDOWS = sys.platform.startswith("win")
 NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
@@ -8126,68 +8128,12 @@ def busy_files(root: Path, budget: float = 4.0, limit: int = 12,
     if not IS_WINDOWS or not root or not os.path.isdir(str(root)):
         return []
     walk_roots = [str(item) for item in (roots or ()) if os.path.isdir(str(item))] or [str(root)]
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        invalid = ctypes.c_void_p(-1).value
-        kernel32.CreateFileW.restype = ctypes.c_void_p
-        mine = {image.casefold() for image in _own_executable_images()}
-
-        def locked(path: str) -> Optional[bool]:
-            if path.casefold() in mine:
-                return False
-            handle = kernel32.CreateFileW(path, 0x00010000, 7, None, 3, 0x80, None)
-            error = kernel32.GetLastError()
-            if handle in (None, 0, invalid):
-                if error in (_ERROR_SHARING_VIOLATION, _ERROR_LOCK_VIOLATION):
-                    return True
-                return False if error in (2, 3) else None
-            kernel32.CloseHandle(ctypes.c_void_p(handle))
-            return False
-
-        deadline = time.monotonic() + budget
-        suspects: list[str] = []
-        incomplete = unknown = False
-        def on_walk_error(_exc):
-            nonlocal unknown
-            unknown = True
-
-        for walk_root in walk_roots:
-            for current, _dirs, files in os.walk(walk_root, onerror=on_walk_error):
-                _dirs.sort(key=lambda item: (item.casefold() != "portabledata", item.casefold()))
-                for name in files:
-                    if time.monotonic() > deadline or len(suspects) >= limit:
-                        incomplete = True
-                        break
-                    path = os.path.join(current, name)
-                    outcome = locked(path)
-                    if outcome is True:
-                        suspects.append(path)
-                    elif outcome is None:
-                        unknown = True
-                if incomplete:
-                    break
-            if incomplete:
-                break
-        confirmed: list[str] = []
-        if suspects:
-            time.sleep(0.4)
-            for path in suspects:
-                outcome = locked(path)
-                if outcome is True:
-                    confirmed.append(path)
-                elif outcome is None:
-                    unknown = True
-        if scan_status is not None:
-            if incomplete:
-                scan_status.append("проверка не охватила все файлы за отведённое время")
-            if unknown:
-                scan_status.append("некоторые файлы не удалось проверить")
-        return confirmed
-    except Exception as exc:
-        if scan_status is not None:
-            scan_status.append(f"ошибка проверки: {exc}")
-        return []
+    mine = {image.casefold() for image in _own_executable_images()}
+    locked, issues = filelocks.scan(walk_roots, budget=budget, limit=limit,
+                                   skip=lambda path: path.casefold() in mine)
+    if scan_status is not None:
+        scan_status.extend(issues)
+    return locked
 
 
 def forget_fonts(root: Path, budget: float = 3.0,
