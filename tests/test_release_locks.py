@@ -179,6 +179,17 @@ class ReleaseDiagnosticsTests(unittest.TestCase):
 class ScanPrivilegeTests(unittest.TestCase):
     """Best-effort backup/restore privileges for ACL-hidden cache folders."""
 
+    @unittest.skipUnless(sys.platform == 'win32', 'needs a real Windows token')
+    def test_privilege_api_roundtrip_does_not_crash(self):
+        # Non-elevated runs get False, elevated runs get True; either way the
+        # AdjustTokenPrivileges roundtrip must not raise.
+        for name in (filelocks.SE_BACKUP_NAME, filelocks.SE_RESTORE_NAME):
+            filelocks._set_privilege(name, True)
+            filelocks._set_privilege(name, False)
+        enabled = filelocks.acquire_scan_privileges()
+        self.assertIsInstance(enabled, list)
+        filelocks.release_scan_privileges(enabled)
+
     def test_privileges_are_noop_off_windows(self):
         if os.name == 'nt':
             self.skipTest('POSIX no-op path')
