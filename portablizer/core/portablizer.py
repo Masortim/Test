@@ -60,6 +60,7 @@ from . import crashinfo as crash_mod
 from . import elevate as elevate_mod
 from . import inno_log as inno_log_mod
 from . import launcher as launcher_mod
+from . import longpaths as longpaths_mod
 from . import netstack as netstack_mod
 from . import procutil
 from . import redist as redist_mod
@@ -1391,6 +1392,7 @@ class Portablizer:
         self._unpacked_with = ""
         # Code 5 can leave a partial executable; its existence is not success.
         self._inno_aborted_with_payload = False
+        self._inno_skipped_error = False
         #: Диагноз последовательно пустых быстрых запусков установщика.
         self._hollow_note = ""
         #: Текущий результат распознавания, нужен и для диагностики лестницы.
@@ -2369,6 +2371,7 @@ class Portablizer:
             self._unpacker_result = ""
             self._unpacked_with = ""
             self._inno_aborted_with_payload = False
+            self._inno_skipped_error = False
             self._hollow_note = ""
             self._detection = None
             self._adobe_detected = False
@@ -2433,7 +2436,7 @@ class Portablizer:
             app_dir = os.path.join(portable_dir, "App")
             data_dir = os.path.join(portable_dir, "PortableData")
             result.portable_dir = portable_dir
-            self.log.info(f"Портативная папка: {portable_dir}")
+            used_short_root = False
 
             # 1. Определение типа установщика
             self._check_cancel()
@@ -2450,6 +2453,27 @@ class Portablizer:
             for e in det.evidence:
                 self.log.debug(f"  • {e}")
             self._warn_downloader_stub(det)
+
+            if (IS_WINDOWS and det.installer_type == InstallerType.INNO
+                    and longpaths_mod.should_use_short_root(opts.output_dir, name)):
+                # Atomically create a fresh directory: _prepare_output removes
+                # App, so an existing unrelated folder must never be selected.
+                original = portable_dir
+                portable_dir = os.path.normpath(longpaths_mod.reserve_short_root(opts.output_dir))
+                app_dir = os.path.join(portable_dir, "App")
+                data_dir = os.path.join(portable_dir, "PortableData")
+                result.portable_dir = portable_dir
+                used_short_root = True
+                self.log.warn(
+                    "Длинный путь Inno Setup: создаю новую короткую папку "
+                    f"в выбранном каталоге вместо {original}. Это уменьшает "
+                    "риск ошибки 206, но не гарантирует поддержку всех путей.")
+                if longpaths_mod.path_units(os.path.abspath(app_dir)) > 40:
+                    self.log.warn(
+                        "Даже сокращённый путь App длинный. Если возникнет "
+                        "ошибка 206, выберите папку вывода ближе к корню диска "
+                        "(например D:\\P); не пропускайте файлы установщика.")
+            self.log.info(f"Портативная папка: {portable_dir}")
 
             # Не очищаем старую сборку, пока не закончилось распознавание:
             # анализ повреждённого/неподдерживаемого установщика не должен
@@ -2663,8 +2687,8 @@ class Portablizer:
             # honest-шанс: распаковать приклеенный к exe ZIP — так устроены
             # многие современные bootstrapper'ы, и это не требует ни прав
             # администратора, ни изменения системы.
-            if (not self._find_main_exe(app_dir, name) and det.has_zip_payload
-                    and not self._adobe_detected):
+            if (not self._inno_skipped_error and not self._find_main_exe(app_dir, name)
+                    and det.has_zip_payload and not self._adobe_detected):
                 # У Adobe приклеенный архив — это весь пакет (payloads, MSI,
                 # Appx). Вываливать его содержимое в App нельзя: пакеты
                 # ставятся отдельно, а не копируются как файлы.
@@ -2676,7 +2700,7 @@ class Portablizer:
             # его содержимое БЕЗ запуска (Inno Setup и NSIS — обычные
             # контейнеры, некоторые из которых 7-Zip читает напрямую).
             # Совместимость зависит от версии и не гарантируется.
-            if not self._find_main_exe(app_dir, name):
+            if not self._inno_skipped_error and not self._find_main_exe(app_dir, name):
                 self._try_unpacker_fallback(opts, app_dir, portable_dir, det,
                                             name)
 
@@ -2723,7 +2747,7 @@ class Portablizer:
 
             # Если установщик не послушался целевого пути, ищем его результат
             # в перенаправленном профиле и в новых каталогах Program Files.
-            if not self._find_main_exe(app_dir, name):
+            if not self._inno_skipped_error and not self._find_main_exe(app_dir, name):
                 self.progress(72, "Поиск файлов, созданных установщиком")
                 online_product = getattr(det, "online_product", None)
                 if (getattr(det, "is_downloader_stub", False) is True
@@ -2772,7 +2796,8 @@ class Portablizer:
                             "могут быть посторонние файлы. Для распакованного "
                             "дистрибутива используйте исходный архив или "
                             "установите программу в отдельный каталог.")
-            elif registry_locations and not self._inno_aborted_with_payload:
+            elif (registry_locations and not self._inno_aborted_with_payload
+                  and not self._inno_skipped_error):
                 self._supplement_recovered_from_registry(
                     app_dir=app_dir,
                     app_name=name,
@@ -2784,7 +2809,7 @@ class Portablizer:
             # забрал файлы в App, оригинал в Program Files может остаться
             # (не совпало имя, не удалился из-за прав). Удаляем только
             # каталоги, имя которых совпадает с приложением.
-            if (not self._inno_aborted_with_payload
+            if (not self._inno_aborted_with_payload and not self._inno_skipped_error
                     and self._find_main_exe(app_dir, name)):
                 leftover = self._cleanup_leftover_install_dirs(
                     name, opts.installer_path, opts, data_dir,
@@ -2826,6 +2851,14 @@ class Portablizer:
             # 6. Поиск главного exe и обнаружение всех вспомогательных программ
             self._check_cancel()
             self.progress(75, "Поиск главного исполняемого файла и лаунчеров")
+            if self._inno_skipped_error:
+                result.hints = self._failure_hints(det, install_rc, opts, portable_dir)
+                result.attempt_outcomes = list(self._attempt_history)
+                raise RuntimeError(
+                    "В журнале Inno Setup есть Ignore в диалоге ошибки. "
+                    "Файлы в App могут быть неполными; готовый портатив не "
+                    "создан, даже если установщик вернул код 0. "
+                    + " ".join(result.hints))
             if self._inno_aborted_with_payload:
                 result.hints = self._failure_hints(det, install_rc, opts, portable_dir)
                 result.attempt_outcomes = list(self._attempt_history)
@@ -2919,6 +2952,20 @@ class Portablizer:
                 runtime_report=runtime_report, save_setup=save_setup,
                 netstack_report=netstack_report)
             result.companion_launchers = companion_files
+            if used_short_root:
+                note = (
+                    "Портатив создан в короткой папке для уменьшения риска "
+                    "ограничения длины путей. При переносе выбирайте короткий "
+                    "путь рядом с корнем диска: вложенные файлы или сама "
+                    "программа могут не работать в длинном пути.")
+                result.hints.append(note)
+                self.log.warn(note)
+                readme_path = os.path.join(portable_dir, "README_PORTABLE.txt")
+                try:
+                    with open(readme_path, "a", encoding="utf-8") as readme:
+                        readme.write("\n\nВАЖНО О ДЛИНЕ ПУТЕЙ\n" + note + "\n")
+                except OSError as exc:
+                    self.log.warn(f"Не удалось дополнить README: {exc}")
             online_product = getattr(det, "online_product", None)
             if (getattr(det, "is_downloader_stub", False) is True
                     and online_product is not None):
@@ -3294,6 +3341,18 @@ class Portablizer:
                 "Получен код 740 при уже повышенных правах Portablizer. "
                 "Проверьте журнал установщика: повторное повышение самого "
                 "Portablizer не гарантирует устранение причины."
+            )
+
+        if (det.installer_type == InstallerType.INNO and portable_dir and any(
+                inno_log_mod.has_long_path_error(os.path.join(portable_dir, log_name))
+                for log_name in ("install.log", "install-interactive.log"))):
+            hints.append(
+                "В журнале есть ошибка Windows 206 (слишком длинный путь). "
+                "Выберите короткую папку вывода у корня диска, например D:\\P, "
+                "и повторите сборку. Не выбирайте «Пропустить файл»: "
+                "сборка может стать неполной. Код 3 сам по себе не доказывает "
+                "проблему длины пути. Не переносите готовую программу в "
+                "длинный путь без отдельной проверки запуска."
             )
 
         if self._unpacker_result and not self._unpacked_with:
@@ -4750,6 +4809,18 @@ class Portablizer:
                                        progress_from=start, progress_to=stop,
                                        console_log=console_log)
             last_rc = rc
+            if (rc in (0, 3010) and getattr(self._detection, "installer_type", None)
+                    == InstallerType.INNO and any(
+                        inno_log_mod.has_ignored_error(path) for path in plan.progress_logs)):
+                self._attempts_made += 1
+                self._attempt_history.append((plan.label, rc))
+                self._inno_skipped_error = True
+                self.log.warn(
+                    "В журнале Inno Setup отмечен Ignore в диалоге ошибки. "
+                    "Установленные файлы могут быть неполными: не запускаю "
+                    "другие сценарии и не считаю установку успешной.")
+                return rc, None
+
             # Классический InstallShield пишет причину отказа в свой
             # setup.log — без неё «код 0 при пустой папке» необъясним.
             self._report_installshield_log(plan)

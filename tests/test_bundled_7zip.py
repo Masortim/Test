@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from portablizer.core import unpacker, inno_log
+from portablizer.core import unpacker, inno_log, longpaths
 from portablizer.core.detect import DetectionResult, InstallerType
 from portablizer.core.silentargs import build_attempts
 
@@ -93,6 +93,46 @@ class WindowsBundled7ZipTests(unittest.TestCase):
             self.assertIsNotNone(detail, log.read_text(encoding='utf-8-sig', errors='replace'))
             self.assertTrue(detail.suppressed)
             self.assertIn('Example.txt', detail.text)
+
+    def test_real_inno_installs_deep_tree_in_reserved_short_root(self):
+        compiler = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+                        'Inno Setup 6', 'ISCC.exe')
+        if not compiler.is_file():
+            self.skipTest('Inno Setup 6 compiler is not installed')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'Example.txt').write_text('deep fixture', encoding='ascii')
+            name = 'PyCharm_' + 'x' * 70
+            self.assertTrue(longpaths.should_use_short_root(str(root), name))
+            short_root = Path(longpaths.reserve_short_root(str(root)))
+            app = short_root / 'App'
+            # Ensure the same relative file exceeds MAX_PATH at the traditional
+            # root while fitting comfortably at the new target. Nothing is moved.
+            parts = []
+            while len(str(app.joinpath(*parts, 'Example.txt'))) < 215:
+                parts.append('a' * 20)
+            relative = Path(*parts, 'Example.txt')
+            old_file = root / (name + '_Portable') / 'App' / relative
+            new_file = app / relative
+            self.assertGreater(len(str(old_file)), 260)
+            self.assertLess(len(str(new_file)), 250)
+            nested = '\\'.join(parts)
+            script = root / 'test.iss'
+            script.write_text(
+                '[Setup]\nAppName=DeepFixture\nAppVersion=1.0\n'
+                'DefaultDirName={autopf}\\DeepFixture\nOutputBaseFilename=fixture\n'
+                'PrivilegesRequired=lowest\nUninstallable=no\nCreateUninstallRegKey=no\n'
+                '[Files]\nSource: "Example.txt"; DestDir: "{app}\\' + nested + '"\n',
+                encoding='ascii')
+            compiled = subprocess.run([str(compiler), '/Q', str(script)], capture_output=True, timeout=120)
+            self.assertEqual(compiled.returncode, 0, compiled.stdout.decode(errors='replace'))
+            det = DetectionResult(installer_type=InstallerType.INNO, confidence=1.0)
+            plan = build_attempts(det, str(root / 'Output/fixture.exe'), str(app), str(short_root))[0]
+            proc = subprocess.run([plan.program] + plan.args, timeout=120)
+            log = short_root / 'install.log'
+            self.assertEqual(proc.returncode, 0, log.read_text(encoding='utf-8-sig', errors='replace'))
+            self.assertEqual(new_file.read_text(), 'deep fixture')
+            self.assertFalse(old_file.exists())
 
     def test_real_inno_installer_is_extracted_or_honestly_rejected(self):
         compiler = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),

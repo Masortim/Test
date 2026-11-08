@@ -23,12 +23,8 @@ class InnoDialog:
     suppressed: bool
 
 
-def read_dialog(path: str) -> Optional[InnoDialog]:
-    """Return a bounded excerpt of the latest explicit Abort dialog, if any.
-
-    Only inspect the end of the log. A missing/truncated/unrecognized log is
-    not evidence for any particular reason. Installer text remains untrusted.
-    """
+def _read_tail(path: str) -> str:
+    """Read a bounded, best-effort decoded tail of an installer log."""
     try:
         with open(path, 'rb') as fh:
             bom = fh.read(4)
@@ -39,7 +35,7 @@ def read_dialog(path: str) -> Optional[InnoDialog]:
             fh.seek(start)
             data = fh.read(_MAX_BYTES + 2)
     except OSError:
-        return None
+        return ""
     if bom.startswith(b'\xff\xfe'):
         text = data.decode('utf-16-le', 'replace').lstrip('\ufeff')
     elif bom.startswith(b'\xfe\xff'):
@@ -53,7 +49,45 @@ def read_dialog(path: str) -> Optional[InnoDialog]:
                 text = data.decode('mbcs', 'replace')
             except LookupError:
                 text = data.decode('cp1251', 'replace')
-    lines = text.splitlines()
+    return text
+
+
+_LONG_PATH = re.compile(
+    r"(?:\b(?:error(?:\s+code)?|winerror|ошибка|код(?:\s+ошибки)?)\s*[:=]?\s*206\b"
+    r"|the filename or extension is too long"
+    r"|имя файла или его расширение имеет слишком большую длину)", re.I)
+
+
+def has_long_path_error(path: str) -> bool:
+    # Code 3 (path not found) alone is not evidence of a long path.
+    return bool(_LONG_PATH.search(_read_tail(path)))
+
+
+
+def has_ignored_error(path: str) -> bool:
+    """Detect an explicit Ignore response to an Abort/Retry/Ignore dialog.
+
+    Normal version-based skips are not errors. The log format is not stable,
+    so an absent match does not prove that every file was installed.
+    """
+    lines = _read_tail(path).splitlines()
+    for index, line in enumerate(lines):
+        if not _DIALOG.search(line):
+            continue
+        for item in lines[index + 1:index + 32]:
+            if _TIMESTAMP.match(item):
+                if re.search(r'user chose\s+ignore\b', item, re.I):
+                    return True
+                break
+    return False
+
+def read_dialog(path: str) -> Optional[InnoDialog]:
+    """Return a bounded excerpt of the latest explicit Abort dialog, if any.
+
+    Only inspect the end of the log. A missing/truncated/unrecognized log is
+    not evidence for any particular reason. Installer text remains untrusted.
+    """
+    lines = _read_tail(path).splitlines()
     for index in range(len(lines) - 1, -1, -1):
         line = lines[index]
         suppressed = bool(_SUPPRESSED.search(line))
