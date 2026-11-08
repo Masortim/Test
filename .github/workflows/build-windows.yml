@@ -58,9 +58,24 @@ jobs:
         shell: pwsh
         run: |
           $url = 'https://github.com/ip7z/7zip/releases/download/26.05/7z2605-x64.exe'
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP/7z-upstream.exe"
-          $actual = (Get-FileHash "$env:RUNNER_TEMP/7z-upstream.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne 'fd99e86f57d8f429ef5ed045bf98315af962e2309b0f1ba87a147a44c71647d0') { throw '7-Zip upstream archive hash mismatch' }
+          $expected = 'fd99e86f57d8f429ef5ed045bf98315af962e2309b0f1ba87a147a44c71647d0'
+          $actual = $null
+          # GitHub's release CDN occasionally serves an error page instead of the
+          # asset (observed 2026-11-08). A single fetch would then kill the whole
+          # build on a hash mismatch, so retry a few times. The pinned hash
+          # check itself is unchanged: we never accept anything else.
+          for ($attempt = 1; $attempt -le 4; $attempt++) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile "$env:RUNNER_TEMP/7z-upstream.exe"
+              $actual = (Get-FileHash "$env:RUNNER_TEMP/7z-upstream.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($actual -eq $expected) { break }
+              Write-Host "attempt ${attempt}: unexpected content (sha256 $actual) - upstream may be serving an error page; retrying"
+            } catch {
+              Write-Host "attempt ${attempt}: download failed: $($_.Exception.Message)"
+            }
+            if ($attempt -lt 4) { Start-Sleep -Seconds (20 * $attempt) }
+          }
+          if ($actual -ne $expected) { throw '7-Zip upstream archive hash mismatch after 4 attempts' }
           $seven = (Get-Command 7z.exe -ErrorAction Stop).Source
           & $seven x -y "-o$env:RUNNER_TEMP/7z-upstream" "$env:RUNNER_TEMP/7z-upstream.exe" | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'Could not unpack upstream 7-Zip' }

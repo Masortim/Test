@@ -135,7 +135,13 @@ class ReleaseDiagnosticsTests(unittest.TestCase):
             self.assertEqual((locked, status), ([], []))
             self.assertEqual(thread.call_count, 1)
             self.assertEqual(kernel.CreateFileW.call_count, 200)
-            self.assertEqual(kernel.CloseHandle.call_count, 200)
+            # On Windows the scan also opens and closes its token once per
+            # privilege (backup + restore, enable + restore). Those CloseHandle
+            # calls are expected; count only the file probes (handle value 42).
+            probes = [call for call in kernel.CloseHandle.call_args_list
+                      if isinstance(call.args[0], ctypes.c_void_p)
+                      and call.args[0].value == 42]
+            self.assertEqual(len(probes), 200)
 
     def test_incomplete_details_are_not_hidden_by_holder(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -168,6 +174,101 @@ class ReleaseDiagnosticsTests(unittest.TestCase):
             self.assertEqual(launcher.release_open_files(Path(r'D:\\P')), [])
         close.assert_not_called()
         kill.assert_not_called()
+
+
+class ScanPrivilegeTests(unittest.TestCase):
+    """Best-effort backup/restore privileges for ACL-hidden cache folders."""
+
+    @unittest.skipUnless(sys.platform == 'win32', 'needs a real Windows token')
+    def test_privilege_api_roundtrip_does_not_crash(self):
+        # Non-elevated runs get False, elevated runs get True; either way the
+        # AdjustTokenPrivileges roundtrip must not raise.
+        for name in (filelocks.SE_BACKUP_NAME, filelocks.SE_RESTORE_NAME):
+            filelocks._set_privilege(name, True)
+            filelocks._set_privilege(name, False)
+        enabled = filelocks.acquire_scan_privileges()
+        self.assertIsInstance(enabled, list)
+        filelocks.release_scan_privileges(enabled)
+
+    def test_privileges_are_noop_off_windows(self):
+        if os.name == 'nt':
+            self.skipTest('POSIX no-op path')
+        self.assertEqual(filelocks.acquire_scan_privileges(), [])
+        # Release is a symmetric no-op; it must not raise either.
+        filelocks.release_scan_privileges([filelocks.SE_BACKUP_NAME,
+                                           filelocks.SE_RESTORE_NAME])
+
+    def test_privilege_acquisition_failure_never_breaks_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            Path(temp, 'file.bin').write_text('x')
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            with mock.patch.object(filelocks, 'acquire_scan_privileges',
+                                   side_effect=RuntimeError('no token')), \
+                 mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+            self.assertEqual((locked, issues), ([], []))
+
+    def test_privilege_release_failure_never_breaks_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            Path(temp, 'file.bin').write_text('x')
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            with mock.patch.object(filelocks, 'release_scan_privileges',
+                                   side_effect=RuntimeError('gone')), \
+                 mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+            self.assertEqual((locked, issues), ([], []))
+
+    def test_privileges_are_released_after_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            Path(temp, 'file.bin').write_text('x')
+            released = []
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            with mock.patch.object(filelocks, 'acquire_scan_privileges',
+                                   return_value=['SeBackupPrivilege']), \
+                 mock.patch.object(filelocks, 'release_scan_privileges',
+                                   side_effect=lambda names: released.extend(names)), \
+                 mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+            self.assertEqual((locked, issues), ([], []))
+            self.assertEqual(released, ['SeBackupPrivilege'])
+
+    @staticmethod
+    def _win_error_5_walk(_root, onerror):
+        exc = PermissionError(13, 'denied')
+        exc.winerror = 5
+        onerror(exc)
+        return iter(())
+
+    def test_walk_error_without_privileges_suggests_elevated_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            with mock.patch.object(filelocks, 'acquire_scan_privileges', return_value=[]), \
+                 mock.patch.object(filelocks.os, 'walk', side_effect=self._win_error_5_walk), \
+                 mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+        text = ' '.join(issues)
+        self.assertEqual(locked, [])
+        self.assertIn('WinError 5', text)
+        self.assertIn('администратора', text)
+        self.assertEqual(text.count('администратора'), 1)
+
+    def test_walk_error_with_privileges_reports_no_elevation_hint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            kernel = mock.Mock()
+            kernel.CreateFileW.return_value = 42
+            with mock.patch.object(filelocks, 'acquire_scan_privileges',
+                                   return_value=['SeBackupPrivilege']), \
+                 mock.patch.object(filelocks.os, 'walk', side_effect=self._win_error_5_walk), \
+                 mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+        text = ' '.join(issues)
+        self.assertEqual(locked, [])
+        self.assertIn('WinError 5', text)
+        self.assertNotIn('администратора', text)
 
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows actual handle test')
