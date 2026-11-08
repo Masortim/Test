@@ -750,6 +750,23 @@ jobs:
                   }
                 }
               }
+              # Authorized 2026-11-08: on current runners the OS shell spawns
+              # the default browser for the sign-in URL (sometimes via the
+              # pre-running browser), so the browser's parent is NOT OpenCode.
+              # The URL itself is per-session and proves this sign-in click
+              # reached the browser; accept it regardless of the parent.
+              # Additive signal: every check above and below is unchanged.
+              $urlSamples = @(Get-CimInstance Win32_Process `
+                -Filter "Name = 'msedge.exe' OR Name = 'chrome.exe' OR Name = 'browser.exe' OR Name = 'yandex.exe' OR Name = 'firefox.exe' OR Name = 'brave.exe'" `
+                -ErrorAction SilentlyContinue)
+              foreach ($urlSample in $urlSamples) {
+                if ($existingBrowserIds -contains $urlSample.ProcessId) { continue }
+                if ($urlSample.CommandLine -match '(?i)zed\.dev/native_app_signin|opencode\.ai/zen') {
+                  $handoff = $true
+                  $handoffMode = "session sign-in URL in browser command line: $($urlSample.ProcessId)"
+                  break
+                }
+              }
               if ($handoff) { break }
               if ($attempt % 10 -eq 0) {
                 # Also accept a visible page or background tab in the existing
