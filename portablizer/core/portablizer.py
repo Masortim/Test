@@ -349,6 +349,7 @@ def _remove_tree_avoiding_links(path: str) -> None:
                 child = os.path.join(current, name)
                 if not _is_reparse_point(child):
                     continue
+                filelocks_mod.clear_readonly(current)
                 try:
                     os.rmdir(child)
                 except OSError:
@@ -359,7 +360,10 @@ def _remove_tree_avoiding_links(path: str) -> None:
                 dirs.remove(name)
     except OSError:
         pass
-    shutil.rmtree(path, ignore_errors=True)
+    shutil.rmtree(
+        path,
+        onerror=filelocks_mod.make_rmtree_onerror(stop_at=path, swallow=True),
+    )
 
 
 def is_elevated() -> bool:
@@ -1661,7 +1665,9 @@ class Portablizer:
         отпускают файл не мгновенно. Раньше такая секундная блокировка
         обрывала всю сборку сообщением «не удалось очистить старый файл»;
         теперь попытка повторяется с нарастающей паузой, а перед последней
-        из папки выгоняются оставшиеся процессы.
+        из папки выгоняются оставшиеся процессы. Также снимает атрибуты
+        «только для чтения» на каталогах (например, ``App\\PyCharm2025.2`` с
+        пользовательским значком ``desktop.ini``) и файлах без обхода junction.
         """
         last: Optional[OSError] = None
         for attempt in range(attempts):
@@ -1672,31 +1678,25 @@ class Portablizer:
                     except OSError:
                         os.unlink(path)
                 elif os.path.isdir(path) and not os.path.islink(path):
-                    filelocks_mod.unhide_wininet_cache(path)
-                    for current, dirs, _files in os.walk(path, topdown=True,
-                                                         followlinks=False):
-                        for name in list(dirs):
-                            child = os.path.join(current, name)
-                            if not _is_reparse_point(child):
-                                continue
-                            try:
-                                os.rmdir(child)
-                            except OSError:
-                                try:
-                                    os.unlink(child)
-                                except OSError:
-                                    pass
-                            dirs.remove(name)
-                    shutil.rmtree(path)
+                    filelocks_mod.rmtree_robust(path)
                 elif os.path.exists(path) or os.path.islink(path):
-                    os.remove(path)
+                    try:
+                        os.remove(path)
+                    except PermissionError:
+                        filelocks_mod.clear_readonly(path)
+                        filelocks_mod.unlock_path_for_delete(path, stop_at=path)
+                        os.remove(path)
                 return
             except OSError as exc:
                 last = exc
                 if attempt == attempts - 2:
+                    parent_dir = os.path.dirname(path)
                     self._release_portable_dir(
-                        os.path.dirname(path),
+                        parent_dir,
                         reason=f"файл занят: {os.path.basename(path)}")
+                    if IS_WINDOWS and os.path.isdir(path):
+                        procutil.forget_fonts(path, budget=2.0)
+                        procutil.release_open_files(parent_dir, budget=6.0)
                 time.sleep(0.4 * (attempt + 1))
         if last is not None:
             raise last
@@ -1906,6 +1906,202 @@ class Portablizer:
                   "NetStack и на каждом ПК регистрируется заново; при "
                   "следующей сборке в эту папку она будет снята автоматически.")
 
+    def _can_reclaim_portable_dir(self, portable_dir: str) -> bool:
+        """Проверяет, что путь — безопасная папка портатива, а не корень/система."""
+        if not portable_dir:
+            return False
+        abs_dir = os.path.abspath(portable_dir)
+        if self._is_drive_root(abs_dir) or _is_reparse_point(abs_dir):
+            return False
+        _drive, tail = os.path.splitdrive(abs_dir)
+        parts = [p for p in tail.strip("\\/").split(os.sep) if p]
+        if not parts:
+            return False
+        if len(parts) == 1 and parts[0].casefold() in self._SYSTEM_DRIVE_SKIP_DIRS:
+            return False
+        norm = os.path.normcase(abs_dir).rstrip("\\/")
+        for env_key in (
+            "SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)",
+            "ProgramW6432", "PROGRAMDATA", "USERPROFILE", "APPDATA",
+            "LOCALAPPDATA",
+        ):
+            env_val = os.environ.get(env_key, "")
+            if env_val:
+                env_norm = os.path.normcase(os.path.abspath(env_val)).rstrip("\\/")
+                if norm == env_norm:
+                    return False
+        return True
+
+    def _elevated_reclaim_dir(self, portable_dir: str,
+                              user_sid: str = "") -> bool:
+        """Восстанавливает права текущего пользователя на папку прошлой сборки через UAC.
+
+        На дополнительных дисках NTFS (``D:\\``, ``E:\\``) папка ``App\\...``,
+        созданная прошлым запуском от имени администратора, принадлежит группе
+        ``Administrators``, а обычным ``Users`` достаётся только чтение без права
+        удаления. Один запрос UAC возвращает владение и наследуемый полный доступ
+        ``TokenUser``, не переходя по символическим ссылкам/junction.
+        """
+        if not self._can_reclaim_portable_dir(portable_dir):
+            return False
+        sid = user_sid or filelocks_mod.current_user_sid_string()
+        if not re.match(r"^S-1-\d+(?:-\d+){1,15}$", sid):
+            return False
+
+        ps_body = (
+            "param([string]$Cfg)\r\n"
+            "$ErrorActionPreference = 'SilentlyContinue'\r\n"
+            "$lines = [IO.File]::ReadAllLines($Cfg, [Text.Encoding]::UTF8)\r\n"
+            "$sid = $lines[0]\r\n"
+            "$root = $lines[1]\r\n"
+            "$done = $lines[2]\r\n"
+            "& takeown.exe /F $root /R /SKIPSL /D Y | Out-Null\r\n"
+            "& icacls.exe $root /grant ('*' + $sid + ':(OI)(CI)F') /T /C /L /Q | Out-Null\r\n"
+            "[IO.File]::WriteAllText($done, 'ok')\r\n"
+        )
+        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+        ps_candidate = os.path.join(
+            sys_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+        ps_exe = ps_candidate if os.path.isfile(ps_candidate) else "powershell.exe"
+
+        ps1_path = ""
+        cfg_path = ""
+        done_path = ""
+        try:
+            fd_ps1, ps1_path = tempfile.mkstemp(prefix="portablizer-reclaim-", suffix=".ps1")
+            with os.fdopen(fd_ps1, "wb") as stream:
+                stream.write(ps_body.encode("ascii"))
+            fd_done, done_path = tempfile.mkstemp(prefix="portablizer-reclaim-", suffix=".done")
+            os.close(fd_done)
+            try:
+                os.remove(done_path)
+            except OSError:
+                pass
+            fd_cfg, cfg_path = tempfile.mkstemp(prefix="portablizer-reclaim-", suffix=".cfg")
+            with os.fdopen(fd_cfg, "wb") as stream:
+                payload = "\n".join([sid, os.path.abspath(portable_dir), done_path]) + "\n"
+                stream.write(payload.encode("utf-8"))
+
+            self.log.warn(
+                "Файлы прошлой сборки созданы с правами администратора — "
+                "запрашиваю повышение через UAC для восстановления прав доступа "
+                "к папке портатива (подтвердите запрос Windows)."
+            )
+            code = elevate_mod._shell_execute_runas(
+                ps_exe,
+                [
+                    "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+                    "-ExecutionPolicy", "Bypass", "-File", ps1_path, cfg_path,
+                ],
+            )
+            if code <= 32:
+                self.log.warn(
+                    "Повышение прав отклонено (или недоступно). Старая папка "
+                    "App осталась под защитой прав администратора."
+                )
+                return False
+
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                if os.path.exists(done_path):
+                    return True
+                time.sleep(0.25)
+            return os.path.exists(done_path)
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug(f"Восстановление прав через UAC не удалось: {exc}")
+            return False
+        finally:
+            for temp_file in (ps1_path, cfg_path, done_path):
+                if temp_file:
+                    try:
+                        os.remove(temp_file)
+                    except OSError:
+                        pass
+
+    def _clean_app_dir(self, portable_dir: str, app_dir: str) -> None:
+        """Очищает старую папку ``App`` с разбором держателей и прав доступа."""
+        if not (os.path.isdir(app_dir) or os.path.exists(app_dir)
+                or _is_reparse_point(app_dir)):
+            return
+        try:
+            self._remove_path(app_dir)
+            return
+        except OSError as exc:
+            if not IS_WINDOWS:
+                raise
+            failed_target = filelocks_mod.display_path(
+                getattr(exc, "filename", "") or app_dir
+            )
+            locked = procutil.busy_files(app_dir, budget=4.0, recheck=0)
+            if os.path.isfile(failed_target) and failed_target not in locked:
+                locked = [failed_target, *locked]
+            holders = procutil.holders(
+                portable_dir, budget=8.0, locked_files=locked
+            )
+            if any(
+                not h.protected and h.image
+                and procutil.is_inside(h.image, portable_dir)
+                for h in holders
+            ):
+                self._release_portable_dir(
+                    portable_dir, reason="повторная очистка App")
+                procutil.forget_fonts(app_dir, budget=2.0)
+                procutil.release_open_files(portable_dir, budget=8.0)
+                try:
+                    self._remove_path(app_dir, attempts=2)
+                    return
+                except OSError as retry_exc:
+                    exc = retry_exc
+                    failed_target = filelocks_mod.display_path(
+                        getattr(exc, "filename", "") or app_dir
+                    )
+                    locked = procutil.busy_files(app_dir, budget=4.0, recheck=0)
+                    holders = procutil.holders(
+                        portable_dir, budget=8.0, locked_files=locked
+                    )
+
+            names = procutil.describe_holders(holders)
+            if names or locked:
+                who = (
+                    ", ".join(names)
+                    if names
+                    else ", ".join(os.path.basename(p) for p in locked[:6])
+                )
+                raise RuntimeError(
+                    f"Не удалось очистить старую папку программы "
+                    f"'{failed_target}' ({exc}). Папку держат открытой: {who}. "
+                    "Закройте открытые окна проводника и программы для этой "
+                    f"папки (или запустите {launcher_mod.STOP_SCRIPT_NAME}) "
+                    "и повторите сборку."
+                ) from exc
+
+            is_perm = isinstance(exc, PermissionError) or getattr(
+                exc, "winerror", None
+            ) == 5
+            if (is_perm and not is_elevated()
+                    and not elevate_mod.elevation_disabled()):
+                if self._elevated_reclaim_dir(portable_dir):
+                    self._remove_path(app_dir, attempts=2)
+                    self.log.ok(
+                        "Права доступа к папке портатива восстановлены, "
+                        "старая папка App очищена."
+                    )
+                    return
+                raise RuntimeError(
+                    f"Не удалось очистить старую папку программы "
+                    f"'{failed_target}' ({exc}): файлы прошлой сборки созданы "
+                    "с правами администратора. Подтвердите запрос UAC либо "
+                    "запустите Portablizer от имени администратора "
+                    "(«Запуск от имени администратора»)."
+                ) from exc
+
+            raise RuntimeError(
+                f"Не удалось очистить старую папку программы "
+                f"'{failed_target}' ({exc}). Если эта папка открыта в "
+                "Проводнике или терминале, закройте окно и повторите сборку."
+            ) from exc
+
     def _prepare_output(self, portable_dir: str, app_dir: str,
                         data_dir: str, installer_path: str = "",
                         result: Optional["PortableResult"] = None) -> None:
@@ -1918,6 +2114,8 @@ class Portablizer:
         """
         os.makedirs(portable_dir, exist_ok=True)
         if IS_WINDOWS:
+            if self._can_reclaim_portable_dir(portable_dir):
+                filelocks_mod.ensure_user_dir_access(portable_dir)
             self._adopt_leftover_services(portable_dir, app_dir, data_dir,
                                           result)
 
@@ -1928,12 +2126,12 @@ class Portablizer:
         # вместо того чтобы просить пользователя искать процесс в диспетчере.
         self._release_portable_dir(portable_dir, reason="перед очисткой")
 
-        if os.path.isdir(app_dir):
-            self._remove_path(app_dir)
-        elif os.path.exists(app_dir):
-            self._remove_path(app_dir)
+        self._clean_app_dir(portable_dir, app_dir)
         os.makedirs(app_dir, exist_ok=True)
         os.makedirs(data_dir, exist_ok=True)
+        if IS_WINDOWS:
+            filelocks_mod.ensure_user_dir_access(app_dir)
+            filelocks_mod.ensure_user_dir_access(data_dir)
         # Старые ссылки и профили браузера не должны переходить в новую
         # сборку. Сначала снимаем ссылку, не заходя в настоящий профиль.
         self._unlink_browser_profiles(data_dir)
@@ -8445,7 +8643,10 @@ class Portablizer:
                 self.log.info(
                     f"Найден брошенный каталог установки: {entry_abs}")
                 try:
-                    shutil.rmtree(entry_abs, ignore_errors=False)
+                    shutil.rmtree(
+                        entry_abs,
+                        onerror=filelocks_mod.make_rmtree_onerror(stop_at=entry_abs),
+                    )
                     removed.append(entry_abs)
                     gone.add(entry_key)
                     self._remember_recovered_source(entry_abs)
@@ -8493,7 +8694,10 @@ class Portablizer:
             # recovered приложению.
             self.log.info(
                 f"Удаляю оригинал установки из Program Files: {source_abs}")
-            shutil.rmtree(source_abs, ignore_errors=False)
+            shutil.rmtree(
+                source_abs,
+                onerror=filelocks_mod.make_rmtree_onerror(stop_at=source_abs),
+            )
         except OSError as exc:
             self.log.warn(
                 f"Не удалось удалить оригинал установки из Program Files "
@@ -8874,7 +9078,10 @@ class Portablizer:
                 os.makedirs(dest_dir, exist_ok=True)
                 shutil.copytree(src_dir, dest_dir, dirs_exist_ok=True)
                 self._remember_recovered_source(src_dir)
-                shutil.rmtree(src_dir, ignore_errors=False)
+                shutil.rmtree(
+                    src_dir,
+                    onerror=filelocks_mod.make_rmtree_onerror(stop_at=src_dir),
+                )
                 relocated.append(dest_dir)
                 self.log.ok(
                     f"Рабочая папка программы перенесена в портатив: "
