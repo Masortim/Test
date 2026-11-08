@@ -171,7 +171,8 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
         for line in errors:
             log.debug(f"Папка не отпускается: {line}")
 
-    locked = procutil.busy_files(folder)
+    scan_status: List[str] = []
+    locked = procutil.busy_files(folder, scan_status=scan_status)
     holders = procutil.holders(folder, locked_files=locked)
     report.holders = procutil.describe_holders(holders)
     if report.holders:
@@ -210,6 +211,15 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
                       "неполной проверке; повторите после закрытия приложений."))
         log.warn(message)
         report.messages.append(message)
+    # A lock and an inaccessible path can coexist. Never hide the latter
+    # behind a holder message, and retain the first check's concrete cause.
+    if report.holders:
+        details = [line for line in errors + scan_status
+                   if not line.startswith("Открытые файлы:")]
+        if details:
+            detail = "Проверка также была неполной: " + " ".join(dict.fromkeys(details))
+            log.warn(detail)
+            report.messages.append(detail)
     return report
 
 
