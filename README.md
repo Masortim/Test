@@ -1,5 +1,31 @@
 # Portablizer
 
+### Кэш WinINet (`Content.IE5`), junction-ссылки и отчёт `StopPortable.cmd` (1.55)
+
+В перенаправленном профиле `PortableData\User\AppData\Local\Microsoft\Windows\INetCache\Content.IE5`
+(а также `Low\Content.IE5` и `History\History.IE5`) Windows `wininet.dll`
+добавляет запрещающую запись ACL (`Everyone: DENY FILE_LIST_DIRECTORY`), а в
+профиле могут присутствовать системные NTFS-junction (`Temporary Internet Files`,
+`Application Data`, `EdgeWebView`). Раньше обычный запуск без прав
+администратора получал `ошибка обхода (WinError 5)` и ложное сообщение «папка
+портатива занята», при повышенных правах `os.walk` не передавал
+`FILE_FLAG_BACKUP_SEMANTICS`, а `StopPortable.cmd` печатал `The folder is STILL locked`
+без имён процессов в консоли.
+
+В 1.55:
+* обход блокировок не заходит внутрь symlink и NTFS-junction (`FILE_ATTRIBUTE_REPARSE_POINT`),
+  чтобы не цеплять системные заглушки профиля и внешние каталоги хоста;
+* на собственных каталогах кэша WinINet (`INetCache\Content.IE5`, `History.IE5`)
+  внутри `PortableData` без прав администратора и без удаления файлов снимается
+  только запрещающий ACE перечисления — папка проверяется, копируется на флешку
+  и удаляется штатным Проводником;
+* при наличии `SeBackupPrivilege` закрытые по ACL каталоги перечисляются через
+  `CreateFileW(..., FILE_FLAG_BACKUP_SEMANTICS)` + `GetFileInformationByHandleEx`,
+  а файлы проверяются с тем же флагом;
+* сборщик и `StopPortable.cmd` различают реальную блокировку и неполную проверку,
+  а `LaunchPortable.exe --stop` выводит конкретных держателей (через Restart
+  Manager и таблицу дескрипторов) прямо в консоль `StopPortable.cmd`.
+
 ### Недоступный кэш WinINet при проверке папки (1.54)
 
 `PortableData\User\AppData\Local\Microsoft\Windows\INetCache\Content.IE5`

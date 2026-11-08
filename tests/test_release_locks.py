@@ -270,6 +270,132 @@ class ScanPrivilegeTests(unittest.TestCase):
         self.assertIn('WinError 5', text)
         self.assertNotIn('администратора', text)
 
+    def test_wininet_cache_marker_matches_only_windows_cache_paths(self):
+        self.assertTrue(filelocks._is_wininet_cache_dir(
+            r'E:\Portable\PyCharm_Portable\PortableData\User\AppData\Local'
+            r'\Microsoft\Windows\INetCache\Content.IE5'
+        ))
+        self.assertTrue(filelocks._is_wininet_cache_dir(
+            r'E:\Portable\PyCharm_Portable\PortableData\User\AppData\Local'
+            r'\Microsoft\Windows\INetCache\Low\Content.IE5'
+        ))
+        self.assertTrue(filelocks._is_wininet_cache_dir(
+            r'D:\App_Portable\PortableData\AppData\Local\Microsoft\Windows'
+            r'\History\History.IE5'
+        ))
+        self.assertFalse(filelocks._is_wininet_cache_dir(
+            r'E:\Portable\PyCharm_Portable\App\bin'
+        ))
+        self.assertFalse(filelocks._is_wininet_cache_dir(
+            r'E:\Portable\PyCharm_Portable\PortableData\User\Documents\Content.IE5'
+        ))
+
+    def test_reparse_point_directories_are_not_traversed_during_scan(self):
+        with tempfile.TemporaryDirectory() as temp, \
+             tempfile.TemporaryDirectory() as outside:
+            portable_file = Path(temp, 'App', 'ok.dll')
+            portable_file.parent.mkdir(parents=True)
+            portable_file.write_text('ok')
+            outside_locked = Path(outside, 'host_webview.dll')
+            outside_locked.write_text('busy')
+            link_dir = Path(temp, 'PortableData', 'EdgeWebView')
+            link_dir.parent.mkdir(parents=True)
+            os.symlink(outside, link_dir, target_is_directory=True)
+
+            probed = []
+            kernel = mock.Mock()
+            def fake_create(path, *_args):
+                probed.append(filelocks.display_path(path))
+                return 42
+            kernel.CreateFileW.side_effect = fake_create
+            with mock.patch.object(ctypes, 'windll', mock.Mock(kernel32=kernel), create=True):
+                locked, issues = filelocks.scan([temp], budget=5)
+
+            self.assertEqual((locked, issues), ([], []))
+            self.assertEqual(probed, [str(portable_file)])
+
+    def test_verify_folder_is_free_reports_incomplete_check_honestly(self):
+        from portablizer.core.portablizer import Portablizer, PortableResult
+
+        engine = Portablizer(Logger())
+        result = PortableResult(success=True)
+        inaccessible = (
+            r'E:\Portable\App\Secret: ошибка обхода (WinError 5)'
+        )
+        with mock.patch('portablizer.core.portablizer.IS_WINDOWS', True), \
+             mock.patch.object(procutil, 'folder_is_free',
+                               side_effect=lambda _r, errs: errs.append(inaccessible) or False), \
+             mock.patch.object(procutil, 'release_folder', return_value=[]), \
+             mock.patch.object(procutil, 'busy_files',
+                               side_effect=lambda _r, scan_status=None, **_k:
+                               scan_status.append(inaccessible) or []), \
+             mock.patch.object(procutil, 'holders', return_value=[]):
+            free = engine._verify_folder_is_free(r'E:\Portable', result)
+
+        self.assertFalse(free)
+        self.assertIn('Не удалось полностью проверить свободу папки', engine.log.text)
+        self.assertIn('Secret', engine.log.text)
+        self.assertNotIn('виновника определить не удалось', engine.log.text)
+
+    def test_verify_folder_is_free_recovers_when_transient_lock_clears(self):
+        from portablizer.core.portablizer import Portablizer, PortableResult
+
+        engine = Portablizer(Logger())
+        result = PortableResult(success=True)
+        calls = iter([False, True])
+        with mock.patch('portablizer.core.portablizer.IS_WINDOWS', True), \
+             mock.patch.object(procutil, 'folder_is_free',
+                               side_effect=lambda _r, _errs=None: next(calls)), \
+             mock.patch.object(procutil, 'release_folder', return_value=[]), \
+             mock.patch.object(procutil, 'busy_files', return_value=[]), \
+             mock.patch.object(procutil, 'holders', return_value=[]):
+            free = engine._verify_folder_is_free(r'E:\Portable', result)
+
+        self.assertTrue(free)
+        self.assertIn('можно удалить', engine.log.text)
+
+    def test_launcher_stop_writes_console_report_and_distinguishes_incomplete_scan(self):
+        from portablizer.core import launcher as launcher_mod
+
+        cfg = launcher_mod.LauncherConfig(app_name='PyCharm', target_exe_rel='App/pycharm64.exe')
+        cmd = launcher_mod.render_stop_cmd(cfg)
+        self.assertIn('PORTABLE_STOP_REPORT', cmd)
+        self.assertIn('if errorlevel 2 goto incomplete', cmd)
+        self.assertIn('--stop\nif errorlevel 1 goto stillbusy', cmd)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp, 'PyCharm_Portable')
+            (root / 'App').mkdir(parents=True)
+            report_file = Path(temp, 'stop-report.txt')
+
+            with mock.patch.dict(os.environ, {'PORTABLE_STOP_REPORT': str(report_file),
+                                              'PORTABLE_LAUNCHER_NO_UI': '1'}), \
+                 mock.patch.object(launcher, 'IS_WINDOWS', True), \
+                 mock.patch.object(launcher, 'release_portable_folder', return_value=[]), \
+                 mock.patch.object(launcher, '_portable_process_list', return_value=[]), \
+                 mock.patch.object(launcher, 'busy_files',
+                                   side_effect=lambda _r, scan_status=None, **_k:
+                                   scan_status.append('E:\\Secret: ошибка обхода (WinError 5)') or []):
+                code = launcher.stop(root)
+            self.assertEqual(code, 2)
+            text = report_file.read_text(encoding='ascii', errors='replace')
+            self.assertIn('Incomplete file check:', text)
+            self.assertIn('traversal error (WinError 5)', text)
+
+            owner = restart_manager.FileOwner(4321, 'explorer.exe', '', r'E:\P\locked.db')
+            with mock.patch.dict(os.environ, {'PORTABLE_STOP_REPORT': str(report_file),
+                                              'PORTABLE_LAUNCHER_NO_UI': '1'}), \
+                 mock.patch.object(launcher, 'IS_WINDOWS', True), \
+                 mock.patch.object(launcher, 'release_portable_folder', return_value=[]), \
+                 mock.patch.object(launcher, '_portable_process_list', return_value=[]), \
+                 mock.patch.object(launcher, 'busy_files', return_value=[r'E:\P\locked.db']), \
+                 mock.patch.object(restart_manager, 'file_owners', return_value=[owner]), \
+                 mock.patch.object(launcher, '_all_processes', return_value=[]):
+                code = launcher.stop(root)
+            self.assertEqual(code, 1)
+            text = report_file.read_text(encoding='ascii', errors='replace')
+            self.assertIn('explorer.exe (pid 4321): locked.db', text)
+
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows actual handle test')
 class WindowsFileOwnerTests(unittest.TestCase):
@@ -356,6 +482,123 @@ k.CloseHandle(ctypes.c_void_p(h))
             self.assertEqual(procutil.busy_files(temp, recheck=0), [])
             proc.terminate()
             proc.wait(timeout=10)
+
+    def test_wininet_content_ie5_deny_acl_and_junction_are_handled_unelevated(self):
+        import shutil as _shutil
+
+        with tempfile.TemporaryDirectory(prefix='portable ie5 ', ignore_cleanup_errors=True) as base:
+            portable = Path(base, 'PyCharm_Portable')
+            content_ie5 = portable.joinpath(
+                'PortableData', 'User', 'AppData', 'Local',
+                'Microsoft', 'Windows', 'INetCache', 'Content.IE5',
+            )
+            content_ie5.mkdir(parents=True)
+            cached = content_ie5 / 'cached.htm'
+            cached.write_text('keep')
+
+            external = Path(base, 'HostEdgeWebView')
+            external.mkdir()
+            ext_locked = external / 'msedgewebview2.dll'
+            ext_locked.write_text('host')
+            ext_holder = self._holder(ext_locked, 0)
+
+            junction = portable.joinpath(
+                'PortableData', 'User', 'AppData', 'Local', 'Temporary Internet Files',
+            )
+            subprocess.run(
+                ['cmd', '/c', 'mklink', '/J', str(junction), str(external)],
+                check=True, capture_output=True,
+            )
+            try:
+                subprocess.run(
+                    ['icacls', str(content_ie5), '/deny', '*S-1-1-0:(S,RD)'],
+                    check=True, capture_output=True,
+                )
+                subprocess.run(
+                    ['icacls', str(junction), '/deny', '*S-1-1-0:(RD)', '/L'],
+                    check=True, capture_output=True,
+                )
+                with self.assertRaises(PermissionError):
+                    os.listdir(content_ie5)
+
+                # Simulate a standard non-elevated user (no backup/restore privileges).
+                with mock.patch.object(filelocks, 'acquire_scan_privileges', return_value=[]):
+                    errors = []
+                    self.assertTrue(procutil.folder_is_free(str(portable), errors), errors)
+                    self.assertEqual(errors, [])
+                    self.assertEqual(cached.read_text(), 'keep')
+                    self.assertIn('cached.htm', os.listdir(content_ie5))
+
+                    # Now lock cached.htm inside Content.IE5 and re-apply WinINet's deny ACE:
+                    # even unelevated, the real lock inside Content.IE5 must be caught!
+                    ie5_holder = self._holder(cached, 0)
+                    subprocess.run(
+                        ['icacls', str(content_ie5), '/deny', '*S-1-1-0:(S,RD)'],
+                        check=True, capture_output=True,
+                    )
+                    errors = []
+                    self.assertFalse(procutil.folder_is_free(str(portable), errors))
+                    self.assertIn('cached.htm', ' '.join(errors))
+                    owners = restart_manager.file_owners([str(cached)])
+                    self.assertTrue(any(o.pid == ie5_holder.pid for o in owners), owners)
+                    self.assertIsNone(ie5_holder.poll())
+                    ie5_holder.terminate()
+                    ie5_holder.wait(timeout=10)
+
+                self.assertIsNone(ext_holder.poll(), 'host junction target holder must stay untouched')
+                subprocess.run(
+                    ['icacls', str(junction), '/remove:d', '*S-1-1-0', '/L'],
+                    capture_output=True,
+                )
+                os.rmdir(junction)
+                _shutil.rmtree(portable)
+                self.assertFalse(portable.exists())
+            finally:
+                subprocess.run(
+                    ['icacls', str(junction), '/remove:d', '*S-1-1-0', '/L'],
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ['icacls', str(content_ie5), '/remove:d', '*S-1-1-0'],
+                    capture_output=True,
+                )
+
+    def test_backup_semantics_scans_acl_hidden_folder_without_changing_acl(self):
+        enabled = filelocks.acquire_scan_privileges()
+        filelocks.release_scan_privileges(enabled)
+        if filelocks.SE_BACKUP_NAME not in enabled:
+            self.skipTest('Runner token does not hold SeBackupPrivilege')
+
+        with tempfile.TemporaryDirectory(prefix='portable backup ', ignore_cleanup_errors=True) as temp:
+            vault = Path(temp, 'CustomProtected')
+            vault.mkdir()
+            item = vault / 'item.bin'
+            item.write_text('secret')
+            try:
+                subprocess.run(
+                    ['icacls', str(vault), '/deny', '*S-1-1-0:(S,RD)'],
+                    check=True, capture_output=True,
+                )
+                with self.assertRaises(PermissionError):
+                    os.listdir(vault)
+
+                locked, issues = filelocks.scan([temp], budget=8, recheck=0)
+                self.assertEqual((locked, issues), ([], []))
+                # ACL of a non-WinINet directory must remain untouched by scan().
+                with self.assertRaises(PermissionError):
+                    os.listdir(vault)
+
+                holder = self._holder(item, 0)
+                locked, issues = filelocks.scan([temp], budget=8, recheck=0)
+                self.assertEqual(issues, [])
+                self.assertIn(str(item), locked)
+                holder.terminate()
+                holder.wait(timeout=10)
+            finally:
+                subprocess.run(
+                    ['icacls', str(vault), '/remove:d', '*S-1-1-0'],
+                    capture_output=True,
+                )
 
 
 if __name__ == '__main__':

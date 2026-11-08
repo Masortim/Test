@@ -874,7 +874,11 @@ def forget_fonts(root: str, budget: float = 4.0) -> int:
         extensions = (".ttf", ".ttc", ".otf", ".fon", ".fnt")
         deadline = time.monotonic() + budget
         removed = 0
-        for current, _dirs, files in os.walk(root):
+        for current, dirs, files in os.walk(root):
+            dirs[:] = [
+                d for d in dirs
+                if not filelocks.is_reparse_point(os.path.join(current, d))
+            ]
             if time.monotonic() > deadline:
                 break
             for name in files:
@@ -975,6 +979,7 @@ def release_folder(root: str, close_grace: float = 4.0,
             while time.monotonic() < deadline and processes_in(root):
                 time.sleep(0.25)
 
+    filelocks.unhide_wininet_cache(root)
     if deep and busy_files(root, budget=min(budget, 4.0)):
         # Дорогой разбор включается только по делу: если ни один файл в
         # папке не занят, обходить таблицу дескрипторов системы незачем.
@@ -1258,6 +1263,7 @@ def folder_is_free(root: str, errors: Optional[List[str]] = None,
     """
     if not root or not os.path.isdir(root):
         return True
+    filelocks.unhide_wininet_cache(root)
     probe = os.path.join(os.path.dirname(os.path.normpath(root)),
                          "." + os.path.basename(os.path.normpath(root))
                          + ".free-probe")
