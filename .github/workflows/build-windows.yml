@@ -604,7 +604,10 @@ jobs:
             # Retry a few times; the error page is ~54 KB while the installer
             # is >100 MB, so a small file means retry, never a valid download.
             $downloaded = $false
-            for ($attempt = 1; $attempt -le 5; $attempt++) {
+            # The CDN flaps with minute-scale windows (504s throughout the
+            # afternoon of 2026-11-08); span a longer window than a few
+            # fixed-backoff retries would cover.
+            for ($attempt = 1; $attempt -le 7; $attempt++) {
               try {
                 Invoke-WebRequest -UseBasicParsing `
                   -Uri "https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-win-x64.exe" `
@@ -615,7 +618,7 @@ jobs:
               } catch {
                 Write-Host "attempt ${attempt}: download failed: $($_.Exception.Message)"
               }
-              if ($attempt -lt 5) { Start-Sleep -Seconds (15 * $attempt) }
+              if ($attempt -lt 7) { Start-Sleep -Seconds (20 * $attempt) }
             }
             if (-not $downloaded) { throw "Could not download the OpenCode installer (GitHub release-asset CDN error?)" }
             $arguments = 'build "' + $installer + '" --out "' +
