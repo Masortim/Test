@@ -5299,6 +5299,7 @@ class OpenFileHolderTests(unittest.TestCase):
                     mock.patch.object(procutil, "folder_is_free",
                                       return_value=False), \
                     mock.patch.object(procutil, "holders", return_value=[]), \
+                    mock.patch.object(maintenance.elevate_mod, "is_elevated", return_value=False), \
                     mock.patch.object(procutil, "busy_files",
                                       return_value=[self.FONT]):
                 report = maintenance.release(str(folder), Logger())
