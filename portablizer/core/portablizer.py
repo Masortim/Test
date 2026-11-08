@@ -58,6 +58,7 @@ from .. import __version__
 from . import adobe as adobe_mod
 from . import crashinfo as crash_mod
 from . import elevate as elevate_mod
+from . import inno_log as inno_log_mod
 from . import launcher as launcher_mod
 from . import netstack as netstack_mod
 from . import procutil
@@ -412,8 +413,8 @@ def _exit_code_hint(rc: Optional[int],
             2: "установка отменена до начала или пользователь отказался от продолжения",
             3: "фатальная ошибка подготовки к следующему этапу установки",
             4: "фатальная ошибка во время установки",
-            5: "установка отменена до начала установки файлов",
-            6: "установка отменена во время установки файлов",
+            5: "установка прервана во время выполнения (Cancel или Abort)",
+            6: "процесс установщика принудительно остановлен отладчиком",
             7: "подготовка к установке завершилась неудачно; причина — в install.log",
             8: "для завершения подготовки требуется перезагрузка компьютера",
         }.get(rc, _EXIT_CODE_HINTS.get(rc, ""))
@@ -1051,8 +1052,8 @@ class InstallStall:
         parts = [f"Установка идёт {redist_mod.human_duration(self.elapsed)}"]
         if self.files or self.written:
             parts.append(
-                f"уже распаковано {redist_mod.format_size(self.written)} "
-                f"в {self.files} файлах")
+                f"в наблюдаемых папках {redist_mod.format_size(self.written)} "
+                f"в {self.files} файлах (включая временные)")
         parts.append(
             f"но последние {redist_mod.human_duration(self.idle)} нет "
             "признаков работы "
@@ -1285,8 +1286,8 @@ class _InstallWatchdog:
         """Что видно про работу установщика (для журнала и подробной строки)."""
         parts: List[str] = []
         if self.bytes or self.files:
-            parts.append(f"распаковано {redist_mod.format_size(self.bytes)} "
-                         f"в {self.files} файлах")
+            parts.append(f"в наблюдаемых папках {redist_mod.format_size(self.bytes)} "
+                         f"в {self.files} файлах (включая временные)")
         if self.io_bytes:
             parts.append(f"диск: {redist_mod.format_size(self.io_bytes)}")
         if self.cpu_seconds:
@@ -1388,6 +1389,8 @@ class Portablizer:
         self._unpacker_result = ""
         #: Каким распаковщиком воспользовались (пусто — ни одним).
         self._unpacked_with = ""
+        # Code 5 can leave a partial executable; its existence is not success.
+        self._inno_aborted_with_payload = False
         #: Диагноз последовательно пустых быстрых запусков установщика.
         self._hollow_note = ""
         #: Текущий результат распознавания, нужен и для диагностики лестницы.
@@ -2365,6 +2368,7 @@ class Portablizer:
             self._last_install_seconds = 0.0
             self._unpacker_result = ""
             self._unpacked_with = ""
+            self._inno_aborted_with_payload = False
             self._hollow_note = ""
             self._detection = None
             self._adobe_detected = False
@@ -2768,7 +2772,7 @@ class Portablizer:
                             "могут быть посторонние файлы. Для распакованного "
                             "дистрибутива используйте исходный архив или "
                             "установите программу в отдельный каталог.")
-            elif registry_locations:
+            elif registry_locations and not self._inno_aborted_with_payload:
                 self._supplement_recovered_from_registry(
                     app_dir=app_dir,
                     app_name=name,
@@ -2780,7 +2784,8 @@ class Portablizer:
             # забрал файлы в App, оригинал в Program Files может остаться
             # (не совпало имя, не удалился из-за прав). Удаляем только
             # каталоги, имя которых совпадает с приложением.
-            if self._find_main_exe(app_dir, name):
+            if (not self._inno_aborted_with_payload
+                    and self._find_main_exe(app_dir, name)):
                 leftover = self._cleanup_leftover_install_dirs(
                     name, opts.installer_path, opts, data_dir,
                     before=install_locations_before, app_dir=app_dir)
@@ -2821,6 +2826,14 @@ class Portablizer:
             # 6. Поиск главного exe и обнаружение всех вспомогательных программ
             self._check_cancel()
             self.progress(75, "Поиск главного исполняемого файла и лаунчеров")
+            if self._inno_aborted_with_payload:
+                result.hints = self._failure_hints(det, install_rc, opts, portable_dir)
+                result.attempt_outcomes = list(self._attempt_history)
+                raise RuntimeError(
+                    "Установщик Inno Setup прервал установку с кодом 5. "
+                    "Файлы, оставшиеся в App, могут быть неполными и сохранены "
+                    "для проверки; работающий портатив не создан. "
+                    + " ".join(result.hints))
             online_product = getattr(det, "online_product", None)
             profile_only_product = bool(
                 getattr(det, "is_downloader_stub", False)
@@ -3256,11 +3269,21 @@ class Portablizer:
 
         if rc == 5 and det.installer_type == InstallerType.INNO:
             hints.append(
-                "Inno Setup: код 5 означает отмену до начала установки файлов, "
-                "а не обязательно отказ в доступе. Проверьте install.log и "
-                "installer-output.log; причина может быть указана в журнале "
-                "установщика. Повторный запрос UAC не устраняет её автоматически."
+                "Inno Setup: код 5 означает отмену во время установки либо "
+                "ответ Abort на сообщение об ошибке; он не указывает точную "
+                "причину. В тихом режиме /SUPPRESSMSGBOXES может выбрать "
+                "Abort автоматически. Проверьте install.log и installer-output.log."
             )
+            for log_name in ("install-interactive.log", "install.log"):
+                detail = inno_log_mod.read_dialog(os.path.join(portable_dir, log_name))
+                if detail:
+                    kind = ("автоматически выбран Abort в подавленном окне"
+                            if detail.suppressed else "выбран Abort в окне ошибки")
+                    hints.append(
+                        f"{log_name}: {kind}. Текст окна: "
+                        + (detail.text or "нет в журнале")
+                    )
+                    break
         elif rc == 5:
             hints.append(
                 "Код 5 зависит от установщика и сам по себе не доказывает "
@@ -4236,6 +4259,16 @@ class Portablizer:
         else:
             self.log.ok(f"Установка завершена (код {rc}).")
 
+        detection = getattr(self, "_detection", None)
+        if (rc == 5 and getattr(detection, "installer_type", None) == InstallerType.INNO):
+            for log_path in plan.progress_logs:
+                detail = inno_log_mod.read_dialog(log_path)
+                if detail:
+                    kind = ("Inno автоматически выбрал Abort в подавленном окне"
+                            if detail.suppressed else "В окне Inno выбран Abort")
+                    self.log.warn(kind + ": " + (detail.text or "текст см. в журнале"))
+                    break
+
         # Проверим, что что-то реально установилось.
         try:
             entries = os.listdir(app_dir)
@@ -4265,10 +4298,30 @@ class Portablizer:
         игнорирующие её, пишут в перенаправленный профиль (``data_dir``), а
         распаковка бандла ``/layout`` — в свою временную папку.
         """
-        roots = [app_dir, data_dir]
-        if plan.output_dir:
-            roots.append(plan.output_dir)
-        return list(dict.fromkeys(path for path in roots if path))
+        candidates = [path for path in (app_dir, data_dir, plan.output_dir) if path]
+        roots: List[str] = []
+        normalized: List[str] = []
+        for path in candidates:
+            candidate = os.path.normcase(os.path.abspath(path))
+            # Do not count a root and its child twice. Preserve the original
+            # paths for filesystem access, including Windows drive spelling.
+            overlaps = []
+            for index, existing in enumerate(normalized):
+                try:
+                    common = os.path.commonpath((candidate, existing))
+                except ValueError:  # different Windows volumes
+                    continue
+                if common == existing:
+                    break
+                if common == candidate:
+                    overlaps.append(index)
+            else:
+                for index in reversed(overlaps):
+                    del roots[index]
+                    del normalized[index]
+                roots.append(path)
+                normalized.append(candidate)
+        return roots
 
     def _install_watch_logs(self, plan: SilentPlan, data_dir: str,
                             console_log: Optional[str]) -> List[str]:
@@ -4805,6 +4858,16 @@ class Portablizer:
                         "неполной."
                     )
                     return rc, plan
+
+            if (rc == 5 and getattr(self._detection, "installer_type", None)
+                    == InstallerType.INNO and self._find_main_exe(app_dir, name)):
+                self._inno_aborted_with_payload = True
+                self.log.warn(
+                    "Inno Setup вернул код 5, но в App остались файлы. "
+                    "Не запускаю следующую установку поверх них и не считаю "
+                    "их готовым портативом: они могут быть неполными."
+                )
+                return rc, None
 
             if self._find_main_exe(app_dir, name):
                 if index > 1:

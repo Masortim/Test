@@ -284,9 +284,9 @@ def plan_language(installer_type: InstallerType, code: str,
                     "GOG.com\\Games — иначе игра останется на английском.")
     return LanguagePlan(
         args=[switch],
-        message=(f"Язык установки: {language.title} (ключ {switch}). Если в "
-                 "установщике нет этого языка, он поставит язык по "
-                 "умолчанию — проверьте файлы App и субтитры в игре."
+        message=(f"Язык установки: {language.title} (ключ {switch}). "
+                 "Наличие языка и поведение установщика при неподдерживаемом "
+                 "ключе не гарантируются; проверьте журнал и файлы программы."
                  f"{gog_note}"),
     )
 

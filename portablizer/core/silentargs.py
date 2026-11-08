@@ -1094,7 +1094,7 @@ def build_attempts(
     if itype == InstallerType.INNO and allow_assisted:
         # Только по явному согласию: не подавляем сообщения и не выбираем
         # ответы за пользователя. У мастера отдельный журнал.
-        args = [f"/DIR={target_dir}"] + extra
+        args = ["/NORESTART", f"/DIR={target_dir}"] + extra
         if log_path("install-interactive.log"):
             args.append(f'/LOG={log_path("install-interactive.log")}')
         attempts.append(SilentPlan(

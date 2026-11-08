@@ -318,6 +318,18 @@ class InstallWaitTests(unittest.TestCase):
                     install_timeout=idle, install_deadline=deadline),
                 str(self.app), str(self.data), console_log=self.console)
 
+    def test_watch_roots_do_not_double_count_target_or_children(self):
+        self.plan.output_dir = str(self.app / '.')
+        roots = self.engine._install_watch_roots(self.plan, str(self.app), str(self.data))
+        self.assertEqual(roots, [str(self.app), str(self.data)])
+        _touch(str(self.app), 'game.bin', 2048)
+        _touch(str(self.data), 'Temp/temporary.bin', 1024)
+        watch = _InstallWatchdog(1, roots=roots, probe_seconds=0.0, dir_seconds=0.0)
+        watch.poll()
+        self.assertEqual(watch.files, 2)
+        self.assertEqual(watch.bytes, 3072)
+        self.assertIn('включая временные', watch.summary())
+
     def test_working_installer_is_never_interrupted_by_the_idle_limit(self):
         """Установщик пишет файлы дольше предела паузы — и не прерывается."""
         proc = _FakeProc()

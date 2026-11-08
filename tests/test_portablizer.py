@@ -3067,10 +3067,34 @@ class FailureDiagnosticsTests(unittest.TestCase):
         with mock.patch("portablizer.core.portablizer.IS_WINDOWS", True), \
              mock.patch("portablizer.core.portablizer.is_elevated", return_value=True):
             hints = " ".join(engine._failure_hints(det, 5, opts, "."))
-        self.assertIn("отмену до начала", hints)
+        self.assertIn("отмену во время установки", hints)
         self.assertNotIn("требует отдельных прав", hints)
         self.assertNotIn("--elevate", hints)
-        self.assertIn("отменена", _exit_code_hint(5, InstallerType.INNO))
+        self.assertIn("во время", _exit_code_hint(5, InstallerType.INNO))
+
+    def test_inno_abort_with_partial_exe_never_creates_launcher(self):
+        class AbortingInstaller(Portablizer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = 0
+
+            def _run_install(self, plan, opts, app_dir, data_dir, **kwargs):
+                self.calls += 1
+                Path(app_dir, "Example.exe").write_bytes(b"MZ partial")
+                return 5
+
+        with tempfile.TemporaryDirectory() as temp:
+            installer = os.path.join(temp, "Setup.exe")
+            _fake_pe(installer, [".text", ".rsrc"], b"This installation was built with Inno Setup")
+            engine = AbortingInstaller(Logger())
+            result = engine.run(PortableOptions(
+                installer_path=installer, output_dir=temp, app_name="Example",
+                allow_assisted_install=True, capture_registry=False, cleanup_host=False))
+            self.assertFalse(result.success)
+            self.assertEqual(engine.calls, 1)
+            self.assertTrue(Path(result.portable_dir, "App", "Example.exe").is_file())
+            self.assertFalse(Path(result.portable_dir, "Launch.bat").exists())
+            self.assertIn("могут быть неполными", " ".join(result.messages))
 
     def test_failure_explains_admin_rights_and_license_switch(self):
         result = self._failed_result(
