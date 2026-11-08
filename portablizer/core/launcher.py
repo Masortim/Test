@@ -2414,6 +2414,14 @@ def browser_login_settings(cfg: "LauncherConfig") -> Dict[str, object]:
 
 # --- Вспомогательные лаунчеры и меню ------------------------------------------
 
+def render_main_alias_bat() -> str:
+    """An ASCII-only alias for the default launcher, without embedding paths."""
+    return ("@echo off\r\n"
+            "rem Portablizer main launcher alias\r\n"
+            "call \"%~dp0Launch.bat\" %*\r\n"
+            "exit /b %ERRORLEVEL%\r\n")
+
+
 def render_companion_bat(cfg: LauncherConfig, target: TargetInfo) -> str:
     """Создаёт надёжный короткий вызов общего портативного лончера.
 

@@ -5752,6 +5752,9 @@ def _arguments_with_executable_alias(
     )
     if not target:
         return result
+    main = str(cfg.get("target_exe_rel", "")).replace("\\", "/").casefold()
+    if target.replace("\\", "/").casefold() == main:
+        return ["--target", target, *result]
     return ["--machine-registry", "--target", target, *result]
 
 
@@ -5789,8 +5792,11 @@ def _select_target(cfg: Dict[str, Any], arguments: Sequence[str]
             continue
         if lowered == "--target" and index + 1 < len(arguments):
             target_rel = str(arguments[index + 1])
-            item = by_path.get(target_rel.replace("\\", "/").casefold(), {})
-            selected_role = str(item.get("role", "auxiliary"))
+            normalized = target_rel.replace("\\", "/").casefold()
+            item = by_path.get(normalized, {})
+            default_role = ("main" if normalized == str(cfg["target_exe_rel"])
+                            .replace("\\", "/").casefold() else "auxiliary")
+            selected_role = str(item.get("role", default_role))
             index += 2
             continue
         forwarded.append(arg)
