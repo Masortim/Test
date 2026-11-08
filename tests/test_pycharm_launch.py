@@ -204,8 +204,10 @@ class Probe {
                 diagnostic = log.read_text(encoding='utf8', errors='replace') if log.exists() else '(no launcher log)'
                 self.assertTrue(marker_ready(root), f'{launch_name} did not start target: {diagnostic}')
                 exe, cwd = marker.read_text(encoding='utf-8-sig').splitlines()
-                self.assertEqual(os.path.normcase(exe), os.path.normcase(str(target)), launch_name)
-                self.assertEqual(os.path.normcase(cwd), os.path.normcase(str(target.parent)), launch_name)
+                # Windows may return a canonical long name where TEMP used an
+                # 8.3 spelling (RUNNER~1). Compare filesystem identity, not text.
+                self.assertTrue(os.path.samefile(exe, target), (launch_name, exe, str(target)))
+                self.assertTrue(os.path.samefile(cwd, target.parent), (launch_name, cwd, str(target.parent)))
             # Wait for detached BAT handoffs and their cleanups before deleting
             # the test roots; each session writes this at the end.
             while time.monotonic() < deadline:
