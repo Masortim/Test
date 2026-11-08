@@ -599,9 +599,25 @@ jobs:
           try {
             New-Item -ItemType Directory -Force -Path (Join-Path $root "out") | Out-Null
             $installer = Join-Path $root "opencode-setup.exe"
-            Invoke-WebRequest -UseBasicParsing `
-              -Uri "https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-win-x64.exe" `
-              -OutFile $installer
+            # GitHub's release-asset CDN intermittently serves an HTML error
+            # page (504) instead of the installer (observed 2026-11-08).
+            # Retry a few times; the error page is ~54 KB while the installer
+            # is >100 MB, so a small file means retry, never a valid download.
+            $downloaded = $false
+            for ($attempt = 1; $attempt -le 5; $attempt++) {
+              try {
+                Invoke-WebRequest -UseBasicParsing `
+                  -Uri "https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-win-x64.exe" `
+                  -OutFile $installer
+                $size = (Get-Item $installer).Length
+                if ($size -gt 1048576) { $downloaded = $true; break }
+                Write-Host "attempt ${attempt}: suspicious download size $size bytes - error page? retrying"
+              } catch {
+                Write-Host "attempt ${attempt}: download failed: $($_.Exception.Message)"
+              }
+              if ($attempt -lt 5) { Start-Sleep -Seconds (15 * $attempt) }
+            }
+            if (-not $downloaded) { throw "Could not download the OpenCode installer (GitHub release-asset CDN error?)" }
             $arguments = 'build "' + $installer + '" --out "' +
               (Join-Path $root "out") + '" --name OpenCode --single-file --no-registry ' +
               '--no-netstack --hard-timeout 180'
