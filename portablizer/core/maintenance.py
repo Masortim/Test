@@ -175,6 +175,17 @@ def release(folder: str, log: Optional[Logger] = None) -> MaintenanceReport:
     locked = procutil.busy_files(folder, scan_status=scan_status)
     holders = procutil.holders(folder, locked_files=locked)
     report.holders = procutil.describe_holders(holders)
+    if not report.holders and not locked and not scan_status:
+        recheck_errors: List[str] = []
+        if procutil.folder_is_free(folder, recheck_errors):
+            report.success = True
+            message = ("При проверке блокировок не обнаружено. Попробуйте удалить "
+                       "или перенести папку; Windows может обнаружить другие препятствия.")
+            log.ok(message)
+            report.messages.append(message)
+            return report
+        if recheck_errors:
+            errors = recheck_errors
     if report.holders:
         message = "Папку держат: " + ", ".join(report.holders)
         log.warn(message + ".")

@@ -2043,11 +2043,19 @@ _STOP_PS_FALLBACK = (
     "if($p.Id -ne $PID){{ $f=''; try{{ $f=$p.Path }}catch{{ $f='' }}; "
     "if($f -and $f.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)){{ $a+=$p }} }} }}; return $a }}; "
     "$script:scanIncomplete=$false; function Busy(){{ $b=@(); $sw=[Diagnostics.Stopwatch]::StartNew(); "
-    "try{{ $all=@(Get-ChildItem -LiteralPath $r -Recurse -Force -ErrorAction Stop) }}catch{{ $script:scanIncomplete=$true; return $b }}; "
-    "foreach($f in ($all | Where-Object {{ -not $_.PSIsContainer }})){{ "
-    "if($sw.Elapsed.TotalSeconds -gt 20){{ $script:scanIncomplete=$true; break }}; "
+    "$q=New-Object 'Collections.Generic.Queue[string]'; $q.Enqueue($r.TrimEnd('\\')); "
+    "while($q.Count -gt 0){{ if($sw.Elapsed.TotalSeconds -gt 20){{ $script:scanIncomplete=$true; break }}; "
+    "$d=$q.Dequeue(); $items=$null; "
+    "try{{ $items=@(Get-ChildItem -LiteralPath $d -Force -ErrorAction Stop) }}catch{{ "
+    "if($d -match '\\\\Microsoft\\\\Windows\\\\(INetCache|Temporary Internet Files|History)(\\\\|$)'){{ "
+    "try{{ $acl=Get-Acl -LiteralPath $d; foreach($ar in @($acl.Access | Where-Object {{ $_.AccessControlType -eq 'Deny' }})){{ [void]$acl.RemoveAccessRuleSpecific($ar) }}; Set-Acl -LiteralPath $d -AclObject $acl; $items=@(Get-ChildItem -LiteralPath $d -Force -ErrorAction Stop) }}catch{{ $items=$null }} }}; "
+    "if($null -eq $items){{ Write-Host ('Cannot inspect: ' + $d); $script:scanIncomplete=$true; continue }} }}; "
+    "foreach($f in $items){{ if($sw.Elapsed.TotalSeconds -gt 20){{ $script:scanIncomplete=$true; break }}; "
+    "if($f.Attributes -band [IO.FileAttributes]::ReparsePoint){{ continue }}; "
+    "if($f.PSIsContainer){{ $q.Enqueue($f.FullName); continue }}; "
     "try{{ $s=[IO.File]::Open($f.FullName,'Open','Read','None'); $s.Close() }}"
-    "catch [IO.IOException]{{ $b+=$f.FullName; if($b.Count -ge 12){{ break }} }}catch{{ $script:scanIncomplete=$true }} }}; return $b }}; "
+    "catch [IO.IOException]{{ $b+=$f.FullName; if($b.Count -ge 12){{ break }} }}catch{{ $script:scanIncomplete=$true }} }}; "
+    "if($b.Count -ge 12){{ break }} }}; return $b }}; "
     "$ps=@(Running); foreach($p in $ps){{ Write-Host ('Closing ' + $p.ProcessName + ' (pid ' + $p.Id + ')'); "
     "try{{ [void]$p.CloseMainWindow() }}catch{{}} }}; "
     "if($ps.Count -gt 0){{ Start-Sleep -Seconds 3; foreach($p in @(Running)){{ try{{ $p.Kill() }}catch{{}} }}; Start-Sleep -Seconds 1 }}; "
@@ -2056,9 +2064,9 @@ _STOP_PS_FALLBACK = (
     "Get-ChildItem -LiteralPath $tmp -Force -ErrorAction SilentlyContinue | "
     "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }}; "
     "$busy=@(Busy); if($busy.Count -gt 0){{ Start-Sleep -Seconds 1; $busy=@(Busy) }}; "
-    "if($script:scanIncomplete){{ Write-Host 'Could not complete the file check.'; exit 1 }}; "
     "if($busy.Count -gt 0){{ Write-Host 'These files are still open and keep the folder locked:'; "
     "foreach($f in $busy){{ Write-Host ('  ' + $f) }}; exit 1 }}; "
+    "if($script:scanIncomplete){{ Write-Host 'Could not complete the file check.'; exit 2 }}; "
     "Write-Host 'Nothing from this folder is running and no file inside is open.'; exit 0\""
 )
 
@@ -2085,6 +2093,9 @@ for %%A in (%*) do (
   if /i "%%~A" == "--elevated" set "STOP_ELEVATED=1"
   if /i "%%~A" == "--nopause" set "STOP_PAUSE="
 )
+set "PORTABLE_STOP_REPORT=%TEMP%\portable-stop-%RANDOM%-%RANDOM%.txt"
+if exist "%PORTABLE_STOP_REPORT%" del /f /q "%PORTABLE_STOP_REPORT%" >nul 2>&1
+if not defined PORTABLE_LAUNCHER_NO_UI set "PORTABLE_LAUNCHER_NO_UI=1"
 
 if not exist "%PORTABLE_ROOT%\App\{exe_launcher}" goto fallback
 rem The launcher reports its own verdict; do not silently fall back after failure.
@@ -2098,12 +2109,19 @@ if errorlevel 1 goto locked
 goto free
 
 :locked
+if errorlevel 2 goto incomplete
 echo.
 echo The file check did not finish or files are still open. Close their owners
 echo normally and try again. External processes and handles are not forced.
 goto stillbusy
 
 :stillbusy
+if errorlevel 2 goto incomplete
+if exist "%PORTABLE_STOP_REPORT%" (
+  echo.
+  type "%PORTABLE_STOP_REPORT%"
+  del /f /q "%PORTABLE_STOP_REPORT%" >nul 2>&1
+)
 echo.
 echo The folder is STILL locked. The names above say who holds it:
 echo   - a program with a window: close that window;
@@ -2112,13 +2130,32 @@ echo   - an antivirus: wait a few seconds and run this file again.
 set "STOP_RC=1"
 goto done
 
+:incomplete
+if exist "%PORTABLE_STOP_REPORT%" (
+  echo.
+  type "%PORTABLE_STOP_REPORT%"
+  del /f /q "%PORTABLE_STOP_REPORT%" >nul 2>&1
+)
+echo.
+echo Could not verify every path in the folder (see the details above).
+echo Running processes from this folder were stopped and no open file lock was
+echo confirmed, but an inaccessible path or timeout prevented a full check.
+echo Running StopPortable.cmd as Administrator can check protected folders.
+set "STOP_RC=1"
+goto done
+
 :free
+if exist "%PORTABLE_STOP_REPORT%" (
+  type "%PORTABLE_STOP_REPORT%"
+  del /f /q "%PORTABLE_STOP_REPORT%" >nul 2>&1
+)
 echo.
 echo The folder is free: it can be deleted, moved or copied now.
 set "STOP_RC=0"
 goto done
 
 :done
+if exist "%PORTABLE_STOP_REPORT%" del /f /q "%PORTABLE_STOP_REPORT%" >nul 2>&1
 if defined STOP_PAUSE pause
 endlocal & exit /b %STOP_RC%
 """

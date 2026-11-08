@@ -58,6 +58,7 @@ from .. import __version__
 from . import adobe as adobe_mod
 from . import crashinfo as crash_mod
 from . import elevate as elevate_mod
+from . import filelocks as filelocks_mod
 from . import inno_log as inno_log_mod
 from . import launcher as launcher_mod
 from . import longpaths as longpaths_mod
@@ -1594,28 +1595,54 @@ class Portablizer:
             for line in probe_errors:
                 self.log.debug(f"Папка не отпускается: {line}")
 
-        holders = procutil.holders(portable_dir)
+        scan_status: List[str] = []
+        locked = procutil.busy_files(portable_dir, scan_status=scan_status)
+        holders = procutil.holders(portable_dir, locked_files=locked)
         names = procutil.describe_holders(holders)
         result.folder_holders = names
+        recheck_errors: List[str] = []
+        if not names and not locked and not scan_status:
+            # Кратковременная блокировка (антивирус при записи новых exe/dll)
+            # могла уже уйти за время обхода процессов и файлов.
+            if procutil.folder_is_free(portable_dir, recheck_errors):
+                self.log.ok(
+                    "Папка портатива свободна: её можно удалить, перенести "
+                    "или скопировать на флешку прямо сейчас.")
+                return True
         if names:
             self.log.warn(
                 "Папку портатива всё ещё держат: " + ", ".join(names) + ".")
             if any(h.protected for h in holders):
                 self.log.warn(
                     "Среди них есть системные процессы (служба кэша шрифтов, "
-                    "индексатор, открытое окно проводника) — их дескрипторы "
-                    "на файлы папки закрываются принудительно; если файл всё "
-                    "ещё занят, нужны права администратора.")
-        else:
-            locked = procutil.busy_files(portable_dir)
+                    "индексатор, открытое окно проводника) — закройте окна "
+                    "этой папки штатно; системные и чужие процессы "
+                    "принудительно не завершаются.")
+        elif locked:
             result.folder_holders = [os.path.basename(p) for p in locked]
-            if locked:
+            self.log.warn(
+                "Папку портатива держат открытые файлы: "
+                + ", ".join(result.folder_holders[:6])
+                + ". Не удалось надёжно определить владельца; чужие процессы "
+                  "и их дескрипторы принудительно не закрываются.")
+            if not is_elevated():
+                self.log.info(
+                    "Повышенные права могут помочь диагностике PID владельца "
+                    "(или проверьте файл в Мониторе ресурсов Windows).")
+        else:
+            details = [
+                line for line in dict.fromkeys((recheck_errors or probe_errors) + scan_status)
+                if line and not line.startswith("Открытые файлы:")
+            ]
+            if scan_status or any(
+                marker in line
+                for line in details
+                for marker in ("ошибка обхода", "Проверка не завершилась",
+                               "Проверка остановлена", "Нельзя проверить")
+            ):
                 self.log.warn(
-                    "Папку портатива держат открытые файлы: "
-                    + ", ".join(result.folder_holders[:6])
-                    + ". Запустите Portablizer от имени администратора — "
-                      "тогда держателя видно по имени и его дескриптор "
-                      "закрывается принудительно.")
+                    "Не удалось полностью проверить свободу папки портатива: "
+                    + " ".join(details[:2]))
             else:
                 self.log.warn(
                     "Папка портатива занята, но виновника определить не "
@@ -1639,7 +1666,27 @@ class Portablizer:
         last: Optional[OSError] = None
         for attempt in range(attempts):
             try:
-                if os.path.isdir(path) and not os.path.islink(path):
+                if _is_reparse_point(path):
+                    try:
+                        os.rmdir(path)
+                    except OSError:
+                        os.unlink(path)
+                elif os.path.isdir(path) and not os.path.islink(path):
+                    filelocks_mod.unhide_wininet_cache(path)
+                    for current, dirs, _files in os.walk(path, topdown=True,
+                                                         followlinks=False):
+                        for name in list(dirs):
+                            child = os.path.join(current, name)
+                            if not _is_reparse_point(child):
+                                continue
+                            try:
+                                os.rmdir(child)
+                            except OSError:
+                                try:
+                                    os.unlink(child)
+                                except OSError:
+                                    pass
+                            dirs.remove(name)
                     shutil.rmtree(path)
                 elif os.path.exists(path) or os.path.islink(path):
                     os.remove(path)

@@ -24,7 +24,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from portablizer.core import filelocks
+from portablizer.core import filelocks, restart_manager
 
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
 IS_WINDOWS = sys.platform.startswith("win")
@@ -8121,6 +8121,32 @@ def describe_open_files(items: "Sequence[tuple[int, int, str, str]]") -> str:
     return ", ".join(sorted(set(parts)))
 
 
+def _describe_locked_files(root: Path, locked: "Sequence[str]") -> str:
+    """Identify processes holding ``locked`` via Restart Manager, then handle scan."""
+    parts = []
+    try:
+        owners = restart_manager.file_owners(locked)
+    except Exception:
+        owners = []
+    if owners:
+        images = dict(_all_processes())
+        for owner in owners:
+            name = (_image_name(images.get(owner.pid, ""))
+                    or _image_name(owner.app_name)
+                    or owner.service_name
+                    or f"pid {owner.pid}")
+            parts.append(f"{name} (pid {owner.pid}): {_image_name(owner.path)}")
+        if parts:
+            return ", ".join(sorted(set(parts)))
+    all_open = open_files_in(root)
+    locked_norm = {os.path.normcase(str(p)) for p in locked}
+    matched = [item for item in all_open
+               if os.path.normcase(str(item[2])) in locked_norm] or all_open
+    return describe_open_files(matched) or ", ".join(
+        _image_name(path) for path in locked[:6]
+    )
+
+
 def busy_files(root: Path, budget: float = 4.0, limit: int = 12,
                roots: "Optional[Sequence[Path]]" = None,
                scan_status: "Optional[list[str]]" = None) -> "list[str]":
@@ -8162,7 +8188,11 @@ def forget_fonts(root: Path, budget: float = 3.0,
         removed = 0
         walk_roots = [str(item) for item in (roots or ()) if os.path.isdir(str(item))]
         for walk_root in walk_roots or [str(root)]:
-            for current, _dirs, files in os.walk(walk_root):
+            for current, dirs, files in os.walk(walk_root):
+                dirs[:] = [
+                    d for d in dirs
+                    if not filelocks.is_reparse_point(os.path.join(current, d))
+                ]
                 if time.monotonic() > deadline:
                     break
                 for name in files:
@@ -8248,15 +8278,19 @@ def purge_portable_temp(root: Path, cfg: "Optional[Dict[str, Any]]" = None
     if isinstance(shutdown, dict) and shutdown.get("purge_temp") is False:
         return 0
     data_name = str(config.get("data_dir_name", "PortableData"))
+    filelocks.unhide_wininet_cache(str(root))
     removed = 0
     for relative in ((data_name, "Temp"),
-                     (data_name, "AppData", "Local", "Temp")):
+                     (data_name, "AppData", "Local", "Temp"),
+                     (data_name, "User", "AppData", "Local", "Temp")):
         folder = root.joinpath(*relative)
-        if not folder.is_dir():
+        if not folder.is_dir() or _is_junction(folder):
             continue
         for entry in folder.iterdir():
             try:
-                if entry.is_dir() and not entry.is_symlink():
+                if _is_junction(entry):
+                    _remove_junction(entry)
+                elif entry.is_dir() and not entry.is_symlink():
                     shutil.rmtree(entry, ignore_errors=True)
                 else:
                     entry.unlink()
@@ -8453,6 +8487,7 @@ def release_leftover_handles(root: Path,
     # папку чистой, второй не нужен.
     if time.monotonic() - _LAST_CLEAN_SWEEP < 10.0:
         return []
+    filelocks.unhide_wininet_cache(str(root))
     scan_status: list[str] = []
     if not busy_files(root, budget=float(cfg.get("busy_budget", 4.0)),
                       roots=roots, scan_status=scan_status):
@@ -8508,10 +8543,7 @@ def _report_folder_state(root: Path,
         _run_log(root, "WARNING: folder check incomplete: " + "; ".join(scan_status))
         return
     if locked:
-        items = [item for item in open_files_in(root)
-                 if item[2] in locked] or open_files_in(root)
-        description = describe_open_files(items) or ", ".join(
-            _image_name(path) for path in locked[:6])
+        description = _describe_locked_files(root, locked)
         _run_log(root, "WARNING: the folder is still locked by open files: "
                  + description
                  + ". Close the owning applications normally; external "
@@ -14320,6 +14352,66 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
         _report_folder_state(root, shutdown)
 
 
+STOP_REPORT_ENV = "PORTABLE_STOP_REPORT"
+
+
+def _stop_report_path() -> str:
+    for arg in sys.argv[1:]:
+        text = str(arg)
+        if text.casefold().startswith("--stop-report="):
+            return text.split("=", 1)[1].strip().strip('"')
+    return str(os.environ.get(STOP_REPORT_ENV, "")).strip()
+
+
+def _console_issue_line(item: str) -> str:
+    text = str(item)
+    if text.startswith("Подсказка:"):
+        return ("  Hint: directory is hidden by Windows ACL; run "
+                "StopPortable.cmd as Administrator to inspect it.")
+    replacements = (
+        ("ошибка обхода", "traversal error"),
+        ("доступ запрещён, проверьте разрешения", "access denied, check permissions"),
+        ("установлен атрибут «только чтение» (проверка его не меняла)",
+         "read-only attribute is set"),
+        ("Проверка не завершилась за отведённое время", "File check timed out"),
+        ("последний путь:", "last path:"),
+        ("Проверка остановлена после", "Stopped after"),
+        ("занятых файлов; остальные не проверены.", "locked files; rest not checked."),
+        ("Других ошибок проверки:", "Additional check errors:"),
+        ("Ошибка проверки:", "Check error:"),
+    )
+    for src, dst in replacements:
+        text = text.replace(src, dst)
+    return "  " + text
+
+
+def _write_stop_report(lines: "Sequence[str]") -> None:
+    target = _stop_report_path()
+    if not target or not lines:
+        return
+    encoding = "ascii"
+    if IS_WINDOWS:
+        try:
+            import ctypes
+
+            cp = (int(ctypes.windll.kernel32.GetConsoleOutputCP())
+                  or int(ctypes.windll.kernel32.GetOEMCP()))
+            if cp == 65001:
+                encoding = "utf-8"
+            elif cp > 0:
+                encoding = f"cp{cp}"
+        except Exception:
+            encoding = "ascii"
+    try:
+        payload = ("\r\n".join(str(line) for line in lines) + "\r\n").encode(
+            encoding, errors="replace"
+        )
+        with open(target, "wb") as handle:
+            handle.write(payload)
+    except OSError:
+        pass
+
+
 def stop(root: Optional[Path] = None) -> int:
     """``LaunchPortable.exe --stop``: free the folder, then report the result.
 
@@ -14352,8 +14444,9 @@ def stop(root: Optional[Path] = None) -> int:
         retry = _retry_stop_elevated(root, "процессы")
         if retry == 0:
             return 0
-        if retry == 1:
-            return 1  # повышенная копия уже показала свой вердикт
+        if retry in (1, 2):
+            return retry  # повышенная копия уже показала свой вердикт
+        _write_stop_report([f"Still running from this folder: {names}"])
         _show_warning(
             "Часть процессов из портативной папки остановить не удалось:\n"
             f"{names}\n\n"
@@ -14365,6 +14458,7 @@ def stop(root: Optional[Path] = None) -> int:
     # оставляют в ней распакованные шрифты и DLL, которые потом держит
     # система. Если из папки ничего не запущено, Temp можно вычистить.
     purge_portable_temp(root, cfg)
+    filelocks.unhide_wininet_cache(str(root))
 
     # Главная проверка: не «кто запущен», а «можно ли удалить папку».
     # Раньше скрипт отвечал «папка свободна», опираясь на список
@@ -14374,14 +14468,20 @@ def stop(root: Optional[Path] = None) -> int:
     locked = busy_files(root, scan_status=scan_status)
     if not locked and scan_status:
         _run_log(root, "--stop: folder check incomplete: " + "; ".join(scan_status))
+        _write_stop_report(
+            ["Incomplete file check:"]
+            + [_console_issue_line(item) for item in scan_status]
+        )
         _show_warning("Не удалось подтвердить, что папка свободна: "
                       + "; ".join(scan_status) + ". Повторите проверку.")
-        return 1
+        return 2
     if locked:
-        items = open_files_in(root)
-        description = describe_open_files(items) or ", ".join(
-            _image_name(path) for path in locked[:6])
+        description = _describe_locked_files(root, locked)
         _run_log(root, f"--stop: the folder is still locked: {description}")
+        report_lines = [f"Held by / locked files: {description}"]
+        for path in locked[:6]:
+            report_lines.append(f"  {path}")
+        _write_stop_report(report_lines)
         _show_warning(
             "Папка портатива всё ещё занята. Файлы или их владельцы:\n"
             f"{description}\n\n"
@@ -14396,7 +14496,12 @@ def stop(root: Optional[Path] = None) -> int:
     holders = module_holders(root)
     if holders:
         description = describe_holders(holders)
+        console_holders = ", ".join(
+            f"{_image_name(image)} (loaded {_image_name(mod)})"
+            for _pid, image, mod in holders
+        )
         _run_log(root, f"--stop: the folder is held from outside: {description}")
+        _write_stop_report([f"Held by loaded module: {console_holders or description}"])
         _show_warning(
             "Из портативной папки ничего не запущено, но её файлы держат "
             "другие программы:\n"
@@ -14406,6 +14511,17 @@ def stop(root: Optional[Path] = None) -> int:
             "после этого папка удалится.")
         return 1
 
+    clean_stopped = [
+        item for item in sorted(set(stopped))
+        if not item.startswith("сняты с регистрации")
+    ]
+    if clean_stopped:
+        _write_stop_report([
+            "Stopped: " + ", ".join(
+                item.replace(" (процесс из папки портатива)", "")
+                for item in clean_stopped
+            )
+        ])
     _run_log(root, "--stop: portable folder released"
              + (": " + ", ".join(sorted(set(stopped))) if stopped else
                 " (nothing was running)"))
@@ -14420,8 +14536,8 @@ def _retry_stop_elevated(root: Path, reason: str) -> int:
     Поэтому лончер сам один раз просит повышение — и только если и это не
     помогло, честно признаётся.
 
-    ``0`` — повышенная копия освободила папку, ``1`` — не смогла и уже
-    показала об этом своё окно, ``-1`` — повышения не было (отказ UAC,
+    ``0`` — повышенная копия освободила папку, ``1``/``2`` — не смогла и уже
+    показала об этом своё окно/отчёт, ``-1`` — повышения не было (отказ UAC,
     запуск из исходников, мы и так администратор).
     """
     if not IS_WINDOWS or _is_elevated():
@@ -14429,14 +14545,20 @@ def _retry_stop_elevated(root: Path, reason: str) -> int:
     if any(str(arg).casefold() == "--elevated" for arg in sys.argv[1:]):
         return -1
     _run_log(root, f"--stop: asking for administrator rights ({reason})")
-    code = _run_elevated(["--stop"])
+    extra_args = ["--stop"]
+    report_path = _stop_report_path()
+    if report_path:
+        extra_args.append(f"--stop-report={report_path}")
+    if _ui_disabled():
+        extra_args.append("--no-ui")
+    code = _run_elevated(extra_args)
     if code is None:
         return -1
     if code == 0:
         _run_log(root, "--stop: the elevated copy released the folder")
         return 0
     _run_log(root, f"--stop: the elevated copy returned {code}")
-    return 1
+    return code if code in (1, 2) else 1
 
 
 def repair_start_menu_command(root: Optional[Path] = None) -> int:
