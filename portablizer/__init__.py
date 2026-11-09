@@ -7,5 +7,5 @@
   * gui/   — современный интерфейс на PySide6 (Qt).
 """
 
-__version__ = "1.55.1"
+__version__ = "1.55.2"
 __app_name__ = "Portablizer"

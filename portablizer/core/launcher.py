@@ -1051,6 +1051,7 @@ set "USERPROFILE=%PORTABLE_DATA%\User"
 set "TEMP=%PORTABLE_DATA%\Temp"
 set "TMP=%PORTABLE_DATA%\Temp"
 set "PROGRAMDATA=%PORTABLE_DATA%\ProgramData"
+set "ALLUSERSPROFILE=%PORTABLE_DATA%\ProgramData"
 set "PUBLIC=%PORTABLE_DATA%\Public"
 set "PORTABLE_DOCUMENTS=%PORTABLE_DATA%\User\Documents"
 set "PORTABLE_APP=1"
@@ -1347,8 +1348,11 @@ echo Diagnostics:   Launch.bat --diagnose
 goto :eof
 
 :portable_paths_check
-if not exist "%PORTABLE_DATA%\portable-root.txt" goto :eof
 if not exist "%PORTABLE_ROOT%\App\{exe_launcher}" goto :eof
+if not exist "%PORTABLE_DATA%\portable-root.txt" (
+  if exist "%PORTABLE_DATA%\portable-root.json" "%PORTABLE_ROOT%\App\{exe_launcher}" --repair-paths >nul 2>&1
+  goto :eof
+)
 set "PORTABLE_ROOT_BEFORE="
 for /f "usebackq delims=" %%R in ("%PORTABLE_DATA%\portable-root.txt") do if not defined PORTABLE_ROOT_BEFORE set "PORTABLE_ROOT_BEFORE=%%R"
 if not defined PORTABLE_ROOT_BEFORE goto :eof
@@ -1699,6 +1703,463 @@ def prepare_vscode_profile(folder: str, main_exe_rel: str,
                     "(update.mode=none) — портатив обновляется через "
                     "UpdatePortable.cmd")
     return notes
+
+
+# --- JetBrains IDE (PyCharm, IntelliJ IDEA, WebStorm, CLion, GoLand, …) ------
+
+JETBRAINS_ENV_PREFIX_BY_STEM: "Dict[str, str]" = {
+    "pycharm": "PYCHARM",
+    "idea": "IDEA",
+    "webstorm": "WEBSTORM",
+    "webide": "WEBIDE",
+    "clion": "CLION",
+    "goland": "GOLAND",
+    "phpstorm": "PHPSTORM",
+    "rider": "RIDER",
+    "rubymine": "RUBYMINE",
+    "datagrip": "DATAGRIP",
+    "dataspell": "DATASPELL",
+    "rustrover": "RUSTROVER",
+    "aqua": "AQUA",
+    "studio": "STUDIO",
+    "devecostudio": "DEVECOSTUDIO",
+    "mps": "MPS",
+    "gateway": "GATEWAY",
+    "jetbrains_client": "JETBRAINS_CLIENT",
+    "jetbrainsclient": "JETBRAINS_CLIENT",
+}
+
+JETBRAINS_ENV_PREFIX_BY_CODE: "Dict[str, str]" = {
+    "py": "PYCHARM", "pc": "PYCHARM", "pe": "PYCHARM", "ds": "DATASPELL",
+    "iu": "IDEA", "ic": "IDEA", "ie": "IDEA",
+    "ws": "WEBSTORM", "cl": "CLION", "go": "GOLAND", "ps": "PHPSTORM",
+    "rd": "RIDER", "rm": "RUBYMINE", "db": "DATAGRIP", "rr": "RUSTROVER",
+    "qa": "AQUA", "ai": "STUDIO", "mps": "MPS", "gw": "GATEWAY",
+    "jbc": "JETBRAINS_CLIENT",
+}
+
+_JAVAAGENT_LINE_RE = re.compile(
+    r"^(\s*-javaagent:)(.+?\.jar)(=\S*|\s*)$", re.IGNORECASE
+)
+_VMOPT_DPROP_PATH_RE = re.compile(
+    r"^(\s*-D[A-Za-z0-9_.-]+=)([A-Za-z]:[\\/].+?)\s*$"
+)
+
+
+def jetbrains_product(main_exe: str) -> "Optional[Dict[str, str]]":
+    """Описание IDE семейства JetBrains (PyCharm, IDEA, WebStorm, CLion и др.).
+
+    Возвращает ``None`` для остальных программ. Поля словаря:
+      * ``name`` — человекочитаемое имя (``PyCharm``);
+      * ``data_dir`` — имя папки в ``JetBrains`` (``PyCharm2025.2``);
+      * ``env_prefix`` — префикс ``XPlatLauncher`` (``PYCHARM``, ``IDEA``);
+      * ``stem`` — базовое имя запускатора без ``64`` (``pycharm``);
+      * ``ide_home`` — корень установки IDE (родитель ``bin``);
+      * ``vmoptions_rel`` — путь штатного ``.vmoptions`` относительно ``ide_home``.
+    """
+    if not main_exe:
+        return None
+    exe_name = os.path.basename(main_exe)
+    raw_stem = os.path.splitext(exe_name)[0].casefold()
+    stem = raw_stem[:-2] if raw_stem.endswith("64") and len(raw_stem) > 2 else raw_stem
+    bin_dir = os.path.dirname(os.path.abspath(main_exe))
+    if os.path.basename(bin_dir).casefold() != "bin":
+        return None
+    ide_home = os.path.dirname(bin_dir)
+    info_path = os.path.join(ide_home, "product-info.json")
+    product: Optional[Dict[str, object]] = None
+    if os.path.isfile(info_path):
+        try:
+            with open(info_path, "r", encoding="utf-8-sig") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                product = loaded
+        except (OSError, ValueError):
+            product = None
+
+    if product is None:
+        if stem not in JETBRAINS_ENV_PREFIX_BY_STEM:
+            return None
+        home_base = os.path.basename(ide_home)
+        has_marker = (
+            os.path.isfile(main_exe + ".vmoptions")
+            or os.path.isfile(os.path.join(bin_dir, "idea.properties"))
+            or home_base.casefold().startswith(stem)
+        )
+        if not has_marker:
+            return None
+        data_dir = home_base if home_base.casefold().startswith(stem) else ""
+        return {
+            "name": stem.capitalize(),
+            "data_dir": data_dir,
+            "env_prefix": JETBRAINS_ENV_PREFIX_BY_STEM[stem],
+            "stem": stem,
+            "ide_home": ide_home,
+            "vmoptions_rel": f"bin/{exe_name}.vmoptions",
+        }
+
+    code = str(product.get("productCode") or "").strip().casefold()
+    env_prefix = ""
+    vmoptions_rel = f"bin/{exe_name}.vmoptions"
+    launch_list = product.get("launch")
+    if isinstance(launch_list, list):
+        for entry in launch_list:
+            if not isinstance(entry, dict):
+                continue
+            vm_rel = str(entry.get("vmOptionsFilePath") or "").strip()
+            if vm_rel:
+                vmoptions_rel = vm_rel.replace("\\", "/")
+            eb = str(entry.get("envVarBaseName") or "").strip()
+            if eb:
+                env_prefix = eb.upper()
+            break
+    if not env_prefix:
+        env_prefix = str(product.get("envVarBaseName") or "").strip().upper()
+    if not env_prefix:
+        env_prefix = (
+            JETBRAINS_ENV_PREFIX_BY_STEM.get(stem)
+            or JETBRAINS_ENV_PREFIX_BY_CODE.get(code)
+            or ""
+        )
+    if not env_prefix:
+        return None
+    name = str(product.get("name") or stem.capitalize()).strip()
+    data_dir = str(product.get("dataDirectoryName") or "").strip()
+    return {
+        "name": name,
+        "data_dir": data_dir,
+        "env_prefix": env_prefix,
+        "stem": stem,
+        "ide_home": ide_home,
+        "vmoptions_rel": vmoptions_rel,
+    }
+
+
+def _resolve_portable_jar_path(
+    jar_candidate: str,
+    portable_dir: str,
+    vmopt_dir: str,
+    extra_roots: Sequence[str],
+    jar_index_cache: "List[Optional[List[str]]]",
+) -> Optional[str]:
+    """Подбирает актуальный путь к ``.jar`` внутри ``portable_dir``."""
+    from . import relpaths as _rp
+
+    port_abs = os.path.abspath(portable_dir)
+    norm_cand = jar_candidate.strip().strip('"').replace("/", os.sep)
+    if _rp.is_within(norm_cand, port_abs) and os.path.isfile(norm_cand):
+        return None  # уже указывает на живой файл внутри текущего корня
+
+    # 1. Явно известные прежние/перенесённые корни.
+    for old_root in extra_roots or ():
+        old_norm = _rp.normalize_root(str(old_root or ""))
+        if old_norm and _rp.is_within(norm_cand, old_norm):
+            rel = _rp.relativize(norm_cand, old_norm)
+            for cand in (
+                os.path.join(port_abs, rel),
+                os.path.join(port_abs, "App", rel),
+            ):
+                if os.path.isfile(cand):
+                    return cand
+
+    # 2. Суффиксы пути после \App\ или \PortableData\ и хвосты сегментов.
+    parts = [p for p in re.split(r"[\\/]+", norm_cand) if p and ":" not in p]
+    for idx, seg in enumerate(parts):
+        low = seg.casefold()
+        if low in ("app", "portabledata"):
+            cand = os.path.join(port_abs, *parts[idx:])
+            if os.path.isfile(cand):
+                return cand
+    for k in range(len(parts), 0, -1):
+        tail = parts[-k:]
+        for base in (port_abs, os.path.join(port_abs, "App")):
+            cand = os.path.join(base, *tail)
+            if os.path.isfile(cand):
+                return cand
+
+    # 3. Однозначный поиск .jar с тем же именем внутри портатива.
+    target_name = os.path.basename(norm_cand).casefold()
+    if not target_name.endswith(".jar"):
+        return None
+    if jar_index_cache[0] is None:
+        found_jars: List[str] = []
+        for cur, dirs, files in os.walk(port_abs):
+            dirs[:] = [
+                d for d in dirs
+                if d.casefold() not in _rp.SKIP_DIRS and not d.startswith("$")
+            ]
+            for fn in files:
+                if fn.casefold().endswith(".jar"):
+                    found_jars.append(os.path.join(cur, fn))
+        jar_index_cache[0] = found_jars
+
+    matches = [
+        p for p in (jar_index_cache[0] or [])
+        if os.path.basename(p).casefold() == target_name
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1 and vmopt_dir:
+        vmopt_abs = os.path.abspath(vmopt_dir)
+        matches.sort(
+            key=lambda p: (
+                0 if os.path.commonpath([p, vmopt_abs]) == os.path.dirname(vmopt_abs)
+                else 1,
+                len(p),
+            )
+        )
+        return matches[0]
+    return None
+
+
+def heal_portable_vmoptions(
+    portable_dir: str,
+    extra_roots: Sequence[str] = (),
+) -> "List[str]":
+    """Чинит пути ``-javaagent:`` и ``-D...=`` во всех ``*.vmoptions`` портатива."""
+    from . import relpaths as _rp
+
+    if not portable_dir or not os.path.isdir(portable_dir):
+        return []
+    port_abs = os.path.abspath(portable_dir)
+    jar_index_cache: List[Optional[List[str]]] = [None]
+    healed: List[str] = []
+
+    for cur, dirs, files in os.walk(port_abs):
+        dirs[:] = [
+            d for d in dirs
+            if d.casefold() not in _rp.SKIP_DIRS and not d.startswith("$")
+        ]
+        for fn in sorted(files):
+            if not fn.casefold().endswith(".vmoptions"):
+                continue
+            vmopt_path = os.path.join(cur, fn)
+            if os.path.islink(vmopt_path):
+                continue
+            loaded = _rp.read_text(vmopt_path)
+            if loaded is None:
+                continue
+            text, encoding = loaded
+            lines = text.splitlines(keepends=True)
+            changed = False
+            new_lines: List[str] = []
+            for line in lines:
+                stripped_nl = line.rstrip("\r\n")
+                ending = line[len(stripped_nl):]
+                if stripped_nl.lstrip().startswith("#"):
+                    new_lines.append(line)
+                    continue
+                m_agent = _JAVAAGENT_LINE_RE.match(stripped_nl)
+                if m_agent:
+                    prefix, jar_raw, suffix = (
+                        m_agent.group(1), m_agent.group(2), m_agent.group(3)
+                    )
+                    resolved = _resolve_portable_jar_path(
+                        jar_raw, port_abs, cur, extra_roots, jar_index_cache
+                    )
+                    if resolved:
+                        use_slash = "/" in jar_raw and "\\" not in jar_raw
+                        formatted = (
+                            resolved.replace("\\", "/") if use_slash else resolved
+                        )
+                        new_line = f"{prefix}{formatted}{suffix}{ending}"
+                        if new_line != line:
+                            line = new_line
+                            changed = True
+                    new_lines.append(line)
+                    continue
+
+                m_prop = _VMOPT_DPROP_PATH_RE.match(stripped_nl)
+                if m_prop:
+                    prop_prefix, prop_val = m_prop.group(1), m_prop.group(2)
+                    norm_val = prop_val.strip().replace("/", os.sep)
+                    if not (_rp.is_within(norm_val, port_abs) and os.path.exists(norm_val)):
+                        parts = [
+                            p for p in re.split(r"[\\/]+", norm_val)
+                            if p and ":" not in p
+                        ]
+                        for idx, seg in enumerate(parts):
+                            if seg.casefold() in ("app", "portabledata"):
+                                cand = os.path.join(port_abs, *parts[idx:])
+                                if os.path.exists(cand):
+                                    use_slash = "/" in prop_val and "\\" not in prop_val
+                                    formatted = (
+                                        cand.replace("\\", "/") if use_slash else cand
+                                    )
+                                    line = f"{prop_prefix}{formatted}{ending}"
+                                    changed = True
+                                break
+                new_lines.append(line)
+
+            if changed:
+                updated = "".join(new_lines)
+                if _rp.write_text(vmopt_path, updated, encoding):
+                    healed.append(os.path.relpath(vmopt_path, port_abs))
+    return healed
+
+
+def jetbrains_portable_env(
+    folder: str,
+    info: "Dict[str, str]",
+    data_dir_name: str = "PortableData",
+) -> "Dict[str, str]":
+    """Переменные окружения JetBrains IDE, если ``-javaagent:`` лежит в отдельном vmoptions."""
+    from . import relpaths as _rp
+
+    del data_dir_name
+    env_prefix = str(info.get("env_prefix") or "").strip().upper()
+    if not env_prefix or not folder or not os.path.isdir(folder):
+        return {}
+
+    ide_home = str(info.get("ide_home") or "")
+    vmoptions_rel = str(info.get("vmoptions_rel") or "").replace("/", os.sep)
+    stock_vmopt = os.path.join(ide_home, vmoptions_rel) if ide_home and vmoptions_rel else ""
+
+    def _has_javaagent(path: str) -> bool:
+        if not path or not os.path.isfile(path):
+            return False
+        loaded = _rp.read_text(path)
+        if loaded is None:
+            return False
+        return any(
+            not ln.lstrip().startswith("#") and "-javaagent:" in ln.casefold()
+            for ln in loaded[0].splitlines()
+        )
+
+    # Если -javaagent: уже вписан прямо в bin/<ide>64.exe.vmoptions, переменная
+    # *_VM_OPTIONS не требуется (починка путей обновит сам файл на месте).
+    if _has_javaagent(stock_vmopt):
+        return {}
+
+    stem = str(info.get("stem") or "").casefold()
+    port_abs = os.path.abspath(folder)
+    candidates: List[Tuple[int, str]] = []
+    for cur, dirs, files in os.walk(port_abs):
+        dirs[:] = [
+            d for d in dirs
+            if d.casefold() not in _rp.SKIP_DIRS and not d.startswith("$")
+        ]
+        # Пользовательский Roaming\JetBrains\<DataDir>\<ide>64.exe.vmoptions
+        # дополняет bin\*.vmoptions автоматически; задавать им *_VM_OPTIONS
+        # нельзя, если там нет полного набора --add-opens.
+        rel_cur = os.path.relpath(cur, port_abs).replace("\\", "/").casefold()
+        for fn in sorted(files):
+            low = fn.casefold()
+            if not low.endswith(".vmoptions"):
+                continue
+            full = os.path.join(cur, fn)
+            if stock_vmopt and os.path.normcase(full) == os.path.normcase(stock_vmopt):
+                continue
+            if not _has_javaagent(full):
+                continue
+            loaded = _rp.read_text(full)
+            body = loaded[0] if loaded else ""
+            is_standalone = (
+                "--add-opens" in body
+                or "vmoptions/" in rel_cur
+                or "netfilter" in rel_cur
+                or "jetbra" in rel_cur
+            )
+            if "appdata/roaming/jetbrains" in rel_cur and not is_standalone:
+                continue
+            score = 0
+            if stem and (low == f"{stem}.vmoptions" or low.startswith(stem)):
+                score -= 10
+            if "vmoptions" in rel_cur or "netfilter" in rel_cur or "jetbra" in rel_cur:
+                score -= 5
+            candidates.append((score, full))
+
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda item: (item[0], len(item[1])))
+    chosen_rel = os.path.relpath(candidates[0][1], port_abs).replace("/", "\\")
+    return {f"{env_prefix}_VM_OPTIONS": f"%PORTABLE_ROOT%\\{chosen_rel}"}
+
+
+def sync_jetbrains_roaming_dirs(
+    folder: str,
+    data_dir: str,
+    data_dir_name: str = "PortableData",
+) -> "List[str]":
+    """Синхронизирует недостающие ключи/настройки между двумя ветками Roaming.
+
+    Часть скриптов установщика пишет в ``%APPDATA%\\JetBrains\\<ver>``
+    (``PortableData\\AppData\\Roaming``), а ``SHGetKnownFolderPath`` в Windows
+    разрешает ``FOLDERID_RoamingAppData`` через ``%USERPROFILE%\\AppData\\Roaming``
+    (``PortableData\\User\\AppData\\Roaming``). Копирование недостающих файлов в
+    обе стороны гарантирует, что ``*.key`` и ``*.vmoptions`` видны всегда.
+    """
+    import shutil as _shutil
+
+    if not folder or not data_dir:
+        return []
+    data_root = os.path.join(folder, data_dir_name or "PortableData")
+    roaming_a = os.path.join(data_root, "AppData", "Roaming", "JetBrains", data_dir)
+    roaming_b = os.path.join(
+        data_root, "User", "AppData", "Roaming", "JetBrains", data_dir
+    )
+    dir_a = os.path.isdir(roaming_a)
+    dir_b = os.path.isdir(roaming_b)
+    if not dir_a and not dir_b:
+        return []
+
+    copied: List[str] = []
+    pairs = []
+    if dir_a:
+        pairs.append((roaming_a, roaming_b))
+    if dir_b:
+        pairs.append((roaming_b, roaming_a))
+    for src_root, dst_root in pairs:
+        for cur, _dirs, files in os.walk(src_root):
+            rel = os.path.relpath(cur, src_root)
+            target_dir = dst_root if rel == "." else os.path.join(dst_root, rel)
+            for fn in files:
+                if fn == ".lock":
+                    continue
+                src_file = os.path.join(cur, fn)
+                dst_file = os.path.join(target_dir, fn)
+                if not os.path.exists(dst_file):
+                    try:
+                        os.makedirs(target_dir, exist_ok=True)
+                        _shutil.copy2(src_file, dst_file)
+                        copied.append(os.path.relpath(dst_file, folder))
+                    except OSError:
+                        continue
+    return copied
+
+
+def prepare_jetbrains_portable(
+    folder: str,
+    main_exe_rel: str,
+    data_dir_name: str = "PortableData",
+    extra_roots: Sequence[str] = (),
+) -> "Tuple[Dict[str, str], List[str]]":
+    """Готовит JetBrains IDE к переносу между любыми папками, дисками и ПК."""
+    notes: List[str] = []
+    healed = heal_portable_vmoptions(folder, extra_roots=extra_roots)
+    if healed:
+        notes.append(
+            "Обновлены пути агента в .vmoptions: " + ", ".join(healed[:5])
+        )
+    main_abs = os.path.join(
+        folder, main_exe_rel.replace("\\", os.sep).replace("/", os.sep)
+    )
+    info = jetbrains_product(main_abs)
+    if info is None:
+        return {}, notes
+    if info.get("data_dir"):
+        synced = sync_jetbrains_roaming_dirs(
+            folder, info["data_dir"], data_dir_name
+        )
+        if synced:
+            notes.append(
+                f"{info['name']}: синхронизированы файлы профиля JetBrains "
+                f"({len(synced)} шт.)"
+            )
+    env_vars = jetbrains_portable_env(folder, info, data_dir_name)
+    for k, v in env_vars.items():
+        notes.append(f"{info['name']}: {k}={v}")
+    return env_vars, notes
 
 
 def is_electron_app(main_exe: str) -> bool:

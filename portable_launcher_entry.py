@@ -1648,10 +1648,30 @@ def _root_marker_pattern(needle: str) -> "re.Pattern[str]":
 
 
 def _replace_root_text(text: str, old: str, new: str) -> str:
-    """Меняет все вхождения пути/маркера ``old`` на ``new`` с границами."""
-    if not text or not old:
+    """Меняет все вхождения пути/маркера ``old`` на ``new`` с границами.
+
+    Если ``new`` начинается с ``old`` (например, ``D:\\PyCharm`` ->
+    ``D:\\PyCharm - Copy``), уже обновлённое вхождение оставляется нетронутым,
+    чтобы повторный проход (``--repair-paths``) не удваивал хвост.
+    """
+    if not text or not old or old.casefold() == new.casefold():
         return text
-    return _root_marker_pattern(old).sub(lambda _match: new, text)
+    prefix_overlap = bool(new) and new.casefold().startswith(old.casefold())
+    new_len = len(new)
+
+    def _sub(match: "re.Match[str]") -> str:
+        if prefix_overlap:
+            start = match.start()
+            tail = text[start:start + new_len]
+            if tail.casefold() == new.casefold():
+                after_idx = start + new_len
+                if after_idx >= len(text) or not re.match(
+                    r"[0-9A-Za-z_.]", text[after_idx]
+                ):
+                    return match.group(0)
+        return new
+
+    return _root_marker_pattern(old).sub(_sub, text)
 
 
 def _rewrite_reg(source: Path, destination: Path,
@@ -1790,6 +1810,7 @@ PATHS_TEXT_SUFFIXES = (
     ".ini", ".cfg", ".conf", ".config", ".json", ".xml", ".yaml", ".yml",
     ".txt", ".reg", ".bat", ".cmd", ".vbs", ".ps1", ".url", ".properties",
     ".settings", ".prefs", ".toml", ".local", ".dat",
+    ".vmoptions", ".key", ".options", ".args", ".rsp", ".env",
 )
 
 #: Каталоги, которые меняются каждую секунду и к переносу отношения не имеют,
@@ -1807,6 +1828,7 @@ PATHS_SKIP_DIRS = (
     "_internal",
     "codecache", "crashpad", "crashdumps", "logs",
     "node_modules", ".git", ".hg", ".svn",
+    "__pycache__", "site-packages", "dist-packages", "typeshed", "stubs",
     "blob_storage", "indexeddb", "service worker",
     "cacheddata", "cachedprofilesdata", "workspacestorage",
 )
@@ -1832,7 +1854,7 @@ PATHS_MAX_BYTES = 2 * 1024 * 1024
 #: обновления), поэтому без этой отметки починка путей обходила и читала файлы
 #: при каждом запуске — вечно. Отметка хранится в том же штампе (``scan``) и
 #: сверяется с текущим набором прежних корней.
-PATHS_SCAN_VERSION = 2
+PATHS_SCAN_VERSION = 3
 
 _PATHS_BOMS = (
     (b"\xef\xbb\xbf", "utf-8-sig"),
@@ -2029,20 +2051,69 @@ def _decode_text_bytes(data: bytes) -> "Optional[tuple[str, str]]":
         return None
 
 
+_PATHS_APP_PRIORITY_DIRS = frozenset({
+    "bin", "conf", "config", "configs", "etc", "settings", "vmoptions",
+})
+_PATHS_APP_HEAVY_DIRS = frozenset({
+    "jbr", "jre", "jdk", "lib", "modules", "plugins", "help",
+    "license", "licenses",
+})
+
+
+def _is_paths_priority_dir(lowered: str) -> bool:
+    return (lowered in _PATHS_APP_PRIORITY_DIRS
+            or "vmoptions" in lowered
+            or "netfilter" in lowered
+            or "jetbra" in lowered)
+
+
+def _write_repaired_bytes(path: Path, encoded: bytes) -> bool:
+    """Записывает исправленный файл, снимая при необходимости флаг Read-Only."""
+    try:
+        path.write_bytes(encoded)
+        return True
+    except PermissionError:
+        try:
+            if path.is_symlink():
+                return False
+            if IS_WINDOWS:
+                import ctypes
+                attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+                if attrs != 0xFFFFFFFF and not (attrs & 0x400) and (attrs & 0x1):
+                    ctypes.windll.kernel32.SetFileAttributesW(
+                        str(path), attrs & ~0x1
+                    )
+            os.chmod(path, 0o666)
+            path.write_bytes(encoded)
+            return True
+        except OSError:
+            return False
+    except OSError:
+        return False
+
+
+def _java_escape_colon(path_text: str) -> str:
+    """Форма ``D\\:\\\\...`` или ``D\\:/...`` из ``java.util.Properties``."""
+    if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
+        return path_text[0] + "\\:" + path_text[2:]
+    return ""
+
+
 def _iter_paths_files(root: Path, settings: Dict[str, Any],
                       deep: bool = False) -> "Iterable[Path]":
     """Текстовые файлы портатива, в которых может жить абсолютный путь.
 
-    ``PortableData`` (там настройки программы) обходится всегда полностью.
-    ``App`` при обычном запуске читается на два уровня вглубь: внутри бывают
-    десятки тысяч файлов, и обходить их все на каждый старт слишком дорого.
-    ``deep=True`` (обновление, ``--repair-paths``) снимает это ограничение:
-    установщик обновления читает каталог установки из конфига программы,
-    который может лежать глубже, и тогда новая версия встанет по старому
-    адресу. Потолок числа файлов при этом выше, но всё равно есть.
+    ``PortableData`` (там настройки программы) обходится всегда первым и
+    полностью. ``App`` идёт после него, начиная с каталогов конфигурации и
+    запуска (``bin``, ``vmoptions``, ``ja-netfilter``, ``config``), а при
+    обычном запуске глубокие служебные поддеревья ограничиваются по глубине.
+    ``deep=True`` (обновление, ``--repair-paths``) снимает это ограничение.
     """
-    suffixes = tuple(str(item).casefold()
-                     for item in settings.get("suffixes") or PATHS_TEXT_SUFFIXES)
+    suffix_set = {str(item).casefold() for item in PATHS_TEXT_SUFFIXES}
+    suffix_set.update(
+        str(item).casefold() for item in settings.get("suffixes") or ()
+    )
+    suffixes = tuple(sorted(suffix_set))
     # Встроенный список объединяется с настройками, а не заменяется ими:
     # конфиг старого портатива содержит собственный ``skip_dirs``, и без
     # объединения новые исключения (``node_modules``) к нему бы не пришли.
@@ -2059,15 +2130,47 @@ def _iter_paths_files(root: Path, settings: Dict[str, Any],
     app_name = "app"
     for current, dirs, files in os.walk(root):
         relative = os.path.relpath(current, root)
-        depth = 0 if relative == "." else relative.count(os.sep) + 1
+        if relative == ".":
+            parts: "tuple[str, ...]" = ()
+            depth = 0
+        else:
+            parts = tuple(relative.split(os.sep))
+            depth = len(parts)
+        in_app = bool(parts and parts[0].casefold() == app_name)
+        in_priority = in_app and any(
+            _is_paths_priority_dir(seg.casefold()) for seg in parts[1:]
+        )
+
+        if depth == 0:
+            ordered = sorted(
+                dirs,
+                key=lambda d: (
+                    0 if d.casefold() == "portabledata"
+                    else (2 if d.casefold() == app_name else 1),
+                    d.casefold(),
+                ),
+            )
+        elif in_app:
+            ordered = sorted(
+                dirs,
+                key=lambda d: (
+                    0 if _is_paths_priority_dir(d.casefold())
+                    else (2 if d.casefold() in _PATHS_APP_HEAVY_DIRS else 1),
+                    d.casefold(),
+                ),
+            )
+        else:
+            ordered = sorted(dirs)
+
         keep = []
-        for name in sorted(dirs):
+        for name in ordered:
             lowered = name.casefold()
             if lowered in skip or lowered.startswith("$"):
                 continue
-            if lowered == app_name and not include_app:
+            if depth == 0 and lowered == app_name and not include_app:
                 continue
-            if lowered == app_name and not deep and depth >= 2:
+            if (in_app and not deep and depth >= 6
+                    and not in_priority and not _is_paths_priority_dir(lowered)):
                 continue
             keep.append(name)
         dirs[:] = keep
@@ -2133,15 +2236,31 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
         return []
 
     # Все начертания запомненных корней. Удвоенная форма (``C:\\\\Apps\\\\Foo``
-    # в JSON и .reg) длиннее обычной, поэтому замены идут от длинной к
-    # короткой: иначе короткая успела бы испортить длинную.
+    # в JSON и .reg) и экранированная форма Java .properties (``C\\:\\\\...``)
+    # длиннее обычной, поэтому замены идут от длинной к короткой.
     pairs: "list[tuple[str, str]]" = []
+    cur_doubled = current.replace("\\", "\\\\")
+    cur_slashed = current.replace("\\", "/")
+    cur_java_bs = _java_escape_colon(cur_doubled)
+    cur_java_sl = _java_escape_colon(cur_slashed)
     for item in remembered:
+        item_doubled = item.replace("\\", "\\\\")
+        item_slashed = item.replace("\\", "/")
+        item_java_bs = _java_escape_colon(item_doubled)
+        item_java_sl = _java_escape_colon(item_slashed)
+        if item_java_bs and cur_java_bs:
+            pairs.append((item_java_bs, cur_java_bs))
+        if item_java_sl and cur_java_sl and item_java_sl != item_java_bs:
+            pairs.append((item_java_sl, cur_java_sl))
         if "\\" in item:
-            pairs.append((item.replace("\\", "\\\\"),
-                          current.replace("\\", "\\\\")))
+            pairs.append((item_doubled, cur_doubled))
         pairs.append((item, current))
-        pairs.append((item.replace("\\", "/"), current.replace("\\", "/")))
+        pairs.append((item_slashed, cur_slashed))
+        if " " in item_slashed:
+            pairs.append(
+                (item_slashed.replace(" ", "%20"),
+                 cur_slashed.replace(" ", "%20"))
+            )
     # Маркер — тоже «не тот» путь: пока он в настройках, ни программа, ни её
     # установщик не понимают, где лежит папка.
     token_pair = (ROOT_TOKEN, current)
@@ -2152,7 +2271,7 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
     files: "list[str]" = []
     total = 0
     # Штамп и отчёт о путях пишем мы сами: переписывать их «старый корень»
-    # бессмысленно, а в отчёте об этом был бы ложный след.
+    # бессмысленно, а в отчёт об этом был бы ложный след.
     own = {_paths_stamp_file(root), _paths_stamp_text_file(root)}
     for path in _iter_paths_files(root, settings, deep=deep):
         if path in own:
@@ -2173,13 +2292,19 @@ def repair_paths(root: Path, cfg: "Optional[Dict[str, Any]]" = None,
         for form, replacement in pairs:
             if not form or form.casefold() not in fixed.casefold():
                 continue
-            replaced += len(_root_marker_pattern(form).findall(fixed))
+            before_step = fixed
             fixed = _replace_root_text(fixed, form, replacement)
+            if fixed != before_step:
+                replaced += max(
+                    len(_root_marker_pattern(form).findall(before_step)), 1
+                )
         if fixed == text:
             continue
         try:
-            path.write_bytes(fixed.encode(encoding))
-        except (OSError, UnicodeError):
+            encoded = fixed.encode(encoding)
+        except UnicodeError:
+            continue
+        if not _write_repaired_bytes(path, encoded):
             continue
         total += max(replaced, 1)
         try:
@@ -2264,8 +2389,10 @@ def expand_root_token_in_files(root: Path,
                                  "without breaking the JSON")
                 continue
         try:
-            path.write_bytes(fixed.encode(encoding))
-        except (OSError, UnicodeError):
+            encoded = fixed.encode(encoding)
+        except UnicodeError:
+            continue
+        if not _write_repaired_bytes(path, encoded):
             continue
         try:
             fixed_files.append(str(path.relative_to(root)))
@@ -2522,6 +2649,65 @@ def _expand_environment(value: Any, env: Dict[str, str]) -> str:
     return re.sub(r"%([^%]+)%", replace, text)
 
 
+_JETBRAINS_ENV_BASES = frozenset({
+    "PYCHARM", "IDEA", "CLION", "PHPSTORM", "GOLAND", "WEBSTORM", "WEBIDE",
+    "RIDER", "DATAGRIP", "RUBYMINE", "DATASPELL", "AQUA", "RUSTROVER",
+    "GATEWAY", "JETBRAINS_CLIENT", "JETBRAINSCLIENT", "STUDIO",
+    "DEVECOSTUDIO", "MPS",
+})
+_JETBRAINS_ENV_SUFFIXES = ("_VM_OPTIONS", "_PROPERTIES", "_JDK_64", "_JDK")
+_SYSTEM_IMMUTABLE_ENV = frozenset({
+    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "PSMODULEPATH",
+    "OS", "USERNAME", "COMPUTERNAME", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL", "PROCESSOR_REVISION",
+})
+
+
+def _is_jetbrains_launcher_env_var(name: str) -> bool:
+    upper = str(name or "").strip().upper()
+    for suf in _JETBRAINS_ENV_SUFFIXES:
+        if upper.endswith(suf):
+            base = upper[:-len(suf)]
+            if base in _JETBRAINS_ENV_BASES:
+                return True
+    return False
+
+
+def _path_is_within_root(candidate: str, root: Path) -> bool:
+    clean = str(candidate or "").strip().strip('"').replace("/", "\\").rstrip("\\")
+    root_clean = str(root).replace("/", "\\").rstrip("\\")
+    if not clean or not root_clean:
+        return False
+    c_fold = os.path.normpath(clean).rstrip("\\").casefold()
+    r_fold = os.path.normpath(root_clean).rstrip("\\").casefold()
+    return c_fold == r_fold or c_fold.startswith(r_fold + "\\")
+
+
+def _retarget_portable_subpath(raw_path: str, root: Path) -> Optional[str]:
+    """Если путь указывает в прежнее место ``...\\App\\...`` или ``...\\PortableData\\...``,
+    возвращает существующий путь внутри текущего ``root``.
+    """
+    clean = str(raw_path or "").strip().strip('"')
+    if not clean:
+        return None
+    parts = [p for p in re.split(r"[\\/]+", clean) if p and ":" not in p]
+    for idx, seg in enumerate(parts):
+        if seg.casefold() in ("app", "portabledata"):
+            cand = root.joinpath(*parts[idx:])
+            if cand.exists():
+                use_slash = "/" in raw_path and "\\" not in raw_path
+                return str(cand).replace("\\", "/") if use_slash else str(cand)
+    for k in range(len(parts), 0, -1):
+        tail = parts[-k:]
+        for base in (root, root / "App"):
+            cand = base.joinpath(*tail)
+            if cand.exists():
+                use_slash = "/" in raw_path and "\\" not in raw_path
+                return str(cand).replace("\\", "/") if use_slash else str(cand)
+    return None
+
+
 def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
     data = root / cfg.get("data_dir_name", "PortableData")
     appdata = data / "AppData" / "Roaming"
@@ -2558,6 +2744,50 @@ def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
         directory.mkdir(parents=True, exist_ok=True)
 
     env = dict(os.environ)
+    stale_roots = remembered_roots(root, cfg)
+    current_str = str(root)
+    current_slashed = current_str.replace("\\", "/")
+    extra_cfg = cfg.get("extra_env")
+    configured_keys = (
+        {str(k).casefold() for k in extra_cfg if k}
+        if isinstance(extra_cfg, dict) else set()
+    )
+
+    for key in list(env.keys()):
+        upper_key = key.upper()
+        if upper_key in _SYSTEM_IMMUTABLE_ENV:
+            continue
+        val = str(env.get(key) or "")
+        if not val:
+            continue
+        updated_val = val
+        if ROOT_TOKEN.casefold() in updated_val.casefold():
+            updated_val = _replace_root_text(updated_val, ROOT_TOKEN, current_str)
+        for old_r in stale_roots:
+            if old_r.casefold() in updated_val.casefold():
+                updated_val = _replace_root_text(updated_val, old_r, current_str)
+            old_sl = old_r.replace("\\", "/")
+            if old_sl != old_r and old_sl.casefold() in updated_val.casefold():
+                updated_val = _replace_root_text(
+                    updated_val, old_sl, current_slashed
+                )
+        if updated_val != val:
+            env[key] = updated_val
+            val = updated_val
+
+        # Изоляция и автопочинка переменных XPlatLauncher (PYCHARM_VM_OPTIONS
+        # и др.): чужой или мёртвый путь из окружения ПК не должен перебивать
+        # настройки внутри портатива после переезда папки.
+        if _is_jetbrains_launcher_env_var(key) and key.casefold() not in configured_keys:
+            cand_path = Path(val.strip().strip('"').replace("/", os.sep))
+            if _path_is_within_root(val, root) and cand_path.exists():
+                continue
+            retargeted = _retarget_portable_subpath(val, root)
+            if retargeted is not None:
+                env[key] = retargeted
+            else:
+                env.pop(key, None)
+
     env.update({
         "APPDATA": str(appdata),
         "LOCALAPPDATA": str(localappdata),
@@ -2565,6 +2795,7 @@ def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
         "TEMP": str(temp),
         "TMP": str(temp),
         "PROGRAMDATA": str(programdata),
+        "ALLUSERSPROFILE": str(programdata),
         "PUBLIC": str(public),
         "PORTABLE_APP": "1",
         "PORTABLE_ROOT": str(root),
@@ -2580,7 +2811,14 @@ def _prepare_environment(root: Path, cfg: Dict[str, Any]) -> Dict[str, str]:
         env["PATH"] = os.pathsep.join(prefixes + [env.get("PATH", "")])
     for key, value in cfg.get("extra_env", {}).items():
         if key:
-            env[str(key)] = _expand_environment(value, env)
+            expanded = _expand_environment(value, env)
+            if _is_jetbrains_launcher_env_var(str(key)):
+                cand_p = Path(expanded.strip().strip('"').replace("/", os.sep))
+                if not cand_p.exists():
+                    retargeted = _retarget_portable_subpath(expanded, root)
+                    if retargeted is not None:
+                        expanded = retargeted
+            env[str(key)] = expanded
     return env
 
 
@@ -6469,6 +6707,446 @@ def _apply_vscode_profile(root: Path, cfg: Dict[str, Any],
                          f"({settings.relative_to(root)}); updates go through "
                          "UpdatePortable.cmd")
     return notes
+
+
+# --- JetBrains IDE (PyCharm, IntelliJ IDEA, WebStorm, CLion, GoLand, …) ------
+
+_JB_PREFIX_BY_STEM = {
+    "pycharm": "PYCHARM", "idea": "IDEA", "webstorm": "WEBSTORM",
+    "webide": "WEBIDE", "clion": "CLION", "goland": "GOLAND",
+    "phpstorm": "PHPSTORM", "rider": "RIDER", "rubymine": "RUBYMINE",
+    "datagrip": "DATAGRIP", "dataspell": "DATASPELL", "rustrover": "RUSTROVER",
+    "aqua": "AQUA", "studio": "STUDIO", "devecostudio": "DEVECOSTUDIO",
+    "mps": "MPS", "gateway": "GATEWAY",
+    "jetbrains_client": "JETBRAINS_CLIENT", "jetbrainsclient": "JETBRAINS_CLIENT",
+}
+_JB_PREFIX_BY_CODE = {
+    "py": "PYCHARM", "pc": "PYCHARM", "pe": "PYCHARM", "ds": "DATASPELL",
+    "iu": "IDEA", "ic": "IDEA", "ie": "IDEA", "ws": "WEBSTORM",
+    "cl": "CLION", "go": "GOLAND", "ps": "PHPSTORM", "rd": "RIDER",
+    "rm": "RUBYMINE", "db": "DATAGRIP", "rr": "RUSTROVER", "qa": "AQUA",
+    "ai": "STUDIO", "mps": "MPS", "gw": "GATEWAY", "jbc": "JETBRAINS_CLIENT",
+}
+_JB_JAVAAGENT_RE = re.compile(
+    r"^(\s*-javaagent:)(.+?\.jar)(=\S*|\s*)$", re.IGNORECASE
+)
+_JB_DPROP_PATH_RE = re.compile(
+    r"^(\s*-D[A-Za-z0-9_.-]+=)([A-Za-z]:[\\/].+?)\s*$"
+)
+
+
+def _jetbrains_product(target: Path) -> "Optional[Dict[str, str]]":
+    """Описание JetBrains IDE по исполняемому файлу или ``None``."""
+    try:
+        exe_name = target.name
+        raw_stem = target.stem.casefold()
+        stem = raw_stem[:-2] if raw_stem.endswith("64") and len(raw_stem) > 2 else raw_stem
+        bin_dir = target.parent
+        if bin_dir.name.casefold() != "bin":
+            return None
+        ide_home = bin_dir.parent
+    except OSError:
+        return None
+
+    info_path = ide_home / "product-info.json"
+    product: Optional[Dict[str, Any]] = None
+    if info_path.is_file():
+        try:
+            loaded = json.loads(info_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                product = loaded
+        except (OSError, ValueError):
+            product = None
+
+    if product is None:
+        if stem not in _JB_PREFIX_BY_STEM:
+            return None
+        home_base = ide_home.name
+        has_marker = (
+            Path(str(target) + ".vmoptions").is_file()
+            or (bin_dir / "idea.properties").is_file()
+            or home_base.casefold().startswith(stem)
+        )
+        if not has_marker:
+            return None
+        return {
+            "name": stem.capitalize(),
+            "data_dir": home_base if home_base.casefold().startswith(stem) else "",
+            "env_prefix": _JB_PREFIX_BY_STEM[stem],
+            "stem": stem,
+            "ide_home": str(ide_home),
+            "vmoptions_rel": f"bin/{exe_name}.vmoptions",
+        }
+
+    code = str(product.get("productCode") or "").strip().casefold()
+    env_prefix = ""
+    vmoptions_rel = f"bin/{exe_name}.vmoptions"
+    launch_list = product.get("launch")
+    if isinstance(launch_list, list):
+        for item in launch_list:
+            if not isinstance(item, dict):
+                continue
+            vm_rel = str(item.get("vmOptionsFilePath") or "").strip()
+            if vm_rel:
+                vmoptions_rel = vm_rel.replace("\\", "/")
+            eb = str(item.get("envVarBaseName") or "").strip()
+            if eb:
+                env_prefix = eb.upper()
+            break
+    if not env_prefix:
+        env_prefix = str(product.get("envVarBaseName") or "").strip().upper()
+    if not env_prefix:
+        env_prefix = (
+            _JB_PREFIX_BY_STEM.get(stem)
+            or _JB_PREFIX_BY_CODE.get(code)
+            or ""
+        )
+    if not env_prefix:
+        return None
+    return {
+        "name": str(product.get("name") or stem.capitalize()).strip(),
+        "data_dir": str(product.get("dataDirectoryName") or "").strip(),
+        "env_prefix": env_prefix,
+        "stem": stem,
+        "ide_home": str(ide_home),
+        "vmoptions_rel": vmoptions_rel,
+    }
+
+
+def _resolve_vmoptions_jar(
+    jar_raw: str,
+    root: Path,
+    vmopt_dir: Path,
+    stale_roots: "Sequence[str]",
+    jar_cache: "list[Optional[list[Path]]]",
+) -> Optional[str]:
+    clean = jar_raw.strip().strip('"')
+    cand_path = Path(clean.replace("/", os.sep))
+    if _path_is_within_root(clean, root) and cand_path.is_file():
+        return None
+
+    for old_r in stale_roots:
+        old_clean = str(old_r).rstrip("\\/")
+        if not old_clean:
+            continue
+        norm_clean = clean.replace("/", "\\")
+        old_bs = old_clean.replace("/", "\\")
+        if norm_clean.casefold().startswith(old_bs.casefold() + "\\"):
+            tail = norm_clean[len(old_bs) + 1:]
+            for candidate in (root / tail, root / "App" / tail):
+                if candidate.is_file():
+                    return str(candidate)
+
+    retargeted = _retarget_portable_subpath(clean, root)
+    if retargeted and Path(retargeted.replace("/", os.sep)).is_file():
+        return str(Path(retargeted.replace("/", os.sep)))
+
+    jar_name = cand_path.name.casefold()
+    if not jar_name.endswith(".jar"):
+        return None
+    if jar_cache[0] is None:
+        skip = {s.casefold() for s in PATHS_SKIP_DIRS}
+        jars: "list[Path]" = []
+        for cur, dirs, files in os.walk(root):
+            dirs[:] = [
+                d for d in dirs
+                if d.casefold() not in skip and not d.startswith("$")
+            ]
+            for fn in files:
+                if fn.casefold().endswith(".jar"):
+                    jars.append(Path(cur) / fn)
+        jar_cache[0] = jars
+
+    matches = [p for p in (jar_cache[0] or []) if p.name.casefold() == jar_name]
+    if len(matches) == 1:
+        return str(matches[0])
+    if len(matches) > 1:
+        vmopt_parent = str(vmopt_dir.parent)
+        matches.sort(
+            key=lambda p: (
+                0 if str(p).casefold().startswith(vmopt_parent.casefold()) else 1,
+                len(str(p)),
+            )
+        )
+        return str(matches[0])
+    return None
+
+
+def heal_vmoptions_files(root: Path,
+                         cfg: "Optional[Dict[str, Any]]" = None) -> "list[str]":
+    """Проверяет все ``*.vmoptions`` внутри портатива и чинит ``-javaagent:``."""
+    if not root.is_dir():
+        return []
+    skip = {s.casefold() for s in PATHS_SKIP_DIRS}
+    stale_roots = remembered_roots(root, cfg)
+    jar_cache: "list[Optional[list[Path]]]" = [None]
+    healed: "list[str]" = []
+
+    for cur, dirs, files in os.walk(root):
+        dirs[:] = [
+            d for d in dirs
+            if d.casefold() not in skip and not d.startswith("$")
+        ]
+        for fn in sorted(files):
+            if not fn.casefold().endswith(".vmoptions"):
+                continue
+            vm_path = Path(cur) / fn
+            try:
+                if vm_path.is_symlink():
+                    continue
+                raw = vm_path.read_bytes()
+            except OSError:
+                continue
+            decoded = _decode_text_bytes(raw)
+            if decoded is None:
+                continue
+            text, encoding = decoded
+            lines = text.splitlines(keepends=True)
+            changed = False
+            out_lines: "list[str]" = []
+            for line in lines:
+                body = line.rstrip("\r\n")
+                ending = line[len(body):]
+                if body.lstrip().startswith("#"):
+                    out_lines.append(line)
+                    continue
+                m_agent = _JB_JAVAAGENT_RE.match(body)
+                if m_agent:
+                    prefix, jar_raw, suffix = (
+                        m_agent.group(1), m_agent.group(2), m_agent.group(3)
+                    )
+                    resolved = _resolve_vmoptions_jar(
+                        jar_raw, root, Path(cur), stale_roots, jar_cache
+                    )
+                    if resolved:
+                        use_slash = "/" in jar_raw and "\\" not in jar_raw
+                        formatted = (
+                            resolved.replace("\\", "/") if use_slash else resolved
+                        )
+                        new_line = f"{prefix}{formatted}{suffix}{ending}"
+                        if new_line != line:
+                            line = new_line
+                            changed = True
+                    out_lines.append(line)
+                    continue
+
+                m_prop = _JB_DPROP_PATH_RE.match(body)
+                if m_prop:
+                    p_prefix, p_val = m_prop.group(1), m_prop.group(2)
+                    cand_p = Path(p_val.strip().replace("/", os.sep))
+                    if not (_path_is_within_root(p_val, root) and cand_p.exists()):
+                        retargeted = _retarget_portable_subpath(p_val, root)
+                        if retargeted:
+                            line = f"{p_prefix}{retargeted}{ending}"
+                            changed = True
+                out_lines.append(line)
+
+            if changed:
+                try:
+                    encoded = "".join(out_lines).encode(encoding)
+                except UnicodeError:
+                    continue
+                if _write_repaired_bytes(vm_path, encoded):
+                    try:
+                        healed.append(str(vm_path.relative_to(root)))
+                    except ValueError:
+                        healed.append(str(vm_path))
+    return healed
+
+
+def _host_appdata_shell_folder_ignores_userprofile() -> bool:
+    """True, если ``User Shell Folders\\AppData`` на этом ПК задан без ``%USERPROFILE%``."""
+    if not IS_WINDOWS:
+        return False
+    reg = _winreg()
+    if reg is None:
+        return False
+    try:
+        with reg.OpenKey(
+            reg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            0,
+            reg.KEY_QUERY_VALUE,
+        ) as key:
+            val, _ = reg.QueryValueEx(key, "AppData")
+            text = str(val or "").strip()
+            return bool(text) and "%userprofile%" not in text.casefold()
+    except OSError:
+        return False
+
+
+def _idea_properties_defines_config(ide_home: Path) -> bool:
+    prop = ide_home / "bin" / "idea.properties"
+    if not prop.is_file():
+        return False
+    try:
+        decoded = _decode_text_bytes(prop.read_bytes())
+    except OSError:
+        return False
+    if decoded is None:
+        return False
+    for line in decoded[0].splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("!"):
+            continue
+        if stripped.startswith("idea.config.path"):
+            return True
+    return False
+
+
+def _apply_jetbrains_profile(root: Path, cfg: Dict[str, Any],
+                             target: Path) -> "list[str]":
+    """Чинит ``.vmoptions`` и синхронизирует профиль JetBrains перед стартом."""
+    info = _jetbrains_product(target)
+    if info is None:
+        return []
+    notes: "list[str]" = []
+    healed = heal_vmoptions_files(root, cfg)
+    if healed:
+        notes.append("jetbrains: updated -javaagent/-D paths in "
+                     + ", ".join(healed[:5]))
+
+    data_dir = str(info.get("data_dir") or "").strip()
+    if data_dir:
+        data = root / str(cfg.get("data_dir_name") or "PortableData")
+        roaming_a = data / "AppData" / "Roaming" / "JetBrains" / data_dir
+        roaming_b = data / "User" / "AppData" / "Roaming" / "JetBrains" / data_dir
+        if roaming_a.is_dir() or roaming_b.is_dir():
+            copied = 0
+            pairs = []
+            if roaming_a.is_dir():
+                pairs.append((roaming_a, roaming_b))
+            if roaming_b.is_dir():
+                pairs.append((roaming_b, roaming_a))
+            for src_root, dst_root in pairs:
+                for cur, _dirs, files in os.walk(src_root):
+                    rel = os.path.relpath(cur, src_root)
+                    dst_dir = dst_root if rel == "." else dst_root / rel
+                    for fn in files:
+                        if fn == ".lock":
+                            continue
+                        src_f = Path(cur) / fn
+                        dst_f = dst_dir / fn
+                        if not dst_f.exists():
+                            try:
+                                dst_dir.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(src_f, dst_f)
+                                copied += 1
+                            except OSError:
+                                continue
+            if copied:
+                notes.append(f"jetbrains: synced {copied} profile file(s) "
+                             f"for {data_dir}")
+    return notes
+
+
+def _jetbrains_environment(env: Dict[str, str], root: Path,
+                           cfg: Dict[str, Any], target: Path) -> Dict[str, str]:
+    """Привязывает переменные ``<IDE>_VM_OPTIONS`` / ``<IDE>_PROPERTIES`` к корню портатива."""
+    info = _jetbrains_product(target)
+    if info is None:
+        return env
+    prefix = str(info.get("env_prefix") or "").strip().upper()
+    if not prefix:
+        return env
+
+    patched = dict(env)
+    vm_key = f"{prefix}_VM_OPTIONS"
+    prop_key = f"{prefix}_PROPERTIES"
+    ide_home = Path(info["ide_home"])
+    stock_vmopt = ide_home / info["vmoptions_rel"].replace("/", os.sep)
+
+    def _file_has_javaagent(path: Path) -> bool:
+        if not path.is_file():
+            return False
+        try:
+            decoded = _decode_text_bytes(path.read_bytes())
+        except OSError:
+            return False
+        if decoded is None:
+            return False
+        return any(
+            not ln.lstrip().startswith("#") and "-javaagent:" in ln.casefold()
+            for ln in decoded[0].splitlines()
+        )
+
+    existing_vm = str(patched.get(vm_key) or "").strip().strip('"')
+    if existing_vm:
+        vm_path = Path(existing_vm.replace("/", os.sep))
+        if not vm_path.is_file():
+            retargeted = _retarget_portable_subpath(existing_vm, root)
+            if retargeted and Path(retargeted.replace("/", os.sep)).is_file():
+                patched[vm_key] = retargeted
+            else:
+                patched.pop(vm_key, None)
+                existing_vm = ""
+
+    if not existing_vm and not _file_has_javaagent(stock_vmopt):
+        stem = str(info.get("stem") or "").casefold()
+        skip = {s.casefold() for s in PATHS_SKIP_DIRS}
+        candidates: "list[tuple[int, Path]]" = []
+        for cur, dirs, files in os.walk(root):
+            dirs[:] = [
+                d for d in dirs
+                if d.casefold() not in skip and not d.startswith("$")
+            ]
+            rel_cur = os.path.relpath(cur, root).replace("\\", "/").casefold()
+            for fn in sorted(files):
+                low = fn.casefold()
+                if not low.endswith(".vmoptions"):
+                    continue
+                cand = Path(cur) / fn
+                if stock_vmopt.is_file() and os.path.normcase(str(cand)) == os.path.normcase(str(stock_vmopt)):
+                    continue
+                if not _file_has_javaagent(cand):
+                    continue
+                decoded = _decode_text_bytes(cand.read_bytes())
+                body = decoded[0] if decoded else ""
+                standalone = (
+                    "--add-opens" in body
+                    or "vmoptions/" in rel_cur
+                    or "netfilter" in rel_cur
+                    or "jetbra" in rel_cur
+                )
+                if "appdata/roaming/jetbrains" in rel_cur and not standalone:
+                    continue
+                score = 0
+                if stem and (low == f"{stem}.vmoptions" or low.startswith(stem)):
+                    score -= 10
+                if "vmoptions" in rel_cur or "netfilter" in rel_cur or "jetbra" in rel_cur:
+                    score -= 5
+                candidates.append((score, cand))
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], len(str(item[1]))))
+            patched[vm_key] = str(candidates[0][1])
+
+    data_dir = str(info.get("data_dir") or "").strip()
+    if (
+        data_dir
+        and not patched.get(prop_key)
+        and not _idea_properties_defines_config(ide_home)
+        and _host_appdata_shell_folder_ignores_userprofile()
+    ):
+        data = root / str(cfg.get("data_dir_name") or "PortableData")
+        roaming = (data / "User" / "AppData" / "Roaming" / "JetBrains" / data_dir)
+        local = (data / "User" / "AppData" / "Local" / "JetBrains" / data_dir)
+        gen_prop = data / "JetBrains" / f"{data_dir}.properties"
+        r_sl = str(roaming).replace("\\", "/")
+        l_sl = str(local).replace("\\", "/")
+        content = (
+            f"idea.config.path={r_sl}\n"
+            f"idea.system.path={l_sl}\n"
+            f"idea.plugins.path={r_sl}/plugins\n"
+            f"idea.log.path={l_sl}/log\n"
+        )
+        try:
+            gen_prop.parent.mkdir(parents=True, exist_ok=True)
+            gen_prop.write_text(content, encoding="utf-8", newline="\n")
+            patched[prop_key] = str(gen_prop)
+        except OSError:
+            pass
+
+    return patched
 
 
 def needs_webview2_bridge(target: Path) -> bool:
@@ -12119,6 +12797,60 @@ def heal_host_registry(root: Path,
                 reg, hive, path, access, stale, root, names, budget))
         except OSError:
             continue
+    if stale:
+        env_changed = _heal_host_environment(reg, stale, root)
+        if env_changed:
+            changed.extend(env_changed)
+    return changed
+
+
+def _heal_host_environment(
+    reg: Any,
+    stale_roots: "Sequence[str]",
+    root: Path,
+) -> "list[str]":
+    """Перенаправляет старые корни портатива в ``HKCU\\Environment``."""
+    changed: "list[str]" = []
+    try:
+        access = int(reg.KEY_QUERY_VALUE) | int(reg.KEY_SET_VALUE)
+        with reg.OpenKey(reg.HKEY_CURRENT_USER, _ENV_KEY, 0, access) as key:
+            info = reg.QueryInfoKey(key)
+            if not isinstance(info, tuple) or len(info) < 2:
+                return []
+            num_values = int(info[1])
+            if num_values <= 0 or num_values > 2048:
+                return []
+            entries: "list[tuple[str, Any, int]]" = []
+            for idx in range(num_values):
+                try:
+                    entries.append(reg.EnumValue(key, idx))
+                except OSError:
+                    break
+            for name, value, kind in entries:
+                if kind not in (reg.REG_SZ, reg.REG_EXPAND_SZ):
+                    continue
+                if not isinstance(value, str) or not value:
+                    continue
+                fixed = retarget_record_text(value, stale_roots, str(root))
+                if fixed == value:
+                    continue
+                try:
+                    reg.SetValueEx(key, name, 0, kind, fixed)
+                    changed.append(f"{_ENV_KEY} :: {name}")
+                except OSError:
+                    continue
+    except (OSError, TypeError, ValueError):
+        return changed
+    if changed:
+        try:
+            import ctypes
+            res = ctypes.c_size_t(0)
+            ctypes.windll.user32.SendMessageTimeoutW(
+                0xFFFF, 0x001A, 0, "Environment", 0x0002, 1000,
+                ctypes.byref(res),
+            )
+        except Exception:  # noqa: BLE001
+            pass
     return changed
 
 
@@ -13782,7 +14514,7 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
     def _repair_paths() -> "list[str]":
         return list(repair_paths(root, cfg))
 
-    _run_step("path repair", _repair_paths)
+    _run_now("path repair", _repair_paths)
 
     timings.tick("install records")
     # Записи об установке на этом ПК (`InstallLocation`, `App Paths`,
@@ -14124,6 +14856,12 @@ def _run_session(argv: Optional[Sequence[str]], root: Path,
             _run_log(root, "vscode: " + line.split(": ", 1)[-1])
     except Exception as exc:  # noqa: BLE001 - профиль не срывает запуск
         _run_log(root, f"vscode: profile setup failed ({exc})")
+    try:
+        for line in _apply_jetbrains_profile(root, cfg, target):
+            _run_log(root, "jetbrains: " + line.split(": ", 1)[-1])
+    except Exception as exc:  # noqa: BLE001 - профиль не срывает запуск
+        _run_log(root, f"jetbrains: profile setup failed ({exc})")
+    env = _jetbrains_environment(env, root, cfg, target)
     timings.tick("profile setup")
     try:
         shell_folders.load()

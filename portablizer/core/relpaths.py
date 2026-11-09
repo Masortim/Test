@@ -74,6 +74,7 @@ TEXT_SUFFIXES: Tuple[str, ...] = (
     ".ini", ".cfg", ".conf", ".config", ".json", ".xml", ".yaml", ".yml",
     ".txt", ".reg", ".bat", ".cmd", ".vbs", ".ps1", ".url", ".properties",
     ".settings", ".prefs", ".toml", ".local", ".dat",
+    ".vmoptions", ".key", ".options", ".args", ".rsp", ".env",
 )
 
 #: Каталоги, которые при переносе обходятся в последнюю очередь: там лежат
@@ -86,9 +87,10 @@ SKIP_DIRS: Tuple[str, ...] = (
     "temp", "tmp", "cache", "caches", "cache2", "gpucache", "shadercache",
     "codecache", "crashpad", "crashdumps", "logs",
     # Пакетные деревья: в них нет настроек программы, зато у Cursor/VS Code
-    # это десятки тысяч package.json. Обход и чтение такого дерева после
-    # каждого переезда папки задерживали запуск на минуты.
+    # и PyCharm это десятки тысяч package.json/стабов. Обход и чтение такого
+    # дерева после каждого переезда папки задерживали запуск на минуты.
     "node_modules", ".git", ".hg", ".svn",
+    "__pycache__", "site-packages", "dist-packages", "typeshed", "stubs",
     "blob_storage", "indexeddb", "service worker",
     "cacheddata", "cachedprofilesdata", "workspacestorage",
 )
@@ -327,17 +329,60 @@ def read_text(path: str) -> Optional[Tuple[str, str]]:
         return None
 
 
+def _clear_readonly(path: str) -> None:
+    """Снимает флаг «только чтение» с обычного файла (без перехода по ссылкам)."""
+    try:
+        if os.path.islink(path):
+            return
+        if IS_WINDOWS:
+            import ctypes
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+            # INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF, FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+            if attrs != 0xFFFFFFFF and not (attrs & 0x400) and (attrs & 0x1):
+                ctypes.windll.kernel32.SetFileAttributesW(str(path), attrs & ~0x1)
+        os.chmod(path, 0o666)
+    except OSError:
+        pass
+
+
 def write_text(path: str, text: str, encoding: str = "utf-8") -> bool:
     """Записывает текст в прежней кодировке (с BOM, если он был)."""
+    try:
+        encoded = text.encode(encoding)
+    except UnicodeError:
+        return False
     try:
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as handle:
-            handle.write(text.encode(encoding))
+        try:
+            with open(path, "wb") as handle:
+                handle.write(encoded)
+        except PermissionError:
+            if not os.path.exists(path) or os.path.islink(path):
+                return False
+            _clear_readonly(path)
+            with open(path, "wb") as handle:
+                handle.write(encoded)
         return True
-    except (OSError, UnicodeError):
+    except OSError:
         return False
+
+
+_APP_PRIORITY_DIRS = frozenset({
+    "bin", "conf", "config", "configs", "etc", "settings", "vmoptions",
+})
+_APP_HEAVY_DIRS = frozenset({
+    "jbr", "jre", "jdk", "lib", "modules", "plugins", "help",
+    "license", "licenses",
+})
+
+
+def _is_app_priority_dir(lower: str) -> bool:
+    return (lower in _APP_PRIORITY_DIRS
+            or "vmoptions" in lower
+            or "netfilter" in lower
+            or "jetbra" in lower)
 
 
 def iter_text_files(root: str, *, include_app: bool = True,
@@ -353,25 +398,50 @@ def iter_text_files(root: str, *, include_app: bool = True,
     root = normalize_root(root)
     if not root or not os.path.isdir(root):
         return
+    app_lower = APP_DIR_NAME.casefold()
     yielded = 0
     for current, dirs, files in os.walk(root):
-        depth = os.path.relpath(current, root).count(os.sep)
-        if os.path.relpath(current, root) == ".":
+        rel_dir = os.path.relpath(current, root)
+        if rel_dir == ".":
+            parts: Tuple[str, ...] = ()
             depth = 0
+        else:
+            parts = tuple(rel_dir.split(os.sep))
+            depth = len(parts)
+        in_app = bool(parts and parts[0].casefold() == app_lower)
+        in_priority = in_app and any(
+            _is_app_priority_dir(seg.casefold()) for seg in parts[1:]
+        )
+
+        if depth == 0:
+            ordered = sorted(
+                dirs,
+                key=lambda d: (
+                    0 if d.casefold() == "portabledata"
+                    else (2 if d.casefold() == app_lower else 1),
+                    d.casefold(),
+                ),
+            )
+        elif in_app:
+            ordered = sorted(
+                dirs,
+                key=lambda d: (
+                    0 if _is_app_priority_dir(d.casefold())
+                    else (2 if d.casefold() in _APP_HEAVY_DIRS else 1),
+                    d.casefold(),
+                ),
+            )
+        else:
+            ordered = sorted(dirs)
+
         keep: List[str] = []
-        for name in sorted(dirs):
+        for name in ordered:
             lower = name.casefold()
-            if lower in SKIP_DIRS:
+            if lower in SKIP_DIRS or lower.startswith("$"):
                 continue
-            if lower in ("netstack", "redist", "updates"):
-                # Наши собственные каталоги: их файлы портативны по построению,
-                # но прочитать их дешевле, чем объяснять, почему их нет в отчёте.
-                keep.append(name)
+            if depth == 0 and lower == app_lower and not include_app:
                 continue
-            if lower == APP_DIR_NAME.casefold():
-                if not include_app or depth >= 2:
-                    continue
-                keep.append(name)
+            if in_app and depth >= 6 and not in_priority and not _is_app_priority_dir(lower):
                 continue
             keep.append(name)
         dirs[:] = keep
@@ -579,6 +649,62 @@ def root_changed(portable_dir: str) -> Optional[Tuple[str, str]]:
     return remembered, current
 
 
+def _java_colon_escape(path_text: str) -> str:
+    """Форма ``D\\:\\\\...`` или ``D\\:/...`` из ``java.util.Properties``."""
+    if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
+        return path_text[0] + "\\:" + path_text[2:]
+    return ""
+
+
+def _extra_repair_pairs(old_root: str, new_root: str) -> List[Tuple[str, str]]:
+    """Дополнительные пары форм (Java ``.properties`` ``\\:`` и URL ``%20``)."""
+    pairs: List[Tuple[str, str]] = []
+    old_esc_bs = _java_colon_escape(old_root.replace("\\", "\\\\"))
+    new_esc_bs = _java_colon_escape(new_root.replace("\\", "\\\\"))
+    if old_esc_bs and new_esc_bs:
+        pairs.append((old_esc_bs, new_esc_bs))
+    old_esc_sl = _java_colon_escape(old_root.replace("\\", "/"))
+    new_esc_sl = _java_colon_escape(new_root.replace("\\", "/"))
+    if old_esc_sl and new_esc_sl and old_esc_sl != old_esc_bs:
+        pairs.append((old_esc_sl, new_esc_sl))
+    old_sl = old_root.replace("\\", "/")
+    new_sl = new_root.replace("\\", "/")
+    if " " in old_sl:
+        pairs.append((old_sl.replace(" ", "%20"), new_sl.replace(" ", "%20")))
+    return pairs
+
+
+def _replace_bounded(text: str, needle: str, replacement: str) -> Tuple[str, int]:
+    """Меняет ``needle`` на ``replacement`` с учётом границ и идемпотентности.
+
+    Если ``replacement`` начинается с ``needle`` (например, при копировании
+    ``D:\\PyCharm`` -> ``D:\\PyCharm - Copy``), уже обновлённый путь не
+    превращается в ``D:\\PyCharm - Copy - Copy`` при повторном проходе.
+    """
+    if not text or not needle or needle.casefold() == replacement.casefold():
+        return text, 0
+    prefix_overlap = replacement.casefold().startswith(needle.casefold())
+    rep_len = len(replacement)
+    count = 0
+
+    def _sub(match: "re.Match[str]") -> str:
+        nonlocal count
+        if prefix_overlap:
+            start = match.start()
+            tail = text[start:start + rep_len]
+            if tail.casefold() == replacement.casefold():
+                after_idx = start + rep_len
+                if after_idx >= len(text) or not re.match(
+                    r"[0-9A-Za-z_.]", text[after_idx]
+                ):
+                    return match.group(0)
+        count += 1
+        return replacement
+
+    updated = _needle_pattern(needle).sub(_sub, text)
+    return updated, count
+
+
 def repair_text(text: str, old_root: str, new_root: str) -> str:
     """Меняет старый корень на новый во всех начертаниях (для чужих конфигов)."""
     if not text or not old_root or not new_root:
@@ -588,10 +714,18 @@ def repair_text(text: str, old_root: str, new_root: str) -> str:
     if old_root.casefold() == new_root.casefold():
         return text
     result = text
+    pairs: List[Tuple[str, str]] = list(_extra_repair_pairs(old_root, new_root))
     for needle in root_forms(old_root):
         doubled = "\\\\" in needle
         replacement = new_root.replace("\\", "\\\\") if doubled else new_root
-        result = _needle_pattern(needle).sub(lambda _m, r=replacement: r, result)
+        pairs.append((needle, replacement))
+    pairs.sort(key=lambda item: len(item[0]), reverse=True)
+    seen: set = set()
+    for needle, replacement in pairs:
+        if not needle or needle in seen:
+            continue
+        seen.add(needle)
+        result, _ = _replace_bounded(result, needle, replacement)
     return result
 
 
@@ -601,13 +735,27 @@ def repair_file(path: str, old_root: str, new_root: str) -> int:
     if loaded is None:
         return 0
     text, encoding = loaded
-    fixed = repair_text(text, old_root, new_root)
+    old_norm = normalize_root(old_root)
+    new_norm = normalize_root(new_root)
+    if not old_norm or not new_norm or old_norm.casefold() == new_norm.casefold():
+        return 0
+    fixed = text
+    hits = 0
+    pairs: List[Tuple[str, str]] = list(_extra_repair_pairs(old_norm, new_norm))
+    for needle in root_forms(old_norm):
+        doubled = "\\\\" in needle
+        replacement = new_norm.replace("\\", "\\\\") if doubled else new_norm
+        pairs.append((needle, replacement))
+    pairs.sort(key=lambda item: len(item[0]), reverse=True)
+    seen: set = set()
+    for needle, replacement in pairs:
+        if not needle or needle in seen:
+            continue
+        seen.add(needle)
+        fixed, c = _replace_bounded(fixed, needle, replacement)
+        hits += c
     if fixed == text:
         return 0
-    # Сколько раз старый корень реально встретился — это и есть число правок.
-    hits = 0
-    for needle in root_forms(old_root):
-        hits += len(_needle_pattern(needle).findall(text))
     if not write_text(path, fixed, encoding):
         return 0
     return max(hits, 1)

@@ -2811,3 +2811,276 @@ def apply_language_to_portable_folder(
     all_keys = sorted(set(user_keys + machine_keys + virtual_keys))
     return applied_regs, all_keys, updated_inis
 
+
+# --- переменные окружения установщика (HKCU\Environment и Session Manager) ----
+
+ENV_USER_KEY = "HKCU\\Environment"
+ENV_MACHINE_KEY = (
+    r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+)
+_ENV_ROOTS: Tuple[Tuple[str, str], ...] = (
+    ("HKCU", "Environment"),
+    ("HKLM", r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+)
+
+_IGNORED_ENV_VARS = frozenset({
+    "", "temp", "tmp", "username", "userprofile", "appdata", "localappdata",
+    "programdata", "allusersprofile", "public", "homedrive", "homepath",
+    "onedrive", "onedriveconsumer", "onedrivecommercial", "psmodulepath",
+    "os", "comspec", "windir", "systemroot", "pathext",
+    "number_of_processors", "processor_architecture", "processor_identifier",
+    "processor_level", "processor_revision", "driverdata",
+})
+
+
+def snapshot_environment(include_user: bool = True) -> Snapshot:
+    """Снимок переменных окружения пользователя и системы (для ``extra_env``).
+
+    Установщики репаков JetBrains (``PYCHARM_VM_OPTIONS``, ``IDEA_VM_OPTIONS``),
+    JDK/SDK и CLI-утилит прописывают пути в ``HKCU\\Environment`` или
+    ``HKLM\\...\\Session Manager\\Environment``. В обычный ``portable.reg`` эти
+    ветки класть нельзя (импорт затронул бы весь ПК), поэтому они переводятся в
+    изолированный ``extra_env`` / ``path_prepend`` внутри ``launcher_config.json``.
+    """
+    if not IS_WINDOWS:
+        return {}
+    snap: Snapshot = {}
+    hives = {
+        "HKCU": winreg.HKEY_CURRENT_USER,  # type: ignore
+        "HKLM": winreg.HKEY_LOCAL_MACHINE,  # type: ignore
+    }
+    for prefix, base in _ENV_ROOTS:
+        if prefix == "HKCU" and not include_user:
+            continue
+        _walk(hives[prefix], base, prefix, snap, max_depth=1,
+              skip_volatile=False, skip_protected=False)
+    return snap
+
+
+def _retarget_env_value(
+    raw_text: str,
+    portable_dir: str,
+    extra_roots: Sequence[str] = (),
+) -> Tuple[str, bool]:
+    """Заменяет корень портатива (и перенесённые каталоги установки) на ``%PORTABLE_ROOT%``."""
+    text = str(raw_text or "")
+    if not text:
+        return text, False
+    port_norm = relpaths.normalize_root(portable_dir)
+    into_portable = False
+    updated = text
+
+    for src in extra_roots or ():
+        src_norm = relpaths.normalize_root(str(src or ""))
+        if not src_norm or (port_norm and src_norm.casefold() == port_norm.casefold()):
+            continue
+        tokenized = relpaths.tokenize_text(updated, src_norm, "%PORTABLE_ROOT%\\App")
+        if tokenized != updated:
+            updated = tokenized.replace("%PORTABLE_ROOT%\\App/", "%PORTABLE_ROOT%/App/")
+            into_portable = True
+
+    if port_norm:
+        tokenized = relpaths.tokenize_text(updated, port_norm, "%PORTABLE_ROOT%")
+        if tokenized != updated:
+            updated = tokenized
+            into_portable = True
+        elif relpaths.is_within(updated.strip().strip('"'), port_norm):
+            into_portable = True
+
+    return updated, into_portable
+
+
+def extract_portable_environment(
+    before: Snapshot,
+    after: Snapshot,
+    portable_dir: str,
+    extra_roots: Sequence[str] = (),
+) -> Tuple[
+    Dict[str, str],
+    List[str],
+    List[Tuple[str, str, Optional[Tuple[int, object]]]],
+]:
+    """Выделяет новые/изменённые переменные окружения установщика.
+
+    Возвращает ``(extra_env, path_prepend, cleanup_actions)``:
+      * ``extra_env`` — словарь ``ИМЯ -> значение`` с ``%PORTABLE_ROOT%``;
+      * ``path_prepend`` — относительные пути к подкаталогам портатива из ``PATH``;
+      * ``cleanup_actions`` — ``(reg_key, value_name, old_entry_or_None)`` для
+        возврата окружения сборочного ПК в исходное состояние.
+    """
+    captured_env: Dict[str, str] = {}
+    path_prepend: List[str] = []
+    cleanup_actions: List[Tuple[str, str, Optional[Tuple[int, object]]]] = []
+    port_norm = relpaths.normalize_root(portable_dir)
+    norm_extras = [
+        relpaths.normalize_root(str(r))
+        for r in (extra_roots or ())
+        if relpaths.normalize_root(str(r))
+    ]
+
+    def _seg_into_portable(seg: str) -> Optional[str]:
+        clean = seg.strip().strip('"')
+        if not clean:
+            return None
+        if port_norm and relpaths.is_within(clean, port_norm):
+            return relpaths.relativize(clean, port_norm)
+        for src_norm in norm_extras:
+            if relpaths.is_within(clean, src_norm):
+                rel = relpaths.relativize(clean, src_norm)
+                return "App" if rel == "." else os.path.join("App", rel)
+        return None
+
+    # Системные переменные идут первыми, пользовательские — поверх них.
+    for reg_key in (ENV_MACHINE_KEY, ENV_USER_KEY):
+        before_raw = before.get(reg_key, {}) if before else {}
+        after_raw = after.get(reg_key, {}) if after else {}
+        if not after_raw:
+            continue
+        before_map: Dict[str, Tuple[str, Tuple[int, object]]] = {
+            str(k).casefold(): (str(k), v)
+            for k, v in before_raw.items()
+        }
+        def _decoded_restore(pair: Optional[Tuple[str, Tuple[int, object]]]
+                             ) -> Optional[Tuple[int, object]]:
+            if pair is None:
+                return None
+            b_type, _ = _as_entry(pair[1])
+            return (b_type, _entry_value(pair[1]))
+
+        for raw_name, after_entry in after_raw.items():
+            v_name = str(raw_name)
+            if not v_name:
+                continue
+            v_type, _ = _as_entry(after_entry)
+            if v_type not in (REG_SZ, REG_EXPAND_SZ):
+                continue
+            after_val = str(_entry_value(after_entry) or "")
+            old_pair = before_map.get(v_name.casefold())
+            if old_pair is not None and old_pair[1] == after_entry:
+                continue
+
+            low_name = v_name.strip().casefold()
+            if low_name == "path":
+                old_val = str(_entry_value(old_pair[1]) or "") if old_pair else ""
+                old_segs = {
+                    s.strip().strip('"').rstrip("\\/").casefold()
+                    for s in old_val.split(";")
+                    if s.strip()
+                }
+                kept_segs: List[str] = []
+                removed_any = False
+                for seg in after_val.split(";"):
+                    rel_seg = _seg_into_portable(seg)
+                    norm_seg = seg.strip().strip('"').rstrip("\\/").casefold()
+                    if rel_seg is not None and norm_seg not in old_segs:
+                        rel_clean = rel_seg.replace("/", "\\")
+                        if rel_clean not in path_prepend:
+                            path_prepend.append(rel_clean)
+                        removed_any = True
+                    else:
+                        kept_segs.append(seg)
+                if removed_any:
+                    if old_pair is None:
+                        restored = ";".join(s for s in kept_segs if s.strip())
+                        cleanup_actions.append(
+                            (reg_key, v_name,
+                             (v_type, restored) if restored else None)
+                        )
+                    else:
+                        cleanup_actions.append(
+                            (reg_key, old_pair[0], _decoded_restore(old_pair))
+                        )
+                continue
+
+            retargeted, into_portable = _retarget_env_value(
+                after_val, port_norm, norm_extras
+            )
+            if low_name in _IGNORED_ENV_VARS:
+                if into_portable:
+                    cleanup_actions.append(
+                        (reg_key, old_pair[0] if old_pair else v_name,
+                         _decoded_restore(old_pair))
+                    )
+                continue
+
+            # Переносим переменную, если она указывает в портатив или явно
+            # создана установщиком для запуска приложения (*_VM_OPTIONS и др.).
+            if into_portable or old_pair is None or retargeted != after_val:
+                existing_key = next(
+                    (k for k in captured_env if k.casefold() == low_name),
+                    v_name,
+                )
+                captured_env[existing_key] = retargeted
+            if into_portable:
+                cleanup_actions.append(
+                    (reg_key, old_pair[0] if old_pair else v_name,
+                     _decoded_restore(old_pair))
+                )
+
+    return captured_env, path_prepend, cleanup_actions
+
+
+def broadcast_environment_change() -> None:
+    """Уведомляет оболочку Windows об изменении ``Environment`` (WM_SETTINGCHANGE)."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        HWND_BROADCAST = 0xFFFF
+        WM_SETTINGCHANGE = 0x001A
+        SMTO_ABORTIFHUNG = 0x0002
+        result = ctypes.c_size_t(0)
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            "Environment",
+            SMTO_ABORTIFHUNG,
+            1000,
+            ctypes.byref(result),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def restore_host_environment(
+    actions: Sequence[Tuple[str, str, Optional[Tuple[int, object]]]],
+) -> List[str]:
+    """Убирает из реестра сборочного ПК переменные окружения, ведущие в портатив."""
+    if not IS_WINDOWS or not actions:
+        return []
+    try:
+        import winreg as _wr  # type: ignore
+    except ImportError:
+        return []
+
+    hives = {
+        "HKCU": _wr.HKEY_CURRENT_USER,
+        "HKLM": _wr.HKEY_LOCAL_MACHINE,
+    }
+    restored: List[str] = []
+    for reg_key, v_name, old_entry in actions:
+        prefix, sep, subkey = str(reg_key).partition("\\")
+        hive = hives.get(prefix.upper())
+        if hive is None or not sep or not subkey:
+            continue
+        try:
+            with _wr.OpenKey(hive, subkey, 0, _wr.KEY_SET_VALUE) as hkey:
+                if old_entry is None:
+                    try:
+                        _wr.DeleteValue(hkey, v_name)
+                        restored.append(f"{reg_key}\\{v_name} (удалено)")
+                    except FileNotFoundError:
+                        pass
+                else:
+                    old_type, old_val = int(old_entry[0]), old_entry[1]
+                    _wr.SetValueEx(hkey, v_name, 0, old_type, old_val)
+                    restored.append(f"{reg_key}\\{v_name} (восстановлено)")
+        except OSError:
+            continue
+
+    if restored:
+        broadcast_environment_change()
+    return restored
+
+
