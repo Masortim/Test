@@ -467,6 +467,18 @@ def refresh(folder: str, log: Optional[Logger] = None,
         except OSError as exc:
             log.warn(f"Профиль {vscode['name']} подготовить не удалось: {exc}")
 
+    try:
+        jb_env, jb_notes = launcher_mod.prepare_jetbrains_portable(
+            folder, cfg.target_exe_rel, cfg.data_dir_name
+        )
+        for key, value in jb_env.items():
+            cfg.extra_env.setdefault(key, value)
+        for note in jb_notes:
+            log.ok(note)
+            report.messages.append(note)
+    except OSError as exc:
+        log.warn(f"Профиль JetBrains подготовить не удалось: {exc}")
+
     files = {
         "Launch.bat": (launcher_mod.render_bat(cfg), "ascii"),
         "LaunchHidden.vbs": (launcher_mod.render_vbs(), "ascii"),

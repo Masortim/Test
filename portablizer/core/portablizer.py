@@ -911,6 +911,11 @@ class RegistryCapture:
     cleanup_cmd_file: str = ""
     cleanup_keys: List[str] = field(default_factory=list)
     cleanup_entries: List[str] = field(default_factory=list)
+    captured_env: Dict[str, str] = field(default_factory=dict)
+    captured_path_prepend: List[str] = field(default_factory=list)
+    env_cleanup_actions: List[Tuple[str, str, Optional[Tuple[int, object]]]] = field(
+        default_factory=list
+    )
 
 
 @dataclass
@@ -2810,9 +2815,13 @@ class Portablizer:
             if switched_user:
                 self.log.warn(switched_user)
             before = {}
+            env_before: reg_mod.Snapshot = {}
             association_include_user = not switched_user
             if IS_WINDOWS:
                 self.progress(22, "Снимок реестра (до установки)")
+                env_before = reg_mod.snapshot_environment(
+                    include_user=not switched_user
+                )
                 if opts.capture_registry:
                     self.log.info("Делаю снимок реестра до установки...")
                     before = reg_mod.snapshot(include_user=not switched_user)
@@ -2952,7 +2961,12 @@ class Portablizer:
 
             # 5. Снимок реестра ПОСЛЕ + поиск файлов + diff
             after: reg_mod.Snapshot = {}
+            env_after: reg_mod.Snapshot = {}
             capture = None
+            if IS_WINDOWS:
+                env_after = reg_mod.snapshot_environment(
+                    include_user=not switched_user
+                )
             if opts.capture_registry and IS_WINDOWS:
                 self._check_cancel()
                 self.progress(65, "Снимок реестра (после установки)")
@@ -3076,13 +3090,46 @@ class Portablizer:
                         shortcut_guard.extra_roots.append(src_root)
                 self._report_own_shortcuts(shortcut_guard, sweep=True)
 
+            captured_env, captured_env_paths, env_cleanup_actions = (
+                reg_mod.extract_portable_environment(
+                    env_before, env_after, portable_dir,
+                    extra_roots=self._recovered_sources,
+                )
+                if env_after else ({}, [], [])
+            )
+            if captured_env:
+                self.log.ok(
+                    "Перехвачены переменные окружения установщика: "
+                    + ", ".join(sorted(captured_env.keys()))
+                )
+
             if opts.capture_registry and (IS_WINDOWS or opts.install_language.strip()):
                 capture = self._capture_registry(
                     portable_dir, before, after, opts,
                 )
+                capture.captured_env = dict(captured_env)
+                capture.captured_path_prepend = list(captured_env_paths)
+                capture.env_cleanup_actions = list(env_cleanup_actions)
                 result.reg_file = capture.reg_file
                 result.registry_keys = capture.keys
                 result.installed_entries_detected = capture.uninstall_entries
+            elif captured_env or captured_env_paths or env_cleanup_actions:
+                capture = RegistryCapture(
+                    diff=reg_mod.RegistryDiff(),
+                    captured_env=dict(captured_env),
+                    captured_path_prepend=list(captured_env_paths),
+                    env_cleanup_actions=list(env_cleanup_actions),
+                )
+                if opts.install_language.strip():
+                    updated_inis = reg_mod.apply_language_to_ini_files(
+                        app_dir, opts.install_language)
+                    if updated_inis:
+                        lang_obj = find_language(opts.install_language)
+                        lang_title = lang_obj.title if lang_obj else opts.install_language
+                        self.log.ok(
+                            f"Язык «{lang_title}» прописан в настройках: "
+                            f"{', '.join(updated_inis)}."
+                        )
             elif opts.install_language.strip():
                 updated_inis = reg_mod.apply_language_to_ini_files(
                     app_dir, opts.install_language)
@@ -4289,6 +4336,15 @@ class Portablizer:
         """
         if not opts.cleanup_host or not IS_WINDOWS:
             return
+        if capture.env_cleanup_actions:
+            restored_env = reg_mod.restore_host_environment(
+                capture.env_cleanup_actions
+            )
+            if restored_env:
+                self.log.ok(
+                    "Очищены следы переменных окружения на этом ПК: "
+                    + ", ".join(restored_env)
+                )
         if not capture.cleanup_keys and not capture.cleanup_file:
             return
 
@@ -7920,7 +7976,18 @@ class Portablizer:
             temp = self._temp_dir_for(data_dir)
             user = os.path.join(data_dir, "User")
             programdata = os.path.join(data_dir, "ProgramData")
-            for d in (appdata, local, temp, user, programdata):
+            public = os.path.join(data_dir, "Public")
+            for d in (
+                appdata,
+                local,
+                temp,
+                user,
+                programdata,
+                public,
+                os.path.join(public, "Documents"),
+                os.path.join(public, "Desktop"),
+                os.path.join(public, "Downloads"),
+            ):
                 os.makedirs(d, exist_ok=True)
             env.update({
                 "APPDATA": appdata,
@@ -7928,6 +7995,8 @@ class Portablizer:
                 "TEMP": temp, "TMP": temp,
                 "USERPROFILE": user,
                 "PROGRAMDATA": programdata,
+                "ALLUSERSPROFILE": programdata,
+                "PUBLIC": public,
             })
         if IS_WINDOWS and is_elevated():
             # Portablizer уже повышен. Дочерний установщик наследует тот же
@@ -10015,6 +10084,15 @@ class Portablizer:
         config_target = next((t.rel_path for t in all_targets if t.role == "config"), "")
 
         extra_env = dict(opts.extra_env)
+        effective_path_prepend = list(path_prepend)
+        if capture is not None:
+            for k, v in capture.captured_env.items():
+                extra_env.setdefault(k, v)
+            existing_pp = {p.casefold() for p in effective_path_prepend}
+            for rel_p in capture.captured_path_prepend:
+                if rel_p and rel_p.casefold() not in existing_pp:
+                    effective_path_prepend.append(rel_p)
+                    existing_pp.add(rel_p.casefold())
         target_args: List[str] = []
         main_abs = os.path.join(portable_dir, main_exe_rel.replace("/", os.sep))
         main_dir = os.path.dirname(main_abs)
@@ -10058,6 +10136,15 @@ class Portablizer:
         if is_pycharm:
             launcher_target = main_exe_rel.replace("\\", "/")
 
+        jb_env, jb_notes = launcher_mod.prepare_jetbrains_portable(
+            portable_dir, main_exe_rel, "PortableData",
+            extra_roots=self._recovered_sources,
+        )
+        for key, value in jb_env.items():
+            extra_env.setdefault(key, value)
+        for note in jb_notes:
+            self.log.ok(note)
+
         cfg = launcher_mod.LauncherConfig(
             app_name=name,
             target_exe_rel=main_exe_rel.replace("\\", "/"),
@@ -10076,7 +10163,7 @@ class Portablizer:
                 and getattr(opts, "cleanup_host", True) else []
             ),
             extra_env=extra_env,
-            path_prepend=path_prepend,
+            path_prepend=effective_path_prepend,
             redirect_known_folders=True,
             targets=all_targets,
             launcher_target_rel=launcher_target,
