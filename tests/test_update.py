@@ -1889,6 +1889,13 @@ class InstallerFileTests(unittest.TestCase):
             empty = self._file(tmp, "setup.exe", b"")
             self.assertIn("пуст", exe_launcher.installer_problem(empty))
 
+    def test_a_script_installer_is_not_checked_for_a_pe_header(self):
+        """``--update script.cmd`` — законный способ: PE-заголовка там нет."""
+        with tempfile.TemporaryDirectory() as tmp:
+            script = self._file(tmp, "FakeSetup.cmd",
+                                b"@echo off\r\nexit /b 0\r\n")
+            self.assertEqual(exe_launcher.installer_problem(script), "")
+
     def test_real_msi_is_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
             msi = self._file(tmp, "setup.msi",

@@ -13396,6 +13396,9 @@ def installer_problem(path: Path) -> str:
     выходил с кодом 2, и распаковка тоже ничего не находила. Причина была в
     самом файле — вместо установщика лежал ответ сервера. Проверка магических
     байтов говорит об этом прямо, не запуская и не распаковывая ничего.
+
+    Проверяются только ``.exe`` и ``.msi``: для остальных файлов (сценарий,
+    который передали в ``--update``) заголовок PE ничего не значит.
     """
     try:
         size = path.stat().st_size
@@ -13411,13 +13414,20 @@ def installer_problem(path: Path) -> str:
     text_head = head[:4]
     ascii_head = "".join(
         chr(byte) if 32 <= byte < 127 else "." for byte in head[:4])
-    if path.suffix.casefold() == ".msi":
+    suffix = path.suffix.casefold()
+    if suffix == ".msi":
         if text_head not in (b"\xd0\xcf\x11\xe0", b"PK\x03\x04"):
             return (f"это не MSI (первые байты «{ascii_head}», "
                     f"{size} байт)")
-    elif not head.startswith(b"MZ"):
-        return (f"это не исполняемый файл Windows (первые байты "
-                f"«{ascii_head}», {size} байт)")
+    elif suffix == ".exe":
+        if not head.startswith(b"MZ"):
+            return (f"это не исполняемый файл Windows (первые байты "
+                    f"«{ascii_head}», {size} байт)")
+    else:
+        # Не .exe и не .msi: лончер умеет запускать и свой сценарий
+        # (installer_args, UpdatePortable.cmd). Требовать PE-заголовок от
+        # такого файла нельзя — проверяем только, что он не пуст.
+        return ""
     if size < UPDATE_MIN_INSTALLER_BYTES:
         return f"файл слишком мал для установщика ({size} байт)"
     return ""
