@@ -75,6 +75,22 @@ def _write(path: Path, text: str = "x") -> Path:
     return path
 
 
+def installer_bytes(size_kb: int = 600) -> bytes:
+    """Байты установщика, который проходит проверку файла обновления.
+
+    Лончер проверяет файл ДО запуска (``installer_problem``): «MZ» и
+    достаточный размер. Тестовый установщик обязан выглядеть установщиком,
+    иначе тест проверяет не то, что нужно.
+    """
+    return b"MZ" + b"\0" * 4096 + b"x" * (size_kb * 1024)
+
+
+def write_installer(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(installer_bytes())
+    return path
+
+
 def make_portable(tmp: str, cfg=None) -> Path:
     root = Path(tmp) / "Ollama_Portable"
     (root / "App").mkdir(parents=True)
@@ -1377,7 +1393,7 @@ class RunUpdateTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_update_from_a_given_file(self):
-        installer = _write(Path(self._tmp.name) / "New.exe", "i")
+        installer = write_installer(Path(self._tmp.name) / "New.exe")
         result = exe_launcher.run_update(
             self.root, OLLAMA_CFG, str(installer), interactive=False,
             runner=fake_installer(NEW_FILES))
@@ -1391,7 +1407,7 @@ class RunUpdateTests(unittest.TestCase):
         self.assertFalse(result.ok)
 
     def test_uses_installer_left_in_updates(self):
-        _write(self.root / "Updates" / "OllamaSetup.exe", "i")
+        write_installer(self.root / "Updates" / "OllamaSetup.exe")
         result = exe_launcher.run_update(
             self.root, OLLAMA_CFG, "", interactive=False,
             runner=fake_installer(NEW_FILES))
@@ -1402,7 +1418,7 @@ class RunUpdateTests(unittest.TestCase):
 
         def downloader(url, destination, progress):
             urls.append(url)
-            _write(destination, "downloaded")
+            write_installer(destination)
             progress(5, 10)
             return destination
 
@@ -1439,7 +1455,7 @@ class RunUpdateTests(unittest.TestCase):
         self.assertIn("UpdatePortable.cmd", result.message)
 
     def test_command_line_entry(self):
-        installer = _write(Path(self._tmp.name) / "New.exe", "i")
+        installer = write_installer(Path(self._tmp.name) / "New.exe")
         with mock.patch.object(exe_launcher, "_show_info"), \
                 mock.patch.object(exe_launcher._BusyNotice, "start"), \
                 mock.patch.object(exe_launcher, "_default_installer_runner",
@@ -1804,6 +1820,190 @@ class StrayInstallerTests(unittest.TestCase):
                 exe_launcher.stop_stray_installers(self.root, OPENCODE_CFG), [])
         kill.assert_not_called()
 
+
+
+class LauncherPackagingTests(unittest.TestCase):
+    """Что обязано попасть в собранный EXE лончера.
+
+    Обе жалобы видны в одном журнале: «download failed: No module named
+    'email'» (сборка без стека скачивания) и «unpacking the installer without
+    running it did not produce the program» (сборка без 7-Zip). Проверка
+    спецификаций — дешёвый способ не потерять это снова.
+    """
+
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1]
+
+    def test_both_launcher_specs_bundle_the_download_stack(self):
+        for name in ("portable_launcher.spec",
+                     "portable_launcher_onedir.spec"):
+            text = (self.root / name).read_text(encoding="utf-8")
+            self.assertIn('"email"', text, name)
+            self.assertIn('"urllib.request"', text, name)
+            self.assertIn('"http.client"', text, name)
+
+    def test_both_launcher_specs_bundle_7zip(self):
+        for name in ("portable_launcher.spec",
+                     "portable_launcher_onedir.spec"):
+            text = (self.root / name).read_text(encoding="utf-8")
+            self.assertIn('"7zip"', text, name)
+
+
+class InstallerFileTests(unittest.TestCase):
+    """Файл обновления проверяется ДО запуска установщика.
+
+    Жалоба (launcher-update.log): «NSIS: код 2» дважды за секунду, затем
+    «unpacking the installer without running it did not produce the program»,
+    три раза подряд. Установщик, который падает мгновенно, и контейнер,
+    который не читается, — это не программа, а ответ сервера или обрывок
+    загрузки. Такой файл нельзя ни запускать, ни распаковывать.
+    """
+
+    def _file(self, folder, name: str, payload: bytes) -> Path:
+        path = Path(folder) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return path
+
+    def test_real_executable_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self._file(tmp, "setup.exe",
+                             b"MZ" + b"\0" * 4096 + b"x" * (600 * 1024))
+            self.assertEqual(exe_launcher.installer_problem(exe), "")
+
+    def test_error_page_is_rejected_before_anything_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = self._file(tmp, "temp-opencode.exe",
+                              b"<!DOCTYPE html><html>Not Found</html>")
+            problem = exe_launcher.installer_problem(page)
+            self.assertIn("не исполняемый файл", problem)
+            self.assertIn("<!DO", problem)
+
+    def test_truncated_download_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            small = self._file(tmp, "setup.exe", b"MZ" + b"\0" * 64)
+            self.assertIn("слишком мал", exe_launcher.installer_problem(small))
+
+    def test_empty_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = self._file(tmp, "setup.exe", b"")
+            self.assertIn("пуст", exe_launcher.installer_problem(empty))
+
+    def test_a_script_installer_is_not_checked_for_a_pe_header(self):
+        """``--update script.cmd`` — законный способ: PE-заголовка там нет."""
+        with tempfile.TemporaryDirectory() as tmp:
+            script = self._file(tmp, "FakeSetup.cmd",
+                                b"@echo off\r\nexit /b 0\r\n")
+            self.assertEqual(exe_launcher.installer_problem(script), "")
+
+    def test_real_msi_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            msi = self._file(tmp, "setup.msi",
+                             b"\xd0\xcf\x11\xe0" + b"\0" * (600 * 1024))
+            self.assertEqual(exe_launcher.installer_problem(msi), "")
+
+    def test_unusable_kept_file_is_replaced_by_a_fresh_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_opencode_portable(tmp)
+            bad = root / "Updates" / "temp-opencode-desktop-win-x64.exe"
+            bad.parent.mkdir(parents=True, exist_ok=True)
+            bad.write_bytes(b"<!DOCTYPE html>error")
+            fresh = root / "Updates" / "opencode-desktop-win-x64.exe"
+
+            def downloader(url, target, progress=None):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"MZ" + b"\0" * 4096 + b"x" * (600 * 1024))
+                return target
+
+            seen = {}
+
+            def apply(root_, cfg, installer, progress=None, runner=None):
+                seen["installer"] = installer
+                result = exe_launcher.UpdateResult()
+                result.ok = True
+                result.message = "ok"
+                return result
+
+            cfg = dict(OPENCODE_CFG, update={
+                "source_url": "https://example.test/"
+                              "opencode-desktop-win-x64.exe"})
+            with mock.patch.object(exe_launcher, "apply_update", apply):
+                result = exe_launcher.run_update(
+                    root, cfg, "", interactive=False, confirm_download=False,
+                    downloader=downloader)
+            self.assertTrue(result.ok, result.message)
+            self.assertEqual(seen["installer"], fresh)
+            self.assertTrue((root / "Updates" /
+                             "temp-opencode-desktop-win-x64.exe.broken").is_file(),
+                            "битый файл должен выйти из поиска, но остаться")
+            log = (root / "PortableData" / "launcher-update.log").read_text(
+                encoding="utf-8")
+            self.assertIn("the update file is unusable", log)
+            self.assertIn("downloading the update again", log)
+
+    def test_unusable_file_without_a_url_is_reported_and_not_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_opencode_portable(
+                tmp, dict(OPENCODE_CFG, update={"source_url": ""}))
+            bad = root / "Updates" / "temp-opencode-desktop-win-x64.exe"
+            bad.parent.mkdir(parents=True, exist_ok=True)
+            bad.write_bytes(b"<html>oops")
+            runner = mock.Mock()
+            result = exe_launcher.run_update(
+                root, dict(OPENCODE_CFG, update={"source_url": ""}), "",
+                interactive=False, runner=runner)
+            self.assertFalse(result.ok)
+            self.assertIn("не похож на установщик", result.message)
+            runner.assert_not_called()
+
+
+class ExtractDiagnosticsTests(unittest.TestCase):
+    """Почему распаковка не дала программу — должно быть видно в журнале.
+
+    Без этого «unpacking ... did not produce the program» не отличить от
+    «7-Zip не смог открыть файл»: лечится это по-разному.
+    """
+
+    def _installer(self, folder: Path) -> Path:
+        path = folder / "Updates" / "temp-opencode-desktop-win-x64.exe"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"MZ" + b"\0" * 4096 + b"x" * (600 * 1024))
+        return path
+
+    def test_extractor_failure_is_logged_with_its_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            installer = self._installer(root)
+            lines = []
+            with mock.patch.object(exe_launcher, "_run_extractor",
+                                   return_value=(2, "ERROR: Cannot open file "
+                                                    "as archive")):
+                found = exe_launcher.extract_installer_payload(
+                    installer, root / "Updates" / "stage", OPENCODE_CFG,
+                    extractors=[_extractor()], log=lines.append)
+            self.assertIsNone(found)
+            joined = "\n".join(lines)
+            self.assertIn("код 2", joined)
+            self.assertIn("Cannot open file as archive", joined)
+
+    def test_missing_program_lists_what_was_actually_unpacked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            installer = self._installer(root)
+            lines = []
+            with mock.patch.object(exe_launcher, "_run_extractor",
+                                   side_effect=fake_unpacker(
+                                       lambda archive, target: {
+                                           "$PLUGINSDIR/installer.nsi": "x",
+                                           "readme.txt": "y",
+                                       })):
+                found = exe_launcher.extract_installer_payload(
+                    installer, root / "Updates" / "stage", OPENCODE_CFG,
+                    extractors=[_extractor()], log=lines.append)
+            self.assertIsNone(found)
+            joined = "\n".join(lines)
+            self.assertIn("программы в нём нет", joined)
+            self.assertIn("$PLUGINSDIR", joined)
 
 
 class PortablizerSideTests(unittest.TestCase):
