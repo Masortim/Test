@@ -13599,6 +13599,22 @@ def prefer_unpacked_install(root: Path, engine: str) -> bool:
     return True
 
 
+_REG_HIVE_NAMES = {
+    "HKLM": "HKEY_LOCAL_MACHINE",
+    "HKCU": "HKEY_CURRENT_USER",
+    "HKCR": "HKEY_CLASSES_ROOT",
+    "HKU": "HKEY_USERS",
+    "HKCC": "HKEY_CURRENT_CONFIG",
+}
+
+
+def _full_reg_key(key: str) -> str:
+    """``HKCU\\Software\\Classes`` -> ``HKEY_CURRENT_USER\\Software\\Classes``."""
+    head, _sep, rest = (key or "").strip().partition("\\")
+    full = _REG_HIVE_NAMES.get(head.upper(), head)
+    return full + ("\\" + rest if rest else "")
+
+
 def _association_text_for_roots(text: str, roots: "Sequence[str]") -> str:
     """Оставляет в REG-снимке только разделы перечисленных корней.
 
@@ -13646,12 +13662,18 @@ class HostAssociationGuard:
         self.root = root
         self.directory = root / UPDATE_DIR_NAME / "AssociationBackup"
         self.before_file = self.directory / "before.reg"
+        #: Список отсутствовавших корней переживает перезапуск: базу может
+        #: восстанавливать уже другой процесс.
+        self.absent_file = self.directory / "absent.json"
         self.before_text: Optional[str] = None
         self.active = False
         #: Корни, попавшие в снимок: только их можно сравнивать и откатывать.
         self.covered: "list[str]" = []
         #: Корни, которые существуют, но прочитать их не удалось.
         self.unreadable: "list[str]" = []
+        #: Корни, которых на момент снимка не было вовсе. Всё, что появится в
+        #: них за время обновления, создал установщик — и это надо убрать.
+        self.absent: "list[str]" = []
 
     def _export_root(self, key: str, folder: Path,
                      index: int) -> "Optional[str]":
@@ -13677,20 +13699,28 @@ class HostAssociationGuard:
         return None
 
     def _export_parts(self, folder: Path
-                      ) -> "tuple[dict[str, str], list[str]]":
-        """Снимок по корням: ``({корень: REG-текст}, [нечитаемые корни])``."""
+                      ) -> "tuple[dict[str, str], list[str], list[str]]":
+        """Снимок по корням.
+
+        Возвращает ``({корень: REG-текст}, [нечитаемые], [отсутствующие])``.
+        Отсутствующий корень — не ошибка: такого раздела на ПК просто нет, и
+        всё, что появится в нём за время обновления, создал установщик.
+        """
         if folder.exists():
             shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir(parents=True, exist_ok=True)
         parts: "dict[str, str]" = {}
         unreadable: "list[str]" = []
+        absent: "list[str]" = []
         for index, key in enumerate(_ASSOCIATION_EXPORT_ROOTS):
             text = self._export_root(key, folder, index)
             if text is None:
                 unreadable.append(key)
             elif text:
                 parts[key] = text
-        return parts, unreadable
+            else:
+                absent.append(key)
+        return parts, unreadable, absent
 
     def snapshot(self) -> bool:
         if not IS_WINDOWS:
@@ -13714,7 +13744,7 @@ class HostAssociationGuard:
             shutil.rmtree(self.directory, ignore_errors=True)
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
-            parts, unreadable = self._export_parts(
+            parts, unreadable, absent = self._export_parts(
                 self.directory / "before-parts")
             if not parts:
                 raise OSError("не удалось прочитать ни один раздел ассоциаций")
@@ -13724,6 +13754,8 @@ class HostAssociationGuard:
             self.before_text = text
             self.covered = list(parts)
             self.unreadable = unreadable
+            self.absent = absent
+            self._write_absent(absent)
             self.active = True
             shutil.rmtree(self.directory / "before-parts", ignore_errors=True)
             if unreadable:
@@ -13739,6 +13771,25 @@ class HostAssociationGuard:
             self.active = False
             return False
 
+    def _write_absent(self, absent: "list[str]") -> None:
+        try:
+            self.absent_file.write_text(
+                json.dumps({"absent": list(absent)}, ensure_ascii=False),
+                encoding="utf-8")
+        except OSError:
+            pass
+
+    def _absent_roots(self) -> "list[str]":
+        """Корни, которых не было на момент снимка (в том числе из файла)."""
+        if self.absent:
+            return list(self.absent)
+        try:
+            data = json.loads(self.absent_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return []
+        items = data.get("absent") if isinstance(data, dict) else None
+        return [str(item) for item in (items or []) if str(item).strip()]
+
     def restore(self) -> list[str]:
         if not IS_WINDOWS:
             return []
@@ -13753,7 +13804,7 @@ class HostAssociationGuard:
         # это и есть «reg export failed (код 1)» из журнала обновления.
         stamp = str(os.getpid())
         try:
-            after_parts, _unreadable = self._export_parts(
+            after_parts, _unreadable, _absent_now = self._export_parts(
                 self.directory / f"after-{stamp}")
         except (OSError, UnicodeError) as exc:
             return [f"cannot compare association state: {exc}"]
@@ -13776,7 +13827,15 @@ class HostAssociationGuard:
         after = _association_text_for_roots(
             "\r\n".join(after_parts.values()), covered)
 
+        # Разделы, которых до обновления не было, а теперь они есть: это
+        # создал установщик (свой ProgID, пункт контекстного меню), и убрать
+        # их надо целиком — вместе с подключами. Снимок по корням иначе такого
+        # раздела просто «не видит»: экспортировать на месте было нечего.
+        created = [key for key in self._absent_roots() if key in after_parts]
         restore_text = _association_restore_text(before, after)
+        if created:
+            restore_text += "".join(
+                f"\r\n[-{_full_reg_key(key)}]\r\n" for key in created)
         if "[" in restore_text:
             restore_file = self.directory / "restore.reg"
             if not write_reg_file(restore_file, restore_text):
@@ -13785,8 +13844,13 @@ class HostAssociationGuard:
             if code != 0:
                 return [f"reg import failed with code {code}"]
         try:
-            verified_parts, _ = self._export_parts(
+            verified_parts, _unreadable, _absent = self._export_parts(
                 self.directory / f"verified-{stamp}")
+            still_there = [key for key in created if key in verified_parts]
+            if still_there:
+                return [f"раздел {still_there[0]} не удалён: установщик создал "
+                        "его за время обновления, и прежнее состояние вернуть "
+                        "не удалось"]
         except (OSError, UnicodeError) as exc:
             return [f"cannot verify association state: {exc}"]
         verified = _association_text_for_roots(
@@ -13798,6 +13862,7 @@ class HostAssociationGuard:
         self.active = False
         self.before_text = None
         self.covered = []
+        self.absent = []
         shutil.rmtree(self.directory, ignore_errors=True)
         _update_log(self.root, "associations: original host state restored")
         return []

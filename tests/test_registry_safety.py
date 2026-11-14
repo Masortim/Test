@@ -602,8 +602,23 @@ class UpdateAssociationGuardTests(unittest.TestCase):
                     state["restore_text"] = _Path(args[1]).read_text("utf-16")
                 except OSError:
                     state["restore_text"] = ""
+                # Настоящий reg import удаляет разделы из строк ``[-KEY]``:
+                # двойник запоминает их, чтобы следующий экспорт их не нашёл.
+                for line in (state["restore_text"] or "").splitlines():
+                    line = line.strip()
+                    if line.startswith("[-") and line.endswith("]"):
+                        state.setdefault("deleted", set()).add(line[2:-1])
                 return 0
             key = args[1]
+            full = ("HKEY_CURRENT_USER" + key[len("HKCU"):]
+                    if key.upper().startswith("HKCU") else key)
+            deleted = state.get("deleted") or set()
+            if any(full == item or full.startswith(item + "\\")
+                   for item in deleted):
+                return 1
+            if key in (state.get("absent_keys") or ()) and not state.get(
+                    "created"):
+                return 1
             if key in failing:
                 return 1
             texts = snapshot.get(key)
@@ -625,14 +640,18 @@ class UpdateAssociationGuardTests(unittest.TestCase):
             lines.append(f"\"{name}\"=\"{value}\"")
         return "\r\n".join(lines) + "\r\n"
 
-    def _guard(self, root, snapshot, state, failing=(), calls=None):
+    def _guard(self, root, snapshot, state, failing=(), calls=None,
+               absent=()):
         patches = [
             mock.patch.object(entry, "IS_WINDOWS", True),
             mock.patch.object(entry, "_ASSOCIATION_EXPORT_ROOTS",
                               tuple(snapshot)),
             mock.patch.object(entry, "_reg",
                               self._fake_reg(snapshot, state, failing, calls)),
-            mock.patch.object(entry, "registry_key_state", return_value=True),
+            mock.patch.object(
+                entry, "registry_key_state",
+                side_effect=lambda key: (str(key) not in absent
+                                         or bool(state.get("created")))),
         ]
         for item in patches:
             item.start()
@@ -704,6 +723,43 @@ class UpdateAssociationGuardTests(unittest.TestCase):
                              "не повод для сообщения об ошибке")
             self.assertTrue(backup.is_file(), "снимок ждёт следующего запуска")
             self.assertIn("сравнение отложено", self._log(root))
+
+    def test_root_created_by_the_installer_is_removed_again(self):
+        """Раздел, которого до обновления не было, убирается целиком.
+
+        Снимок по корням не может экспортировать несуществующий раздел, а
+        установщик именно такие и создаёт (свой ProgID, пункт контекстного
+        меню). Раньше общий снимок ``HKCU\\Software\\Classes`` видел их как
+        «добавленные» и удалял; теперь лончер помнит список отсутствовавших
+        корней и удаляет появившееся в них сам.
+        """
+        suffix = str(os.getpid())
+        keep = r"HKCU\Software\Classes\.pbt" + suffix
+        fresh = r"HKCU\Software\Classes\After.PBT" + suffix
+        state = {"absent_keys": {fresh}, "created": False, "imported": False}
+        fresh_text = self._reg_text(fresh + r"\shell\open\command",
+                                    {"": r'"C:\After\after.exe" "%1"'})
+        snapshot = {
+            keep: (self._reg_text(keep, {"": "Before.ProgID"}),
+                   self._reg_text(keep, {"": "Before.ProgID"})),
+            fresh: (fresh_text, fresh_text),
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            guard = self._guard(Path(temp), snapshot, state, absent={fresh})
+            self.assertTrue(guard.snapshot())
+            self.assertEqual(guard.absent, [fresh])
+            self.assertTrue((guard.directory / "absent.json").is_file())
+
+            # Установщик создал раздел, которого раньше не было.
+            state["created"] = True
+            self.assertEqual(guard.restore(), [])
+
+        restore_text = state.get("restore_text") or ""
+        self.assertIn(f"[-HKEY_CURRENT_USER\\Software\\Classes\\After.PBT"
+                      f"{suffix}]", restore_text)
+        self.assertEqual(state.get("deleted"),
+                         {f"HKEY_CURRENT_USER\\Software\\Classes\\"
+                          f"After.PBT{suffix}"})
 
     def test_broken_registry_does_not_start_the_update(self):
         with tempfile.TemporaryDirectory() as temp:
