@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -113,11 +114,12 @@ def make_lnk(path: Path, target: str) -> Path:
 
 
 def fake_installer(files, code=0, record=None):
-    """Двойник установщика: кладёт ``files`` в папку из ключа /DIR=."""
+    """Двойник установщика: кладёт ``files`` в папку из ключа /DIR= или /D=."""
     def runner(command, env, cwd, timeout):
         if record is not None:
             record.append(command)
-        match = re.search(r"/DIR=(\S+)", command)
+        match = (re.search(r"/DIR=(\S+)", command)
+                 or re.search(r"/D=(\S+)\s*$", command))
         if match and files:
             target = Path(match.group(1))
             for rel, text in files.items():
@@ -235,12 +237,33 @@ class InstallerCommandTests(unittest.TestCase):
         self.assertIn("/S", command)
         self.assertTrue(command.endswith("/D=" + str(Path("C:/p/Updates/stage"))))
 
+    def test_nsis_is_started_as_an_update(self):
+        """``--updated``: electron-builder не выходит с кодом 2, если процесс
+        программы ещё держит файлы, и не создаёт ярлык на рабочем столе."""
+        _label, command = exe_launcher.install_commands(
+            Path("C:/dl/opencode-desktop-win-x64.exe"),
+            Path("C:/p/Updates/stage"), "nsis")[0]
+        self.assertIn("--updated", command)
+        self.assertIn("--no-desktop-shortcut", command)
+
+    def test_nsis_second_rung_is_a_plain_silent_run(self):
+        """nsis-web не принимает ``--updated`` без --package-file."""
+        commands = exe_launcher.install_commands(
+            Path("C:/dl/opencode-desktop-win-x64.exe"),
+            Path("C:/p/Updates/stage"), "nsis")
+        self.assertEqual(len(commands), 2)
+        label, command = commands[1]
+        self.assertIn("NSIS", label)
+        self.assertNotIn("--updated", command)
+        self.assertIn("/S", command)
+        self.assertTrue(command.endswith("/D=" + str(Path("C:/p/Updates/stage"))))
+
     def test_msi_and_unknown_ladders(self):
         msi = exe_launcher.install_commands(Path("a.msi"), Path("s"), "msi")
         self.assertEqual(len(msi), 2)
         self.assertIn("TARGETDIR=", msi[0][1])
         unknown = exe_launcher.install_commands(Path("a.exe"), Path("s"), "unknown")
-        self.assertEqual(len(unknown), 2)
+        self.assertEqual(len(unknown), 3, "Inno + NSIS как обновление + NSIS тихо")
 
     def test_custom_args_replace_the_ladder(self):
         commands = exe_launcher.install_commands(
@@ -1467,6 +1490,317 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(exe_launcher._download_name(
             "https://ollama.com/download/OllamaSetup.exe"), "OllamaSetup.exe")
         self.assertEqual(exe_launcher._download_name("https://x/y?id=1"), "Update.exe")
+
+
+# --- обновление, когда установщик не смог поставить программу -------------------
+#
+# Жалоба (launcher-update.log): «NSIS: no usable result (code 2)»,
+# «Установщик не положил программу в папку: NSIS: код 2. Портатив не изменён».
+# electron-builder выходит с кодом 2, если не смог закрыть приложение, увидел
+# второй экземпляр установщика или споткнулся о прежний деинсталлятор. Файлы
+# программы при этом лежат внутри самого установщика — их можно достать, не
+# выполняя его.
+
+
+def fake_unpacker(script):
+    """Двойник распаковщика: кладёт файлы в папку из ключа ``-o``."""
+    calls = []
+
+    def runner(command, timeout):
+        command = [str(item) for item in command]
+        archive = Path(command[-1])
+        target = None
+        for item in command:
+            if item.startswith("-o"):
+                target = Path(item[2:])
+        calls.append((archive, target))
+        files = script(archive, target)
+        if files is None:
+            return 2, "unsupported container"
+        for relative, text in files.items():
+            _write(target / relative, text)
+        return 0, ""
+
+    runner.calls = calls
+    return runner
+
+
+def _extractor():
+    from portablizer.core import unpacker as unpacker_mod
+    return unpacker_mod.Extractor(unpacker_mod.STYLE_7ZIP, "/opt/7z")
+
+
+NEW_OPENCODE = {
+    "OpenCode.exe": "new-app",
+    "resources/app.asar": "asar",
+}
+
+
+class UnpackedUpdateTests(unittest.TestCase):
+    """Установщик вернул код 2 — новая версия достаётся распаковкой."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = make_opencode_portable(self._tmp.name)
+        self.installer = _write(
+            self.root / "Updates" / "temp-opencode-desktop-win-x64.exe",
+            "installer")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def apply(self, runner=None, extractors=None, unpacker=None):
+        patches = [
+            mock.patch.object(exe_launcher, "update_extractors",
+                              return_value=(extractors if extractors is not None
+                                            else [_extractor()])),
+            mock.patch.object(exe_launcher, "_run_extractor",
+                              unpacker or fake_unpacker(
+                                  lambda archive, target: dict(NEW_OPENCODE))),
+        ]
+        with patches[0], patches[1]:
+            return exe_launcher.apply_update(
+                self.root, OPENCODE_CFG, self.installer,
+                runner=runner or fake_installer({}, code=2))
+
+    def test_failed_installer_is_replaced_by_unpacking(self):
+        result = self.apply()
+        self.assertTrue(result.ok, result.message)
+        app = self.root / "App"
+        self.assertEqual((app / "OpenCode.exe").read_text(), "new-app")
+        self.assertTrue((app / "resources" / "app.asar").is_file())
+        self.assertEqual((app / "LaunchPortable.exe").read_text(), "launcher")
+        self.assertEqual((app / "Saves" / "slot1.sav").read_text(), "my-save")
+        self.assertIn("распакована", result.message)
+        log = (self.root / "PortableData" / "launcher-update.log").read_text(
+            encoding="utf-8")
+        self.assertIn("no usable result (code 2)", log)
+        self.assertIn("was unpacked from the installer without running it", log)
+
+    def test_container_service_folders_are_not_copied(self):
+        unpacker = fake_unpacker(lambda archive, target: {
+            "OpenCode.exe": "new-app",
+            "$PLUGINSDIR/setup.tmp": "service",
+            "$TEMP/x.bin": "temp",
+            "{tmp}/y.bin": "temp",
+        })
+        self.assertTrue(self.apply(unpacker=unpacker).ok)
+        app = self.root / "App"
+        self.assertFalse((app / "$PLUGINSDIR").exists())
+        self.assertFalse((app / "$TEMP").exists())
+        self.assertFalse((app / "{tmp}").exists())
+
+    def test_nested_app_archive_is_unpacked_too(self):
+        """electron-builder: внутри NSIS лежит app-64.7z с файлами программы."""
+        def script(archive, target):
+            if archive.name.casefold() == "app-64.7z":
+                return dict(NEW_OPENCODE)
+            return {"$PLUGINSDIR/app-64.7z": "archive"}
+
+        unpacker = fake_unpacker(script)
+        result = self.apply(unpacker=unpacker)
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual((self.root / "App" / "OpenCode.exe").read_text(),
+                         "new-app")
+        self.assertEqual([call[0].name for call in unpacker.calls],
+                         ["temp-opencode-desktop-win-x64.exe", "app-64.7z"])
+        log = (self.root / "PortableData" / "launcher-update.log").read_text(
+            encoding="utf-8")
+        self.assertIn("nested archive(s): 1", log)
+
+    def test_no_unpacker_keeps_the_portable_and_explains(self):
+        result = self.apply(extractors=[])
+        self.assertFalse(result.ok)
+        self.assertIn("7z.exe", result.message)
+        self.assertEqual((self.root / "App" / "OpenCode.exe").read_text(),
+                         "old-app")
+        self.assertFalse((self.root / "Updates" / "stage").exists())
+
+    def test_unsupported_container_keeps_the_portable(self):
+        result = self.apply(unpacker=fake_unpacker(lambda a, t: None))
+        self.assertFalse(result.ok)
+        self.assertEqual((self.root / "App" / "OpenCode.exe").read_text(),
+                         "old-app")
+
+    def test_installer_success_clears_the_remembered_strategy(self):
+        exe_launcher.remember_install_mode(self.root, True, engine="nsis")
+        with mock.patch.object(exe_launcher, "update_extractors",
+                               return_value=[]):
+            result = exe_launcher.apply_update(
+                self.root, OPENCODE_CFG, self.installer,
+                runner=fake_installer(NEW_OPENCODE))
+        self.assertTrue(result.ok, result.message)
+        self.assertFalse(exe_launcher.install_mode(self.root)["prefer_unpack"])
+
+    def test_next_update_starts_with_unpacking_and_skips_the_installer(self):
+        """Второй раз код 2 уже не нужен: способ запомнен."""
+        self.assertTrue(self.apply().ok)
+        self.assertTrue(exe_launcher.install_mode(self.root)["prefer_unpack"])
+        installer = _write(
+            self.root / "Updates" / "temp-opencode-desktop-win-x64.exe",
+            "installer-2")
+        commands = []
+
+        def runner(command, env, cwd, timeout):
+            commands.append(command)
+            return 2
+
+        with mock.patch.object(exe_launcher, "update_extractors",
+                               return_value=[_extractor()]), \
+             mock.patch.object(exe_launcher, "_run_extractor",
+                               fake_unpacker(
+                                   lambda archive, target: dict(NEW_OPENCODE))):
+            result = exe_launcher.apply_update(
+                self.root, OPENCODE_CFG, installer, runner=runner)
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(commands, [], "установщик второй раз не запускается")
+        log = (self.root / "PortableData" / "launcher-update.log").read_text(
+            encoding="utf-8")
+        self.assertIn("failed here before", log)
+
+    def test_remembered_strategy_is_retried_after_a_month(self):
+        """Вендорская установка — штатный путь: раз в месяц пробуем снова."""
+        exe_launcher.remember_install_mode(self.root, True, engine="nsis")
+        self.assertTrue(exe_launcher.prefer_unpacked_install(
+            self.root, "nsis"))
+        note = self.root / "Updates" / exe_launcher.INSTALL_MODE_NAME
+        old = time.time() - 40 * 86400
+        os.utime(note, (old, old))
+        self.assertFalse(exe_launcher.prefer_unpacked_install(
+            self.root, "nsis"))
+
+    def test_msi_is_never_unpacked_blindly(self):
+        exe_launcher.remember_install_mode(self.root, True, engine="msi")
+        self.assertFalse(exe_launcher.prefer_unpacked_install(
+            self.root, "msi"))
+
+    def test_unpacked_update_keeps_the_previous_version_for_rollback(self):
+        self.assertTrue(self.apply().ok)
+        rollback = exe_launcher.rollback_update(self.root, OPENCODE_CFG)
+        self.assertTrue(rollback.ok, rollback.message)
+        self.assertEqual((self.root / "App" / "OpenCode.exe").read_text(),
+                         "old-app")
+
+
+class UpdateLockTests(unittest.TestCase):
+    """Два обновления одновременно — второй установщик и порча stage."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = make_portable(self._tmp.name)
+        self.installer = _write(Path(self._tmp.name) / "Setup.exe", "installer")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def lock(self, pid: int, **extra) -> Path:
+        updates = self.root / "Updates"
+        updates.mkdir(parents=True, exist_ok=True)
+        path = updates / exe_launcher.UPDATE_LOCK_NAME
+        path.write_text(json.dumps(dict({"pid": pid}, **extra)),
+                        encoding="utf-8")
+        return path
+
+    def dead_pid(self) -> int:
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait()
+        return int(process.pid)
+
+    def test_live_lock_blocks_the_second_update(self):
+        self.lock(os.getppid())
+        with mock.patch.object(exe_launcher, "UPDATE_LOCK_WAIT", 0.1):
+            result = exe_launcher.apply_update(
+                self.root, OLLAMA_CFG, self.installer,
+                runner=fake_installer(NEW_FILES))
+        self.assertFalse(result.ok)
+        self.assertIn("уже выполняется", result.message)
+        self.assertEqual((self.root / "App" / "ollama app.exe").read_text(),
+                         "old-app")
+
+    def test_orphaned_lock_is_taken_over(self):
+        path = self.lock(self.dead_pid())
+        result = exe_launcher.apply_update(
+            self.root, OLLAMA_CFG, self.installer,
+            runner=fake_installer(NEW_FILES))
+        self.assertTrue(result.ok, result.message)
+        self.assertFalse(path.exists(), "замок снят после обновления")
+
+    def test_update_finished_by_another_process_is_not_repeated(self):
+        updates = self.root / "Updates"
+        updates.mkdir(parents=True, exist_ok=True)
+        (updates / "journal.json").write_text(json.dumps({
+            "state": "done", "replaced": [], "added": [],
+            "finished_at": time.time() + 60,
+        }), encoding="utf-8")
+        runner = mock.Mock()
+        result = exe_launcher.apply_update(
+            self.root, OLLAMA_CFG, self.installer, runner=runner)
+        self.assertTrue(result.ok, result.message)
+        self.assertIn("уже обновлена", result.message)
+        runner.assert_not_called()
+
+    def test_lock_is_released_after_a_failed_update(self):
+        result = exe_launcher.apply_update(
+            self.root, OLLAMA_CFG, self.installer,
+            runner=fake_installer({}, code=2))
+        self.assertFalse(result.ok)
+        self.assertFalse(
+            (self.root / "Updates" / exe_launcher.UPDATE_LOCK_NAME).exists())
+
+    def test_rollback_refuses_while_an_update_runs(self):
+        self.assertTrue(exe_launcher.apply_update(
+            self.root, OLLAMA_CFG, self.installer,
+            runner=fake_installer(NEW_FILES)).ok)
+        self.lock(os.getppid())
+        result = exe_launcher.rollback_update(self.root, OLLAMA_CFG)
+        self.assertFalse(result.ok)
+        self.assertIn("идёт обновление", result.message)
+        self.assertEqual((self.root / "App" / "ollama app.exe").read_text(),
+                         "new-app")
+
+
+class StrayInstallerTests(unittest.TestCase):
+    """Уборка «родного» апдейтера не должна убивать наш установщик."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = make_opencode_portable(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def stop(self, image: str) -> "list[str]":
+        with mock.patch.object(exe_launcher, "_portable_process_list",
+                               return_value=[(4242, image)]), \
+             mock.patch.object(exe_launcher, "_terminate_pids") as kill:
+            stopped = exe_launcher.stop_stray_installers(
+                self.root, OPENCODE_CFG)
+        if stopped:
+            kill.assert_called_once()
+        else:
+            kill.assert_not_called()
+        return stopped
+
+    def test_update_installer_in_updates_is_not_stopped(self):
+        image = str(self.root / "Updates" / "temp-opencode-desktop-win-x64.exe")
+        self.assertEqual(self.stop(image), [])
+
+    def test_downloaded_installer_of_the_program_is_still_stopped(self):
+        image = str(self.root / "PortableData" / "AppData" / "Local"
+                    / "opencode-updater" / "pending"
+                    / "opencode-desktop-win-x64.exe")
+        self.assertEqual(len(self.stop(image)), 1)
+
+    def test_running_installer_pid_is_not_touched(self):
+        image = str(self.root / "Downloads" / "opencode-desktop-win-x64.exe")
+        with mock.patch.object(exe_launcher, "_RUNNING_INSTALLER_PID", 4242), \
+             mock.patch.object(exe_launcher, "_portable_process_list",
+                               return_value=[(4242, image)]), \
+             mock.patch.object(exe_launcher, "_terminate_pids") as kill:
+            self.assertEqual(
+                exe_launcher.stop_stray_installers(self.root, OPENCODE_CFG), [])
+        kill.assert_not_called()
+
 
 
 class PortablizerSideTests(unittest.TestCase):

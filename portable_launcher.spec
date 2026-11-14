@@ -4,11 +4,19 @@ import os
 
 block_cipher = None
 
+# 7-Zip едет вместе с лончером: обновление умеет достать новую версию из
+# установщика, не запуская его (см. «обновление без установщика» в
+# portable_launcher_entry.py). Это ~2,5 МБ, зато на ПК без 7-Zip и без сети
+# обновление всё равно доходит до конца: NSIS может завершиться кодом 2 и не
+# положить программу в папку, а распаковка её достаёт.
 a = Analysis(
     ["portable_launcher_entry.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        (os.path.join("portablizer", "resources", "7zip", "x64"),
+         os.path.join("resources", "7zip", "x64")),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

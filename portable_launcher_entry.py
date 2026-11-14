@@ -24,7 +24,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from portablizer.core import filelocks, restart_manager
+from portablizer.core import filelocks, restart_manager, unpacker
 
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
 IS_WINDOWS = sys.platform.startswith("win")
@@ -10421,12 +10421,43 @@ def update_markers(root: Path, cfg: Dict[str, Any]) -> "list[Path]":
     return _glob_in_data(root, cfg, update_settings(cfg)["markers"])
 
 
+#: Установщик, который обновление запустило само (для отказа от «уборки»).
+_ACTIVE_UPDATE_INSTALLER: "Optional[Path]" = None
+
+#: PID запущенного нами установщика (пока он работает).
+_RUNNING_INSTALLER_PID = 0
+
+
+def _is_update_installer(root: Path, image: str) -> bool:
+    """Это установщик, запущенный самим обновлением, а не программой?
+
+    Обновление кладёт установщик в ``Updates`` и запускает его оттуда. Имя у
+    него ровно то, по которому ищут «родной» апдейтер (``opencode-desktop-win-
+    *.exe``), поэтому прежняя уборка принимала его за чужой и завершала — а
+    установщик NSIS, убитый на середине, возвращает код 2, и обновление
+    выглядело неудачным. Файлы внутри ``Updates`` — наши по определению.
+    """
+    folded = str(image or "").replace("/", "\\").casefold()
+    if not folded:
+        return False
+    active = _ACTIVE_UPDATE_INSTALLER
+    if active is not None:
+        if folded == str(active).replace("/", "\\").casefold():
+            return True
+    prefix = (str(root / UPDATE_DIR_NAME).replace("/", "\\")
+              .rstrip("\\").casefold() + "\\")
+    return folded.startswith(prefix)
+
+
 def stop_stray_installers(root: Path, cfg: Dict[str, Any]) -> "list[str]":
     """Завершает «родной» установщик, запущенный из портатива.
 
     Он поставил бы программу мимо App и умер бы на полпути вместе с лончером.
     Совпадение по имени (``ollamasetup*``): у Inno Setup рабочая копия в
     Temp называется ``OllamaSetup.tmp``, и она тоже должна уйти.
+
+    Установщик, запущенный самим обновлением (он лежит в ``Updates``), не
+    трогается: его завершение и есть та самая ошибка «NSIS: код 2».
     """
     import fnmatch
 
@@ -10435,6 +10466,10 @@ def stop_stray_installers(root: Path, cfg: Dict[str, Any]) -> "list[str]":
         return []
     victims = []
     for pid, image in _portable_process_list(root):
+        if pid == _RUNNING_INSTALLER_PID:
+            continue
+        if _is_update_installer(root, image):
+            continue
         name = _image_name(image).casefold()
         if any(fnmatch.fnmatch(name, pattern) for pattern in names):
             victims.append((pid, _image_name(image)))
@@ -10808,19 +10843,31 @@ def install_commands(installer: Path, target_dir: Path, engine: str,
             args.append(f"/LOG={log_file}")
         return "Inno Setup", quote(args)
 
-    def nsis() -> "tuple[str, str]":
+    def nsis(as_update: bool = True) -> "tuple[str, str]":
         # --no-desktop-shortcut понимают установщики electron-builder (OpenCode
         # и т.п.): обновление внутри портатива не должно оставлять ярлык на
         # рабочем столе чужого ПК. Классический NSIS ключ просто игнорирует —
         # появившийся ярлык уберёт ShortcutGuard в apply_update().
+        # --updated — тот же ключ, которым electron-updater помечает «это
+        # обновление»: установщик electron-builder тогда не завершается с
+        # кодом 2, если процесс программы ещё держит файлы (он закрывает его
+        # сам), и не создаёт ярлык на рабочем столе. Классический NSIS
+        # незнакомый ключ игнорирует.
+        # Без ключа — вторая ступень: так ставится классический NSIS и
+        # nsis-web (последнему --updated без --package-file как раз запрещён).
         # /D= обязан идти последним и без кавычек.
-        return ("NSIS", quote([program, "/S", "--no-desktop-shortcut"])
-                + f" /D={target}")
+        args = [program, "/S"]
+        if as_update:
+            args += ["--updated", "--no-desktop-shortcut"]
+        else:
+            args += ["--no-desktop-shortcut"]
+        label = "NSIS" if as_update else "NSIS: обычный тихий режим"
+        return (label, quote(args) + f" /D={target}")
 
     if engine == "inno":
         return [inno()]
     if engine == "nsis":
-        return [nsis()]
+        return [nsis(), nsis(as_update=False)]
     if engine == "msi":
         return [
             ("MSI: административная распаковка",
@@ -10830,7 +10877,8 @@ def install_commands(installer: Path, target_dir: Path, engine: str,
              quote(["msiexec.exe", "/i", program, "/qn", "/norestart",
                     f"INSTALLDIR={target}"])),
         ]
-    return [inno(), nsis()]
+    # Движок не определён: сначала Inno, потом NSIS в двух видах.
+    return [inno(), nsis(), nsis(as_update=False)]
 
 
 def _clear_dir(path: Path) -> None:
@@ -10884,6 +10932,272 @@ def locate_payload(stage: Path, cfg: Dict[str, Any]) -> Optional[Path]:
             if candidate == stage or stage in candidate.parents:
                 return candidate
     return None
+
+
+# --- обновление без установщика: распаковка «как есть» -------------------------
+#
+# Зачем это нужно
+# ---------------
+# Сторонний установщик обновления не всегда ставит программу туда, куда его
+# просят. У electron-builder (OpenCode Desktop) NSIS-установщик в тихом режиме
+# завершается кодом 2 и не кладёт в папку ничего, когда:
+#
+# * приложение ещё держит файлы («app is running» — установщик пытается его
+#   закрыть, не может и выходит с ``SetErrorLevel 2``);
+# * уже работает другой экземпляр этого же установщика (``SetErrorLevel 2``);
+# * прежний деинсталлятор, записанный в реестре этого ПК, не отработал:
+#   ``handleUninstallResult`` выходит с кодом 2 после пяти попыток. У
+#   портатива он смотрит в ``App``, который обновление как раз подменяет.
+#
+# Код 2 — общий «Quit» NSIS, разбирать его по журналу бессмысленно: файлов
+# программы в ``Updates\stage`` всё равно нет, и пользователь видит «Портатив
+# остался прежним». Поэтому у обновления есть второй, детерминированный путь:
+# распаковать сам установщик, **не выполняя его**. Inno Setup и NSIS — обычные
+# упакованные контейнеры, 7-Zip читает их напрямую, а Windows при этом не
+# меняется вовсе: ни реестр, ни ярлыки, ни службы, ни каталоги в профиле.
+# У electron-builder внутри NSIS лежит ``app-64.7z`` — он распаковывается
+# вторым шагом.
+
+#: Имена распаковщиков, которыми читаются контейнеры установщиков.
+UPDATE_EXTRACTOR_NAMES = ("7z.exe", "7za.exe", "7zr.exe")
+
+#: Сколько ждать распаковку установщика: большие дистрибутивы — это минуты.
+UPDATE_EXTRACT_TIMEOUT = 900.0
+
+#: Сколько вложенных архивов разбирать (у electron-builder их один —
+#: ``app-64.7z`` внутри ``$PLUGINSDIR``).
+UPDATE_NESTED_LIMIT = 4
+
+#: Служебные папки контейнера: в портатив они не переносятся.
+_CONTAINER_JUNK = frozenset({
+    "$pluginsdir", "$temp", "$sys", "$win", "$userappdata", "$commonappdata",
+    "$localappdata", "$appdata", "$programfiles", "$programfiles64",
+    "{tmp}", "{sys}", "{win}", "{userappdata}", "{commonappdata}",
+    "{pf}", "{pf64}", "{localappdata}", "{appdata}", "{commonpf}",
+    "{commonpf64}", "{commondesktop}", "{commonstartmenu}",
+})
+
+
+def _resource_dirs() -> "list[Path]":
+    """Где искать приложенный 7-Zip: рядом с самим лончером.
+
+    ``sys._MEIPASS`` покрывает обе сборки: onefile распаковывается во временную
+    папку, onedir кладёт ресурсы в ``_internal``. Остальные пути нужны для
+    ручной раскладки и для распаковки лончера «как есть».
+    """
+    found: "list[Path]" = []
+    bundled = getattr(sys, "_MEIPASS", "")
+    if bundled:
+        found.append(Path(bundled) / "resources" / "7zip" / "x64")
+    runtime = _runtime_directory()
+    found += [
+        runtime / "_internal" / "resources" / "7zip" / "x64",
+        runtime / "resources" / "7zip" / "x64",
+        runtime / "7zip" / "x64",
+        runtime / "7zip",
+    ]
+    return found
+
+
+def update_extractors(root: "Optional[Path]" = None) -> "list[Any]":
+    """Распаковщики для обновления без установщика, в порядке предпочтения.
+
+    Сначала своё: 7-Zip, приложенный к лончеру, и ``PortableData\\Tools`` —
+    тогда обновление работает на ПК без 7-Zip и без сети. Потом найденное на
+    этом ПК (7-Zip, WinRAR, встроенный ``tar.exe``). Пустой список — не
+    ошибка: обновление просто останется установщику.
+    """
+    candidates: "list[Path]" = []
+    for folder in _resource_dirs():
+        candidates.extend(folder / name for name in UPDATE_EXTRACTOR_NAMES)
+    if root is not None:
+        tools = _data_dir(root, {}) / "Tools"
+        for folder in (tools / "7zip" / "x64", tools / "7zip", tools):
+            candidates.extend(folder / name for name in UPDATE_EXTRACTOR_NAMES)
+    found: "list[Any]" = []
+    seen: "set[str]" = set()
+    for candidate in candidates:
+        text = str(candidate)
+        folded = text.casefold()
+        if folded in seen or not candidate.is_file():
+            continue
+        # 7z.exe без 7z.dll — не распаковщик: он просто не запустится.
+        if (candidate.name.casefold() == "7z.exe"
+                and not (candidate.parent / "7z.dll").is_file()):
+            continue
+        seen.add(folded)
+        found.append(unpacker.Extractor(unpacker.STYLE_7ZIP, text))
+    for extractor in unpacker.find_extractors():
+        folded = str(extractor.path).casefold()
+        if folded in seen:
+            continue
+        seen.add(folded)
+        found.append(extractor)
+    return found
+
+
+def _run_extractor(command: "Sequence[str]", timeout: float
+                   ) -> "tuple[int, str]":
+    """Запускает распаковщик. Возвращает ``(код, вывод)``."""
+    kwargs: "Dict[str, Any]" = {}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = NO_WINDOW
+    try:
+        # stdin закрыт: 7-Zip умеет спрашивать пароль, а ждать ввода в
+        # обновлении нельзя — лучше честная ошибка распаковки.
+        process = subprocess.run(  # noqa: S603
+            list(command), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        return -1, "распаковка не завершилась за отведённое время"
+    except OSError as exc:
+        return -1, str(exc)
+    return int(process.returncode or 0), (process.stdout or b"").decode(
+        "utf-8", "replace")
+
+
+def _extract_archive(extractor: Any, archive: Path, target: Path,
+                     runner: Any, timeout: float) -> bool:
+    """Распаковывает ``archive`` в ``target``. ``True`` — в ``target`` есть файлы."""
+    _clear_dir(target)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    command = unpacker.extractor_argv(extractor, str(archive), str(target))
+    try:
+        code, _output = runner(command, timeout)
+    except Exception:  # noqa: BLE001 - распаковка не срывает обновление
+        return False
+    # Код 1 у 7-Zip — предупреждение (часть файлов не распакована), а не
+    # отказ: то, что достали, всё равно проверяется.
+    if code not in (0, 1):
+        return False
+    try:
+        return any(target.iterdir())
+    except OSError:
+        return False
+
+
+def _nested_archives(tree: Path, limit: int = UPDATE_NESTED_LIMIT
+                     ) -> "list[Path]":
+    """Архивы внутри распакованного контейнера (``app-64.7z`` и подобные)."""
+    found: "list[Path]" = []
+    for current, dirs, files in os.walk(tree):
+        try:
+            depth = len(Path(current).relative_to(tree).parts)
+        except ValueError:
+            continue
+        if depth >= 3:
+            dirs[:] = []
+        dirs.sort()
+        for name in sorted(files):
+            if name.casefold().endswith((".7z", ".zip")):
+                found.append(Path(current) / name)
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+def extract_installer_payload(installer: Path, stage: Path,
+                              cfg: Dict[str, Any],
+                              extractors: "Optional[Sequence[Any]]" = None,
+                              runner: "Optional[Any]" = None,
+                              work_dir: "Optional[Path]" = None,
+                              timeout: float = UPDATE_EXTRACT_TIMEOUT
+                              ) -> "Optional[tuple[Any, str]]":
+    """Достаёт программу из установщика, не запуская установщик.
+
+    Возвращает ``(распаковщик, отчёт)`` — программа уже лежит в ``stage`` —
+    или ``None``, если ни один распаковщик не смог достать содержимое.
+    Установщик при этом не выполняется: реестр, ярлыки, службы и профиль этого
+    ПК остаются нетронутыми.
+    """
+    extractors = list(extractors) if extractors is not None else update_extractors()
+    if not extractors:
+        return None
+    if not installer.is_file():
+        return None
+    run = runner or _run_extractor
+    work = work_dir or (stage.parent / "unpack")
+    _clear_dir(work)
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    try:
+        for index, extractor in enumerate(extractors):
+            bundle = work / f"bundle{index}"
+            if not _extract_archive(extractor, installer, bundle, run, timeout):
+                _clear_dir(bundle)
+                continue
+            payload = locate_payload(bundle, cfg)
+            nested = 0
+            for archive in _nested_archives(bundle):
+                if payload is not None:
+                    break
+                nested += 1
+                inner = work / f"nested{index}-{nested}"
+                if not _extract_archive(extractor, archive, inner, run, timeout):
+                    _clear_dir(inner)
+                    continue
+                payload = locate_payload(inner, cfg)
+                if payload is not None:
+                    bundle = inner
+            if payload is None:
+                _clear_dir(bundle)
+                continue
+            _clear_dir(stage)
+            try:
+                stage.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return None
+            moved = _promote_payload(payload, stage)
+            if not moved:
+                _clear_dir(stage)
+                continue
+            return (extractor,
+                    f"{moved} file(s) from {installer.name}"
+                    + (f"; nested archive(s): {nested}" if nested else ""))
+    finally:
+        _clear_dir(work)
+    return None
+
+
+def _promote_payload(source: Path, destination: Path) -> int:
+    """Переносит содержимое распакованной программы в ``stage``.
+
+    Служебные папки контейнера (``$PLUGINSDIR``, ``{tmp}``, ``{sys}`` и
+    прочие) не переносятся: подменять системные каталоги чужого ПК — это не
+    портативность.
+    """
+    moved = 0
+    try:
+        entries = sorted(source.iterdir(), key=lambda item: item.name.casefold())
+    except OSError:
+        return 0
+    for entry in entries:
+        if entry.name.casefold() in _CONTAINER_JUNK:
+            continue
+        target = destination / entry.name
+        try:
+            if target.exists() or target.is_symlink():
+                if target.is_dir() and not target.is_symlink():
+                    _clear_dir(target)
+                else:
+                    target.unlink()
+            _move_with_retry(entry, target)
+        except OSError:
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.copytree(entry, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(entry, target)
+            except OSError:
+                continue
+        moved += 1
+    return moved
 
 
 # --- следы установки на этом ПК -------------------------------------------------
@@ -13218,8 +13532,115 @@ def _association_mismatches(before: str, after: str, current: str) -> list[str]:
     return sorted(mismatches, key=str.casefold)
 
 
+# --- каким способом обновление сработало в прошлый раз -------------------------
+#
+# Если установщик этой программы уже не смог поставить её в папку, а
+# распаковка смогла, следующий запуск начинает с распаковки: незачем каждый
+# раз снова получать «NSIS: код 2» и оставлять следы установщика в Windows.
+# Как только установщик отработает нормально, предпочтение снимается.
+
+#: Файл-памятка о способе, которым обновление прошло в прошлый раз.
+INSTALL_MODE_NAME = "install-mode.json"
+
+#: Через сколько снова попробовать обычный установщик. Вендорская установка —
+#: штатный путь, поэтому предпочтение распаковке не вечное: раз в месяц
+#: установщик запускается снова и, если он починился, предпочтение снимается.
+INSTALL_MODE_RETRY = 30 * 86400.0
+
+
+def _install_mode_path(root: Path) -> Path:
+    return root / UPDATE_DIR_NAME / INSTALL_MODE_NAME
+
+
+def install_mode(root: Path) -> "Dict[str, Any]":
+    """Памятка об обновлении: ``{"prefer_unpack": True, ...}``."""
+    try:
+        data = json.loads(_install_mode_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def remember_install_mode(root: Path, prefer_unpack: bool,
+                          engine: str = "", note: str = "") -> None:
+    """Запоминает, ставить ли новый установщик сразу распаковкой."""
+    data: "Dict[str, Any]" = {
+        "prefer_unpack": bool(prefer_unpack),
+        "engine": engine,
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if note:
+        data["note"] = note
+    try:
+        path = _install_mode_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+    except OSError:
+        pass
+
+
+def prefer_unpacked_install(root: Path, engine: str) -> bool:
+    """Пора ли ставить новую версию распаковкой, не запуская установщик."""
+    data = install_mode(root)
+    if data.get("prefer_unpack") is not True:
+        return False
+    # У MSI распаковка даёт внутренности пакета, а не готовую программу.
+    if str(engine).casefold() not in ("", "nsis", "inno", "unknown"):
+        return False
+    try:
+        age = time.time() - _install_mode_path(root).stat().st_mtime
+    except OSError:
+        return False
+    if age > INSTALL_MODE_RETRY:
+        _update_log(root, "the remembered unpacking strategy is older than "
+                          "a month; trying the installer again")
+        return False
+    return True
+
+
+def _association_text_for_roots(text: str, roots: "Sequence[str]") -> str:
+    """Оставляет в REG-снимке только разделы перечисленных корней.
+
+    Нужно, когда часть корней прочитать не удалось: сравнивать и откатывать
+    можно только то, что есть в обоих снимках. Иначе нечитаемый раздел
+    выглядел бы как «удалённый» и его значения восстанавливались бы целиком.
+    """
+    normalized = [item for item in (_normalize_reg_section_header(root)
+                                    for root in roots) if item]
+    if not normalized:
+        return "Windows Registry Editor Version 5.00\r\n"
+    lines: "list[str]" = []
+    for header, values in _parse_reg_sections(text).items():
+        folded = header.casefold()
+        if not any(folded == root.casefold()
+                   or folded.startswith(root.casefold() + "\\")
+                   for root in normalized):
+            continue
+        lines.append(f"[{header}]")
+        for name, rhs in values.items():
+            lines.append(_reg_assignment(name, rhs))
+        lines.append("")
+    return ("Windows Registry Editor Version 5.00\r\n\r\n"
+            + "\r\n".join(lines))
+
+
 class HostAssociationGuard:
-    """Сохраняет ассоциации текущего ПК вокруг стороннего обновителя."""
+    """Сохраняет ассоциации текущего ПК вокруг стороннего обновителя.
+
+    Снимок ``HKCU\\Software\\Classes`` — самый большой раздел реестра на
+    машине, и ``reg export`` иногда отказывает (код 1: занятый файл, слишком
+    длинный обход, защищённая ветка, одновременный экспорт другим процессом).
+    Раньше одна такая осечка останавливала обновление целиком, а на сравнении
+    давала сообщение «Не удалось подтвердить восстановление программ по
+    умолчанию». Теперь снимок делается по корням: нечитаемый корень
+    пропускается (с записью в журнал), остальные сравниваются и откатываются
+    как обычно.
+    """
+
+    #: Сколько раз повторять экспорт одного корня, прежде чем признать его
+    #: нечитаемым (занятый файл обычно освобождается за доли секунды).
+    EXPORT_ATTEMPTS = 2
 
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -13227,42 +13648,91 @@ class HostAssociationGuard:
         self.before_file = self.directory / "before.reg"
         self.before_text: Optional[str] = None
         self.active = False
+        #: Корни, попавшие в снимок: только их можно сравнивать и откатывать.
+        self.covered: "list[str]" = []
+        #: Корни, которые существуют, но прочитать их не удалось.
+        self.unreadable: "list[str]" = []
 
-    def _export(self, folder: Path) -> str:
+    def _export_root(self, key: str, folder: Path,
+                     index: int) -> "Optional[str]":
+        """Снимок одного корня. ``None`` — корень не читается."""
+        last = 0
+        attempts = max(1, int(self.EXPORT_ATTEMPTS))
+        for attempt in range(attempts):
+            path = folder / f"{index:02d}-{attempt}.reg"
+            code = _reg(("export", key, str(path), "/y"))
+            if code == 0 and path.is_file():
+                try:
+                    return _decode_reg(path.read_bytes())
+                except (OSError, UnicodeError):
+                    code = -1
+            last = code
+            # Ошибка экспорта несуществующего ключа безопасна: корня нет.
+            if registry_key_state(key) is False:
+                return ""
+            if attempt + 1 < attempts:
+                time.sleep(0.3)
+        _update_log(self.root, f"associations: {key} не читается "
+                               f"(reg export, код {last})")
+        return None
+
+    def _export_parts(self, folder: Path
+                      ) -> "tuple[dict[str, str], list[str]]":
+        """Снимок по корням: ``({корень: REG-текст}, [нечитаемые корни])``."""
         if folder.exists():
             shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir(parents=True, exist_ok=True)
-        parts: "list[str]" = []
+        parts: "dict[str, str]" = {}
+        unreadable: "list[str]" = []
         for index, key in enumerate(_ASSOCIATION_EXPORT_ROOTS):
-            path = folder / f"{index:02d}.reg"
-            code = _reg(("export", key, str(path), "/y"))
-            if code == 0 and path.is_file():
-                parts.append(_decode_reg(path.read_bytes()))
-                continue
-            # Ошибка экспорта несуществующего ключа безопасна. Ошибку чтения
-            # существующего/неизвестного ключа нельзя выдать за пустой снимок.
-            if registry_key_state(key) is False:
-                continue
-            raise OSError(f"reg export failed for {key} (code {code})")
-        return "\r\n".join(parts)
+            text = self._export_root(key, folder, index)
+            if text is None:
+                unreadable.append(key)
+            elif text:
+                parts[key] = text
+        return parts, unreadable
 
     def snapshot(self) -> bool:
         if not IS_WINDOWS:
             return True
         # Backup от прерванного обновления важнее нового снимка: сначала
         # повторяем его восстановление и только потом разрешаем новый запуск.
-        if self.before_file.is_file() and self.restore():
-            return False
+        if self.before_file.is_file():
+            problems = self.restore()
+            if problems:
+                _update_log(self.root,
+                            "associations: " + "; ".join(problems[:3]))
+                return False
+            if self.before_file.is_file():
+                # Реестр сейчас не читается: сверку откладываем на следующий
+                # запуск и обновление не блокируем — иначе на машине с
+                # нечитаемым разделом Classes оно не начнётся никогда.
+                _update_log(self.root,
+                            "associations: прежний снимок остался на следующий "
+                            "запуск (реестр сейчас не читается)")
         if self.directory.exists():
             shutil.rmtree(self.directory, ignore_errors=True)
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
-            text = self._export(self.directory / "before-parts")
+            parts, unreadable = self._export_parts(
+                self.directory / "before-parts")
+            if not parts:
+                raise OSError("не удалось прочитать ни один раздел ассоциаций")
+            text = "\r\n".join(parts.values())
             if not write_reg_file(self.before_file, text):
                 raise OSError("cannot write association baseline")
             self.before_text = text
+            self.covered = list(parts)
+            self.unreadable = unreadable
             self.active = True
             shutil.rmtree(self.directory / "before-parts", ignore_errors=True)
+            if unreadable:
+                _update_log(
+                    self.root,
+                    "associations: снимок неполный, не читаются "
+                    + ", ".join(unreadable[:3])
+                    + (" ..." if len(unreadable) > 3 else "")
+                    + "; эти разделы не сравниваются")
             return True
         except (OSError, UnicodeError) as exc:
             _update_log(self.root, f"associations: baseline failed ({exc})")
@@ -13275,11 +13745,36 @@ class HostAssociationGuard:
         if not self.active and not self.before_file.is_file():
             return []
         try:
-            before = (self.before_text if self.before_text is not None
-                      else _decode_reg(self.before_file.read_bytes()))
-            after = self._export(self.directory / "after")
+            before_raw = (self.before_text if self.before_text is not None
+                          else _decode_reg(self.before_file.read_bytes()))
+        except (OSError, UnicodeError) as exc:
+            return [f"cannot read association baseline: {exc}"]
+        # Своя папка на процесс: два одновременных снимка в одной папке —
+        # это и есть «reg export failed (код 1)» из журнала обновления.
+        stamp = str(os.getpid())
+        try:
+            after_parts, _unreadable = self._export_parts(
+                self.directory / f"after-{stamp}")
         except (OSError, UnicodeError) as exc:
             return [f"cannot compare association state: {exc}"]
+        covered = [key for key in (self.covered or list(after_parts))
+                   if key in after_parts]
+        skipped = [key for key in (self.covered or [])
+                   if key not in after_parts]
+        if not covered:
+            _update_log(self.root,
+                        "associations: состояние реестра сейчас не читается — "
+                        "сравнение отложено на следующий запуск; снимок сохранён")
+            return []
+        if skipped:
+            _update_log(self.root,
+                        "associations: не перечитаны "
+                        + ", ".join(skipped[:3])
+                        + (" ..." if len(skipped) > 3 else "")
+                        + "; эти разделы не сравнивались")
+        before = _association_text_for_roots(before_raw, covered)
+        after = _association_text_for_roots(
+            "\r\n".join(after_parts.values()), covered)
 
         restore_text = _association_restore_text(before, after)
         if "[" in restore_text:
@@ -13290,15 +13785,19 @@ class HostAssociationGuard:
             if code != 0:
                 return [f"reg import failed with code {code}"]
         try:
-            verified = self._export(self.directory / "verified")
+            verified_parts, _ = self._export_parts(
+                self.directory / f"verified-{stamp}")
         except (OSError, UnicodeError) as exc:
             return [f"cannot verify association state: {exc}"]
+        verified = _association_text_for_roots(
+            "\r\n".join(verified_parts.values()), covered)
         mismatches = _association_mismatches(before, after, verified)
         if mismatches:
             return mismatches
 
         self.active = False
         self.before_text = None
+        self.covered = []
         shutil.rmtree(self.directory, ignore_errors=True)
         _update_log(self.root, "associations: original host state restored")
         return []
@@ -13356,6 +13855,119 @@ def _write_journal(root: Path, data: "Dict[str, Any]") -> None:
         os.replace(temporary, path)
     except OSError:
         pass
+
+
+# --- одно обновление за раз ----------------------------------------------------
+#
+# Два одновременных обновления — это два установщика над одной папкой
+# ``Updates\stage`` и два снимка ассоциаций в одной папке. NSIS в этом случае
+# завершается кодом 2 («уже работает другой экземпляр установщика»), второй
+# процесс чистит stage первому, а ``reg export`` падает на занятом файле — в
+# журнале это и выглядит как «NSIS: код 2» плюс «cannot compare association
+# state: reg export failed». Поэтому обновление берёт замок: второй процесс
+# ждёт первого и, если тот всё поставил, ничего не ставит повторно.
+
+#: Файл замка обновления внутри ``Updates``.
+UPDATE_LOCK_NAME = "update.lock"
+
+#: Сколько ждать, пока обновление в другом процессе закончится.
+UPDATE_LOCK_WAIT = 90.0
+
+#: Замок старше этого возраста считается осиротевшим даже при живом PID:
+#: номер процесса мог достаться другой программе после перезагрузки.
+UPDATE_LOCK_STALE = 6 * 3600.0
+
+#: Замок принадлежит этому процессу: хэндл и путь (для release).
+_UPDATE_LOCK: "Optional[tuple[int, Path]]" = None
+
+
+def _update_lock_path(root: Path) -> Path:
+    return root / UPDATE_DIR_NAME / UPDATE_LOCK_NAME
+
+
+def update_lock_owner(root: Path) -> int:
+    """PID процесса, который держит замок (0 — замка нет или он испорчен)."""
+    try:
+        data = json.loads(_update_lock_path(root).read_text(encoding="utf-8"))
+        return int(data.get("pid", 0) or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
+
+
+def acquire_update_lock(root: Path, wait: float = 0.0,
+                        poll: float = 0.5) -> bool:
+    """Захватывает замок обновления. ``False`` — его держит живой процесс.
+
+    ``wait`` — сколько ждать чужое обновление. Замок осиротевший (процесс
+    умер, питание пропало) снимается: он не должен блокировать обновление
+    навсегда.
+    """
+    global _UPDATE_LOCK
+    path = _update_lock_path(root)
+    if _UPDATE_LOCK is not None and _UPDATE_LOCK[1] == path:
+        return True
+    deadline = time.monotonic() + max(0.0, float(wait))
+    while True:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            owner = update_lock_owner(root)
+            aged = False
+            try:
+                aged = (time.time() - path.stat().st_mtime) > UPDATE_LOCK_STALE
+            except OSError:
+                aged = True
+            if (owner and owner != os.getpid() and _pid_alive(owner)
+                    and not aged):
+                if time.monotonic() < deadline:
+                    time.sleep(poll)
+                    continue
+                return False
+            # Замок остался от процесса, которого уже нет (или ему слишком
+            # много времени: номер процесса успел достаться другой программе).
+            _remove_file(path)
+            continue
+        except OSError:
+            return False
+        try:
+            os.write(handle, json.dumps({
+                "pid": os.getpid(),
+                "started": time.time(),
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }, ensure_ascii=False).encode("utf-8"))
+        except OSError:
+            pass
+        _UPDATE_LOCK = (handle, path)
+        return True
+
+
+def release_update_lock(root: Path) -> None:
+    """Снимает замок, если его держит этот процесс."""
+    global _UPDATE_LOCK
+    if _UPDATE_LOCK is None:
+        return
+    handle, path = _UPDATE_LOCK
+    _UPDATE_LOCK = None
+    try:
+        os.close(handle)
+    except OSError:
+        pass
+    # Чужой замок (успел перехватить другой процесс) не трогаем.
+    if update_lock_owner(root) in (0, os.getpid()):
+        _remove_file(path)
+
+
+def _update_finished_since(root: Path, since: float) -> bool:
+    """Другой процесс успел поставить обновление, пока мы ждали замок."""
+    journal = _read_journal(root)
+    if journal.get("state") != "done":
+        return False
+    try:
+        finished = float(journal.get("finished_at", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        finished = 0.0
+    return finished >= since
 
 
 def _move_with_retry(source: Path, destination: Path, attempts: int = 6) -> None:
@@ -13423,10 +14035,18 @@ def _rollback_journal(root: Path, journal: "Dict[str, Any]") -> "list[str]":
 
 def _default_installer_runner(command: str, env: "Dict[str, str]", cwd: str,
                               timeout: float) -> Optional[int]:
-    """Запускает установщик и ждёт его завершения. ``None`` - таймаут."""
+    """Запускает установщик и ждёт его завершения. ``None`` - таймаут.
+
+    PID работающего установщика запоминается: пока обновление его ждёт, ни
+    этот процесс, ни другой экземпляр лончера не должны принять его за
+    «родной апдейтер программы» и завершить (см.
+    :func:`stop_stray_installers`).
+    """
+    global _RUNNING_INSTALLER_PID
     process = subprocess.Popen(  # noqa: S603
         command, cwd=cwd, env=env, creationflags=NO_WINDOW,
         stdin=subprocess.DEVNULL)
+    _RUNNING_INSTALLER_PID = int(process.pid or 0)
     try:
         return process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -13435,6 +14055,8 @@ def _default_installer_runner(command: str, env: "Dict[str, str]", cwd: str,
         except OSError:
             pass
         return None
+    finally:
+        _RUNNING_INSTALLER_PID = 0
 
 
 def remembered_roots(root: Path,
@@ -13530,6 +14152,59 @@ def _copy_tree_into(source: Path, stage: Path,
                 continue
             copied.append(str(relative).replace("\\", "/"))
     return copied
+
+
+def _adopt_extracted_installer(root: Path, cfg: Dict[str, Any],
+                               installer: Path, stage: Path,
+                               settings: Dict[str, Any], say: Any
+                               ) -> "tuple[Optional[Path], str]":
+    """Достаёт программу из установщика, не запуская его.
+
+    Возвращает ``(корень программы в stage, чем распаковано)``. Пустой второй
+    элемент — распаковка не понадобилась или не удалась (причина в журнале).
+    """
+    extractors = update_extractors(root)
+    if not extractors:
+        _update_log(
+            root,
+            "the installer put nothing into the folder and there is no "
+            "unpacker to read it: install 7-Zip or put 7z.exe with 7z.dll "
+            "into PortableData\\Tools")
+        return None, ""
+    _update_log(root, "unpackers available: "
+                + ", ".join(str(item) for item in extractors[:4]))
+    say("распаковываю установщик без запуска")
+    _clear_dir(stage)
+    try:
+        stage.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None, ""
+    try:
+        found = extract_installer_payload(
+            installer, stage, cfg, extractors=extractors,
+            work_dir=root / UPDATE_DIR_NAME / "unpack",
+            timeout=UPDATE_EXTRACT_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001 - распаковка не срывает обновление
+        _update_log(root, f"unpacking the installer failed ({exc})")
+        return None, ""
+    if found is None:
+        _update_log(
+            root, "unpacking the installer without running it did not "
+                  "produce the program (the container may be unsupported "
+                  "by the available unpacker)")
+        _clear_dir(stage)
+        return None, ""
+    extractor, report = found
+    payload = locate_payload(stage, cfg)
+    if payload is None:
+        _clear_dir(stage)
+        return None, ""
+    _update_log(
+        root, "the new version was unpacked from the installer without "
+              f"running it: {extractor}; {report}")
+    remember_install_mode(root, True, engine=installer_engine(installer),
+                          note=f"{extractor}: {report}")
+    return payload, f"{extractor}: {report}"
 
 
 def adopt_from_redirected_profile(root: Path, cfg: Dict[str, Any], stage: Path,
@@ -13781,21 +14456,49 @@ def apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
                  progress: "Optional[Any]" = None,
                  runner: "Optional[Any]" = None) -> UpdateResult:
     """Обновляет портатив, не оставляя ассоциации стороннего установщика."""
-    associations = HostAssociationGuard(root)
-    result: Optional[UpdateResult] = None
+    started = time.time()
+    # Одно обновление за раз. Два одновременных (два экземпляра лончера
+    # поймали «перезапуск для обновления») — это два установщика над одной
+    # папкой stage: второй выходит с кодом 2, первый остаётся без файлов, а
+    # снимки ассоциаций мешают друг другу. Второй процесс ждёт первого и,
+    # если тот всё поставил, ничего не ставит повторно.
+    if not acquire_update_lock(root, wait=UPDATE_LOCK_WAIT):
+        owner = update_lock_owner(root)
+        _update_log(root, "another update is already running"
+                    + (f" (pid {owner})" if owner else ""))
+        return UpdateResult().fail(
+            "Обновление уже выполняется другим процессом портатива"
+            + (f" (PID {owner})" if owner else "")
+            + ". Дождитесь его окончания и повторите. Подробности: "
+            f"PortableData\\{UPDATE_LOG_NAME}")
     try:
-        result = _apply_update(root, cfg, installer, progress, runner,
-                               associations)
-        return result
+        if _update_finished_since(root, started):
+            done = UpdateResult()
+            done.ok = True
+            done.message = ("Программа уже обновлена другим процессом "
+                            "обновления.")
+            _update_log(root, "another process finished the update; "
+                              "nothing to do")
+            return done
+        associations = HostAssociationGuard(root)
+        result: Optional[UpdateResult] = None
+        try:
+            result = _apply_update(root, cfg, installer, progress, runner,
+                                   associations)
+            return result
+        finally:
+            problems = associations.restore()
+            if problems:
+                detail = ", ".join(problems[:3])
+                warning = ("Не удалось подтвердить восстановление программ по "
+                           f"умолчанию ({detail}). Backup: "
+                           f"{associations.directory}")
+                _update_log(root, "associations: " + warning)
+                if result is not None:
+                    result.message += (("\n" if result.message else "")
+                                       + warning)
     finally:
-        problems = associations.restore()
-        if problems:
-            detail = ", ".join(problems[:3])
-            warning = ("Не удалось подтвердить восстановление программ по "
-                       f"умолчанию ({detail}). Backup: {associations.directory}")
-            _update_log(root, "associations: " + warning)
-            if result is not None:
-                result.message += ("\n" if result.message else "") + warning
+        release_update_lock(root)
 
 
 def _apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
@@ -13902,6 +14605,23 @@ def _apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
                                 stale_roots=stale_roots, portable_root=root)
     _update_log(root, f"installer engine: {engine}; {len(commands)} command(s)")
 
+    payload: Optional[Path] = None
+    failures: "list[str]" = []
+    extracted = ""
+    if prefer_unpacked_install(root, engine):
+        # Прошлый раз этот установщик не положил программу в папку, а
+        # распаковка положила. Начинаем с неё: код 2 и следы установщика в
+        # Windows не нужны, если содержимое можно достать без запуска.
+        _update_log(root, "this installer failed here before; unpacking it "
+                          "without running it first")
+        payload, extracted = _adopt_extracted_installer(
+            root, cfg, installer, stage, settings, say)
+        if payload is not None:
+            commands = []
+        else:
+            _clear_dir(stage)
+            stage.mkdir(parents=True, exist_ok=True)
+
     # Ярлыки: обновление не должно оставлять на рабочем столе статичный
     # ярлык, ведущий в прежнее место папки. Убираются только файлы,
     # появившиеся за время установки и указывающие внутрь портатива.
@@ -13914,24 +14634,35 @@ def _apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
     guard = HostTraceGuard()
     guard.snapshot()
     env = _prepare_environment(root, cfg)
-    payload: Optional[Path] = None
-    failures: "list[str]" = []
+    # Установщик обновления лежит в Updates и запускается оттуда. Его имя
+    # совпадает с шаблоном «родного» апдейтера программы, поэтому слежка за
+    # обновлением не должна принимать его за чужой и завершать: убитый
+    # установщик NSIS возвращает код 2, и обновление выглядело проваленным.
+    _update_log(root, "the update installer runs from Updates; it is not "
+                      "stopped as a stray installer")
     try:
         for label, command in commands:
             say(f"устанавливаю новую версию ({label})")
             _update_log(root, f"running: {command}")
+            global _ACTIVE_UPDATE_INSTALLER
+            _ACTIVE_UPDATE_INSTALLER = installer
             try:
-                code = run_installer(command, env, str(updates),
-                                     settings["timeout"])
-            except OSError as exc:
-                failures.append(f"{label}: не запустился ({exc})")
-                _update_log(root, failures[-1])
-                continue
+                try:
+                    code = run_installer(command, env, str(updates),
+                                         settings["timeout"])
+                except OSError as exc:
+                    failures.append(f"{label}: не запустился ({exc})")
+                    _update_log(root, failures[-1])
+                    continue
+            finally:
+                _ACTIVE_UPDATE_INSTALLER = None
             # Установщик мог запустить только что поставленную программу.
             release_portable_folder(root, shutdown)
             payload = locate_payload(stage, cfg)
             if payload is not None and code in UPDATE_OK_CODES:
                 _update_log(root, f"{label}: installed, code {code}")
+                remember_install_mode(root, False, engine=engine,
+                                      note=f"{label}, code {code}")
                 break
             payload = None
             failures.append(f"{label}: код {code}")
@@ -13985,13 +14716,29 @@ def _apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
             payload = locate_payload(stage, cfg)
 
     if payload is None:
+        # Последний рубеж: установщик не поставил программу (NSIS так делает
+        # с кодом 2, если не смог закрыть приложение, увидел второй экземпляр
+        # установщика или споткнулся о прежний деинсталлятор в реестре). Тогда
+        # содержимое установщика достаётся распаковкой — без его запуска:
+        # Windows при этом не меняется вовсе.
+        payload, extracted = _adopt_extracted_installer(
+            root, cfg, installer, stage, settings, say)
+
+    if payload is None:
         journal["state"] = "failed"
         _write_journal(root, journal)
         _clear_dir(stage)
+        hint = ""
+        if not update_extractors(root):
+            hint = (" Распаковщика нет: положите 7z.exe и 7z.dll в "
+                    "PortableData\\Tools (или установите 7-Zip) — тогда "
+                    "обновление сможет поставить программу из самого "
+                    "установщика, не запуская его.")
         return result.fail(
             "Установщик не положил программу в папку: "
-            + ("; ".join(failures) or "нет результата") + ". Портатив не "
-            "изменён. Подробности: PortableData\\" + UPDATE_LOG_NAME)
+            + ("; ".join(failures) or "нет результата") + "." + hint
+            + " Портатив не изменён. Подробности: PortableData\\"
+            + UPDATE_LOG_NAME)
 
     say("заменяю файлы программы")
     journal["state"] = "swapping"
@@ -14023,6 +14770,7 @@ def _apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
             + suffix)
 
     journal["state"] = "done"
+    journal["finished_at"] = time.time()
     _write_journal(root, journal)
     _clear_dir(stage)
     if settings["keep_backup"]:
@@ -14048,7 +14796,11 @@ def _apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
     result.message = ("Программа обновлена внутри портатива."
                       + (" Прежняя версия сохранена в папке Updates\\backup "
                          "(команда --rollback вернёт её; папку можно удалить, "
-                         "чтобы освободить место)." if result.backup else ""))
+                         "чтобы освободить место)." if result.backup else "")
+                      + (f" Установщик не смог поставить программу в папку, "
+                         f"поэтому новая версия распакована из него без "
+                         f"запуска ({extracted}); Windows не менялась."
+                         if extracted else ""))
     _update_log(root, "update finished successfully")
     return result
 
@@ -14064,18 +14816,28 @@ def rollback_update(root: Path, cfg: Dict[str, Any]) -> UpdateResult:
         return result.fail("Откат уже выполнен.")
     if journal.get("replaced") and not backup.is_dir():
         return result.fail("Папка Updates\\backup удалена: откатывать не из чего.")
-    release_portable_folder(root, shutdown_settings(cfg))
-    problems = _rollback_journal(root, journal)
-    if problems:
-        return result.fail("Откат прошёл не полностью: "
-                           + "; ".join(problems[:3]))
-    journal["state"] = "rolled-back"
-    _write_journal(root, journal)
-    _clear_dir(backup)
-    result.ok = True
-    result.message = "Прежняя версия программы возвращена."
-    _update_log(root, "rolled back to the previous version")
-    return result
+    # Откат не должен пересекаться с идущим обновлением: оба меняют App.
+    if not acquire_update_lock(root):
+        owner = update_lock_owner(root)
+        return result.fail(
+            "Сейчас идёт обновление в другом процессе портатива"
+            + (f" (PID {owner})" if owner else "")
+            + ": откат не начат, попробуйте после его окончания.")
+    try:
+        release_portable_folder(root, shutdown_settings(cfg))
+        problems = _rollback_journal(root, journal)
+        if problems:
+            return result.fail("Откат прошёл не полностью: "
+                               + "; ".join(problems[:3]))
+        journal["state"] = "rolled-back"
+        _write_journal(root, journal)
+        _clear_dir(backup)
+        result.ok = True
+        result.message = "Прежняя версия программы возвращена."
+        _update_log(root, "rolled back to the previous version")
+        return result
+    finally:
+        release_update_lock(root)
 
 
 def recover_interrupted_update(root: Path, cfg: Dict[str, Any]) -> Optional[str]:
@@ -14099,6 +14861,10 @@ def recover_interrupted_update(root: Path, cfg: Dict[str, Any]) -> Optional[str]
             return None
     if state == "installing":
         _clear_dir(root / UPDATE_DIR_NAME / "stage")
+        # Распаковка установщика (обновление без его запуска) тоже могла не
+        # дойти до конца: её рабочая папка занимает столько же, сколько сама
+        # программа, и оставаться на диске не должна.
+        _clear_dir(root / UPDATE_DIR_NAME / "unpack")
         journal["state"] = "failed"
         _write_journal(root, journal)
         _update_log(root, "an interrupted installation was cleaned up; "
@@ -14110,6 +14876,7 @@ def recover_interrupted_update(root: Path, cfg: Dict[str, Any]) -> Optional[str]
         journal["state"] = "rollback-failed" if problems else "rolled-back"
         _write_journal(root, journal)
         _clear_dir(root / UPDATE_DIR_NAME / "stage")
+        _clear_dir(root / UPDATE_DIR_NAME / "unpack")
         _update_log(root, "an interrupted file swap was rolled back"
                     + (": " + "; ".join(problems[:3]) if problems else ""))
         if problems:
