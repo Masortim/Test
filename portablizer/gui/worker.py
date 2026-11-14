@@ -112,8 +112,15 @@ class MaintenanceWorker(QThread):
                 language=self.language,
             )
         elif self.action == "update":
+            # copy_exe: перед обновлением программы лончер в папке
+            # перевыпускается, если он старее встроенного. Обновление
+            # запускает лончер папки, поэтому без этого «Обновить программу»
+            # снова идёт старой сборкой.
+            engine = Portablizer(logger=self.logger)
             report = maintenance.update_app(
-                self.folder, self.installer, self.logger)
+                self.folder, self.installer, self.logger,
+                copy_exe=lambda folder, rel: engine._copy_exe_launcher(
+                    folder, rel))
         elif self.action == "netstack":
             # Распаковка установщика ради драйвера может занять секунды —
             # окно в это время обязано оставаться живым.
