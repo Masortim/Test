@@ -1910,6 +1910,43 @@ class PortablizerSideTests(unittest.TestCase):
                     self.assertFalse(
                         maintenance.launcher_matches_builder(str(root)))
 
+    def test_update_rebuilds_a_stale_launcher_before_updating(self):
+        """Обновление идёт лончером папки — значит его надо перевыпустить.
+
+        Иначе «Обновить программу» запускает старую сборку лончера (она лежит
+        в App), и та повторяет свои старые ошибки: «не сработало» сколько ни
+        нажимай.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            refreshed = maintenance.MaintenanceReport(folder=str(root))
+            refreshed.success = True
+            with mock.patch.object(maintenance, "launcher_matches_builder",
+                                   return_value=False), \
+                 mock.patch.object(maintenance, "refresh",
+                                   return_value=refreshed) as refresh:
+                report = maintenance.update_app(
+                    str(root), runner=lambda cmd: 0,
+                    copy_exe=lambda folder, rel: "copied")
+            refresh.assert_called_once()
+            self.assertEqual(refresh.call_args.kwargs["shared_saves"], False,
+                             "сейвы не должны сводиться в одно хранилище "
+                             "побочным эффектом обновления")
+            self.assertTrue(report.success)
+            self.assertIn("перевыпущен", "\n".join(report.messages))
+
+    def test_update_keeps_a_matching_launcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            with mock.patch.object(maintenance, "launcher_matches_builder",
+                                   return_value=True), \
+                 mock.patch.object(maintenance, "refresh") as refresh:
+                report = maintenance.update_app(
+                    str(root), runner=lambda cmd: 0,
+                    copy_exe=lambda folder, rel: "copied")
+            refresh.assert_not_called()
+            self.assertTrue(report.success)
+
     def test_maintenance_update_reports_missing_launcher(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_portable(tmp)

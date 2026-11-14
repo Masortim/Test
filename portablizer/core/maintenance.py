@@ -831,18 +831,51 @@ def _tail(path: str, lines: int = 6) -> List[str]:
 
 
 def update_app(folder: str, installer: str = "", log: Optional[Logger] = None,
-               runner=None) -> MaintenanceReport:
+               runner=None, copy_exe=None) -> MaintenanceReport:
     """Обновляет программу внутри портатива через его собственный лончер.
 
     ``installer`` - файл установщика или ``http(s)``-адрес; пусто - лончер
     возьмёт скачанное программой или загрузит актуальную версию по адресу
     из ``launcher_config.json``. ``runner(command) -> int`` подменяется в
     тестах.
+
+    ``copy_exe`` — функция ``(portable_dir, destination_rel) -> str`` из
+    портаблизера (как у :func:`refresh`). Обновление запускает лончер **из
+    папки**, то есть ту сборку, что лежит в портативе, а не встроенную в
+    Portablizer. Поэтому перед обновлением лончер в папке перевыпускается,
+    если он отличается: иначе старая сборка повторяет старые ошибки, и
+    «Обновить программу» никогда не заработает.
     """
     log = log or Logger()
     report = MaintenanceReport(folder=folder)
     exe = os.path.join(folder, "App", "LaunchPortable.exe")
-    if not looks_like_portable(folder) or not os.path.isfile(exe):
+    if not looks_like_portable(folder):
+        message = (
+            "В папке нет launcher_config.json или App — это не портатив, "
+            "собранный Portablizer. Обновлять нечего.")
+        log.error(message)
+        report.messages.append(message)
+        return report
+    if copy_exe is not None and (not os.path.isfile(exe)
+                                 or not launcher_matches_builder(folder)):
+        note = launcher_size_note(folder)
+        log.info("Лончер в папке — старая сборка"
+                 + (f" ({note})" if note else "")
+                 + ": перевыпускаю его перед обновлением программы.")
+        try:
+            rebuilt = refresh(folder, log, copy_exe=copy_exe,
+                              shared_saves=False)
+        except Exception as exc:  # noqa: BLE001 - лончер не срывает обновление
+            rebuilt = None
+            log.warn(f"Не удалось перевыпустить лончер: {exc}")
+        if rebuilt is not None and rebuilt.success:
+            message = ("Лончер в папке перевыпущен текущей сборкой — "
+                       "обновление пойдёт им, а не прежним.")
+            log.ok(message)
+            report.messages.append(message)
+        else:
+            log.warn("Лончер в папке остался прежним: обновление пойдёт им.")
+    if not os.path.isfile(exe):
         message = (
             "В папке нет App\\LaunchPortable.exe. Сначала нажмите «Обновить "
             "лончер»: он перевыпустит лончер, умеющий обновлять программу.")
