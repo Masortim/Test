@@ -1576,6 +1576,9 @@ class UnpackedUpdateTests(unittest.TestCase):
             encoding="utf-8")
         self.assertIn("no usable result (code 2)", log)
         self.assertIn("was unpacked from the installer without running it", log)
+        # По журналу видно, КАКАЯ сборка лончера работала: старые сборки эту
+        # строку не пишут, и «не сработало» перестаёт быть догадкой.
+        self.assertIn("launcher build: " + exe_launcher.LAUNCHER_BUILD, log)
 
     def test_container_service_folders_are_not_copied(self):
         unpacker = fake_unpacker(lambda archive, target: {
@@ -1856,6 +1859,56 @@ class PortablizerSideTests(unittest.TestCase):
             self.assertEqual(commands[0][1:], ["--update", "C:/dl/Setup.exe", "--yes"])
             report = maintenance.update_app(str(root), runner=lambda cmd: 0)
             self.assertTrue(report.success)
+
+    def test_maintenance_failure_message_shows_the_log_reason(self):
+        """Диалог показывает причину, а не только путь к журналу.
+
+        Пользователь присылает скриншот окна: по нему должно быть видно, ЧТО
+        случилось, иначе диагностика превращается в переписку.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            log = root / "PortableData" / "launcher-update.log"
+            _write(log, "[2026-11-14 18:03:32] update started from temp-1.exe\n"
+                        "[2026-11-14 18:03:32] NSIS: no usable result "
+                        "(code 2)\n")
+            report = maintenance.update_app(str(root), runner=lambda cmd: 1)
+            message = "\n".join(report.messages)
+            self.assertIn("Обновление не удалось (код 1)", message)
+            self.assertIn("no usable result (code 2)", message)
+
+    def test_maintenance_failure_mentions_a_stale_launcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            with mock.patch.object(maintenance, "launcher_matches_builder",
+                                   return_value=False):
+                report = maintenance.update_app(str(root),
+                                                runner=lambda cmd: 1)
+            message = "\n".join(report.messages)
+            self.assertIn("Обновить лончер", message)
+
+    def test_launcher_match_compares_with_the_bundled_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_portable(tmp)
+            bundled = Path(tmp) / "bundled.exe"
+            bundled.write_bytes(b"x" * 12)
+            with mock.patch.object(maintenance, "launcher_matches_builder",
+                                   wraps=maintenance.launcher_matches_builder):
+                with mock.patch("portablizer.core.portablizer"
+                                ".bundled_exe_launcher_path",
+                                return_value=str(bundled)), \
+                     mock.patch("portablizer.core.portablizer"
+                                ".bundled_exe_launcher_dir",
+                                return_value=""):
+                    self.assertFalse(
+                        maintenance.launcher_matches_builder(str(root)))
+                    same = root / "App" / "LaunchPortable.exe"
+                    same.write_bytes(b"y" * 12)
+                    self.assertTrue(
+                        maintenance.launcher_matches_builder(str(root)))
+                    same.write_bytes(b"y" * 99)
+                    self.assertFalse(
+                        maintenance.launcher_matches_builder(str(root)))
 
     def test_maintenance_update_reports_missing_launcher(self):
         with tempfile.TemporaryDirectory() as tmp:

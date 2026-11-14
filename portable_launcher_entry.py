@@ -27,6 +27,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from portablizer.core import filelocks, restart_manager, unpacker
 
 ROOT_TOKEN = "@@PORTABLE_ROOT@@"
+
+#: Отпечаток сборки лончера. Пишется первой строкой в журнал обновления и
+#: печатается по ``--version``: по журналу видно, КАКОЙ лончер на самом деле
+#: работал. Старые сборки такой строки не пишут вовсе — именно это и надо
+#: отличать, когда «обновление не работает» после обновления лончера.
+LAUNCHER_BUILD = "2026-11-14 (unpack+lock)"
 IS_WINDOWS = sys.platform.startswith("win")
 NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 ERROR_ICON = 0x00000010
@@ -14621,6 +14627,7 @@ def _apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
 
     shutdown = shutdown_settings(cfg)
     say("закрываю программу")
+    _update_log(root, f"launcher build: {LAUNCHER_BUILD}")
     _update_log(root, f"update started from {installer.name}")
     release_portable_folder(root, shutdown)
     if IS_WINDOWS and _portable_process_list(root):
@@ -16414,6 +16421,11 @@ def diagnose(root: Optional[Path] = None) -> int:
 def main() -> int:
     root: Optional[Path] = None
     arguments = [str(arg).casefold() for arg in sys.argv[1:]]
+    # --version: сборка лончера без запуска программы и без диалогов. Нужна,
+    # чтобы отличить в папке старый лончер от нового (см. LAUNCHER_BUILD).
+    if any(arg in ("--version", "/version") for arg in arguments):
+        print(f"PortableLauncher build: {LAUNCHER_BUILD}")
+        return 0
     # Починка меню «Пуск» — единственная команда, которой папка портатива не
     # нужна: меню ломается как раз тогда, когда портатива под рукой может не
     # быть. Она работает и из любой папки, куда скопировали этот EXE.

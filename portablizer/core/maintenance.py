@@ -749,6 +749,78 @@ def repair_start_menu(log: Optional[Logger] = None) -> MaintenanceReport:
 UPDATE_LOG_NAME = "launcher-update.log"
 
 
+#: Слова, по которым в журнале обновления видно причину отказа. Нужны, чтобы
+#: диалог «Обновление не удалось» показывал причину, а не только путь к файлу:
+#: пользователь присылает скриншот, и по нему должно быть понятно, что делать.
+_FAILURE_HINTS = (
+    "failed", "no usable result", "cannot", "error", "unable", "missing",
+    "не удал", "код ", "нет установщика", "not stopped", "denied",
+)
+
+
+def update_failure_reason(path: str, lines: int = 3) -> str:
+    """Последние «говорящие» строки журнала обновления (пусто — их нет)."""
+    picked = [line for line in _tail(path, 60)
+              if any(hint in line.casefold() for hint in _FAILURE_HINTS)]
+    return " / ".join(picked[-lines:]) if picked else ""
+
+
+def launcher_size_note(folder: str) -> str:
+    """«лончер в папке N Б, в этой сборке M Б» — доказательство, а не догадка."""
+    try:
+        from .portablizer import bundled_exe_launcher_path
+        bundled = os.path.getsize(bundled_exe_launcher_path())
+        current = os.path.getsize(
+            os.path.join(folder, "App", "LaunchPortable.exe"))
+    except Exception:  # noqa: BLE001 - нет ресурса или файла: сказать нечего
+        return ""
+    return f"лончер в папке {current} Б, в этой сборке Portablizer {bundled} Б"
+
+
+def launcher_matches_builder(folder: str) -> bool:
+    """Совпадает ли лончер в папке с лончером этой сборки Portablizer.
+
+    Обновление программы запускает ``App\\LaunchPortable.exe`` — ту сборку
+    лончера, которая лежит в папке, а не ту, что встроена в Portablizer.
+    Старый лончер повторяет и старые ошибки (например, «NSIS: код 2»),
+    поэтому расхождение надо показать пользователю.
+    """
+    try:
+        from .portablizer import bundled_exe_launcher_dir, \
+            bundled_exe_launcher_path
+    except Exception:  # noqa: BLE001 - в сборке без ресурса проверка не нужна
+        return True
+    current = os.path.join(folder, "App", "LaunchPortable.exe")
+    try:
+        size = os.path.getsize(current)
+    except OSError:
+        return True
+
+    def _same(candidate: str) -> bool:
+        try:
+            return bool(candidate) and os.path.getsize(candidate) == size
+        except OSError:
+            return False
+
+    known = []
+    try:
+        known.append(bundled_exe_launcher_path())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        base = bundled_exe_launcher_dir()
+        if base:
+            known.append(os.path.join(base, "PortableLauncher.exe"))
+    except Exception:  # noqa: BLE001
+        pass
+    known = [item for item in known if item and os.path.isfile(item)]
+    if not known:
+        # Ресурса лончера рядом нет (запуск из исходников без сборки):
+        # сравнивать не с чем, и пугать пользователя нечем.
+        return True
+    return any(_same(item) for item in known)
+
+
 def _tail(path: str, lines: int = 6) -> List[str]:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -814,6 +886,17 @@ def update_app(folder: str, installer: str = "", log: Optional[Logger] = None,
     else:
         message = (f"Обновление не удалось (код {code}). Портатив остался "
                    f"прежним. Подробности: {update_log}")
+        reason = update_failure_reason(update_log)
+        if reason:
+            message += "\nПричина (последние строки журнала): " + reason
+        if not launcher_matches_builder(folder):
+            note = launcher_size_note(folder)
+            message += ("\nЛончер в папке — не та сборка, что встроена в этот "
+                        "Portablizer"
+                        + (f" ({note})" if note else "")
+                        + ". Нажмите «Обновить лончер» и повторите: иначе "
+                        "обновление снова пойдёт старым лончером, и в журнале "
+                        "не будет строки «launcher build».")
         log.error(message)
     report.messages.append(message)
     return report
