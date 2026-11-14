@@ -20,11 +20,16 @@ import os
 
 block_cipher = None
 
+# 7-Zip рядом с лончером (в ``_internal``): этим распаковщиком обновление
+# достаёт новую версию из установщика, не запуская его.
 a = Analysis(
     ["portable_launcher_entry.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        (os.path.join("portablizer", "resources", "7zip", "x64"),
+         os.path.join("resources", "7zip", "x64")),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

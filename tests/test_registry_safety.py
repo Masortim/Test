@@ -576,6 +576,202 @@ class UpdateAssociationGuardTests(unittest.TestCase):
             self.assertIn("Установщик не запускался", result.message)
             runner.assert_not_called()
 
+
+    # --- снимок ассоциаций, когда часть реестра не читается -------------------
+    #
+    # Жалоба (launcher-update.log): «cannot compare association state: reg
+    # export failed for HKCU\Software\Classes (code 1)» и «Не удалось
+    # подтвердить восстановление программ по умолчанию». Самый большой раздел
+    # реестра иногда не отдаётся целиком: занятый файл, защищённая ветка,
+    # одновременный экспорт вторым процессом. Одна такая осечка не должна
+    # останавливать обновление и не должна превращаться в ошибку для
+    # пользователя.
+
+    def _fake_reg(self, snapshot, state, failing=(), calls=None):
+        """``reg.exe``-двойник: пишет UTF-16 ``.reg`` из готового текста."""
+        from pathlib import Path as _Path
+
+        def fake(args):
+            args = [str(item) for item in args]
+            if calls is not None:
+                calls.append(args)
+            action = args[0].casefold()
+            if action == "import":
+                state["imported"] = True
+                try:
+                    state["restore_text"] = _Path(args[1]).read_text("utf-16")
+                except OSError:
+                    state["restore_text"] = ""
+                # Настоящий reg import удаляет разделы из строк ``[-KEY]``:
+                # двойник запоминает их, чтобы следующий экспорт их не нашёл.
+                for line in (state["restore_text"] or "").splitlines():
+                    line = line.strip()
+                    if line.startswith("[-") and line.endswith("]"):
+                        state.setdefault("deleted", set()).add(line[2:-1])
+                return 0
+            key = args[1]
+            full = ("HKEY_CURRENT_USER" + key[len("HKCU"):]
+                    if key.upper().startswith("HKCU") else key)
+            deleted = state.get("deleted") or set()
+            if any(full == item or full.startswith(item + "\\")
+                   for item in deleted):
+                return 1
+            if key in (state.get("absent_keys") or ()) and not state.get(
+                    "created"):
+                return 1
+            if key in failing:
+                return 1
+            texts = snapshot.get(key)
+            if texts is None:
+                return 1
+            text = texts[1] if state.get("imported") else texts[0]
+            path = _Path(args[2])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(text.encode("utf-16"))
+            return 0
+
+        return fake
+
+    @staticmethod
+    def _reg_text(key: str, values) -> str:
+        full = "HKEY_CURRENT_USER" + key[len("HKCU"):]
+        lines = ["Windows Registry Editor Version 5.00", "", f"[{full}]"]
+        for name, value in values.items():
+            lines.append(f"\"{name}\"=\"{value}\"")
+        return "\r\n".join(lines) + "\r\n"
+
+    def _guard(self, root, snapshot, state, failing=(), calls=None,
+               absent=()):
+        patches = [
+            mock.patch.object(entry, "IS_WINDOWS", True),
+            mock.patch.object(entry, "_ASSOCIATION_EXPORT_ROOTS",
+                              tuple(snapshot)),
+            mock.patch.object(entry, "_reg",
+                              self._fake_reg(snapshot, state, failing, calls)),
+            mock.patch.object(
+                entry, "registry_key_state",
+                side_effect=lambda key: (str(key) not in absent
+                                         or bool(state.get("created")))),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        return entry.HostAssociationGuard(root)
+
+    def _log(self, root) -> str:
+        path = root / "PortableData" / "launcher-update.log"
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+    def test_unreadable_root_does_not_stop_the_update(self):
+        readable = r"HKCU\Software\Classes\.guard" + str(os.getpid())
+        broken = r"HKCU\Software\Classes\.broken" + str(os.getpid())
+        snapshot = {
+            readable: (self._reg_text(readable, {"Keep": "same"}), "")[0],
+            broken: self._reg_text(broken, {"Value": "one"}),
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            guard = self._guard(root, snapshot, {}, failing=(broken,))
+            self.assertTrue(guard.snapshot())
+            self.assertEqual(guard.covered, [readable])
+            self.assertEqual(guard.unreadable, [broken])
+            self.assertIn("снимок неполный", self._log(root))
+
+    def test_only_covered_roots_are_compared_and_restored(self):
+        readable = r"HKCU\Software\Classes\.guard" + str(os.getpid())
+        broken = r"HKCU\Software\Classes\.broken" + str(os.getpid())
+        before = self._reg_text(readable, {"Value": "one", "Keep": "same"})
+        after = self._reg_text(readable, {"Value": "two", "Added": "x"})
+        restored = self._reg_text(readable, {"Value": "one", "Keep": "same"})
+        snapshot = {readable: (before, restored),
+                    broken: self._reg_text(broken, {"Value": "one"})}
+        calls = []
+        state = {}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            guard = self._guard(root, snapshot, state, failing=(broken,),
+                                calls=calls)
+            self.assertTrue(guard.snapshot())
+            snapshot[readable] = (after, restored)
+            self.assertEqual(guard.restore(), [],
+                             "откат без ошибок: нечитаемый корень не в счёте")
+            text = state.get("restore_text", "")
+            # В .reg-файле корень записан полным именем улья.
+            self.assertIn(readable.replace("HKCU", "HKEY_CURRENT_USER"), text)
+            self.assertIn('"Value"="one"', text)
+            self.assertIn('"Added"=-', text)
+            self.assertNotIn(broken.replace("HKCU", "HKEY_CURRENT_USER"), text,
+                             "нечитаемый раздел не восстанавливается вслепую")
+            self.assertIn("original host state restored", self._log(root))
+            self.assertEqual(
+                [call[0] for call in calls if call[0] == "import"], ["import"])
+            self.assertFalse(
+                (root / "Updates" / "AssociationBackup").exists(),
+                "сверка прошла — снимок больше не нужен")
+
+    def test_unreadable_registry_keeps_the_baseline_for_the_next_run(self):
+        readable = r"HKCU\Software\Classes\.guard" + str(os.getpid())
+        snapshot = {readable: (self._reg_text(readable, {"Value": "one"}), "")[0]}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            guard = self._guard(root, snapshot, {})
+            self.assertTrue(guard.snapshot())
+            backup = root / "Updates" / "AssociationBackup" / "before.reg"
+            self.assertTrue(backup.is_file())
+            guard._export_root = lambda key, folder, index: None  # реестр недоступен
+            self.assertEqual(guard.restore(), [],
+                             "не повод для сообщения об ошибке")
+            self.assertTrue(backup.is_file(), "снимок ждёт следующего запуска")
+            self.assertIn("сравнение отложено", self._log(root))
+
+    def test_root_created_by_the_installer_is_removed_again(self):
+        """Раздел, которого до обновления не было, убирается целиком.
+
+        Снимок по корням не может экспортировать несуществующий раздел, а
+        установщик именно такие и создаёт (свой ProgID, пункт контекстного
+        меню). Раньше общий снимок ``HKCU\\Software\\Classes`` видел их как
+        «добавленные» и удалял; теперь лончер помнит список отсутствовавших
+        корней и удаляет появившееся в них сам.
+        """
+        suffix = str(os.getpid())
+        keep = r"HKCU\Software\Classes\.pbt" + suffix
+        fresh = r"HKCU\Software\Classes\After.PBT" + suffix
+        state = {"absent_keys": {fresh}, "created": False, "imported": False}
+        fresh_text = self._reg_text(fresh + r"\shell\open\command",
+                                    {"": r'"C:\After\after.exe" "%1"'})
+        snapshot = {
+            keep: (self._reg_text(keep, {"": "Before.ProgID"}),
+                   self._reg_text(keep, {"": "Before.ProgID"})),
+            fresh: (fresh_text, fresh_text),
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            guard = self._guard(Path(temp), snapshot, state, absent={fresh})
+            self.assertTrue(guard.snapshot())
+            self.assertEqual(guard.absent, [fresh])
+            self.assertTrue((guard.directory / "absent.json").is_file())
+
+            # Установщик создал раздел, которого раньше не было.
+            state["created"] = True
+            self.assertEqual(guard.restore(), [])
+
+        restore_text = state.get("restore_text") or ""
+        self.assertIn(f"[-HKEY_CURRENT_USER\\Software\\Classes\\After.PBT"
+                      f"{suffix}]", restore_text)
+        self.assertEqual(state.get("deleted"),
+                         {f"HKEY_CURRENT_USER\\Software\\Classes\\"
+                          f"After.PBT{suffix}"})
+
+    def test_broken_registry_does_not_start_the_update(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "App").mkdir()
+            (root / "Updates" / "AssociationBackup").mkdir(parents=True)
+            (root / "Updates" / "AssociationBackup" / "before.reg").write_bytes(
+                b"\xff\xfe" + "Windows Registry Editor Version 5.00\r\n"
+                .encode("utf-16-le"))
+            guard = self._guard(root, {}, {}, failing=())
+            self.assertFalse(guard.snapshot())
+
     def test_heal_never_rewrites_an_association_tree(self):
         fake_reg = mock.Mock()
         fake_reg.HKEY_CURRENT_USER = object()
