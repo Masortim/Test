@@ -30,7 +30,27 @@ a = Analysis(
         (os.path.join("portablizer", "resources", "7zip", "x64"),
          os.path.join("resources", "7zip", "x64")),
     ],
-    hiddenimports=[],
+    hiddenimports=[
+        # Скачивание обновления идёт через urllib: в замороженной сборке
+        # лишённый статических импортов email не попадал в неё, и загрузка
+        # падала с «No module named 'email'» (реальная жалоба).
+        "email",
+        "email.parser",
+        "email.message",
+        "email.feedparser",
+        "email.errors",
+        "email.header",
+        "email.utils",
+        "email._policybase",
+        "http",
+        "http.client",
+        "http.cookiejar",
+        "urllib.request",
+        "urllib.error",
+        "urllib.parse",
+        "ssl",
+        "_ssl",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

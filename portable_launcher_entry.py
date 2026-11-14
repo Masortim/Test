@@ -11064,21 +11064,32 @@ def _run_extractor(command: "Sequence[str]", timeout: float
 
 
 def _extract_archive(extractor: Any, archive: Path, target: Path,
-                     runner: Any, timeout: float) -> bool:
+                     runner: Any, timeout: float,
+                     log: "Optional[Any]" = None) -> bool:
     """Распаковывает ``archive`` в ``target``. ``True`` — в ``target`` есть файлы."""
     _clear_dir(target)
     try:
         target.mkdir(parents=True, exist_ok=True)
-    except OSError:
+    except OSError as exc:
+        if log:
+            log(f"{extractor}: cannot create the work folder ({exc})")
         return False
     command = unpacker.extractor_argv(extractor, str(archive), str(target))
     try:
-        code, _output = runner(command, timeout)
-    except Exception:  # noqa: BLE001 - распаковка не срывает обновление
+        code, output = runner(command, timeout)
+    except Exception as exc:  # noqa: BLE001 - распаковка не срывает обновление
+        if log:
+            log(f"{extractor}: cannot run ({exc})")
         return False
     # Код 1 у 7-Zip — предупреждение (часть файлов не распакована), а не
     # отказ: то, что достали, всё равно проверяется.
     if code not in (0, 1):
+        if log:
+            detail = " | ".join(line.strip() for line in
+                                str(output or "").splitlines()
+                                if line.strip())[:400]
+            log(f"{extractor}: код {code} на {archive.name}"
+                + (f": {detail}" if detail else ""))
         return False
     try:
         return any(target.iterdir())
@@ -11111,7 +11122,8 @@ def extract_installer_payload(installer: Path, stage: Path,
                               extractors: "Optional[Sequence[Any]]" = None,
                               runner: "Optional[Any]" = None,
                               work_dir: "Optional[Path]" = None,
-                              timeout: float = UPDATE_EXTRACT_TIMEOUT
+                              timeout: float = UPDATE_EXTRACT_TIMEOUT,
+                              log: "Optional[Any]" = None
                               ) -> "Optional[tuple[Any, str]]":
     """Достаёт программу из установщика, не запуская установщик.
 
@@ -11135,22 +11147,30 @@ def extract_installer_payload(installer: Path, stage: Path,
     try:
         for index, extractor in enumerate(extractors):
             bundle = work / f"bundle{index}"
-            if not _extract_archive(extractor, installer, bundle, run, timeout):
+            if not _extract_archive(extractor, installer, bundle, run, timeout,
+                                    log):
                 _clear_dir(bundle)
                 continue
             payload = locate_payload(bundle, cfg)
             nested = 0
+            if payload is None and log:
+                log(f"{extractor}: содержимое разобрано, программы в нём нет; "
+                    "верхний уровень: " + _top_level(bundle))
             for archive in _nested_archives(bundle):
                 if payload is not None:
                     break
                 nested += 1
                 inner = work / f"nested{index}-{nested}"
-                if not _extract_archive(extractor, archive, inner, run, timeout):
+                if not _extract_archive(extractor, archive, inner, run, timeout,
+                                        log):
                     _clear_dir(inner)
                     continue
                 payload = locate_payload(inner, cfg)
                 if payload is not None:
                     bundle = inner
+                elif log:
+                    log(f"{extractor}: во вложенном {archive.name} программы "
+                        "нет; верхний уровень: " + _top_level(inner))
             if payload is None:
                 _clear_dir(bundle)
                 continue
@@ -11169,6 +11189,16 @@ def extract_installer_payload(installer: Path, stage: Path,
     finally:
         _clear_dir(work)
     return None
+
+
+def _top_level(folder: Path, limit: int = 8) -> str:
+    """Имена верхнего уровня — для журнала, когда программы не нашлось."""
+    try:
+        names = sorted((item.name for item in folder.iterdir()),
+                       key=str.casefold)
+    except OSError:
+        return "(папка недоступна)"
+    return ", ".join(names[:limit]) + (" ..." if len(names) > limit else "")
 
 
 def _promote_payload(source: Path, destination: Path) -> int:
@@ -13354,6 +13384,56 @@ def download_installer(url: str, destination: Path,
     return destination
 
 
+#: Меньше этого настоящий установщик десктопной программы не бывает: файл на
+#: пару десятков килобайт — это страница ошибки загрузки или обрывок.
+UPDATE_MIN_INSTALLER_BYTES = 512 * 1024
+
+
+def installer_problem(path: Path) -> str:
+    """Почему файл не похож на установщик (пустая строка — похож).
+
+    Жалоба: обновление дважды запускало установщик, который за секунду
+    выходил с кодом 2, и распаковка тоже ничего не находила. Причина была в
+    самом файле — вместо установщика лежал ответ сервера. Проверка магических
+    байтов говорит об этом прямо, не запуская и не распаковывая ничего.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"файл недоступен ({exc})"
+    if size <= 0:
+        return "файл пуст"
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(8)
+    except OSError as exc:
+        return f"файл не читается ({exc})"
+    text_head = head[:4]
+    ascii_head = "".join(
+        chr(byte) if 32 <= byte < 127 else "." for byte in head[:4])
+    if path.suffix.casefold() == ".msi":
+        if text_head not in (b"\xd0\xcf\x11\xe0", b"PK\x03\x04"):
+            return (f"это не MSI (первые байты «{ascii_head}», "
+                    f"{size} байт)")
+    elif not head.startswith(b"MZ"):
+        return (f"это не исполняемый файл Windows (первые байты "
+                f"«{ascii_head}», {size} байт)")
+    if size < UPDATE_MIN_INSTALLER_BYTES:
+        return f"файл слишком мал для установщика ({size} байт)"
+    return ""
+
+
+def _free_space_note(root: Path) -> str:
+    """«свободно N ГБ» — установщику и распаковке нужно место на диске."""
+    try:
+        free = shutil.disk_usage(str(root)).free
+    except OSError:
+        return ""
+    if free >= 1024 ** 3:
+        return f"свободно {free / 1024 ** 3:.1f} ГБ"
+    return f"свободно {free / 1024 ** 2:.0f} МБ"
+
+
 def _download_name(url: str) -> str:
     from urllib.parse import urlparse, unquote
 
@@ -14254,7 +14334,8 @@ def _adopt_extracted_installer(root: Path, cfg: Dict[str, Any],
         found = extract_installer_payload(
             installer, stage, cfg, extractors=extractors,
             work_dir=root / UPDATE_DIR_NAME / "unpack",
-            timeout=UPDATE_EXTRACT_TIMEOUT)
+            timeout=UPDATE_EXTRACT_TIMEOUT,
+            log=lambda line: _update_log(root, "unpack: " + line))
     except Exception as exc:  # noqa: BLE001 - распаковка не срывает обновление
         _update_log(root, f"unpacking the installer failed ({exc})")
         return None, ""
@@ -14628,7 +14709,14 @@ def _apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
     shutdown = shutdown_settings(cfg)
     say("закрываю программу")
     _update_log(root, f"launcher build: {LAUNCHER_BUILD}")
-    _update_log(root, f"update started from {installer.name}")
+    try:
+        size = installer.stat().st_size
+    except OSError:
+        size = 0
+    _update_log(root, f"update started from {installer.name} ({size} байт)")
+    space = _free_space_note(root)
+    if space:
+        _update_log(root, f"disk: {space} на {root.drive or root}")
     release_portable_folder(root, shutdown)
     if IS_WINDOWS and _portable_process_list(root):
         return result.fail(
@@ -14806,9 +14894,11 @@ def _apply_update(root: Path, cfg: Dict[str, Any], installer: Path,
                     "PortableData\\Tools (или установите 7-Zip) — тогда "
                     "обновление сможет поставить программу из самого "
                     "установщика, не запуская его.")
+        space = _free_space_note(root)
         return result.fail(
             "Установщик не положил программу в папку: "
             + ("; ".join(failures) or "нет результата") + "." + hint
+            + (f" На диске {space}." if space else "")
             + " Портатив не изменён. Подробности: PortableData\\"
             + UPDATE_LOG_NAME)
 
@@ -15006,6 +15096,33 @@ def run_update(root: Path, cfg: Dict[str, Any], source: str = "",
             "Нет установщика новой версии. Положите его в папку Updates, "
             "перетащите на UpdatePortable.cmd или запустите "
             "App\\LaunchPortable.exe --update <файл или ссылка>.")
+    if installer is not None:
+        problem = installer_problem(installer)
+        if problem:
+            # Битый файл не запускаем и не распаковываем: установщик,
+            # который за секунду выходит с кодом 2, — это, как правило,
+            # страница ошибки загрузки, а не программа.
+            _update_log(root, f"the update file is unusable: {problem}: "
+                              f"{installer}")
+            # Адрес из настроек: битый файл заменяется свежей загрузкой.
+            url = settings["source_url"]
+            if not url:
+                return result.fail(
+                    "Файл обновления не похож на установщик: " + problem
+                    + ". Установщик не запускался, портатив не изменён. "
+                    "Скачайте обновление заново (или положите настоящий "
+                    "установщик в папку Updates).")
+            _update_log(root, "downloading the update again: the kept file "
+                              "is unusable")
+            _forget_pending(root)
+            # Битый файл не удаляем (пусть пользователь посмотрит), но и не
+            # подставляем его снова: переименование выводит его из поиска.
+            try:
+                installer.rename(installer.with_name(
+                    installer.name + ".broken"))
+            except OSError:
+                pass
+            installer = None
     if url and confirm_download and interactive and not _ask_yes_no(
             f"Скачать новую версию программы с адреса\n{url}\n"
             "и установить её внутрь портатива?\n\n"
@@ -15038,6 +15155,14 @@ def run_update(root: Path, cfg: Dict[str, Any], source: str = "",
             except Exception as exc:  # noqa: BLE001 - сеть бывает любой
                 _update_log(root, f"download failed: {exc}")
                 return result.fail(f"Не удалось скачать установщик: {exc}")
+            problem = installer_problem(downloaded)
+            if problem:
+                _remove_file(downloaded)
+                _update_log(root, f"downloaded file is unusable: {problem}")
+                return result.fail(
+                    "Скачанный файл не похож на установщик: " + problem
+                    + ". Он удалён и не будет запущен. Проверьте адрес "
+                    "обновления в настройках портатива.")
             status = _authenticode_status(downloaded)
             if status in ("NotSigned", "HashMismatch"):
                 _remove_file(downloaded)
